@@ -1,0 +1,20 @@
+services:
+  cockroachdb:
+    image: cockroachdb/cockroach:latest
+    container_name: langchain-cockroachdb
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    environment:
+      - COCKROACH_DATABASE=defaultdb
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health?ready=1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  cockroach-data:

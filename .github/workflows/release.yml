@@ -1,0 +1,16 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (e.g., 0.1.0)
+        required: true
+        type: string
+
+jobs:
+  release:
+    uses: ./.github/workflows/_release.yml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit

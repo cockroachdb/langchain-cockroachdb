@@ -1,0 +1,75 @@
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      cockroachdb:
+        image: cockroachdb/cockroach:latest
+        options: >-
+          --health-cmd "curl -f http://localhost:8080/health?ready=1 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup UV
+        uses: ./.github/actions/uv_setup
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[dev]"
+
+      - name: Start CockroachDB
+        run: |
+          docker run -d --name cockroach \
+            --network host \
+            cockroachdb/cockroach:latest \
+            start-single-node --insecure
+          
+          # Wait for CockroachDB to be ready
+          for i in {1..30}; do
+            if docker exec cockroach ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
+              echo "CockroachDB is ready"
+              break
+            fi
+            echo "Waiting for CockroachDB... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit -v --tb=short
+
+      - name: Run integration tests
+        env:
+          USE_TESTCONTAINER: "false"
+        run: |
+          pytest tests/integration -v --tb=short
+
+      - name: Generate coverage report
+        if: inputs.python-version == '3.12'
+        run: |
+          pytest tests --cov=langchain_cockroachdb --cov-report=xml --cov-report=html
+
+      - name: Upload coverage
+        if: inputs.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: integration
+          name: codecov-umbrella
+        continue-on-error: true
