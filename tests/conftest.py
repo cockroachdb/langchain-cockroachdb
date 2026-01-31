@@ -68,7 +68,7 @@ def cockroachdb_container() -> Generator[Optional[CockroachDBContainer], None, N
 
 
 @pytest.fixture(scope="session")
-def connection_string(cockroachdb_container: CockroachDBContainer | None) -> str:
+def connection_string(cockroachdb_container: Optional[CockroachDBContainer]) -> str:
     """Get connection string for tests.
 
     Uses testcontainer if USE_TESTCONTAINER=true (default).
