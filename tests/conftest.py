@@ -47,7 +47,7 @@ class CockroachDBContainer(DockerContainer):
 
 
 @pytest.fixture(scope="session")
-def cockroachdb_container() -> Generator[CockroachDBContainer | None, None, None]:
+def cockroachdb_container() -> Generator[Optional[CockroachDBContainer], None, None]:
     """Start CockroachDB container for test session."""
     use_testcontainer = os.getenv("USE_TESTCONTAINER", "true").lower() == "true"
 
