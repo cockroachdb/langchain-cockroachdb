@@ -1,0 +1,90 @@
+site_name: langchain-cockroachdb
+site_description: LangChain integration for CockroachDB with native vector support
+site_author: Virag Tripathi
+site_url: https://viragtripathi.github.io/langchain-cockroachdb/
+
+repo_name: viragtripathi/langchain-cockroachdb
+repo_url: https://github.com/viragtripathi/langchain-cockroachdb
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quick-start.md
+    - Configuration: getting-started/configuration.md
+  - Guides:
+    - Vector Store: guides/vector-store.md
+    - Vector Indexes: guides/vector-indexes.md
+    - Hybrid Search: guides/hybrid-search.md
+    - Chat History: guides/chat-history.md
+    - Async vs Sync: guides/async-vs-sync.md
+  - Examples:
+    - Overview: examples/index.md
+    - Basic Usage: examples/basic-usage.md
+    - Advanced Filtering: examples/advanced-filtering.md
+    - Index Optimization: examples/index-optimization.md
+  - API Reference:
+    - Engine: api/engine.md
+    - Vector Store: api/vectorstore.md
+    - Indexes: api/indexes.md
+    - Chat History: api/chat-history.md
+  - Development:
+    - Contributing: development/contributing.md
+    - Architecture: development/architecture.md
+    - Testing: development/testing.md
+  - About:
+    - Changelog: about/changelog.md
+    - License: about/license.md
