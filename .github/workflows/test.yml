@@ -15,18 +15,22 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       python-version: "3.9"
+    secrets: inherit
 
   test-python-3-10:
     uses: ./.github/workflows/_test.yml
     with:
       python-version: "3.10"
+    secrets: inherit
 
   test-python-3-11:
     uses: ./.github/workflows/_test.yml
     with:
       python-version: "3.11"
+    secrets: inherit
 
   test-python-3-12:
     uses: ./.github/workflows/_test.yml
     with:
       python-version: "3.12"
+    secrets: inherit
