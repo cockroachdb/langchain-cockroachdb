@@ -1,4 +1,4 @@
-# <img src="assets/cockroachdb_logo.svg" alt="🪳" width="32" height="32" style="vertical-align: middle;"/> langchain-cockroachdb
+# <img src="https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" alt="🪳" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -390,10 +390,10 @@ vectorstore = AsyncCockroachDBVectorStore(
 CockroachDB has specific guidance for vector operations:
 
 | Vector Dimension | Recommended Batch Size |
-|-----------------|------------------------|
-| < 512          | 200-500               |
-| 512-1536       | 100-200               |
-| > 1536         | 50-100                |
+|------------------|------------------------|
+| < 512            | 200-500                |
+| 512-1536         | 100-200                |
+| > 1536           | 50-100                 |
 
 ```python
 # Adjust batch size based on your embeddings
@@ -482,7 +482,7 @@ mypy langchain_cockroachdb
 
 ## 📖 Documentation
 
-- [Contributing Guidelines](CONTRIBUTING.md)
+- [Contributing Guidelines](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CONTRIBUTING.md)
 - [Development Guide](DEVELOPMENT.md)
 - [Changelog](CHANGELOG.md)
 - [CockroachDB Vector Indexes](https://www.cockroachlabs.com/docs/stable/vector-indexes)
@@ -490,7 +490,7 @@ mypy langchain_cockroachdb
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CONTRIBUTING.md) for guidelines.
 
 ### Quick Contribution Checklist
 
@@ -538,35 +538,19 @@ async with engine.engine.connect() as conn:
     print(f"Vectors: {result.scalar()}")
 ```
 
-## 🌟 Why Choose langchain-cockroachdb?
-
-| Feature | langchain-cockroachdb | pgvector |
-|---------|----------------------|----------|
-| Horizontal Scaling | ✅ Native | ❌ Requires sharding |
-| High Availability | ✅ Built-in | ⚠️ Requires setup |
-| ACID Guarantees | ✅ SERIALIZABLE | ✅ SERIALIZABLE |
-| Geo-Distribution | ✅ Multi-region | ❌ Limited |
-| Vector Index | ✅ C-SPANN | ✅ HNSW/IVFFlat |
-| Full-Text Search | ✅ Native GIN | ✅ Native GIN |
-| Consistency | ✅ Strong | ✅ Strong |
-| Setup Complexity | ⭐⭐⭐ | ⭐⭐ |
-
 ## 📝 License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Apache License 2.0 - see [LICENSE](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
 - Built on [LangChain](https://github.com/langchain-ai/langchain)
 - Powered by [CockroachDB](https://www.cockroachlabs.com/)
-- Inspired by [langchain-postgres](https://github.com/langchain-ai/langchain-postgres)
 
 ## 🔗 Links
 
 - [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
 - [LangChain Documentation](https://python.langchain.com/)
-- [Issue Tracker](https://github.com/cockroachdb/langchain-cockroachdb/issues)
-- [Discussions](https://github.com/cockroachdb/langchain-cockroachdb/discussions)
 
 ---
 

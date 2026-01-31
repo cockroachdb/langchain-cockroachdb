@@ -29,24 +29,27 @@ jobs:
 
       - name: Start CockroachDB
         run: |
-          docker run -d --name cockroach \
-            --network host \
+          docker run -d --name cockroachdb \
+            -p 26257:26257 \
+            -p 8080:8080 \
             cockroachdb/cockroach:latest \
             start-single-node --insecure
           
           # Wait for CockroachDB to be ready
+          echo "Waiting for CockroachDB to start..."
           for i in {1..30}; do
-            if docker exec cockroach ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
-              echo "CockroachDB is ready"
+            if docker exec cockroachdb ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
+              echo "✅ CockroachDB is ready!"
               break
             fi
-            echo "Waiting for CockroachDB... ($i/30)"
+            echo "Waiting... ($i/30)"
             sleep 2
           done
 
       - name: Run tests
         env:
           USE_TESTCONTAINER: "false"
+          COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
         run: |
           pytest tests -v
 

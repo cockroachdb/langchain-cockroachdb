@@ -11,15 +11,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
-    services:
-      cockroachdb:
-        image: cockroachdb/cockroach:latest
-        options: >-
-          --health-cmd "curl -f http://localhost:8080/health?ready=1 || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
 
     steps:
       - uses: actions/checkout@v4
@@ -35,20 +26,25 @@ jobs:
 
       - name: Start CockroachDB
         run: |
-          docker run -d --name cockroach \
-            --network host \
+          docker run -d --name cockroachdb \
+            -p 26257:26257 \
+            -p 8080:8080 \
             cockroachdb/cockroach:latest \
             start-single-node --insecure
           
           # Wait for CockroachDB to be ready
+          echo "Waiting for CockroachDB to start..."
           for i in {1..30}; do
-            if docker exec cockroach ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
-              echo "CockroachDB is ready"
+            if docker exec cockroachdb ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
+              echo "✅ CockroachDB is ready!"
               break
             fi
-            echo "Waiting for CockroachDB... ($i/30)"
+            echo "Waiting... ($i/30)"
             sleep 2
           done
+          
+          # Verify it's running
+          docker exec cockroachdb ./cockroach version
 
       - name: Run unit tests
         run: |
@@ -57,6 +53,7 @@ jobs:
       - name: Run integration tests
         env:
           USE_TESTCONTAINER: "false"
+          COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
         run: |
           pytest tests/integration -v --tb=short
 
