@@ -1,8 +1,11 @@
 # <img src="https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" alt="🪳" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
+[![Tests](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/viragtripathi/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/viragtripathi/langchain-cockroachdb)
+[![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 **High-performance LangChain integration for CockroachDB with native vector support, optimized for distributed SQL workloads.**
 
@@ -52,7 +55,7 @@ make lint                # Run linter
 make examples            # Run all examples
 ```
 
-See [MAKEFILE.md](MAKEFILE.md) for complete command reference.
+See [MAKEFILE.md](https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/MAKEFILE.md) for complete command reference.
 
 Or with uv (recommended):
 
@@ -70,7 +73,7 @@ from langchain_openai import OpenAIEmbeddings
 
 # Initialize connection
 engine = CockroachDBEngine.from_connection_string(
-    "postgresql://user:password@localhost:26257/defaultdb?sslmode=require"
+    "cockroachdb://user:password@localhost:26257/defaultdb?sslmode=require"
 )
 
 # Create vector store
@@ -109,7 +112,7 @@ from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
 
 async def main():
     engine = CockroachDBEngine.from_connection_string(
-        "postgresql://user:password@localhost:26257/defaultdb"
+        "cockroachdb://user:password@localhost:26257/defaultdb"
     )
     
     vectorstore = AsyncCockroachDBVectorStore(
@@ -319,7 +322,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 # Create history
 history = CockroachDBChatMessageHistory(
     session_id="user_123_conversation_456",
-    connection_string="postgresql://...",
+    connection_string="cockroachdb://...",
     table_name="chat_history",
 )
 
