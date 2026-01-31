@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import AsyncGenerator, Generator
+from typing import Optional
 
 import pytest
 import pytest_asyncio
