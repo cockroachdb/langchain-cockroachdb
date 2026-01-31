@@ -1,6 +1,7 @@
 # <img src="https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" alt="🪳" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
 [![Tests](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/viragtripathi/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/viragtripathi/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)
@@ -29,7 +30,7 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 - **Score Fusion**: Weighted sum and Reciprocal Rank Fusion (RRF)
 - **Query-Time Tuning**: Adjust beam size for accuracy/speed tradeoff
 
-### 🏗️ Production-Ready
+### 🏗️ Reliability Features
 - **SERIALIZABLE Isolation**: Built for CockroachDB's default isolation level
 - **Multi-Tenancy**: Index prefix columns for efficient tenant isolation
 - **Connection Pooling**: Configurable connection pools with health checks
@@ -40,26 +41,6 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 
 ```bash
 pip install langchain-cockroachdb
-```
-
-## 🛠️ Development
-
-This project uses a Makefile for common tasks:
-
-```bash
-make help                # Show all available commands
-make dev                 # Setup development environment
-make test                # Run tests
-make lint                # Run linter
-make examples            # Run all examples
-```
-
-See [MAKEFILE.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/MAKEFILE.md) for complete command reference.
-
-Or with uv (recommended):
-
-```bash
-uv pip install langchain-cockroachdb
 ```
 
 ## 🚀 Quick Start
@@ -444,123 +425,9 @@ engine = CockroachDBEngine.from_connection_string(
 )
 ```
 
-## 🔧 Development
-
-### Setup Development Environment
-
-```bash
-# Clone repository
-git clone https://github.com/cockroachdb/langchain-cockroachdb.git
-cd langchain-cockroachdb
-
-# Create virtual environment
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install with dev dependencies
-uv pip install -e ".[dev]"
-
-# Start CockroachDB
-docker-compose up -d
-
-# Run tests
-pytest tests/unit -v              # Unit tests (fast, no DB)
-pytest tests/integration -v       # Integration tests (requires DB)
-pytest tests --cov=langchain_cockroachdb  # With coverage
-```
-
-### Code Quality
-
-```bash
-# Linting
-ruff check langchain_cockroachdb tests
-
-# Auto-fix
-ruff check langchain_cockroachdb tests --fix
-
-# Type checking
-mypy langchain_cockroachdb
-```
-
-## 📖 Documentation
-
-- [Contributing Guidelines](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CONTRIBUTING.md)
-- [Development Guide](DEVELOPMENT.md)
-- [Changelog](CHANGELOG.md)
-- [CockroachDB Vector Indexes](https://www.cockroachlabs.com/docs/stable/vector-indexes)
-- [LangChain Documentation](https://python.langchain.com/docs/modules/data_connection/vectorstores/)
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CONTRIBUTING.md) for guidelines.
-
-### Quick Contribution Checklist
-
-- [ ] Tests pass: `pytest tests -v`
-- [ ] Linting passes: `ruff check langchain_cockroachdb tests`
-- [ ] Type checking passes: `mypy langchain_cockroachdb`
-- [ ] Documentation updated
-- [ ] Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
-
-## 📊 Performance
-
-Benchmarks comparing CockroachDB with pgvector (coming soon):
-
-- Insert throughput
-- Query latency (p50, p95, p99)
-- Index build time
-- Scaling characteristics
-
-## 🐛 Troubleshooting
-
-### Connection Issues
-
-```python
-# Test connection
-async with engine.engine.connect() as conn:
-    result = await conn.execute(text("SELECT version()"))
-    print(result.scalar())
-```
-
-### Enable SQL Logging
-
-```python
-import logging
-logging.basicConfig()
-logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
-```
-
-### Check Vector Count
-
-```python
-async with engine.engine.connect() as conn:
-    result = await conn.execute(
-        text(f"SELECT COUNT(*) FROM {vectorstore.collection_name}")
-    )
-    print(f"Vectors: {result.scalar()}")
-```
-
-## 📝 License
-
-Apache License 2.0 - see [LICENSE](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built on [LangChain](https://github.com/langchain-ai/langchain)
-- Powered by [CockroachDB](https://www.cockroachlabs.com/)
-
-## 🔗 Links
-
-- [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
-- [LangChain Documentation](https://python.langchain.com/)
-
----
-
-**Built with ❤️ for the CockroachDB and LangChain communities**
-
 ## ⚙️ Configuration
 
-### Production-Ready Retry Logic
+### Automatic Retry Logic
 
 All operations automatically retry on transient errors (40001 serialization failures, connection errors):
 
@@ -630,7 +497,7 @@ ids = await vectorstore.aadd_texts(texts, batch_size=50)
 | Workload | Pool | Overflow | Retries | Backoff | Batch |
 |----------|------|----------|---------|---------|-------|
 | **Development** | 5 | 10 | 3 | 0.1s → 1s | 100 |
-| **Production Web** | 20 | 40 | 10 | 0.1s → 30s | 100 |
+| **Web Applications** | 20 | 40 | 10 | 0.1s → 30s | 100 |
 | **Batch Jobs** | 3 | 5 | 20 | 0.5s → 60s | 50 |
 | **Multi-Region** | 15 | 30 | 15 | 0.2s → 60s | 50 |
 | **Low Latency** | 5 | 10 | 2 | 0.05s → 1s | 100 |
@@ -650,7 +517,7 @@ results = await vectorstore.asimilarity_search("query")
 ```
 
 **Use async when:**
-- Building production web applications
+- Building web applications
 - High concurrent operations
 - Distributed/multi-region CockroachDB
 - Modern LLM apps (OpenAI/Anthropic APIs are async)
@@ -731,4 +598,37 @@ python -m pytest tests/integration/test_configuration.py -v # Configuration
 **Requirements:**
 - Unit tests: Just Python (no Docker)
 - Integration tests: Docker Desktop running (uses testcontainers)
+
+
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CONTRIBUTING.md) for guidelines.
+
+### Quick Contribution Checklist
+
+- [ ] Tests pass: `pytest tests -v`
+- [ ] Linting passes: `ruff check langchain_cockroachdb tests`
+- [ ] Type checking passes: `mypy langchain_cockroachdb`
+- [ ] Documentation updated
+- [ ] Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
+
+## 📝 License
+
+Apache License 2.0 - see [LICENSE](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- Built on [LangChain](https://github.com/langchain-ai/langchain)
+- Powered by [CockroachDB](https://www.cockroachlabs.com/)
+
+
+## 🔗 Links
+
+- [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
+- [LangChain Documentation](https://python.langchain.com/)
+
+---
+
+**Built with ❤️ for the CockroachDB and LangChain communities**
 

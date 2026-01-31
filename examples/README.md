@@ -68,7 +68,7 @@ Synchronous wrapper for simple scripts:
 
 ### 3. retry_configuration.py (Configuration)
 
-Production-ready configuration examples:
+Configuration examples for different workloads:
 - Default configuration (development)
 - High-performance configuration (production web apps)
 - Low-latency configuration (single-region)
