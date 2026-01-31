@@ -1,4 +1,4 @@
-"""Async vector store implementation for CockroachDB."""
+"""Async vector store implementation for CockroachDB with transaction retry support."""
 
 import uuid
 from collections.abc import Iterable
@@ -13,6 +13,7 @@ from sqlalchemy import text
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import HybridSearchConfig
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
+from langchain_cockroachdb.retry import async_retry_with_backoff
 
 
 class AsyncCockroachDBVectorStore(VectorStore):
@@ -32,6 +33,11 @@ class AsyncCockroachDBVectorStore(VectorStore):
         id_column: str = "id",
         hybrid_search_config: Optional[HybridSearchConfig] = None,
         batch_size: int = 100,
+        retry_max_attempts: int = 3,
+        retry_initial_backoff: float = 0.1,
+        retry_max_backoff: float = 5.0,
+        retry_backoff_multiplier: float = 2.0,
+        retry_jitter: bool = True,
     ):
         """Initialize async vector store.
 
@@ -39,14 +45,19 @@ class AsyncCockroachDBVectorStore(VectorStore):
             engine: CockroachDBEngine instance
             embeddings: Embeddings model
             collection_name: Table name for this collection
-            schema: Database schema
-            distance_strategy: Distance metric for similarity
-            content_column: Name of content column
-            embedding_column: Name of embedding column
-            metadata_column: Name of metadata column
-            id_column: Name of ID column
+            schema: Database schema (default: public)
+            distance_strategy: Distance metric for similarity (default: COSINE)
+            content_column: Name of content column (default: content)
+            embedding_column: Name of embedding column (default: embedding)
+            metadata_column: Name of metadata column (default: metadata)
+            id_column: Name of ID column (default: id)
             hybrid_search_config: Optional hybrid search configuration
-            batch_size: Default batch size for inserts (CockroachDB recommendation: smaller batches)
+            batch_size: Batch size for inserts - CockroachDB works best with smaller batches (default: 100)
+            retry_max_attempts: Maximum retry attempts for operations (default: 3)
+            retry_initial_backoff: Initial backoff delay in seconds (default: 0.1)
+            retry_max_backoff: Maximum backoff delay in seconds (default: 5.0)
+            retry_backoff_multiplier: Backoff multiplier (default: 2.0)
+            retry_jitter: Add randomization to backoff (default: True)
         """
         self.engine = engine
         self._embeddings = embeddings
@@ -59,6 +70,11 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self.id_column = id_column
         self.hybrid_search_config = hybrid_search_config
         self.batch_size = batch_size
+        self.retry_max_attempts = retry_max_attempts
+        self.retry_initial_backoff = retry_initial_backoff
+        self.retry_max_backoff = retry_max_backoff
+        self.retry_backoff_multiplier = retry_backoff_multiplier
+        self.retry_jitter = retry_jitter
         self._fqn = f"{schema}.{collection_name}"
 
     @property
@@ -73,17 +89,53 @@ class AsyncCockroachDBVectorStore(VectorStore):
         ids: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add texts to vector store.
+        """Add texts to vector store with automatic retry on failures.
 
         Args:
             texts: Texts to add
             metadatas: Optional metadata for each text
             ids: Optional IDs for texts
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (batch_size override supported)
 
         Returns:
             List of IDs for added texts
         """
+
+        # Apply retry with instance configuration
+        @async_retry_with_backoff(
+            max_retries=self.retry_max_attempts,
+            initial_backoff=self.retry_initial_backoff,
+            max_backoff=self.retry_max_backoff,
+            backoff_multiplier=self.retry_backoff_multiplier,
+            jitter=self.retry_jitter,
+        )
+        async def _add_batch(batch_texts, batch_embeddings, batch_metadatas, batch_ids):
+            insert_sql = f"""
+                INSERT INTO {self._fqn} 
+                ({self.id_column}, {self.content_column}, {self.embedding_column}, {self.metadata_column})
+                VALUES (:id, :content, CAST(:embedding AS VECTOR), CAST(:metadata AS jsonb))
+                ON CONFLICT ({self.id_column}) DO UPDATE SET
+                    {self.content_column} = EXCLUDED.{self.content_column},
+                    {self.embedding_column} = EXCLUDED.{self.embedding_column},
+                    {self.metadata_column} = EXCLUDED.{self.metadata_column}
+            """
+
+            async with self.engine.engine.begin() as conn:
+                for text, embedding, metadata, id_val in zip(
+                    batch_texts, batch_embeddings, batch_metadatas, batch_ids
+                ):
+                    import json
+
+                    await conn.execute(
+                        text(insert_sql),
+                        {
+                            "id": id_val,
+                            "content": text,
+                            "embedding": str(embedding),
+                            "metadata": json.dumps(metadata),
+                        },
+                    )
+
         texts_list = list(texts)
         if not texts_list:
             return []

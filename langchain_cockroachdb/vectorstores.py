@@ -161,3 +161,12 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
                 **kwargs,
             )
         )
+
+    def apply_vector_index(self, index: Any, **kwargs: Any) -> None:
+        """Apply vector index to the table (sync).
+
+        Args:
+            index: Index configuration
+            **kwargs: Additional arguments
+        """
+        asyncio.run(self.aapply_vector_index(index, **kwargs))

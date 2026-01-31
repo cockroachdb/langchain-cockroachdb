@@ -1,7 +1,6 @@
 # <img src="https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" alt="🪳" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
 [![Tests](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/viragtripathi/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/viragtripathi/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)
@@ -55,7 +54,7 @@ make lint                # Run linter
 make examples            # Run all examples
 ```
 
-See [MAKEFILE.md](https://raw.githubusercontent.com/viragtripathi/langchain-cockroachdb/main/MAKEFILE.md) for complete command reference.
+See [MAKEFILE.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/MAKEFILE.md) for complete command reference.
 
 Or with uv (recommended):
 
@@ -558,3 +557,178 @@ Apache License 2.0 - see [LICENSE](https://github.com/viragtripathi/langchain-co
 ---
 
 **Built with ❤️ for the CockroachDB and LangChain communities**
+
+## ⚙️ Configuration
+
+### Production-Ready Retry Logic
+
+All operations automatically retry on transient errors (40001 serialization failures, connection errors):
+
+```python
+# Engine-level retry configuration
+engine = CockroachDBEngine.from_connection_string(
+    "cockroachdb://...",
+    retry_max_attempts=10,           # Max retries (default: 5)
+    retry_initial_backoff=0.1,       # Initial delay in seconds (default: 0.1)
+    retry_max_backoff=30.0,          # Max delay in seconds (default: 10.0)
+    retry_backoff_multiplier=2.0,    # Exponential multiplier (default: 2.0)
+    retry_jitter=True,               # Add randomization (default: True)
+)
+
+# VectorStore-level retry configuration (per-batch)
+vectorstore = AsyncCockroachDBVectorStore(
+    engine=engine,
+    embeddings=embeddings,
+    collection_name="docs",
+    retry_max_attempts=5,            # Per-batch retries (default: 3)
+    retry_initial_backoff=0.1,
+    retry_max_backoff=5.0,
+)
+```
+
+**Retry Logic Features:**
+- ✅ Automatic detection of retryable errors (40001, connection failures)
+- ✅ Exponential backoff with jitter (prevents thundering herd)
+- ✅ Configurable per engine and per vectorstore
+- ✅ Based on CockroachDB best practices
+
+### Connection Pool Configuration
+
+```python
+engine = CockroachDBEngine.from_connection_string(
+    "cockroachdb://...",
+    pool_size=20,                    # Base connections (default: 10)
+    max_overflow=40,                 # Additional connections (default: 20)
+    pool_pre_ping=True,              # Health checks (default: True)
+    pool_recycle=1800,               # Recycle after 30min (default: 3600)
+    pool_timeout=30.0,               # Connection timeout (default: 30.0)
+)
+```
+
+### Batch Size Configuration
+
+```python
+vectorstore = AsyncCockroachDBVectorStore(
+    engine=engine,
+    embeddings=embeddings,
+    collection_name="docs",
+    batch_size=100,                  # Default batch size (default: 100)
+)
+
+# Override at runtime
+ids = await vectorstore.aadd_texts(texts, batch_size=50)
+```
+
+**Batch Size Guidelines:**
+- Small embeddings (< 512 dims): 100-500
+- Large embeddings (> 1024 dims): 50-100
+- High write contention: 10-50
+- CockroachDB works best with smaller batches compared to single-node databases
+
+### Configuration Presets
+
+| Workload | Pool | Overflow | Retries | Backoff | Batch |
+|----------|------|----------|---------|---------|-------|
+| **Development** | 5 | 10 | 3 | 0.1s → 1s | 100 |
+| **Production Web** | 20 | 40 | 10 | 0.1s → 30s | 100 |
+| **Batch Jobs** | 3 | 5 | 20 | 0.5s → 60s | 50 |
+| **Multi-Region** | 15 | 30 | 15 | 0.2s → 60s | 50 |
+| **Low Latency** | 5 | 10 | 2 | 0.05s → 1s | 100 |
+
+See `examples/retry_configuration.py` for detailed examples.
+
+## 🔄 Async vs Sync
+
+### When to Use Async (Recommended)
+
+```python
+from langchain_cockroachdb import AsyncCockroachDBVectorStore
+
+# Async provides 10-100x throughput for distributed databases
+vectorstore = AsyncCockroachDBVectorStore(...)
+results = await vectorstore.asimilarity_search("query")
+```
+
+**Use async when:**
+- Building production web applications
+- High concurrent operations
+- Distributed/multi-region CockroachDB
+- Modern LLM apps (OpenAI/Anthropic APIs are async)
+
+**Benefits:**
+- Non-blocking I/O (handle 1000s of requests)
+- Better throughput on network-bound operations
+- Natural fit for async LLM APIs
+- Efficient connection pool usage
+
+### When to Use Sync
+
+```python
+from langchain_cockroachdb import CockroachDBVectorStore
+
+# Sync wrapper for simple scripts
+vectorstore = CockroachDBVectorStore(...)
+results = vectorstore.similarity_search("query")
+```
+
+**Use sync when:**
+- Simple scripts or batch jobs
+- Sequential processing
+- Legacy code without async/await
+- Simpler mental model needed
+
+See `examples/sync_usage.py` for complete example.
+
+## 🧪 Testing
+
+Comprehensive test coverage (92 tests across 9 test files):
+
+```bash
+# All tests
+make test
+
+# Unit tests only (fast, no Docker required)
+python -m pytest tests/unit -v
+
+# Integration tests (requires Docker)
+python -m pytest tests/integration -v
+
+# Specific test categories
+python -m pytest tests/unit/test_retry.py -v          # Retry logic
+python -m pytest tests/integration/test_sync_wrapper.py -v  # Sync wrapper
+python -m pytest tests/integration/test_configuration.py -v # Configuration
+```
+
+### Test Structure
+
+**Unit Tests (37 tests) - No database required:**
+- `test_hybrid_search.py` (8 tests) - Hybrid search fusion logic
+- `test_indexes.py` (12 tests) - Index SQL generation
+- `test_retry.py` (17 tests) - Retry decorators, error detection, backoff
+
+**Integration Tests (55 tests) - Requires Docker:**
+- `test_engine.py` (8 tests) - Engine initialization, connection pooling
+- `test_vectorstore.py` (14 tests) - Vector store operations
+- `test_chat_history.py` (6 tests) - Chat message persistence
+- `test_retry_behavior.py` (5 tests) - Real database retry scenarios
+- `test_sync_wrapper.py` (12 tests) - Sync wrapper API
+- `test_configuration.py` (10 tests) - Configuration parameters
+
+### Test Categories by Feature
+
+| Feature | Unit Tests | Integration Tests | Total |
+|---------|-----------|-------------------|-------|
+| Retry Logic | 17 | 5 | 22 |
+| Sync Wrapper | 0 | 12 | 12 |
+| Configuration | 0 | 10 | 10 |
+| Vector Operations | 0 | 14 | 14 |
+| Indexes | 12 | 0 | 12 |
+| Hybrid Search | 8 | 0 | 8 |
+| Engine | 0 | 8 | 8 |
+| Chat History | 0 | 6 | 6 |
+| **Total** | **37** | **55** | **92** |
+
+**Requirements:**
+- Unit tests: Just Python (no Docker)
+- Integration tests: Docker Desktop running (uses testcontainers)
+

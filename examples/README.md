@@ -24,6 +24,12 @@ export COCKROACHDB_URL="cockroachdb://root@localhost:26257/defaultdb?sslmode=dis
 # Quickstart - basic vector store usage
 python examples/quickstart.py
 
+# Sync usage - synchronous wrapper for simple scripts
+python examples/sync_usage.py
+
+# Retry configuration - production configuration presets
+python examples/retry_configuration.py
+
 # Vector indexes - C-SPANN index creation and tuning
 python examples/vector_indexes.py
 
@@ -39,9 +45,9 @@ python examples/chat_history.py
 
 ## Examples Overview
 
-### 1. quickstart.py
+### 1. quickstart.py (Async)
 
-Basic vector store operations:
+Basic async vector store operations:
 - Connecting to CockroachDB
 - Creating tables
 - Adding documents
@@ -50,7 +56,30 @@ Basic vector store operations:
 
 **Good for**: First-time users, getting started
 
-### 2. vector_indexes.py
+### 2. sync_usage.py (Sync Wrapper)
+
+Synchronous wrapper for simple scripts:
+- CockroachDBVectorStore (sync API)
+- All CRUD operations in sync mode
+- When to use sync vs async
+- Sync wrapper benefits and tradeoffs
+
+**Good for**: Simple scripts, batch jobs, legacy code without async/await
+
+### 3. retry_configuration.py (Configuration)
+
+Production-ready configuration examples:
+- Default configuration (development)
+- High-performance configuration (production web apps)
+- Low-latency configuration (single-region)
+- Batch job configuration (resilient long-running)
+- Multi-region configuration (high latency tolerance)
+- Runtime configuration override
+- Configuration guidelines by workload
+
+**Good for**: Production deployments, performance tuning, different workload patterns
+
+### 4. vector_indexes.py
 
 Vector index management:
 - Creating C-SPANN indexes
@@ -61,7 +90,7 @@ Vector index management:
 
 **Good for**: Performance optimization, production deployments
 
-### 3. hybrid_search.py
+### 5. hybrid_search.py
 
 Combining FTS and vector search:
 - TSVECTOR column creation
@@ -71,7 +100,7 @@ Combining FTS and vector search:
 
 **Good for**: Best search quality, combining keyword + semantic
 
-### 4. metadata_filtering.py
+### 6. metadata_filtering.py
 
 Advanced metadata queries:
 - Equality and comparison operators
@@ -82,7 +111,7 @@ Advanced metadata queries:
 
 **Good for**: Multi-tenant applications, filtered search
 
-### 5. chat_history.py
+### 7. chat_history.py
 
 Persistent conversation storage:
 - Session management

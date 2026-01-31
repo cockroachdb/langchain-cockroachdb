@@ -1,4 +1,4 @@
-"""CockroachDB async engine management."""
+"""CockroachDB async engine management with transaction retry support."""
 
 import asyncio
 from typing import Any, Optional
@@ -6,18 +6,39 @@ from typing import Any, Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from langchain_cockroachdb.retry import async_retry_with_backoff
+
 
 class CockroachDBEngine:
     """Manages async SQLAlchemy engine for CockroachDB with retry support."""
 
-    def __init__(self, engine: AsyncEngine):
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        retry_max_attempts: int = 5,
+        retry_initial_backoff: float = 0.1,
+        retry_max_backoff: float = 10.0,
+        retry_backoff_multiplier: float = 2.0,
+        retry_jitter: bool = True,
+    ):
         """Initialize with existing async engine.
 
         Args:
             engine: SQLAlchemy AsyncEngine connected to CockroachDB
+            retry_max_attempts: Maximum retry attempts (default: 5)
+            retry_initial_backoff: Initial backoff delay in seconds (default: 0.1)
+            retry_max_backoff: Maximum backoff delay in seconds (default: 10.0)
+            retry_backoff_multiplier: Backoff multiplier (default: 2.0)
+            retry_jitter: Add randomization to backoff (default: True)
         """
         self._engine = engine
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.retry_max_attempts = retry_max_attempts
+        self.retry_initial_backoff = retry_initial_backoff
+        self.retry_max_backoff = retry_max_backoff
+        self.retry_backoff_multiplier = retry_backoff_multiplier
+        self.retry_jitter = retry_jitter
 
     @classmethod
     def from_connection_string(
@@ -27,15 +48,29 @@ class CockroachDBEngine:
         pool_size: int = 10,
         max_overflow: int = 20,
         pool_pre_ping: bool = True,
+        pool_recycle: int = 3600,
+        pool_timeout: float = 30.0,
+        retry_max_attempts: int = 5,
+        retry_initial_backoff: float = 0.1,
+        retry_max_backoff: float = 10.0,
+        retry_backoff_multiplier: float = 2.0,
+        retry_jitter: bool = True,
         **kwargs: Any,
     ) -> "CockroachDBEngine":
         """Create engine from connection string.
 
         Args:
             connection_string: CockroachDB connection URL
-            pool_size: Connection pool size
-            max_overflow: Max connections beyond pool_size
-            pool_pre_ping: Enable connection health checks
+            pool_size: Connection pool size (default: 10)
+            max_overflow: Max connections beyond pool_size (default: 20)
+            pool_pre_ping: Enable connection health checks (default: True)
+            pool_recycle: Recycle connections after N seconds (default: 3600)
+            pool_timeout: Connection timeout in seconds (default: 30.0)
+            retry_max_attempts: Maximum retry attempts (default: 5)
+            retry_initial_backoff: Initial backoff delay in seconds (default: 0.1)
+            retry_max_backoff: Maximum backoff delay in seconds (default: 10.0)
+            retry_backoff_multiplier: Backoff multiplier (default: 2.0)
+            retry_jitter: Add randomization to backoff (default: True)
             **kwargs: Additional arguments for create_async_engine
 
         Returns:
@@ -52,9 +87,18 @@ class CockroachDBEngine:
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_pre_ping=pool_pre_ping,
+            pool_recycle=pool_recycle,
+            pool_timeout=pool_timeout,
             **kwargs,
         )
-        return cls(engine)
+        return cls(
+            engine,
+            retry_max_attempts=retry_max_attempts,
+            retry_initial_backoff=retry_initial_backoff,
+            retry_max_backoff=retry_max_backoff,
+            retry_backoff_multiplier=retry_backoff_multiplier,
+            retry_jitter=retry_jitter,
+        )
 
     @classmethod
     def from_engine(cls, engine: AsyncEngine) -> "CockroachDBEngine":
@@ -106,6 +150,8 @@ class CockroachDBEngine:
     ) -> None:
         """Create vector store table with optional full-text search.
 
+        Uses retry logic configured on engine instance.
+
         Args:
             table_name: Name of the table to create
             vector_dimension: Dimension of vector embeddings
@@ -117,37 +163,49 @@ class CockroachDBEngine:
             create_tsvector: Create TSVECTOR column for FTS
             drop_if_exists: Drop table if it exists
         """
-        fqn = f"{schema}.{table_name}"
 
-        async with self._engine.begin() as conn:
-            if drop_if_exists:
-                await conn.execute(text(f"DROP TABLE IF EXISTS {fqn}"))
+        # Apply retry with instance configuration
+        @async_retry_with_backoff(
+            max_retries=self.retry_max_attempts,
+            initial_backoff=self.retry_initial_backoff,
+            max_backoff=self.retry_max_backoff,
+            backoff_multiplier=self.retry_backoff_multiplier,
+            jitter=self.retry_jitter,
+        )
+        async def _create_table() -> None:
+            fqn = f"{schema}.{table_name}"
 
-            create_sql = f"""
-                CREATE TABLE IF NOT EXISTS {fqn} (
-                    id {id_type} PRIMARY KEY DEFAULT gen_random_uuid(),
-                    {content_column} TEXT,
-                    {embedding_column} VECTOR({vector_dimension}),
-                    {metadata_column} JSONB DEFAULT '{{}}'::jsonb,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """
-            await conn.execute(text(create_sql))
+            async with self._engine.begin() as conn:
+                if drop_if_exists:
+                    await conn.execute(text(f"DROP TABLE IF EXISTS {fqn}"))
 
-            if create_tsvector:
-                tsvector_col = f"{content_column}_tsvector"
-                alter_sql = f"""
-                    ALTER TABLE {fqn} 
-                    ADD COLUMN IF NOT EXISTS {tsvector_col} TSVECTOR 
-                    GENERATED ALWAYS AS (to_tsvector('english', {content_column})) STORED
+                create_sql = f"""
+                    CREATE TABLE IF NOT EXISTS {fqn} (
+                        id {id_type} PRIMARY KEY DEFAULT gen_random_uuid(),
+                        {content_column} TEXT,
+                        {embedding_column} VECTOR({vector_dimension}),
+                        {metadata_column} JSONB DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ DEFAULT now()
+                    )
                 """
-                await conn.execute(text(alter_sql))
+                await conn.execute(text(create_sql))
 
-                index_sql = f"""
-                    CREATE INDEX IF NOT EXISTS {table_name}_{tsvector_col}_idx 
-                    ON {fqn} USING GIN ({tsvector_col})
-                """
-                await conn.execute(text(index_sql))
+                if create_tsvector:
+                    tsvector_col = f"{content_column}_tsvector"
+                    alter_sql = f"""
+                        ALTER TABLE {fqn} 
+                        ADD COLUMN IF NOT EXISTS {tsvector_col} TSVECTOR 
+                        GENERATED ALWAYS AS (to_tsvector('english', {content_column})) STORED
+                    """
+                    await conn.execute(text(alter_sql))
+
+                    index_sql = f"""
+                        CREATE INDEX IF NOT EXISTS {table_name}_{tsvector_col}_idx 
+                        ON {fqn} USING GIN ({tsvector_col})
+                    """
+                    await conn.execute(text(index_sql))
+
+        await _create_table()
 
     def init_vectorstore_table(
         self,
