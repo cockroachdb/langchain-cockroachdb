@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/viragtripathi/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/viragtripathi/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)
+[![Downloads](https://img.shields.io/pypi/dm/langchain-cockroachdb)](https://pypi.org/project/langchain-cockroachdb/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 <p>
