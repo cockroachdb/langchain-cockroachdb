@@ -106,6 +106,7 @@ clean: ## Clean build artifacts and cache files
 	rm -rf .mypy_cache/
 	rm -rf htmlcov/
 	rm -rf .coverage
+	rm -rf site/
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 	@echo "$(GREEN)✓ Cleanup complete$(NC)"
@@ -202,10 +203,23 @@ publish: build ## Publish to PyPI
 		echo "$(YELLOW)Cancelled$(NC)"; \
 	fi
 
-docs: ## Generate API documentation
-	@echo "$(BLUE)Generating documentation...$(NC)"
-	@echo "$(YELLOW)Documentation generation not yet configured$(NC)"
-	@echo "See README.md for current documentation"
+docs: ensure-venv ## Build documentation site with mkdocs
+	@echo "$(BLUE)Building documentation...$(NC)"
+	@if [ ! -f .venv/bin/mkdocs ]; then \
+		echo "$(YELLOW)Installing docs dependencies...$(NC)"; \
+		.venv/bin/pip install -e ".[docs]" > /dev/null; \
+	fi
+	@.venv/bin/mkdocs build --strict
+	@echo "$(GREEN)✓ Documentation built: site/$(NC)"
+
+docs-serve: ensure-venv ## Serve documentation locally (with live reload)
+	@echo "$(BLUE)Starting documentation server...$(NC)"
+	@if [ ! -f .venv/bin/mkdocs ]; then \
+		echo "$(YELLOW)Installing docs dependencies...$(NC)"; \
+		.venv/bin/pip install -e ".[docs]"; \
+	fi
+	@echo "$(YELLOW)Opening http://127.0.0.1:8000$(NC)"
+	@.venv/bin/mkdocs serve
 
 version: ## Show current version
 	@echo "$(BLUE)Current version:$(NC)"

@@ -83,3 +83,13 @@ Thumbs.db
 # UV
 uv.lock
 CLAUDE.md
+
+# Internal documentation (use make help instead)
+MAKEFILE.md
+
+# Performance tests and benchmarks (local only)
+tests/performance/
+BENCHMARK_RESULTS.md
+*_benchmark_results.txt
+*_results.txt
+LANGCHAIN_INTEGRATION.md
