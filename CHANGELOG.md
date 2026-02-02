@@ -34,6 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - N/A (initial release)
 
-## [0.1.0] - TBD
+## [0.1.0] - 2026-02-01
 
 Initial alpha release.
