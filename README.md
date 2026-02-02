@@ -7,11 +7,11 @@
 [![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-<p align="center">
+<p>
   <strong>LangChain integration for CockroachDB with native vector support</strong>
 </p>
 
-<p align="center">
+<p>
   <a href="#quick-start">Quick Start</a> •
   <a href="#features">Features</a> •
   <a href="https://viragtripathi.github.io/langchain-cockroachdb/">Documentation</a> •
@@ -171,7 +171,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/virag
 - **Distributed SQL** - Scale horizontally across regions
 - **Native Vector Support** - First-class `VECTOR` type and C-SPANN indexes  
 - **Strong Consistency** - SERIALIZABLE isolation by default
-- **Cloud Native** - Deploy anywhere (AWS, GCP, Azure, on-prem)
+- **Cloud Native** - Deploy anywhere (IBM, AWS, GCP, Azure, on-prem)
 - **PostgreSQL Compatible** - Familiar SQL with distributed superpowers
 
 ## License
