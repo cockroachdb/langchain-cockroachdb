@@ -18,13 +18,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
-[project.urls]
-Homepage = "https://github.com/viragtripathi/langchain-cockroachdb"
-Documentation = "https://viragtripathi.github.io/langchain-cockroachdb/"
-Repository = "https://github.com/viragtripathi/langchain-cockroachdb"
-Issues = "https://github.com/viragtripathi/langchain-cockroachdb/issues"
-Changelog = "https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CHANGELOG.md"
-
 dependencies = [
     "langchain-core>=0.3.0",
     "sqlalchemy[asyncio]>=2.0.0",
@@ -34,6 +27,13 @@ dependencies = [
     "greenlet>=3.0.0",
     "numpy>=1.26.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/viragtripathi/langchain-cockroachdb"
+Documentation = "https://viragtripathi.github.io/langchain-cockroachdb/"
+Repository = "https://github.com/viragtripathi/langchain-cockroachdb"
+Issues = "https://github.com/viragtripathi/langchain-cockroachdb/issues"
+Changelog = "https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
