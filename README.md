@@ -192,4 +192,3 @@ Built for the CockroachDB and LangChain communities.
 - [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
 - [LangChain Documentation](https://python.langchain.com/)
 - [Report Issues](https://github.com/viragtripathi/langchain-cockroachdb/issues)
-- [Discussions](https://github.com/viragtripathi/langchain-cockroachdb/discussions)
