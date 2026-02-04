@@ -4,7 +4,7 @@ Get started with langchain-cockroachdb in 5 minutes!
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - CockroachDB running (Cloud, Docker, or local)
 - langchain-cockroachdb installed
 

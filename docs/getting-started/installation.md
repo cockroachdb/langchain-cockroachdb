@@ -2,8 +2,8 @@
 
 ## Requirements
 
-- Python 3.9 or higher
-- CockroachDB 23.1 or higher (for native vector support)
+- Python 3.10 or higher
+- CockroachDB 24.2 or higher (for native vector support)
 
 ## Install from PyPI
 
@@ -20,7 +20,7 @@ uv pip install langchain-cockroachdb
 ## Install from Source
 
 ```bash
-git clone https://github.com/viragtripathi/langchain-cockroachdb.git
+git clone https://github.com/cockroachdb/langchain-cockroachdb.git
 cd langchain-cockroachdb
 pip install -e .
 ```
@@ -30,7 +30,7 @@ pip install -e .
 For contributing or development:
 
 ```bash
-git clone https://github.com/viragtripathi/langchain-cockroachdb.git
+git clone https://github.com/cockroachdb/langchain-cockroachdb.git
 cd langchain-cockroachdb
 pip install -e ".[dev]"
 ```

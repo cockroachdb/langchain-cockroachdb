@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite (92 tests)
 - Full documentation with mkdocs
 - 7 working examples
-- Support for Python 3.9-3.12
+- Support for Python 3.10-3.12
 
 ### Features
 - Native CockroachDB VECTOR type support
@@ -32,5 +32,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both async and sync APIs
 - Multi-tenant index support
 
-[Unreleased]: https://github.com/viragtripathi/langchain-cockroachdb/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/viragtripathi/langchain-cockroachdb/releases/tag/v0.1.0
+[Unreleased]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cockroachdb/langchain-cockroachdb/releases/tag/v0.1.0

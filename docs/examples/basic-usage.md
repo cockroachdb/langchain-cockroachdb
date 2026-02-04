@@ -6,7 +6,7 @@ Core examples for getting started with langchain-cockroachdb.
 
 Complete example from zero to searching in 5 minutes.
 
-**File:** [`examples/quickstart.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/quickstart.py)
+**File:** [`examples/quickstart.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/quickstart.py)
 
 ```python
 import asyncio
@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
 Using the synchronous API for simple scripts.
 
-**File:** [`examples/sync_usage.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/sync_usage.py)
+**File:** [`examples/sync_usage.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/sync_usage.py)
 
 ```python
 import os
@@ -122,7 +122,7 @@ if __name__ == "__main__":
 
 Persistent conversation storage.
 
-**File:** [`examples/chat_history.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/chat_history.py)
+**File:** [`examples/chat_history.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/chat_history.py)
 
 ```python
 import os

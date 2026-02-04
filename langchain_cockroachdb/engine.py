@@ -1,7 +1,7 @@
 """CockroachDB async engine management with transaction retry support."""
 
 import asyncio
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -33,7 +33,7 @@ class CockroachDBEngine:
             retry_jitter: Add randomization to backoff (default: True)
         """
         self._engine = engine
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.retry_max_attempts = retry_max_attempts
         self.retry_initial_backoff = retry_initial_backoff
         self.retry_max_backoff = retry_max_backoff

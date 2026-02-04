@@ -1,7 +1,6 @@
 """Chat message history implementation for CockroachDB."""
 
 import json
-from typing import Optional
 
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
@@ -15,8 +14,8 @@ class CockroachDBChatMessageHistory(BaseChatMessageHistory):
     def __init__(
         self,
         session_id: str,
-        connection_string: Optional[str] = None,
-        engine: Optional[AsyncEngine] = None,
+        connection_string: str | None = None,
+        engine: AsyncEngine | None = None,
         table_name: str = "message_store",
         schema: str = "public",
     ):

@@ -9,7 +9,7 @@ description = "LangChain integration for CockroachDB with native vector support"
 authors = [{name = "Virag Tripathi", email="virag.tripathi@gmail.com"}]
 license = {text = "Apache-2.0"}
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["langchain", "cockroachdb", "vector", "embeddings", "ai", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,11 +29,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/viragtripathi/langchain-cockroachdb"
-Documentation = "https://viragtripathi.github.io/langchain-cockroachdb/"
-Repository = "https://github.com/viragtripathi/langchain-cockroachdb"
-Issues = "https://github.com/viragtripathi/langchain-cockroachdb/issues"
-Changelog = "https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/cockroachdb/langchain-cockroachdb"
+Documentation = "https://cockroachdb.github.io/langchain-cockroachdb/"
+Repository = "https://github.com/cockroachdb/langchain-cockroachdb"
+Issues = "https://github.com/cockroachdb/langchain-cockroachdb/issues"
+Changelog = "https://github.com/cockroachdb/langchain-cockroachdb/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
@@ -64,18 +64,18 @@ addopts = "-v --tb=short"
 
 [tool.black]
 line-length = 100
-target-version = ['py39', 'py310', 'py311', 'py312']
+target-version = ['py310', 'py311', 'py312']
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "PLR"]
 ignore = ["E501", "PLR0913", "PLR2004", "PLR0911"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

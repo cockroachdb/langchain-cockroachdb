@@ -11,9 +11,9 @@ Based on CockroachDB best practices and patterns from crdb-dump project.
 import asyncio
 import logging
 import random
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,7 @@ def async_retry_with_backoff(
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             backoff = initial_backoff
-            last_exception: Optional[Exception] = None
+            last_exception: Exception | None = None
 
             for attempt in range(max_retries):
                 try:
@@ -162,7 +162,7 @@ def sync_retry_with_backoff(
             import time
 
             backoff = initial_backoff
-            last_exception: Optional[Exception] = None
+            last_exception: Exception | None = None
 
             for attempt in range(max_retries):
                 try:

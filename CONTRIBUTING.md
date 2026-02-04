@@ -10,7 +10,7 @@ Please be respectful and constructive in all interactions. We aim to foster an o
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.10 or higher
 - [uv](https://github.com/astral-sh/uv) for package management
 - Docker for running CockroachDB locally
 - Git

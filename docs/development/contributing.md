@@ -268,12 +268,12 @@ Maintainers only:
 
 ## Getting Help
 
-- **Issues**: [GitHub Issues](https://github.com/viragtripathi/langchain-cockroachdb/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/viragtripathi/langchain-cockroachdb/discussions)
+- **Issues**: [GitHub Issues](https://github.com/cockroachdb/langchain-cockroachdb/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/cockroachdb/langchain-cockroachdb/discussions)
 
 ## Code of Conduct
 
-Be respectful and inclusive. See [CODE_OF_CONDUCT.md](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/CODE_OF_CONDUCT.md).
+Be respectful and inclusive. See [CODE_OF_CONDUCT.md](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 

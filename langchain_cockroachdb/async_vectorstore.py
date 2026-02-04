@@ -2,7 +2,7 @@
 
 import uuid
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 from langchain_core.documents import Document
@@ -31,7 +31,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         embedding_column: str = "embedding",
         metadata_column: str = "metadata",
         id_column: str = "id",
-        hybrid_search_config: Optional[HybridSearchConfig] = None,
+        hybrid_search_config: HybridSearchConfig | None = None,
         batch_size: int = 100,
         retry_max_attempts: int = 3,
         retry_initial_backoff: float = 0.1,
@@ -85,8 +85,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
     async def aadd_texts(
         self,
         texts: Iterable[str],
-        metadatas: Optional[list[dict]] = None,
-        ids: Optional[list[str]] = None,
+        metadatas: list[dict] | None = None,
+        ids: list[str] | None = None,
         **kwargs: Any,
     ) -> list[str]:
         """Add texts to vector store with automatic retry on failures.
@@ -122,7 +122,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
 
             async with self.engine.engine.begin() as conn:
                 for text, embedding, metadata, id_val in zip(
-                    batch_texts, batch_embeddings, batch_metadatas, batch_ids
+                    batch_texts, batch_embeddings, batch_metadatas, batch_ids, strict=True
                 ):
                     import json
 
@@ -171,7 +171,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         import json
 
         values = []
-        for content, embedding, metadata, doc_id in zip(texts, embeddings, metadatas, ids):
+        for content, embedding, metadata, doc_id in zip(
+            texts, embeddings, metadatas, ids, strict=True
+        ):
             embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
             escaped_content = content.replace("'", "''")
             metadata_json = json.dumps(metadata).replace("'", "''")
@@ -195,8 +197,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self,
         query: str,
         k: int = 4,
-        filter: Optional[dict] = None,
-        query_options: Optional[CSPANNQueryOptions] = None,
+        filter: dict | None = None,
+        query_options: CSPANNQueryOptions | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         """Search for similar documents with scores.
@@ -220,8 +222,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self,
         embedding: list[float],
         k: int = 4,
-        filter: Optional[dict] = None,
-        query_options: Optional[CSPANNQueryOptions] = None,
+        filter: dict | None = None,
+        query_options: CSPANNQueryOptions | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         """Search for similar documents by embedding vector.
@@ -274,7 +276,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self,
         query: str,
         k: int = 4,
-        filter: Optional[dict] = None,
+        filter: dict | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Search for similar documents.
@@ -297,7 +299,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         k: int = 4,
         fetch_k: int = 20,
         lambda_mult: float = 0.5,
-        filter: Optional[dict] = None,
+        filter: dict | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Max marginal relevance search.
@@ -359,9 +361,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
 
     async def adelete(
         self,
-        ids: Optional[list[str]] = None,
+        ids: list[str] | None = None,
         **kwargs: Any,
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Delete documents by IDs.
 
         Args:
@@ -385,7 +387,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
     async def aapply_vector_index(
         self,
         index: CSPANNIndex,
-        prefix_columns: Optional[list[str]] = None,
+        prefix_columns: list[str] | None = None,
     ) -> None:
         """Apply C-SPANN vector index.
 
@@ -492,9 +494,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         cls,
         texts: list[str],
         embedding: Embeddings,
-        metadatas: Optional[list[dict]] = None,
-        engine: Optional[CockroachDBEngine] = None,
-        connection_string: Optional[str] = None,
+        metadatas: list[dict] | None = None,
+        engine: CockroachDBEngine | None = None,
+        connection_string: str | None = None,
         collection_name: str = "langchain_vectors",
         **kwargs: Any,
     ) -> "AsyncCockroachDBVectorStore":
@@ -536,7 +538,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
     def add_texts(
         self,
         texts: Iterable[str],
-        metadatas: Optional[list[dict]] = None,
+        metadatas: list[dict] | None = None,
         **kwargs: Any,
     ) -> list[str]:
         """Sync wrapper - not implemented for async-only store."""
@@ -556,7 +558,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         cls,
         texts: list[str],
         embedding: Embeddings,
-        metadatas: Optional[list[dict]] = None,
+        metadatas: list[dict] | None = None,
         **kwargs: Any,
     ) -> "AsyncCockroachDBVectorStore":
         """Sync wrapper - not implemented for async-only store."""

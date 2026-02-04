@@ -2,10 +2,10 @@
 
 **LangChain integration for CockroachDB with native vector support**
 
-[![Tests](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/viragtripathi/langchain-cockroachdb/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/viragtripathi/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/viragtripathi/langchain-cockroachdb)
+[![Tests](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/cockroachdb/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/cockroachdb/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 ---
@@ -134,9 +134,9 @@ Choose your path:
 
 ## Community & Support
 
-- **GitHub**: [viragtripathi/langchain-cockroachdb](https://github.com/viragtripathi/langchain-cockroachdb)
-- **Issues**: [Report bugs or request features](https://github.com/viragtripathi/langchain-cockroachdb/issues)
-- **Discussions**: [Ask questions](https://github.com/viragtripathi/langchain-cockroachdb/discussions)
+- **GitHub**: [cockroachdb/langchain-cockroachdb](https://github.com/cockroachdb/langchain-cockroachdb)
+- **Issues**: [Report bugs or request features](https://github.com/cockroachdb/langchain-cockroachdb/issues)
+- **Discussions**: [Ask questions](https://github.com/cockroachdb/langchain-cockroachdb/discussions)
 
 ## Contributing
 

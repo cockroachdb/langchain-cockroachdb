@@ -4,7 +4,7 @@ langchain-cockroachdb is licensed under the Apache License 2.0.
 
 ## Apache License 2.0
 
-Copyright 2024 Virag Tripathi
+Copyright 2026 Virag Tripathi
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ limitations under the License.
 ## Full License Text
 
 The full license text is available at:
-https://github.com/viragtripathi/langchain-cockroachdb/blob/main/LICENSE
+https://github.com/cockroachdb/langchain-cockroachdb/blob/main/LICENSE
 
 ## Third-Party Licenses
 

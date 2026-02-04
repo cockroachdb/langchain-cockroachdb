@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -18,8 +18,8 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
     def add_texts(
         self,
         texts: Iterable[str],
-        metadatas: Optional[list[dict]] = None,
-        ids: Optional[list[str]] = None,
+        metadatas: list[dict] | None = None,
+        ids: list[str] | None = None,
         **kwargs: Any,
     ) -> list[str]:
         """Add texts to vector store (sync).
@@ -39,7 +39,7 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         self,
         query: str,
         k: int = 4,
-        filter: Optional[dict] = None,
+        filter: dict | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Search for similar documents (sync).
@@ -59,8 +59,8 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         self,
         query: str,
         k: int = 4,
-        filter: Optional[dict] = None,
-        query_options: Optional[CSPANNQueryOptions] = None,
+        filter: dict | None = None,
+        query_options: CSPANNQueryOptions | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         """Search with scores (sync).
@@ -87,7 +87,7 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         k: int = 4,
         fetch_k: int = 20,
         lambda_mult: float = 0.5,
-        filter: Optional[dict] = None,
+        filter: dict | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """MMR search (sync).
@@ -111,9 +111,9 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
 
     def delete(
         self,
-        ids: Optional[list[str]] = None,
+        ids: list[str] | None = None,
         **kwargs: Any,
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Delete documents (sync).
 
         Args:
@@ -130,9 +130,9 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         cls,
         texts: list[str],
         embedding: Embeddings,
-        metadatas: Optional[list[dict]] = None,
-        engine: Optional[CockroachDBEngine] = None,
-        connection_string: Optional[str] = None,
+        metadatas: list[dict] | None = None,
+        engine: CockroachDBEngine | None = None,
+        connection_string: str | None = None,
         collection_name: str = "langchain_vectors",
         **kwargs: Any,
     ) -> "CockroachDBVectorStore":

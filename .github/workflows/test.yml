@@ -11,12 +11,6 @@ jobs:
   lint:
     uses: ./.github/workflows/_lint.yml
 
-  test-python-3-9:
-    uses: ./.github/workflows/_test.yml
-    with:
-      python-version: "3.9"
-    secrets: inherit
-
   test-python-3-10:
     uses: ./.github/workflows/_test.yml
     with:

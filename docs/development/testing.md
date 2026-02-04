@@ -272,7 +272,7 @@ TOTAL                                    1234     45    96%
 Tests run automatically on:
 - Every push
 - Every pull request
-- Python 3.9, 3.10, 3.11, 3.12
+- Python 3.10, 3.11, 3.12
 
 ### GitHub Actions
 
@@ -284,7 +284,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python

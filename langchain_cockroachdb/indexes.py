@@ -1,7 +1,6 @@
 """Vector index abstractions for CockroachDB C-SPANN indexes."""
 
 from enum import Enum
-from typing import Optional
 
 
 class DistanceStrategy(str, Enum):
@@ -39,9 +38,9 @@ class CSPANNIndex:
     def __init__(
         self,
         distance_strategy: DistanceStrategy = DistanceStrategy.COSINE,
-        min_partition_size: Optional[int] = None,
-        max_partition_size: Optional[int] = None,
-        name: Optional[str] = None,
+        min_partition_size: int | None = None,
+        max_partition_size: int | None = None,
+        name: str | None = None,
     ):
         """Initialize C-SPANN index configuration.
 
@@ -62,7 +61,7 @@ class CSPANNIndex:
         column_name: str,
         *,
         schema: str = "public",
-        prefix_columns: Optional[list[str]] = None,
+        prefix_columns: list[str] | None = None,
     ) -> str:
         """Generate CREATE VECTOR INDEX SQL.
 
@@ -117,7 +116,7 @@ class CSPANNIndex:
 class CSPANNQueryOptions:
     """Query-time options for C-SPANN vector search."""
 
-    def __init__(self, beam_size: Optional[int] = None):
+    def __init__(self, beam_size: int | None = None):
         """Initialize query options.
 
         Args:

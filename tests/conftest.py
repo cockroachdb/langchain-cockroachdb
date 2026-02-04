@@ -2,7 +2,6 @@
 
 import os
 from collections.abc import AsyncGenerator, Generator
-from typing import Optional
 
 import pytest
 import pytest_asyncio
@@ -48,7 +47,7 @@ class CockroachDBContainer(DockerContainer):
 
 
 @pytest.fixture(scope="session")
-def cockroachdb_container() -> Generator[Optional[CockroachDBContainer], None, None]:
+def cockroachdb_container() -> Generator[CockroachDBContainer | None, None, None]:
     """Start CockroachDB container for test session."""
     use_testcontainer = os.getenv("USE_TESTCONTAINER", "true").lower() == "true"
 
@@ -68,7 +67,7 @@ def cockroachdb_container() -> Generator[Optional[CockroachDBContainer], None, N
 
 
 @pytest.fixture(scope="session")
-def connection_string(cockroachdb_container: Optional[CockroachDBContainer]) -> str:
+def connection_string(cockroachdb_container: CockroachDBContainer | None) -> str:
     """Get connection string for tests.
 
     Uses testcontainer if USE_TESTCONTAINER=true (default).

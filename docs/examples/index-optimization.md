@@ -2,7 +2,7 @@
 
 Performance optimization with C-SPANN indexes.
 
-**File:** [`examples/vector_indexes.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/vector_indexes.py)
+**File:** [`examples/vector_indexes.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/vector_indexes.py)
 
 ## Creating Indexes
 

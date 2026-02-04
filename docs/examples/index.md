@@ -4,7 +4,7 @@ Working code examples demonstrating langchain-cockroachdb features.
 
 ## Available Examples
 
-All examples are available in the [`examples/`](https://github.com/viragtripathi/langchain-cockroachdb/tree/main/examples) directory of the repository.
+All examples are available in the [`examples/`](https://github.com/cockroachdb/langchain-cockroachdb/tree/main/examples) directory of the repository.
 
 ### Basic Usage
 

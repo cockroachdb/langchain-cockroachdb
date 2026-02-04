@@ -4,7 +4,7 @@ Complex queries and hybrid search examples.
 
 ## Advanced Metadata Filtering
 
-**File:** [`examples/metadata_filtering.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/metadata_filtering.py)
+**File:** [`examples/metadata_filtering.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/metadata_filtering.py)
 
 ### Comparison Operators
 
@@ -84,7 +84,7 @@ results = await vectorstore.asimilarity_search(
 
 Combining full-text search with vector similarity.
 
-**File:** [`examples/hybrid_search.py`](https://github.com/viragtripathi/langchain-cockroachdb/blob/main/examples/hybrid_search.py)
+**File:** [`examples/hybrid_search.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/hybrid_search.py)
 
 ### Basic Hybrid Search
 
