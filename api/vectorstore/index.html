@@ -1207,6 +1207,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.aget_by_ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aget_by_ids
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.amax_marginal_relevance_search" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1222,6 +1233,17 @@
     <span class="md-ellipsis">
       
         asimilarity_search
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.asimilarity_search_by_vector" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        asimilarity_search_by_vector
       
     </span>
   </a>
@@ -1255,6 +1277,17 @@
     <span class="md-ellipsis">
       
         from_texts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.get_by_ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_by_ids
       
     </span>
   </a>
@@ -1349,6 +1382,17 @@
     <span class="md-ellipsis">
       
         similarity_search
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.vectorstores.CockroachDBVectorStore.similarity_search_by_vector" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        similarity_search_by_vector
       
     </span>
   </a>
@@ -1904,6 +1948,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.aget_by_ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aget_by_ids
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.amax_marginal_relevance_search" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1919,6 +1974,17 @@
     <span class="md-ellipsis">
       
         asimilarity_search
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.asimilarity_search_by_vector" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        asimilarity_search_by_vector
       
     </span>
   </a>
@@ -1952,6 +2018,17 @@
     <span class="md-ellipsis">
       
         from_texts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.get_by_ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_by_ids
       
     </span>
   </a>
@@ -2046,6 +2123,17 @@
     <span class="md-ellipsis">
       
         similarity_search
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.vectorstores.CockroachDBVectorStore.similarity_search_by_vector" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        similarity_search_by_vector
       
     </span>
   </a>
@@ -3047,6 +3135,82 @@
 <div class="doc doc-object doc-function">
 
 
+<h3 id="langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.aget_by_ids" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">aget_by_ids</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.aget_by_ids" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Get documents by their IDs.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>ids</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Sequence">Sequence</span>[<span title="str">str</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of IDs to retrieve.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="list">list</span>[<span title="langchain_core.documents.Document">Document</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of Document objects found.</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
 <h3 id="langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.amax_marginal_relevance_search" class="doc doc-heading">
             <code class="highlight language-python"><span class="n">amax_marginal_relevance_search</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">fetch_k</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">lambda_mult</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span> <span class="nb">filter</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
 
@@ -3313,6 +3477,130 @@
             <td>
               <div class="doc-md-description">
                 <p>List of documents</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.asimilarity_search_by_vector" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">asimilarity_search_by_vector</span><span class="p">(</span><span class="n">embedding</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="nb">filter</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.asimilarity_search_by_vector" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Return docs most similar to embedding vector.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>embedding</code>
+            </td>
+            <td>
+                  <code><span title="list">list</span>[<span title="float">float</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Embedding to look up documents similar to.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>k</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Number of results to return.</p>
+              </div>
+            </td>
+            <td>
+                  <code>4</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>filter</code>
+            </td>
+            <td>
+                  <code><span title="dict">dict</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Metadata filter.</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>**kwargs</code>
+            </td>
+            <td>
+                  <code><span title="typing.Any">Any</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Additional arguments.</p>
+              </div>
+            </td>
+            <td>
+                  <code>{}</code>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="list">list</span>[<span title="langchain_core.documents.Document">Document</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of documents most similar to the query vector.</p>
               </div>
             </td>
           </tr>
@@ -3620,6 +3908,78 @@
     <div class="doc doc-contents ">
 
         <p>Sync wrapper - not implemented for async-only store.</p>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.get_by_ids" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">get_by_ids</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.async_vectorstore.AsyncCockroachDBVectorStore.get_by_ids" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Get documents by their IDs (sync).</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>ids</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Sequence">Sequence</span>[<span title="str">str</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of IDs to retrieve.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="list">list</span>[<span title="langchain_core.documents.Document">Document</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of Document objects found.</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
 
 
     </div>
@@ -4398,6 +4758,126 @@
             <td>
               <div class="doc-md-description">
                 <p>List of documents</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.vectorstores.CockroachDBVectorStore.similarity_search_by_vector" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">similarity_search_by_vector</span><span class="p">(</span><span class="n">embedding</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="nb">filter</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.vectorstores.CockroachDBVectorStore.similarity_search_by_vector" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Return docs most similar to embedding vector (sync).</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>embedding</code>
+            </td>
+            <td>
+                  <code><span title="list">list</span>[<span title="float">float</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Embedding to look up documents similar to.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>k</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Number of results to return.</p>
+              </div>
+            </td>
+            <td>
+                  <code>4</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>filter</code>
+            </td>
+            <td>
+                  <code><span title="dict">dict</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Metadata filter.</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>**kwargs</code>
+            </td>
+            <td>
+                  <code><span title="typing.Any">Any</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Additional arguments.</p>
+              </div>
+            </td>
+            <td>
+                  <code>{}</code>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="list">list</span>[<span title="langchain_core.documents.Document">Document</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>List of documents most similar to the query vector.</p>
               </div>
             </td>
           </tr>
