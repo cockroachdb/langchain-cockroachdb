@@ -65,7 +65,14 @@ history.clear()
 ```python
 # Table is created automatically on first use
 # Or create explicitly:
-await CockroachDBChatMessageHistory.acreate_tables(connection_string)
+history = CockroachDBChatMessageHistory(
+    session_id="setup",
+    connection_string=connection_string,
+)
+await history._acreate_table_if_not_exists()
+
+# Sync version:
+history.create_table_if_not_exists()
 ```
 
 Default table schema:
@@ -93,10 +100,11 @@ history = CockroachDBChatMessageHistory(
 ### Drop Table
 
 ```python
-await CockroachDBChatMessageHistory.adrop_tables(
-    connection_string,
-    table_name="message_store"
-)
+# Use engine.adrop_table() to drop the table
+from langchain_cockroachdb import CockroachDBEngine
+
+engine = CockroachDBEngine.from_connection_string(connection_string)
+await engine.adrop_table("message_store")
 ```
 
 ## Integration with LangChain
@@ -423,7 +431,11 @@ history = CockroachDBChatMessageHistory(
 
 ```python
 # Explicitly create tables
-await CockroachDBChatMessageHistory.acreate_tables(connection_string)
+history = CockroachDBChatMessageHistory(
+    session_id="setup",
+    connection_string=connection_string,
+)
+await history._acreate_table_if_not_exists()
 ```
 
 ### Messages Not Persisting

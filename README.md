@@ -1,7 +1,6 @@
 # <img src="https://raw.githubusercontent.com/cockroachdb/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
 [![Tests](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/cockroachdb/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/cockroachdb/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb/month)](https://pepy.tech/project/langchain-cockroachdb)

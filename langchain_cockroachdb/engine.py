@@ -216,6 +216,37 @@ class CockroachDBEngine:
         """Sync wrapper for ainit_vectorstore_table."""
         self._run_async(self.ainit_vectorstore_table(table_name, vector_dimension, **kwargs))
 
+    async def adrop_table(
+        self,
+        table_name: str,
+        *,
+        schema: str = "public",
+    ) -> None:
+        """Drop a table.
+
+        Args:
+            table_name: Name of the table to drop
+            schema: Database schema (default: public)
+        """
+
+        @async_retry_with_backoff(
+            max_retries=self.retry_max_attempts,
+            initial_backoff=self.retry_initial_backoff,
+            max_backoff=self.retry_max_backoff,
+            backoff_multiplier=self.retry_backoff_multiplier,
+            jitter=self.retry_jitter,
+        )
+        async def _drop_table() -> None:
+            fqn = f"{schema}.{table_name}"
+            async with self._engine.begin() as conn:
+                await conn.execute(text(f"DROP TABLE IF EXISTS {fqn}"))
+
+        await _drop_table()
+
+    def drop_table(self, table_name: str, **kwargs: Any) -> None:
+        """Sync wrapper for adrop_table."""
+        self._run_async(self.adrop_table(table_name, **kwargs))
+
     async def aclose(self) -> None:
         """Close async engine."""
         await self._engine.dispose()

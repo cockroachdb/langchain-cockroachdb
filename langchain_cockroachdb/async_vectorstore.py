@@ -1,7 +1,7 @@
 """Async vector store implementation for CockroachDB with transaction retry support."""
 
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -121,7 +121,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
             """
 
             async with self.engine.engine.begin() as conn:
-                for text, embedding, metadata, id_val in zip(
+                for txt, embedding, metadata, id_val in zip(
                     batch_texts, batch_embeddings, batch_metadatas, batch_ids, strict=True
                 ):
                     import json
@@ -130,7 +130,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
                         text(insert_sql),
                         {
                             "id": id_val,
-                            "content": text,
+                            "content": txt,
                             "embedding": str(embedding),
                             "metadata": json.dumps(metadata),
                         },
@@ -147,6 +147,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
 
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
+        else:
+            ids = [id if id is not None else str(uuid.uuid4()) for id in ids]
 
         batch_size = kwargs.get("batch_size", self.batch_size)
 
@@ -265,6 +267,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         documents = []
         for row in rows:
             doc = Document(
+                id=str(row[0]),
                 page_content=row[1],
                 metadata=row[2] or {},
             )
@@ -291,6 +294,29 @@ class AsyncCockroachDBVectorStore(VectorStore):
             List of documents
         """
         results = await self.asimilarity_search_with_score(query, k=k, filter=filter, **kwargs)
+        return [doc for doc, _ in results]
+
+    async def asimilarity_search_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Return docs most similar to embedding vector.
+
+        Args:
+            embedding: Embedding to look up documents similar to.
+            k: Number of results to return.
+            filter: Metadata filter.
+            **kwargs: Additional arguments.
+
+        Returns:
+            List of documents most similar to the query vector.
+        """
+        results = await self.asimilarity_search_with_score_by_vector(
+            embedding, k=k, filter=filter, **kwargs
+        )
         return [doc for doc, _ in results]
 
     async def amax_marginal_relevance_search(
@@ -383,6 +409,51 @@ class AsyncCockroachDBVectorStore(VectorStore):
             await conn.execute(text(sql))
 
         return True
+
+    async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        """Get documents by their IDs.
+
+        Args:
+            ids: List of IDs to retrieve.
+
+        Returns:
+            List of Document objects found.
+        """
+        if not ids:
+            return []
+
+        ids_str = ",".join(f"'{id}'" for id in ids)
+        sql = f"""
+            SELECT {self.id_column}, {self.content_column}, {self.metadata_column}
+            FROM {self._fqn}
+            WHERE {self.id_column} IN ({ids_str})
+        """
+
+        async with self.engine.engine.connect() as conn:
+            result = await conn.execute(text(sql))
+            rows = result.fetchall()
+
+        return [
+            Document(
+                id=str(row[0]),
+                page_content=row[1],
+                metadata=row[2] or {},
+            )
+            for row in rows
+        ]
+
+    def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        """Get documents by their IDs (sync).
+
+        Args:
+            ids: List of IDs to retrieve.
+
+        Returns:
+            List of Document objects found.
+        """
+        import asyncio
+
+        return asyncio.run(self.aget_by_ids(ids))
 
     async def aapply_vector_index(
         self,
