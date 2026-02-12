@@ -208,7 +208,7 @@ Subscribe to repository notifications to stay informed about security updates.
 
 This package is designed to work with CockroachDB's security features:
 
-- SERIALIZABLE isolation level (strong consistency)
+- SERIALIZABLE isolation level by default (strong consistency), READ COMMITTED also supported
 - TLS encryption in transit
 - Support for audit logging (via CockroachDB)
 - Role-based access control (via CockroachDB)

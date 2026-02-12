@@ -13,7 +13,6 @@ from sqlalchemy import text
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import HybridSearchConfig
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
-from langchain_cockroachdb.retry import async_retry_with_backoff
 
 
 class AsyncCockroachDBVectorStore(VectorStore):
@@ -31,6 +30,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
         embedding_column: str = "embedding",
         metadata_column: str = "metadata",
         id_column: str = "id",
+        namespace_column: str = "namespace",
+        namespace: str | None = None,
         hybrid_search_config: HybridSearchConfig | None = None,
         batch_size: int = 100,
         retry_max_attempts: int = 3,
@@ -51,6 +52,11 @@ class AsyncCockroachDBVectorStore(VectorStore):
             embedding_column: Name of embedding column (default: embedding)
             metadata_column: Name of metadata column (default: metadata)
             id_column: Name of ID column (default: id)
+            namespace_column: Name of namespace column (default: namespace)
+            namespace: Namespace for multi-tenancy isolation. When set, all operations
+                are scoped to this namespace. Requires the table to have a namespace
+                column (created with namespace_column param in ainit_vectorstore_table).
+                Default: None (no namespace filtering, backward compatible).
             hybrid_search_config: Optional hybrid search configuration
             batch_size: Batch size for inserts - CockroachDB works best with smaller batches (default: 100)
             retry_max_attempts: Maximum retry attempts for operations (default: 3)
@@ -68,6 +74,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self.embedding_column = embedding_column
         self.metadata_column = metadata_column
         self.id_column = id_column
+        self.namespace_column = namespace_column
+        self.namespace = namespace
         self.hybrid_search_config = hybrid_search_config
         self.batch_size = batch_size
         self.retry_max_attempts = retry_max_attempts
@@ -81,6 +89,13 @@ class AsyncCockroachDBVectorStore(VectorStore):
     def embeddings(self) -> Embeddings:
         """Get embeddings model."""
         return self._embeddings
+
+    def _namespace_filter(self) -> str:
+        """Return a SQL WHERE fragment for namespace filtering, or empty string."""
+        if self.namespace is not None:
+            escaped = self.namespace.replace("'", "''")
+            return f"{self.namespace_column} = '{escaped}'"
+        return ""
 
     async def aadd_texts(
         self,
@@ -100,41 +115,6 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of IDs for added texts
         """
-
-        # Apply retry with instance configuration
-        @async_retry_with_backoff(
-            max_retries=self.retry_max_attempts,
-            initial_backoff=self.retry_initial_backoff,
-            max_backoff=self.retry_max_backoff,
-            backoff_multiplier=self.retry_backoff_multiplier,
-            jitter=self.retry_jitter,
-        )
-        async def _add_batch(batch_texts, batch_embeddings, batch_metadatas, batch_ids):
-            insert_sql = f"""
-                INSERT INTO {self._fqn} 
-                ({self.id_column}, {self.content_column}, {self.embedding_column}, {self.metadata_column})
-                VALUES (:id, :content, CAST(:embedding AS VECTOR), CAST(:metadata AS jsonb))
-                ON CONFLICT ({self.id_column}) DO UPDATE SET
-                    {self.content_column} = EXCLUDED.{self.content_column},
-                    {self.embedding_column} = EXCLUDED.{self.embedding_column},
-                    {self.metadata_column} = EXCLUDED.{self.metadata_column}
-            """
-
-            async with self.engine.engine.begin() as conn:
-                for txt, embedding, metadata, id_val in zip(
-                    batch_texts, batch_embeddings, batch_metadatas, batch_ids, strict=True
-                ):
-                    import json
-
-                    await conn.execute(
-                        text(insert_sql),
-                        {
-                            "id": id_val,
-                            "content": txt,
-                            "embedding": str(embedding),
-                            "metadata": json.dumps(metadata),
-                        },
-                    )
 
         texts_list = list(texts)
         if not texts_list:
@@ -172,6 +152,10 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """Insert a batch of vectors."""
         import json
 
+        has_ns = self.namespace is not None
+        ns_col = f", {self.namespace_column}" if has_ns else ""
+        ns_escaped = self.namespace.replace("'", "''") if has_ns and self.namespace else ""
+
         values = []
         for content, embedding, metadata, doc_id in zip(
             texts, embeddings, metadatas, ids, strict=True
@@ -179,17 +163,22 @@ class AsyncCockroachDBVectorStore(VectorStore):
             embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
             escaped_content = content.replace("'", "''")
             metadata_json = json.dumps(metadata).replace("'", "''")
+            ns_val = f", '{ns_escaped}'" if has_ns else ""
             values.append(
-                f"('{doc_id}', '{escaped_content}', '{embedding_str}', '{metadata_json}'::jsonb)"
+                f"('{doc_id}', '{escaped_content}', '{embedding_str}', "
+                f"'{metadata_json}'::jsonb{ns_val})"
             )
 
+        ns_update = (
+            f", {self.namespace_column} = EXCLUDED.{self.namespace_column}" if has_ns else ""
+        )
         sql = f"""
-            INSERT INTO {self._fqn} ({self.id_column}, {self.content_column}, {self.embedding_column}, {self.metadata_column})
+            INSERT INTO {self._fqn} ({self.id_column}, {self.content_column}, {self.embedding_column}, {self.metadata_column}{ns_col})
             VALUES {",".join(values)}
             ON CONFLICT ({self.id_column}) DO UPDATE SET
                 {self.content_column} = EXCLUDED.{self.content_column},
                 {self.embedding_column} = EXCLUDED.{self.embedding_column},
-                {self.metadata_column} = EXCLUDED.{self.metadata_column}
+                {self.metadata_column} = EXCLUDED.{self.metadata_column}{ns_update}
         """
 
         async with self.engine.engine.begin() as conn:
@@ -243,9 +232,13 @@ class AsyncCockroachDBVectorStore(VectorStore):
         operator = self.distance_strategy.get_operator()
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        where_clause = ""
+        conditions = []
+        ns_filter = self._namespace_filter()
+        if ns_filter:
+            conditions.append(ns_filter)
         if filter:
-            where_clause = "WHERE " + self._build_filter_clause(filter)
+            conditions.append(self._build_filter_clause(filter))
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
 
         sql = f"""
             SELECT {self.id_column}, {self.content_column}, {self.metadata_column},
@@ -403,7 +396,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
             return True
 
         ids_str = ",".join(f"'{id}'" for id in ids)
-        sql = f"DELETE FROM {self._fqn} WHERE {self.id_column} IN ({ids_str})"
+        ns_filter = self._namespace_filter()
+        ns_clause = f" AND {ns_filter}" if ns_filter else ""
+        sql = f"DELETE FROM {self._fqn} WHERE {self.id_column} IN ({ids_str}){ns_clause}"
 
         async with self.engine.engine.begin() as conn:
             await conn.execute(text(sql))
@@ -423,10 +418,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
             return []
 
         ids_str = ",".join(f"'{id}'" for id in ids)
+        ns_filter = self._namespace_filter()
+        ns_clause = f" AND {ns_filter}" if ns_filter else ""
         sql = f"""
             SELECT {self.id_column}, {self.content_column}, {self.metadata_column}
             FROM {self._fqn}
-            WHERE {self.id_column} IN ({ids_str})
+            WHERE {self.id_column} IN ({ids_str}){ns_clause}
         """
 
         async with self.engine.engine.connect() as conn:

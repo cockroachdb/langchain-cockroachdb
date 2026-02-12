@@ -537,3 +537,4 @@ await handle_conversation("user-123", [
 - [Vector Store](vector-store.md) - For RAG applications
 - [Configuration](../getting-started/configuration.md) - Optimize performance
 - [API Reference](../api/chat-history.md) - Full API documentation
+- [LangChain Official: CockroachDB Chat Message History](https://docs.langchain.com/oss/python/integrations/chat_message_histories/cockroachdb)

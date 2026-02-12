@@ -67,20 +67,24 @@ nav:
     - Configuration: getting-started/configuration.md
   - Guides:
     - Vector Store: guides/vector-store.md
+    - Multi-Tenancy: guides/multi-tenancy.md
     - Vector Indexes: guides/vector-indexes.md
     - Hybrid Search: guides/hybrid-search.md
     - Chat History: guides/chat-history.md
+    - LangGraph Checkpointer: guides/checkpointer.md
     - Async vs Sync: guides/async-vs-sync.md
   - Examples:
     - Overview: examples/index.md
     - Basic Usage: examples/basic-usage.md
     - Advanced Filtering: examples/advanced-filtering.md
     - Index Optimization: examples/index-optimization.md
+    - Checkpointer: examples/checkpointer.md
   - API Reference:
     - Engine: api/engine.md
     - Vector Store: api/vectorstore.md
     - Indexes: api/indexes.md
     - Chat History: api/chat-history.md
+    - Checkpointer: api/checkpointer.md
   - Development:
     - Contributing: development/contributing.md
     - Architecture: development/architecture.md

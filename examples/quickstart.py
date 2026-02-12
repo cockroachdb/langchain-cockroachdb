@@ -57,8 +57,13 @@ async def main() -> None:
     texts = [doc.page_content for doc in documents]
     metadatas = [doc.metadata for doc in documents]
 
-    ids = await vectorstore.aadd_texts(texts, metadatas=metadatas)
-    print(f"   Added {len(ids)} documents")
+    # IDs in add documents: pass custom IDs or let them be auto-generated
+    import uuid
+
+    custom_ids = [str(uuid.uuid4()) for _ in texts]
+    ids = await vectorstore.aadd_texts(texts, metadatas=metadatas, ids=custom_ids)
+    print(f"   Added {len(ids)} documents with custom IDs")
+    print(f"   First ID: {ids[0]}")
 
     print("\n3. Similarity search...")
     results = await vectorstore.asimilarity_search("What is CockroachDB?", k=2)
@@ -73,7 +78,14 @@ async def main() -> None:
     for doc, score in results_with_scores:
         print(f"   Score: {score:.4f} - {doc.page_content[:50]}...")
 
-    print("\n5. Filtered search...")
+    print("\n5. Search by vector...")
+    query_vector = await embeddings.aembed_query("distributed database")
+    results_by_vec = await vectorstore.asimilarity_search_by_vector(query_vector, k=2)
+
+    for i, doc in enumerate(results_by_vec, 1):
+        print(f"   Result {i}: {doc.page_content[:50]}...")
+
+    print("\n6. Filtered search...")
     filtered_results = await vectorstore.asimilarity_search(
         "technology",
         k=5,
@@ -84,7 +96,13 @@ async def main() -> None:
     for doc in filtered_results:
         print(f"   - {doc.page_content}")
 
-    print("\n✅ Quickstart complete!")
+    print("\n7. Delete by ID...")
+    deleted = await vectorstore.adelete([ids[0]])
+    print(f"   Deleted: {deleted}")
+    remaining = await vectorstore.asimilarity_search("", k=10)
+    print(f"   Remaining documents: {len(remaining)}")
+
+    print("\n   Quickstart complete!")
 
     await engine.aclose()
 

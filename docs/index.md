@@ -3,7 +3,6 @@
 **LangChain integration for CockroachDB with native vector support**
 
 [![Tests](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/cockroachdb/langchain-cockroachdb/branch/main/graph/badge.svg)](https://codecov.io/gh/cockroachdb/langchain-cockroachdb)
 [![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -25,8 +24,8 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 
 ### 🏗️ Reliability Features
 - **Automatic Retry Logic**: Handles 40001 serialization errors with exponential backoff
-- **SERIALIZABLE Isolation**: Built for CockroachDB's default isolation level
-- **Multi-Tenancy**: Index prefix columns for efficient tenant isolation
+- **Isolation Level Support**: Works with both SERIALIZABLE (default, recommended) and READ COMMITTED
+- **Multi-Tenancy**: [Namespace-based isolation](guides/multi-tenancy.md) with C-SPANN prefix columns
 - **Connection Pooling**: Configurable connection pools with health checks
 - **Horizontal Scalability**: Designed for distributed deployments
 
@@ -34,6 +33,12 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 - **Persistent Storage**: Store conversation history in CockroachDB
 - **Session Management**: Organize by session/thread ID
 - **LangChain Integration**: Drop-in replacement for other chat history implementations
+
+### 🧠 LangGraph Checkpointer
+- **Short-Term Memory**: Persist agent state across conversation turns
+- **Human-in-the-Loop**: Interrupt and resume workflows with durable state
+- **Fault Tolerance**: Recover from process restarts without losing progress
+- **Sync & Async**: Both `CockroachDBSaver` and `AsyncCockroachDBSaver`
 
 ### 🔄 Async & Sync APIs
 - **Async-First**: High-performance async operations for I/O concurrency
@@ -88,7 +93,7 @@ asyncio.run(main())
 
 - **Distributed by Design**: Scale horizontally across regions
 - **Native Vector Support**: First-class `VECTOR` type and C-SPANN indexes
-- **SERIALIZABLE**: Strong consistency without sacrificing performance
+- **Strong Consistency**: SERIALIZABLE by default, READ COMMITTED also supported
 - **Cloud Native**: Deploy anywhere (AWS, GCP, Azure, on-prem)
 - **PostgreSQL Compatible**: Familiar SQL with distributed superpowers
 
@@ -131,6 +136,12 @@ Choose your path:
     [:octicons-arrow-right-24: Examples](examples/index.md)
 
 </div>
+
+## LangChain Official Integration Docs
+
+- [CockroachDB Provider](https://docs.langchain.com/oss/python/integrations/providers/cockroachdb)
+- [CockroachDB Vector Store](https://docs.langchain.com/oss/python/integrations/vectorstores/cockroachdb)
+- [CockroachDB Chat Message History](https://docs.langchain.com/oss/python/integrations/chat_message_histories/cockroachdb)
 
 ## Community & Support
 

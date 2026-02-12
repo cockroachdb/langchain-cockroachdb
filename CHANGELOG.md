@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-19
+
+### Added
+- LangGraph checkpointer: `CockroachDBSaver` and `AsyncCockroachDBSaver` for
+  persisting LangGraph workflow state (short-term memory, human-in-the-loop,
+  fault tolerance). Uses JSONB aggregation instead of multidimensional arrays
+  for CockroachDB compatibility.
+- Multi-tenancy: opt-in namespace column on vectorstore for tenant isolation.
+  All CRUD and search operations are scoped when `namespace` is set.
+- Vectorstore standard tests compliance (25/25 LangChain standard tests passing)
+- Documentation: checkpointer guide, multi-tenancy guide, API reference,
+  runnable examples for both features
+- Updated quickstart example to demonstrate all vectorstore feature table columns
+  (delete by ID, search by vector, search with score, IDs in add documents)
+
+### Changed
+- Clarified isolation level support: works with both SERIALIZABLE (default,
+  recommended) and READ COMMITTED
+- Added LangChain official integration doc links to README and docsite
+- Test suite expanded from 92 to 177 tests
+
+## [0.1.0] - 2026-02-01
+
 ### Added
 - Initial implementation of langchain-cockroachdb
 - CockroachDBEngine for connection management
@@ -18,22 +41,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chat message history persistence
 - Comprehensive unit and integration tests
 - Development and contributing guidelines
-
-### Changed
-- N/A (initial release)
-
-### Deprecated
-- N/A (initial release)
-
-### Removed
-- N/A (initial release)
-
-### Fixed
-- N/A (initial release)
-
-### Security
-- N/A (initial release)
-
-## [0.1.0] - 2026-02-01
-
-Initial alpha release.

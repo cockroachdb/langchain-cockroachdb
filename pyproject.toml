@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-cockroachdb"
-version = "0.1.0"
+version = "0.2.0"
 description = "LangChain integration for CockroachDB with native vector support"
 authors = [{name = "Virag Tripathi", email="virag.tripathi@gmail.com"}]
 license = {text = "Apache-2.0"}
@@ -20,6 +20,7 @@ classifiers = [
 
 dependencies = [
     "langchain-core>=0.3.0",
+    "langgraph-checkpoint>=2.1.2,<5.0.0",
     "sqlalchemy[asyncio]>=2.0.0",
     "sqlalchemy-cockroachdb>=2.0.2",
     "psycopg[binary,pool]>=3.1.0",

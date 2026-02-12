@@ -33,6 +33,18 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 |---------|-------------|----------|
 | [chat_history.py](basic-usage.md#chat-history) | Persistent conversations | Session management |
 
+### LangGraph Checkpointer
+
+| Example | Description | Features |
+|---------|-------------|----------|
+| [checkpointer.py](checkpointer.md) | LangGraph state persistence | Short-term memory, human-in-the-loop |
+
+### Multi-Tenancy
+
+| Example | Description | Features |
+|---------|-------------|----------|
+| [multi_tenancy.py](../guides/multi-tenancy.md) | Namespace-based tenant isolation | Per-tenant stores, admin view |
+
 ## Running Examples
 
 ### Prerequisites

@@ -41,6 +41,12 @@ python examples/metadata_filtering.py
 
 # Chat history - conversation persistence
 python examples/chat_history.py
+
+# Checkpointer - LangGraph state persistence
+python examples/checkpointer.py
+
+# Multi-tenancy - namespace-based tenant isolation
+python examples/multi_tenancy.py
 ```
 
 ## Examples Overview
@@ -120,6 +126,27 @@ Persistent conversation storage:
 - Integration with LangChain chains
 
 **Good for**: Chatbots, conversational AI
+
+### 8. checkpointer.py
+
+LangGraph checkpointer with CockroachDB:
+- Sync and async checkpointer usage
+- Connection pool mode
+- Saving, retrieving, and listing checkpoints
+- Pending sends migration
+- Thread deletion
+
+**Good for**: LangGraph agents, short-term memory, human-in-the-loop workflows
+
+### 9. multi_tenancy.py
+
+Namespace-based multi-tenancy:
+- Opt-in namespace column creation
+- Per-tenant vector store instances
+- Search, delete, and get_by_ids isolation
+- Admin view (no namespace) for cross-tenant access
+
+**Good for**: SaaS applications, multi-tenant RAG pipelines
 
 ## Next Steps
 
