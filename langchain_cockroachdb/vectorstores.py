@@ -81,6 +81,28 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
             )
         )
 
+    def similarity_search_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Return docs most similar to embedding vector (sync).
+
+        Args:
+            embedding: Embedding to look up documents similar to.
+            k: Number of results to return.
+            filter: Metadata filter.
+            **kwargs: Additional arguments.
+
+        Returns:
+            List of documents most similar to the query vector.
+        """
+        return asyncio.run(
+            self.asimilarity_search_by_vector(embedding, k=k, filter=filter, **kwargs)
+        )
+
     def max_marginal_relevance_search(
         self,
         query: str,
