@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.2">
     
     
       
@@ -530,6 +530,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langgraph-checkpointer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        🧠 LangGraph Checkpointer
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#async-sync-apis" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -572,6 +583,17 @@
     <span class="md-ellipsis">
       
         Getting Started
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#langchain-official-integration-docs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LangChain Official Integration Docs
       
     </span>
   </a>
@@ -853,6 +875,34 @@
   
   
     <li class="md-nav__item">
+      <a href="guides/multi-tenancy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Multi-Tenancy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="guides/vector-indexes/" class="md-nav__link">
         
   
@@ -917,6 +967,34 @@
     
   
     Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="guides/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Checkpointer
   
 
     
@@ -1131,6 +1209,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="examples/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1291,6 +1397,34 @@
     
   
     Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="api/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
   
 
     
@@ -1656,6 +1790,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langgraph-checkpointer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        🧠 LangGraph Checkpointer
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#async-sync-apis" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1698,6 +1843,17 @@
     <span class="md-ellipsis">
       
         Getting Started
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#langchain-official-integration-docs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LangChain Official Integration Docs
       
     </span>
   </a>
@@ -1760,7 +1916,6 @@
 <h1 id="langchain-cockroachdb">langchain-cockroachdb<a class="headerlink" href="#langchain-cockroachdb" title="Permanent link">&para;</a></h1>
 <p><strong>LangChain integration for CockroachDB with native vector support</strong></p>
 <p><a href="https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml"><img alt="Tests" src="https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg" /></a>
-<a href="https://codecov.io/gh/cockroachdb/langchain-cockroachdb"><img alt="codecov" src="https://codecov.io/gh/cockroachdb/langchain-cockroachdb/branch/main/graph/badge.svg" /></a>
 <a href="https://badge.fury.io/py/langchain-cockroachdb"><img alt="PyPI version" src="https://badge.fury.io/py/langchain-cockroachdb.svg" /></a>
 <a href="https://www.python.org/downloads/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10+-blue.svg" /></a>
 <a href="https://opensource.org/licenses/Apache-2.0"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a></p>
@@ -1779,8 +1934,8 @@
 <h3 id="reliability-features">🏗️ Reliability Features<a class="headerlink" href="#reliability-features" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>Automatic Retry Logic</strong>: Handles 40001 serialization errors with exponential backoff</li>
-<li><strong>SERIALIZABLE Isolation</strong>: Built for CockroachDB's default isolation level</li>
-<li><strong>Multi-Tenancy</strong>: Index prefix columns for efficient tenant isolation</li>
+<li><strong>Isolation Level Support</strong>: Works with both SERIALIZABLE (default, recommended) and READ COMMITTED</li>
+<li><strong>Multi-Tenancy</strong>: <a href="guides/multi-tenancy/">Namespace-based isolation</a> with C-SPANN prefix columns</li>
 <li><strong>Connection Pooling</strong>: Configurable connection pools with health checks</li>
 <li><strong>Horizontal Scalability</strong>: Designed for distributed deployments</li>
 </ul>
@@ -1789,6 +1944,13 @@
 <li><strong>Persistent Storage</strong>: Store conversation history in CockroachDB</li>
 <li><strong>Session Management</strong>: Organize by session/thread ID</li>
 <li><strong>LangChain Integration</strong>: Drop-in replacement for other chat history implementations</li>
+</ul>
+<h3 id="langgraph-checkpointer">🧠 LangGraph Checkpointer<a class="headerlink" href="#langgraph-checkpointer" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Short-Term Memory</strong>: Persist agent state across conversation turns</li>
+<li><strong>Human-in-the-Loop</strong>: Interrupt and resume workflows with durable state</li>
+<li><strong>Fault Tolerance</strong>: Recover from process restarts without losing progress</li>
+<li><strong>Sync &amp; Async</strong>: Both <code>CockroachDBSaver</code> and <code>AsyncCockroachDBSaver</code></li>
 </ul>
 <h3 id="async-sync-apis">🔄 Async &amp; Sync APIs<a class="headerlink" href="#async-sync-apis" title="Permanent link">&para;</a></h3>
 <ul>
@@ -1841,7 +2003,7 @@
 <ul>
 <li><strong>Distributed by Design</strong>: Scale horizontally across regions</li>
 <li><strong>Native Vector Support</strong>: First-class <code>VECTOR</code> type and C-SPANN indexes</li>
-<li><strong>SERIALIZABLE</strong>: Strong consistency without sacrificing performance</li>
+<li><strong>Strong Consistency</strong>: SERIALIZABLE by default, READ COMMITTED also supported</li>
 <li><strong>Cloud Native</strong>: Deploy anywhere (AWS, GCP, Azure, on-prem)</li>
 <li><strong>PostgreSQL Compatible</strong>: Familiar SQL with distributed superpowers</li>
 </ul>
@@ -1875,6 +2037,12 @@
 </li>
 </ul>
 </div>
+<h2 id="langchain-official-integration-docs">LangChain Official Integration Docs<a class="headerlink" href="#langchain-official-integration-docs" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="https://docs.langchain.com/oss/python/integrations/providers/cockroachdb">CockroachDB Provider</a></li>
+<li><a href="https://docs.langchain.com/oss/python/integrations/vectorstores/cockroachdb">CockroachDB Vector Store</a></li>
+<li><a href="https://docs.langchain.com/oss/python/integrations/chat_message_histories/cockroachdb">CockroachDB Chat Message History</a></li>
+</ul>
 <h2 id="community-support">Community &amp; Support<a class="headerlink" href="#community-support" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>GitHub</strong>: <a href="https://github.com/cockroachdb/langchain-cockroachdb">cockroachdb/langchain-cockroachdb</a></li>

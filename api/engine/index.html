@@ -15,7 +15,7 @@
         <link rel="canonical" href="https://cockroachdb.github.io/langchain-cockroachdb/api/engine/">
       
       
-        <link rel="prev" href="../../examples/index-optimization/">
+        <link rel="prev" href="../../examples/checkpointer/">
       
       
         <link rel="next" href="../vectorstore/">
@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.2">
     
     
       
@@ -670,6 +670,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../guides/multi-tenancy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Multi-Tenancy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../guides/vector-indexes/" class="md-nav__link">
         
   
@@ -734,6 +762,34 @@
     
   
     Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Checkpointer
   
 
     
@@ -935,6 +991,34 @@
     
   
     Index Optimization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
   
 
     
@@ -1363,6 +1447,34 @@
     
   
     Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
   
 
     
@@ -2270,7 +2382,7 @@
 
 
 <h3 id="langchain_cockroachdb.engine.CockroachDBEngine.ainit_vectorstore_table" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">ainit_vectorstore_table</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">vector_dimension</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">&#39;public&#39;</span><span class="p">,</span> <span class="n">id_type</span><span class="o">=</span><span class="s1">&#39;UUID&#39;</span><span class="p">,</span> <span class="n">content_column</span><span class="o">=</span><span class="s1">&#39;content&#39;</span><span class="p">,</span> <span class="n">embedding_column</span><span class="o">=</span><span class="s1">&#39;embedding&#39;</span><span class="p">,</span> <span class="n">metadata_column</span><span class="o">=</span><span class="s1">&#39;metadata&#39;</span><span class="p">,</span> <span class="n">create_tsvector</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">drop_if_exists</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">ainit_vectorstore_table</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">vector_dimension</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">&#39;public&#39;</span><span class="p">,</span> <span class="n">id_type</span><span class="o">=</span><span class="s1">&#39;UUID&#39;</span><span class="p">,</span> <span class="n">content_column</span><span class="o">=</span><span class="s1">&#39;content&#39;</span><span class="p">,</span> <span class="n">embedding_column</span><span class="o">=</span><span class="s1">&#39;embedding&#39;</span><span class="p">,</span> <span class="n">metadata_column</span><span class="o">=</span><span class="s1">&#39;metadata&#39;</span><span class="p">,</span> <span class="n">namespace_column</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">create_tsvector</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">drop_if_exists</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></code>
 
   <span class="doc doc-labels">
       <small class="doc doc-label doc-label-async"><code>async</code></small>
@@ -2281,7 +2393,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Create vector store table with optional full-text search.</p>
+        <p>Create vector store table with optional full-text search and namespace.</p>
 <p>Uses retry logic configured on engine instance.</p>
 
 
@@ -2406,6 +2518,22 @@
             </td>
             <td>
                   <code>&#39;metadata&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>namespace_column</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Name of namespace column for multi-tenancy (default: None, disabled)</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
             </td>
           </tr>
           <tr class="doc-section-item">
