@@ -1,16 +1,71 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Version to release (e.g., 0.1.0)
-        required: true
-        type: string
+ workflow_dispatch:
+   inputs:
+     version:
+       description: Version to release (e.g., 0.1.0)
+       required: true
+       type: string
 
 jobs:
-  release:
-    uses: ./.github/workflows/_release.yml
-    with:
-      version: ${{ inputs.version }}
-    secrets: inherit
+ release:
+   runs-on: ubuntu-latest
+   permissions:
+     contents: write
+     id-token: write
+
+   steps:
+     - uses: actions/checkout@v6
+
+     - name: Setup UV
+       uses: ./.github/actions/uv_setup
+       with:
+         python-version: "3.12"
+
+     - name: Install dependencies
+       run: |
+         uv pip install --system -e ".[dev]"
+
+     - name: Start CockroachDB
+       run: |
+         docker run -d --name cockroachdb \
+           -p 26257:26257 \
+           -p 8080:8080 \
+           cockroachdb/cockroach:latest \
+           start-single-node --insecure
+
+         echo "Waiting for CockroachDB to start..."
+         for i in {1..30}; do
+           if docker exec cockroachdb ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
+             echo "CockroachDB is ready!"
+             break
+           fi
+           echo "Waiting... ($i/30)"
+           sleep 2
+         done
+
+     - name: Run tests
+       env:
+         USE_TESTCONTAINER: "false"
+         COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+       run: |
+         pytest tests -v
+
+     - name: Build package
+       run: |
+         uv build
+
+     - name: Publish to PyPI
+       uses: pypa/gh-action-pypi-publish@release/v1
+       with:
+         skip-existing: true
+
+     - name: Create GitHub Release
+       uses: softprops/action-gh-release@v2
+       with:
+         tag_name: v${{ inputs.version }}
+         name: Release v${{ inputs.version }}
+         draft: false
+         prerelease: false
+         generate_release_notes: true
