@@ -88,23 +88,39 @@ asyncio.run(main())
 - Native `VECTOR` type support with C-SPANN indexes
 - Advanced metadata filtering (`$and`, `$or`, `$gt`, `$in`, etc.)
 - Hybrid search (full-text + vector similarity)
-- Multi-tenant index support with prefix columns
+- Multi-tenancy with namespace-based isolation and C-SPANN prefix columns
+
+### Chat History
+- Persistent conversation storage in CockroachDB
+- Session management by thread ID
+- Drop-in replacement for other LangChain chat history implementations
+
+### LangGraph Checkpointer
+- Short-term memory for multi-turn LangGraph agents
+- Human-in-the-loop with interrupt/resume support
+- Both `CockroachDBSaver` (sync) and `AsyncCockroachDBSaver`
+- Compatible with LangGraph's `compile(checkpointer=...)` interface
 
 ### Reliability
 - Automatic retry logic with exponential backoff
 - Connection pooling with health checks
 - Configurable for different workloads
-- Built for SERIALIZABLE isolation
+- Works with both SERIALIZABLE (default, recommended) and READ COMMITTED isolation
 
 ### Developer Experience
 - Async-first design for high concurrency
 - Sync wrapper for simple scripts
 - Type-safe with full type hints
-- Comprehensive test suite (92 tests)
+- Comprehensive test suite (177 tests)
 
 ## Documentation
 
 **📚 [Complete Documentation](https://cockroachdb.github.io/langchain-cockroachdb/)**
+
+**LangChain Official Integration Docs:**
+- [CockroachDB Provider](https://docs.langchain.com/oss/python/integrations/providers/cockroachdb)
+- [CockroachDB Vector Store](https://docs.langchain.com/oss/python/integrations/vectorstores/cockroachdb)
+- [CockroachDB Chat Message History](https://docs.langchain.com/oss/python/integrations/chat_message_histories/cockroachdb)
 
 **Getting Started:**
 - [Installation](https://cockroachdb.github.io/langchain-cockroachdb/getting-started/installation/)
@@ -116,6 +132,8 @@ asyncio.run(main())
 - [Vector Indexes](https://cockroachdb.github.io/langchain-cockroachdb/guides/vector-indexes/)
 - [Hybrid Search](https://cockroachdb.github.io/langchain-cockroachdb/guides/hybrid-search/)
 - [Chat History](https://cockroachdb.github.io/langchain-cockroachdb/guides/chat-history/)
+- [Multi-Tenancy](https://cockroachdb.github.io/langchain-cockroachdb/guides/multi-tenancy/)
+- [LangGraph Checkpointer](https://cockroachdb.github.io/langchain-cockroachdb/guides/checkpointer/)
 - [Async vs Sync](https://cockroachdb.github.io/langchain-cockroachdb/guides/async-vs-sync/)
 
 ## Examples
@@ -128,6 +146,8 @@ asyncio.run(main())
 - [`hybrid_search.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/hybrid_search.py) - FTS + vector search
 - [`metadata_filtering.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/metadata_filtering.py) - Advanced queries
 - [`chat_history.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/chat_history.py) - Persistent conversations
+- [`checkpointer.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/checkpointer.py) - LangGraph checkpointer
+- [`multi_tenancy.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/multi_tenancy.py) - Namespace-based multi-tenancy
 - [`retry_configuration.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/retry_configuration.py) - Configuration patterns
 
 ## Development
@@ -169,9 +189,17 @@ Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/cockr
 
 - **Distributed SQL** - Scale horizontally across regions
 - **Native Vector Support** - First-class `VECTOR` type and C-SPANN indexes  
-- **Strong Consistency** - SERIALIZABLE isolation by default
+- **Strong Consistency** - SERIALIZABLE isolation by default, READ COMMITTED also supported
 - **Cloud Native** - Deploy anywhere (IBM, AWS, GCP, Azure, on-prem)
 - **PostgreSQL Compatible** - Familiar SQL with distributed superpowers
+
+## Links
+
+- [GitHub Repository](https://github.com/cockroachdb/langchain-cockroachdb)
+- [PyPI Package](https://pypi.org/project/langchain-cockroachdb/)
+- [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
+- [LangChain Documentation](https://python.langchain.com/)
+- [Report Issues](https://github.com/cockroachdb/langchain-cockroachdb/issues)
 
 ## License
 
@@ -183,11 +211,3 @@ Built for the CockroachDB and LangChain communities.
 
 - [CockroachDB](https://www.cockroachlabs.com/) - Distributed SQL database
 - [LangChain](https://github.com/langchain-ai/langchain) - LLM application framework
-
-## Links
-
-- [GitHub Repository](https://github.com/cockroachdb/langchain-cockroachdb)
-- [PyPI Package](https://pypi.org/project/langchain-cockroachdb/)
-- [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
-- [LangChain Documentation](https://python.langchain.com/)
-- [Report Issues](https://github.com/cockroachdb/langchain-cockroachdb/issues)

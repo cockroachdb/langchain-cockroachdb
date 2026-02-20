@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-19
+
+### Added
+- LangGraph checkpointer: `CockroachDBSaver` and `AsyncCockroachDBSaver` for
+  persisting LangGraph workflow state (short-term memory, human-in-the-loop,
+  fault tolerance)
+- Multi-tenancy: opt-in namespace column on vectorstore for tenant isolation
+- Vectorstore standard tests compliance (25/25 LangChain standard tests passing)
+- Checkpointer guide, multi-tenancy guide, API reference, runnable examples
+
+### Changed
+- Clarified isolation level support: works with both SERIALIZABLE (default,
+  recommended) and READ COMMITTED
+- Test suite expanded from 92 to 177 tests
+
 ## [0.1.0] - 2024-01-31
 
 ### Added
@@ -32,5 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both async and sync APIs
 - Multi-tenant index support
 
-[Unreleased]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cockroachdb/langchain-cockroachdb/releases/tag/v0.1.0

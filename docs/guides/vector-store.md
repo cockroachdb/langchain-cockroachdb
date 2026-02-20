@@ -532,6 +532,35 @@ for doc, score in results:
     print(f"Relevance: {score:.2f}")
 ```
 
+## Multi-Tenancy (Namespaces)
+
+Isolate documents by tenant within a single table:
+
+```python
+# Create table with namespace column (opt-in)
+await engine.ainit_vectorstore_table(
+    table_name="documents",
+    vector_dimension=1536,
+    namespace_column="namespace",
+)
+
+# Per-tenant stores
+store_a = AsyncCockroachDBVectorStore(
+    engine=engine, embeddings=embeddings,
+    collection_name="documents", namespace="tenant-a",
+)
+store_b = AsyncCockroachDBVectorStore(
+    engine=engine, embeddings=embeddings,
+    collection_name="documents", namespace="tenant-b",
+)
+
+# All operations (search, delete, get_by_ids) are scoped to the namespace
+await store_a.aadd_texts(["Tenant A doc"])
+results = await store_a.asimilarity_search("doc")  # Only tenant A's docs
+```
+
+See the [Multi-Tenancy Guide](multi-tenancy.md) for the full guide including C-SPANN prefix column indexing.
+
 ## Error Handling
 
 ```python
@@ -546,6 +575,8 @@ except Exception as e:
 
 ## Next Steps
 
+- [Multi-Tenancy](multi-tenancy.md) - Namespace-based tenant isolation
 - [Vector Indexes](vector-indexes.md) - Optimize query performance
 - [Hybrid Search](hybrid-search.md) - Combine FTS with vectors
 - [Configuration](../getting-started/configuration.md) - Tune for your workload
+- [LangChain Official: CockroachDB Vector Store](https://docs.langchain.com/oss/python/integrations/vectorstores/cockroachdb)

@@ -145,10 +145,11 @@ class CockroachDBEngine:
         content_column: str = "content",
         embedding_column: str = "embedding",
         metadata_column: str = "metadata",
+        namespace_column: str | None = None,
         create_tsvector: bool = False,
         drop_if_exists: bool = False,
     ) -> None:
-        """Create vector store table with optional full-text search.
+        """Create vector store table with optional full-text search and namespace.
 
         Uses retry logic configured on engine instance.
 
@@ -160,6 +161,7 @@ class CockroachDBEngine:
             content_column: Name of content column
             embedding_column: Name of embedding column
             metadata_column: Name of metadata column
+            namespace_column: Name of namespace column for multi-tenancy (default: None, disabled)
             create_tsvector: Create TSVECTOR column for FTS
             drop_if_exists: Drop table if it exists
         """
@@ -179,9 +181,11 @@ class CockroachDBEngine:
                 if drop_if_exists:
                     await conn.execute(text(f"DROP TABLE IF EXISTS {fqn}"))
 
+                ns_col = f"{namespace_column} TEXT NOT NULL DEFAULT ''," if namespace_column else ""
                 create_sql = f"""
                     CREATE TABLE IF NOT EXISTS {fqn} (
                         id {id_type} PRIMARY KEY DEFAULT gen_random_uuid(),
+                        {ns_col}
                         {content_column} TEXT,
                         {embedding_column} VECTOR({vector_dimension}),
                         {metadata_column} JSONB DEFAULT '{{}}'::jsonb,
@@ -189,6 +193,13 @@ class CockroachDBEngine:
                     )
                 """
                 await conn.execute(text(create_sql))
+
+                if namespace_column:
+                    index_sql = f"""
+                        CREATE INDEX IF NOT EXISTS {table_name}_{namespace_column}_idx
+                        ON {fqn} ({namespace_column})
+                    """
+                    await conn.execute(text(index_sql))
 
                 if create_tsvector:
                     tsvector_col = f"{content_column}_tsvector"

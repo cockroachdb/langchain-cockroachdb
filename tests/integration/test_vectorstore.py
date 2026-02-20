@@ -1,5 +1,7 @@
 """Integration tests for vector store."""
 
+import uuid
+
 import pytest
 from langchain_core.embeddings import Embeddings
 
@@ -281,3 +283,168 @@ class TestAsyncCockroachDBVectorStore:
 
             results = await vectorstore.asimilarity_search("database", k=3)
             assert len(results) <= 3
+
+    async def test_namespace_isolation(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that namespaces isolate documents from each other."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_isolation"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        await store_a.aadd_texts(["doc for tenant A"], ids=[id_a])
+        await store_b.aadd_texts(["doc for tenant B"], ids=[id_b])
+
+        results_a = await store_a.asimilarity_search("doc", k=10)
+        results_b = await store_b.asimilarity_search("doc", k=10)
+
+        assert len(results_a) == 1
+        assert results_a[0].page_content == "doc for tenant A"
+        assert len(results_b) == 1
+        assert results_b[0].page_content == "doc for tenant B"
+
+    async def test_namespace_delete_isolation(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that delete in one namespace doesn't affect another."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_delete"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        await store_a.aadd_texts(["doc A"], ids=[id_a])
+        await store_b.aadd_texts(["doc B"], ids=[id_b])
+
+        await store_a.adelete([id_a])
+
+        results_a = await store_a.asimilarity_search("doc", k=10)
+        results_b = await store_b.asimilarity_search("doc", k=10)
+
+        assert len(results_a) == 0
+        assert len(results_b) == 1
+
+    async def test_namespace_get_by_ids_isolation(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that get_by_ids respects namespace."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_getbyids"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        await store_a.aadd_texts(["doc A"], ids=[id_a])
+        await store_b.aadd_texts(["doc B"], ids=[id_b])
+
+        # Tenant A can see id_a but not id_b
+        assert len(await store_a.aget_by_ids([id_a])) == 1
+        assert len(await store_a.aget_by_ids([id_b])) == 0
+
+        # Tenant B can see id_b but not id_a
+        assert len(await store_b.aget_by_ids([id_b])) == 1
+        assert len(await store_b.aget_by_ids([id_a])) == 0
+
+    async def test_no_namespace_sees_all(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that no namespace (None) sees all documents -- backward compatible."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_all"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+        store_all = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            # no namespace -- sees everything
+        )
+
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        await store_a.aadd_texts(["doc A"], ids=[id_a])
+        await store_b.aadd_texts(["doc B"], ids=[id_b])
+
+        results = await store_all.asimilarity_search("doc", k=10)
+        assert len(results) == 2
