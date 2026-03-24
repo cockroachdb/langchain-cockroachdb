@@ -74,7 +74,7 @@ from langchain_cockroachdb import CockroachDBSaver
 conn = Connection.connect(
     "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
     autocommit=True,
-    prepare_threshold=0,
+    prepare_threshold=5,
     row_factory=dict_row,
 )
 saver = CockroachDBSaver(conn)
@@ -120,7 +120,7 @@ await saver.setup()
 
 ### Factory Method (Recommended)
 
-The simplest approach -- handles connection string conversion and pool setup:
+The simplest approach -- handles connection string conversion, pool setup, and enables prepared statement caching (`prepare_threshold=5`) for query plan reuse:
 
 ```python
 # Sync
@@ -295,31 +295,71 @@ The `setup()` method creates three tables and associated indexes:
 
 Migrations are applied incrementally and idempotently -- calling `setup()` multiple times is safe.
 
+## Row-Level TTL
+
+CockroachDB supports automatic deletion of expired rows via [Row-Level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). The checkpointer exposes this as an opt-in feature for automatic cleanup of old checkpoint data.
+
+### Enabling TTL
+
+```python
+# Sync
+with CockroachDBSaver.from_conn_string(DB_URI) as saver:
+    saver.setup()
+
+    # Expire checkpoints older than 30 days, clean up daily
+    saver.enable_ttl(ttl_interval="30 days", cron="@daily")
+
+# Async
+async with AsyncCockroachDBSaver.from_conn_string(DB_URI) as saver:
+    await saver.setup()
+    await saver.aenable_ttl(ttl_interval="7 days", cron="@hourly")
+```
+
+### Disabling TTL
+
+```python
+saver.disable_ttl()       # sync
+await saver.adisable_ttl()  # async
+```
+
+### How It Works
+
+- `setup()` adds a `created_at TIMESTAMPTZ` column (with `DEFAULT now()`) to all three checkpoint tables via migration.
+- `enable_ttl()` uses CockroachDB's `ttl_expiration_expression` (recommended over `ttl_expire_after` to avoid full table rewrites).
+- CockroachDB runs a background job on the specified cron schedule to delete rows where `created_at + interval` is in the past.
+- `enable_ttl()` is idempotent -- calling it again updates the interval and cron.
+- `disable_ttl()` removes TTL from all three tables.
+
+!!! note
+    TTL deletion is **eventual** -- expired rows remain queryable until the background job runs. CockroachDB rate-limits deletions to minimize impact on foreground queries.
+
+## Performance
+
+The CockroachDB checkpointer includes several performance optimizations over the base PostgresSaver approach:
+
+### Separate Lightweight Queries
+
+Instead of correlated subqueries with `jsonb_agg`/`jsonb_build_object`, the checkpointer issues separate simple queries for checkpoints, blobs, and writes. Each query uses primary key lookups.
+
+### Batch Fetching in list()
+
+When listing multiple checkpoints, blobs and writes for **all** returned checkpoints are fetched in just 2 batch queries (instead of 2 per checkpoint). This reduces database round trips from 2N+1 to 3 total, regardless of how many checkpoints are returned.
+
+### Raw BYTEA Deserialization
+
+Blob data is read as raw BYTEA via psycopg3's binary cursor protocol, eliminating the overhead of hex-encoding in SQL and decoding in Python.
+
+### Prepared Statement Caching
+
+The `from_conn_string()` factory sets `prepare_threshold=5`, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths.
+
 ## CockroachDB-Specific Adaptations
 
 This checkpointer is modeled on `langgraph-checkpoint-postgres` (PostgresSaver) with the following adaptations for CockroachDB compatibility:
 
-### JSONB Instead of Multidimensional Arrays
+### Separate Queries Instead of Multidimensional Arrays
 
-CockroachDB does not support multidimensional arrays. The PostgresSaver uses:
-
-```sql
--- PostgresSaver (not compatible with CockroachDB):
-SELECT array_agg(array[bl.channel::bytea, bl.type::bytea, bl.blob]) ...
-```
-
-The CockroachDB checkpointer uses JSONB aggregation instead:
-
-```sql
--- CockroachDBSaver:
-SELECT jsonb_agg(jsonb_build_object(
-    'channel', bl.channel,
-    'type', bl.type,
-    'blob', encode(bl.blob, 'hex')
-)) ...
-```
-
-Blob data is hex-encoded within the JSONB structure and decoded during deserialization.
+CockroachDB does not support multidimensional arrays. The PostgresSaver uses correlated subqueries with `array_agg(array[...])`. The CockroachDB checkpointer instead fetches blobs and writes via separate lightweight primary key lookups, with batch variants for `list()`.
 
 ### Index Creation Without CONCURRENTLY
 
@@ -346,9 +386,11 @@ FROM jsonb_each_text(checkpoint -> 'channel_versions') AS jt
 | Connection library | psycopg3 | psycopg3 |
 | Connection modes | Connection, Pool, Pipeline | Connection, Pool, Pipeline |
 | Isolation level | READ COMMITTED | SERIALIZABLE (default), READ COMMITTED supported |
-| Array aggregation | `array_agg(array[...])` | `jsonb_agg(jsonb_build_object(...))` |
+| Blob/write fetching | Correlated subqueries | Separate PK lookups + batch fetching |
 | Index creation | `CREATE INDEX CONCURRENTLY` | `CREATE INDEX` (non-blocking by default) |
-| Blob encoding | Native bytea arrays | Hex-encoded in JSONB |
+| Blob encoding | Native bytea arrays | Raw BYTEA via binary cursor |
+| Prepared statements | `prepare_threshold=0` (disabled) | `prepare_threshold=5` (enabled) |
+| Row-level TTL | Not supported | `enable_ttl()` / `disable_ttl()` |
 | Async support | Yes | Yes |
 | Thread deletion | Yes | Yes |
 | Pipeline support | Yes | Yes |

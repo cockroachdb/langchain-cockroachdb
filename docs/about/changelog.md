@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-03-24
+
+### Changed
+- Checkpointer query performance optimization: replaced correlated subqueries
+  with separate lightweight queries and raw BYTEA deserialization.
+- Batch fetching in `list()`: 3 total queries instead of 2N+1.
+- Prepared statement caching (`prepare_threshold=5`) for query plan reuse.
+
+### Added
+- CockroachDB row-level TTL: `enable_ttl()` / `disable_ttl()` (sync and async)
+- Checkpointer performance benchmark script
+
 ## [0.2.0] - 2026-02-19
 
 ### Added
@@ -47,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both async and sync APIs
 - Multi-tenant index support
 
-[Unreleased]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cockroachdb/langchain-cockroachdb/releases/tag/v0.1.0

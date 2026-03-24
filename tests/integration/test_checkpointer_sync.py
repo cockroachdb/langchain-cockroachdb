@@ -6,6 +6,7 @@ Tests CockroachDBSaver with connection, pool, and pipeline modes.
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from uuid import uuid4
 
@@ -347,3 +348,140 @@ class TestCockroachDBSaverSync:
             config = saver.put(config, chkpnt, {}, {})
             result = saver.get_tuple(config)
             assert result is not None
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    def test_batch_list(self, connection_string: str, saver_name: str) -> None:
+        """Test that list() returns correct blobs/writes for multiple checkpoints."""
+        with _saver(saver_name, connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-batch", "checkpoint_ns": ""}
+            }
+            chkpnt_1 = empty_checkpoint()
+            config = saver.put(config, chkpnt_1, {"step": 1}, {})
+            saver.put_writes(config, [("ch1", "val1")], task_id="task-1")
+
+            chkpnt_2 = create_checkpoint(chkpnt_1, {}, 1)
+            config = saver.put(config, chkpnt_2, {"step": 2}, {})
+            saver.put_writes(config, [("ch2", "val2")], task_id="task-2")
+
+            chkpnt_3 = create_checkpoint(chkpnt_2, {}, 2)
+            config = saver.put(config, chkpnt_3, {"step": 3}, {})
+
+            results = list(
+                saver.list({"configurable": {"thread_id": "thread-batch", "checkpoint_ns": ""}})
+            )
+            assert len(results) == 3
+
+            # Results are ordered by checkpoint_id DESC (newest first)
+            assert results[0].metadata["step"] == 3
+            assert results[1].metadata["step"] == 2
+            assert results[2].metadata["step"] == 1
+
+            # Each checkpoint should have its own writes (not mixed up)
+            assert len(results[1].pending_writes) == 1
+            assert results[1].pending_writes[0][1] == "ch2"
+            assert results[1].pending_writes[0][2] == "val2"
+
+            assert len(results[2].pending_writes) == 1
+            assert results[2].pending_writes[0][1] == "ch1"
+            assert results[2].pending_writes[0][2] == "val1"
+
+            # Latest checkpoint has no writes
+            assert len(results[0].pending_writes) == 0
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    def test_enable_disable_ttl(self, connection_string: str, saver_name: str) -> None:
+        """Test that enable_ttl() and disable_ttl() execute without errors."""
+        with _saver(saver_name, connection_string) as saver:
+            # Store a checkpoint first so tables have data
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}
+            }
+            saver.put(config, empty_checkpoint(), {"source": "input"}, {})
+
+            # Enable TTL -- should succeed without error
+            saver.enable_ttl(ttl_interval="30 days", cron="@daily")
+
+            # Data should still be accessible after enabling TTL
+            result = saver.get_tuple(
+                {"configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+            assert result.metadata["source"] == "input"
+
+            # Disable TTL -- should succeed without error
+            saver.disable_ttl()
+
+            # Data should still be accessible after disabling TTL
+            result = saver.get_tuple(
+                {"configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    def test_ttl_idempotent(self, connection_string: str, saver_name: str) -> None:
+        """Test that enable_ttl() can be called multiple times (idempotent)."""
+        with _saver(saver_name, connection_string) as saver:
+            saver.enable_ttl(ttl_interval="7 days")
+            saver.enable_ttl(ttl_interval="14 days")
+            saver.disable_ttl()
+            saver.disable_ttl()
+
+    def test_ttl_expiration(self, connection_string: str) -> None:
+        """Test that rows are actually deleted after TTL expires.
+
+        This test backdates created_at to make rows immediately eligible for
+        deletion, then waits for the CockroachDB TTL background job to run.
+        """
+        with _base_saver(connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}
+            }
+            config = saver.put(config, empty_checkpoint(), {"source": "ttl-test"}, {})
+            saver.put_writes(config, [("ch1", "val1")], task_id="task-1")
+
+            # Verify data exists
+            result = saver.get_tuple(
+                {"configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+
+            # Backdate created_at to 1 hour ago so rows are immediately expired
+            with saver._cursor() as cur:
+                cur.execute(
+                    "UPDATE checkpoints SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+                cur.execute(
+                    "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+                cur.execute(
+                    "UPDATE checkpoint_writes SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+
+            # Enable TTL with 1-second expiry and every-minute cron
+            saver.enable_ttl(ttl_interval="1 second", cron="* * * * *")
+
+            # Poll until rows are deleted (TTL job runs on cron schedule).
+            # CockroachDB's TTL job fires at the next minute boundary and may
+            # take additional time to select+delete rows, so we allow 5 minutes.
+            deleted = False
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                result = saver.get_tuple(
+                    {"configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}}
+                )
+                if result is None:
+                    deleted = True
+                    break
+                time.sleep(5)
+
+            assert deleted, (
+                "TTL did not delete expired rows within 5 minutes. "
+                "The CockroachDB TTL background job may not have run yet."
+            )
+
+            # Clean up: disable TTL
+            saver.disable_ttl()

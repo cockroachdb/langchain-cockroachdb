@@ -144,6 +144,40 @@ with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
     print(result["messages"][-1])
 ```
 
+## Row-Level TTL (Automatic Expiry)
+
+Enable automatic cleanup of old checkpoint data using CockroachDB's row-level TTL:
+
+```python
+from langchain_cockroachdb import CockroachDBSaver
+
+DB_URI = "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+
+with CockroachDBSaver.from_conn_string(DB_URI) as saver:
+    saver.setup()
+
+    # Expire checkpoints older than 7 days, clean up hourly
+    saver.enable_ttl(ttl_interval="7 days", cron="@hourly")
+
+    # Use the checkpointer normally
+    graph = workflow.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "user-123"}}
+    result = graph.invoke({"messages": [("user", "Hello!")]}, config)
+
+    # To disable TTL later:
+    # saver.disable_ttl()
+```
+
+Async variant:
+
+```python
+from langchain_cockroachdb import AsyncCockroachDBSaver
+
+async with AsyncCockroachDBSaver.from_conn_string(DB_URI) as saver:
+    await saver.setup()
+    await saver.aenable_ttl(ttl_interval="30 days", cron="@daily")
+```
+
 ## Next Steps
 
 - [Checkpointer Guide](../guides/checkpointer.md) - Detailed guide with all connection modes

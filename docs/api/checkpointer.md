@@ -32,12 +32,14 @@ Asynchronous checkpointer for LangGraph workflows.
 | `list()` | `alist()` | List checkpoints with optional filters |
 | `put_writes()` | `aput_writes()` | Store intermediate writes |
 | `delete_thread()` | `adelete_thread()` | Delete all checkpoints for a thread |
+| `enable_ttl(ttl_interval, cron)` | `aenable_ttl(ttl_interval, cron)` | Enable CockroachDB row-level TTL |
+| `disable_ttl()` | `adisable_ttl()` | Disable CockroachDB row-level TTL |
 
 ### Factory Methods
 
 | Method | Description |
 |--------|-------------|
-| `from_conn_string(conn_string)` | Create saver from a connection string (context manager) |
+| `from_conn_string(conn_string)` | Create saver from a connection string (context manager, `prepare_threshold=5`) |
 
 ## Connection Types
 
