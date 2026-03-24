@@ -98,7 +98,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         """
         conn_string = _sanitize_conn_string(conn_string)
         with Connection.connect(
-            conn_string, autocommit=True, prepare_threshold=0, row_factory=dict_row
+            conn_string, autocommit=True, prepare_threshold=5, row_factory=dict_row
         ) as conn:
             if pipeline:
                 with conn.pipeline() as pipe:
@@ -154,7 +154,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             params.append(int(limit))
 
         with self._cursor() as cur:
-            cur.execute(query, params)
+            cur.execute(query, params, binary=True)
             values = cur.fetchall()
             if not values:
                 return
@@ -174,16 +174,30 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                     grouped_by_parent[value["parent_checkpoint_id"]].append(value)
                 for sends in cur:
                     for value in grouped_by_parent[sends["checkpoint_id"]]:
-                        if value["channel_values"] is None:
-                            value["channel_values"] = []
                         self._migrate_pending_sends(
                             sends["sends"],
                             value["checkpoint"],
-                            value["channel_values"],
+                            value.setdefault("_blob_values", {}),
                         )
 
+            # Batch-fetch blobs and writes grouped by (thread_id, checkpoint_ns)
+            groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+            for v in values:
+                groups[(v["thread_id"], v["checkpoint_ns"])].append(v["checkpoint_id"])
+
+            blobs_by_id: dict[str, dict[str, Any]] = {}
+            writes_by_id: dict[str, list[tuple[str, str, Any]]] = {}
+            for (tid, cns), cids in groups.items():
+                cur.execute(self.SELECT_BLOBS_BATCH_SQL, (tid, cns, cids), binary=True)
+                blobs_by_id.update(self._load_blobs_batch(cur.fetchall()))
+                cur.execute(self.SELECT_WRITES_BATCH_SQL, (tid, cns, cids), binary=True)
+                writes_by_id.update(self._load_writes_batch(cur.fetchall()))
+
             for value in values:
-                yield self._load_checkpoint_tuple(value)
+                cid = value["checkpoint_id"]
+                blob_values = {**(value.get("_blob_values") or {}), **(blobs_by_id.get(cid) or {})}
+                pending_writes = writes_by_id.get(cid, [])
+                yield self._build_checkpoint_tuple(value, blob_values, pending_writes)
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database.
@@ -207,7 +221,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             )
 
         with self._cursor() as cur:
-            cur.execute(self.SELECT_SQL + where, args)
+            cur.execute(self.SELECT_SQL + where, args, binary=True)
             value = cur.fetchone()
             if value is None:
                 return None
@@ -218,15 +232,15 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                     (thread_id, [value["parent_checkpoint_id"]]),
                 )
                 if sends := cur.fetchone():
-                    if value["channel_values"] is None:
-                        value["channel_values"] = []
+                    blob_values: dict[str, Any] = {}
                     self._migrate_pending_sends(
                         sends["sends"],
                         value["checkpoint"],
-                        value["channel_values"],
+                        blob_values,
                     )
+                    value["_blob_values"] = blob_values
 
-            return self._load_checkpoint_tuple(value)
+            return self._load_checkpoint_tuple_with_cursor(cur, value)
 
     def put(
         self,
@@ -342,6 +356,27 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                 (str(thread_id),),
             )
 
+    def enable_ttl(self, ttl_interval: str = "7 days", cron: str = "@daily") -> None:
+        """Enable CockroachDB row-level TTL on checkpoint tables.
+
+        Rows older than ttl_interval will be automatically deleted by a
+        background CockroachDB job on the specified cron schedule.
+
+        Args:
+            ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
+            cron: Cron schedule for the TTL deletion job (default: '@daily').
+        """
+        self._validate_ttl_params(ttl_interval, cron)
+        with self._cursor() as cur:
+            for sql_template in self.ENABLE_TTL_SQL:
+                cur.execute(sql_template.format(interval=ttl_interval, cron=cron))
+
+    def disable_ttl(self) -> None:
+        """Disable CockroachDB row-level TTL on checkpoint tables."""
+        with self._cursor() as cur:
+            for sql in self.DISABLE_TTL_SQL:
+                cur.execute(sql)
+
     @contextmanager
     def _cursor(self, *, pipeline: bool = False) -> Iterator[Cursor[DictRow]]:
         """Create a database cursor as a context manager."""
@@ -370,34 +405,32 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                 with conn.cursor(binary=True, row_factory=dict_row) as cur:
                     yield cur
 
-    def _load_checkpoint_tuple(self, value: DictRow) -> CheckpointTuple:
-        """Convert a database row into a CheckpointTuple."""
-        return CheckpointTuple(
-            {
-                "configurable": {
-                    "thread_id": value["thread_id"],
-                    "checkpoint_ns": value["checkpoint_ns"],
-                    "checkpoint_id": value["checkpoint_id"],
-                }
-            },
-            {
-                **value["checkpoint"],
-                "channel_values": {
-                    **(value["checkpoint"].get("channel_values") or {}),
-                    **self._load_blobs(value["channel_values"]),
-                },
-            },
-            value["metadata"],
-            (
-                {
-                    "configurable": {
-                        "thread_id": value["thread_id"],
-                        "checkpoint_ns": value["checkpoint_ns"],
-                        "checkpoint_id": value["parent_checkpoint_id"],
-                    }
-                }
-                if value["parent_checkpoint_id"]
-                else None
-            ),
-            self._load_writes(value["pending_writes"]),
+    def _load_checkpoint_tuple_with_cursor(
+        self, cur: Cursor[DictRow], value: DictRow
+    ) -> CheckpointTuple:
+        """Convert a database row into a CheckpointTuple, fetching blobs and writes separately."""
+        thread_id = value["thread_id"]
+        checkpoint_ns = value["checkpoint_ns"]
+        checkpoint_id = value["checkpoint_id"]
+        checkpoint = value["checkpoint"]
+
+        # Fetch blobs via separate query
+        cv_pairs = self._get_channel_version_pairs(checkpoint)
+        blob_values: dict[str, Any] = value.get("_blob_values") or {}
+        if cv_pairs:
+            cur.execute(
+                self.SELECT_BLOBS_SQL,
+                (thread_id, checkpoint_ns, cv_pairs),
+                binary=True,
+            )
+            blob_values = {**blob_values, **self._load_blobs(cur.fetchall())}
+
+        # Fetch writes via separate query
+        cur.execute(
+            self.SELECT_WRITES_SQL,
+            (thread_id, checkpoint_ns, checkpoint_id),
+            binary=True,
         )
+        pending_writes = self._load_writes(cur.fetchall())
+
+        return self._build_checkpoint_tuple(value, blob_values, pending_writes)

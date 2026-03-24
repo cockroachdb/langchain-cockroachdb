@@ -6,6 +6,7 @@ Tests AsyncCockroachDBSaver with connection and pool modes.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -356,3 +357,125 @@ class TestAsyncCockroachDBSaver:
             config = await saver.aput(config, empty_checkpoint(), {}, {})
             result = await saver.aget_tuple(config)
             assert result is not None
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    async def test_batch_list(self, connection_string: str, saver_name: str) -> None:
+        """Test that alist() returns correct blobs/writes for multiple checkpoints."""
+        async with _saver(saver_name, connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-batch", "checkpoint_ns": ""}
+            }
+            chkpnt_1 = empty_checkpoint()
+            config = await saver.aput(config, chkpnt_1, {"step": 1}, {})
+            await saver.aput_writes(config, [("ch1", "val1")], task_id="task-1")
+
+            chkpnt_2 = create_checkpoint(chkpnt_1, {}, 1)
+            config = await saver.aput(config, chkpnt_2, {"step": 2}, {})
+            await saver.aput_writes(config, [("ch2", "val2")], task_id="task-2")
+
+            chkpnt_3 = create_checkpoint(chkpnt_2, {}, 2)
+            config = await saver.aput(config, chkpnt_3, {"step": 3}, {})
+
+            results = [
+                c
+                async for c in saver.alist(
+                    {"configurable": {"thread_id": "thread-batch", "checkpoint_ns": ""}}
+                )
+            ]
+            assert len(results) == 3
+
+            assert results[0].metadata["step"] == 3
+            assert results[1].metadata["step"] == 2
+            assert results[2].metadata["step"] == 1
+
+            assert len(results[1].pending_writes) == 1
+            assert results[1].pending_writes[0][1] == "ch2"
+            assert results[1].pending_writes[0][2] == "val2"
+
+            assert len(results[2].pending_writes) == 1
+            assert results[2].pending_writes[0][1] == "ch1"
+            assert results[2].pending_writes[0][2] == "val1"
+
+            assert len(results[0].pending_writes) == 0
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    async def test_enable_disable_ttl(self, connection_string: str, saver_name: str) -> None:
+        """Test that aenable_ttl() and adisable_ttl() execute without errors."""
+        async with _saver(saver_name, connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}
+            }
+            await saver.aput(config, empty_checkpoint(), {"source": "input"}, {})
+
+            await saver.aenable_ttl(ttl_interval="30 days", cron="@daily")
+
+            result = await saver.aget_tuple(
+                {"configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+            assert result.metadata["source"] == "input"
+
+            await saver.adisable_ttl()
+
+            result = await saver.aget_tuple(
+                {"configurable": {"thread_id": "thread-ttl", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    async def test_ttl_idempotent(self, connection_string: str, saver_name: str) -> None:
+        """Test that aenable_ttl() can be called multiple times."""
+        async with _saver(saver_name, connection_string) as saver:
+            await saver.aenable_ttl(ttl_interval="7 days")
+            await saver.aenable_ttl(ttl_interval="14 days")
+            await saver.adisable_ttl()
+            await saver.adisable_ttl()
+
+    async def test_ttl_expiration(self, connection_string: str) -> None:
+        """Test that rows are actually deleted after TTL expires."""
+        async with _base_saver(connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}
+            }
+            config = await saver.aput(config, empty_checkpoint(), {"source": "ttl-test"}, {})
+            await saver.aput_writes(config, [("ch1", "val1")], task_id="task-1")
+
+            result = await saver.aget_tuple(
+                {"configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}}
+            )
+            assert result is not None
+
+            # Backdate created_at to make rows immediately expired
+            async with saver._cursor() as cur:
+                await cur.execute(
+                    "UPDATE checkpoints SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+                await cur.execute(
+                    "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+                await cur.execute(
+                    "UPDATE checkpoint_writes SET created_at = now() - INTERVAL '1 hour' "
+                    "WHERE thread_id = 'thread-ttl-expire'"
+                )
+
+            await saver.aenable_ttl(ttl_interval="1 second", cron="* * * * *")
+
+            deleted = False
+            deadline = asyncio.get_event_loop().time() + 300
+            while asyncio.get_event_loop().time() < deadline:
+                result = await saver.aget_tuple(
+                    {"configurable": {"thread_id": "thread-ttl-expire", "checkpoint_ns": ""}}
+                )
+                if result is None:
+                    deleted = True
+                    break
+                await asyncio.sleep(5)
+
+            assert deleted, (
+                "TTL did not delete expired rows within 5 minutes. "
+                "The CockroachDB TTL background job may not have run yet."
+            )
+
+            await saver.adisable_ttl()
