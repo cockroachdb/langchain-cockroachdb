@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.2">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
@@ -1309,6 +1309,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.disable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        disable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.from_conn_string" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1407,6 +1429,28 @@
     <span class="md-ellipsis">
       
         adelete_thread
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.adisable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        adisable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aenable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aenable_ttl
       
     </span>
   </a>
@@ -1939,6 +1983,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.disable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        disable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.from_conn_string" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2037,6 +2103,28 @@
     <span class="md-ellipsis">
       
         adelete_thread
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.adisable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        adisable_ttl
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aenable_ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aenable_ttl
       
     </span>
   </a>
@@ -2349,6 +2437,91 @@ with LangGraph's checkpointer interface.</p>
             </td>
             <td>
                 <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.disable_ttl" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">disable_ttl</span><span class="p">()</span></code>
+
+<a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.disable_ttl" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Disable CockroachDB row-level TTL on checkpoint tables.</p>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">&#39;7 days&#39;</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">&#39;@daily&#39;</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Enable CockroachDB row-level TTL on checkpoint tables.</p>
+<p>Rows older than ttl_interval will be automatically deleted by a
+background CockroachDB job on the specified cron schedule.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>ttl_interval</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Interval after which rows expire (e.g., '7 days', '30 days').</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;7 days&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>cron</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Cron schedule for the TTL deletion job (default: '@daily').</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;@daily&#39;</code>
             </td>
           </tr>
       </tbody>
@@ -2989,6 +3162,97 @@ with LangGraph's checkpointer interface.</p>
             </td>
             <td>
                 <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.adisable_ttl" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">adisable_ttl</span><span class="p">()</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.adisable_ttl" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Disable CockroachDB row-level TTL on checkpoint tables.</p>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aenable_ttl" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">aenable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">&#39;7 days&#39;</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">&#39;@daily&#39;</span><span class="p">)</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aenable_ttl" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Enable CockroachDB row-level TTL on checkpoint tables.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>ttl_interval</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Interval after which rows expire (e.g., '7 days', '30 days').</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;7 days&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>cron</code>
+            </td>
+            <td>
+                  <code><span title="str">str</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Cron schedule for the TTL deletion job (default: '@daily').</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;@daily&#39;</code>
             </td>
           </tr>
       </tbody>
@@ -3695,6 +3959,16 @@ the first time the checkpointer is used.</p>
 <td><code>adelete_thread()</code></td>
 <td>Delete all checkpoints for a thread</td>
 </tr>
+<tr>
+<td><code>enable_ttl(ttl_interval, cron)</code></td>
+<td><code>aenable_ttl(ttl_interval, cron)</code></td>
+<td>Enable CockroachDB row-level TTL</td>
+</tr>
+<tr>
+<td><code>disable_ttl()</code></td>
+<td><code>adisable_ttl()</code></td>
+<td>Disable CockroachDB row-level TTL</td>
+</tr>
 </tbody>
 </table>
 <h3 id="factory-methods">Factory Methods<a class="headerlink" href="#factory-methods" title="Permanent link">&para;</a></h3>
@@ -3708,7 +3982,7 @@ the first time the checkpointer is used.</p>
 <tbody>
 <tr>
 <td><code>from_conn_string(conn_string)</code></td>
-<td>Create saver from a connection string (context manager)</td>
+<td>Create saver from a connection string (context manager, <code>prepare_threshold=5</code>)</td>
 </tr>
 </tbody>
 </table>
