@@ -11,7 +11,7 @@ from langchain_core.vectorstores import VectorStore
 from sqlalchemy import text
 
 from langchain_cockroachdb.engine import CockroachDBEngine
-from langchain_cockroachdb.hybrid_search_config import HybridSearchConfig
+from langchain_cockroachdb.hybrid_search_config import FusionType, HybridSearchConfig
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
 
 
@@ -184,6 +184,42 @@ class AsyncCockroachDBVectorStore(VectorStore):
         async with self.engine.engine.begin() as conn:
             await conn.execute(text(sql))
 
+    async def _fts_search(
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict | None = None,
+    ) -> list[tuple[str, float]]:
+        """Perform Full-Text Search and return (id, score) tuples."""
+        lang = self.hybrid_search_config.fts_query_language if self.hybrid_search_config else "english"
+        escaped_query = query.replace("'", "''")
+        tsvector_col = f"{self.content_column}_tsvector"
+        
+        conditions = []
+        ns_filter = self._namespace_filter()
+        if ns_filter:
+            conditions.append(ns_filter)
+        if filter:
+            conditions.append(self._build_filter_clause(filter))
+            
+        conditions.append(f"{tsvector_col} @@ websearch_to_tsquery('{lang}', '{escaped_query}')")
+        
+        where_clause = "WHERE " + " AND ".join(conditions)
+        
+        sql = f"""
+            SELECT {self.id_column}, ts_rank({tsvector_col}, websearch_to_tsquery('{lang}', '{escaped_query}')) AS fts_score
+            FROM {self._fqn}
+            {where_clause}
+            ORDER BY fts_score DESC
+            LIMIT {k}
+        """
+        
+        async with self.engine.engine.connect() as conn:
+            result = await conn.execute(text(sql))
+            rows = result.fetchall()
+            
+        return [(str(row[0]), float(row[1])) for row in rows]
+
     async def asimilarity_search_with_score(
         self,
         query: str,
@@ -204,6 +240,45 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of (document, score) tuples
         """
+        if self.hybrid_search_config:
+            # Hybrid search execution
+            query_embedding = await self._embeddings.aembed_query(query)
+            fetch_k = kwargs.get("fetch_k", max(k * 4, 60))
+            
+            import asyncio
+            fts_task = asyncio.create_task(self._fts_search(query, k=fetch_k, filter=filter))
+            vec_task = asyncio.create_task(
+                self.asimilarity_search_with_score_by_vector(
+                    query_embedding, k=fetch_k, filter=filter, query_options=query_options, **kwargs
+                )
+            )
+            fts_scores, v_results = await asyncio.gather(fts_task, vec_task)
+            
+            v_scores = []
+            doc_map = {}
+            for doc, dist in v_results:
+                doc_map[doc.id] = doc
+                if self.hybrid_search_config.fusion_type == FusionType.WEIGHTED_SUM:
+                    v_scores.append((doc.id, 1.0 - dist))
+                else:
+                    v_scores.append((doc.id, dist))
+                    
+            fused_scores = self.hybrid_search_config.fuse_scores(fts_scores, v_scores)
+            
+            top_ids = [did for did, _ in fused_scores[:k]]
+            missing_ids = [did for did in top_ids if did not in doc_map]
+            
+            if missing_ids:
+                missing_docs = await self.aget_by_ids(missing_ids)
+                for doc in missing_docs:
+                    doc_map[doc.id] = doc
+            
+            final_results = []
+            for did, final_score in fused_scores[:k]:
+                if did in doc_map:
+                    final_results.append((doc_map[did], final_score))
+            return final_results
+            
         query_embedding = await self._embeddings.aembed_query(query)
         return await self.asimilarity_search_with_score_by_vector(
             query_embedding, k=k, filter=filter, query_options=query_options, **kwargs
