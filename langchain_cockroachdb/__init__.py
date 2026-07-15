@@ -4,7 +4,7 @@ from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 from langchain_cockroachdb.chat_message_histories import CockroachDBChatMessageHistory
 from langchain_cockroachdb.checkpointer import AsyncCockroachDBSaver, CockroachDBSaver
 from langchain_cockroachdb.engine import CockroachDBEngine
-from langchain_cockroachdb.hybrid_search_config import HybridSearchConfig
+from langchain_cockroachdb.hybrid_search_config import FusionType, HybridSearchConfig
 from langchain_cockroachdb.indexes import (
     CSPANNIndex,
     CSPANNQueryOptions,
@@ -24,6 +24,7 @@ __all__ = [
     "CSPANNIndex",
     "CSPANNQueryOptions",
     "DistanceStrategy",
+    "FusionType",
     "HybridSearchConfig",
     "CockroachDBChatMessageHistory",
     "CockroachDBSaver",
@@ -33,4 +34,4 @@ __all__ = [
     "is_retryable_error",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"

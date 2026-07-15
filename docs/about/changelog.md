@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
+### Fixed
+- Hybrid search now actually executes. Setting `hybrid_search_config`
+  previously had no effect: only vector similarity ran and the FTS half never
+  fired (#7). The regular search methods now run both searches in parallel
+  and fuse the results.
+
+### Added
+- `fts_language` parameter on `ainit_vectorstore_table` for non-English
+  tsvector columns
+- `fetch_k` keyword argument to control the hybrid candidate pool size
+- `fts_rank_normalization` option exposing the ts_rank bitmask
+- Score normalization for weighted sum fusion
+
+### Changed
+- Default fusion method is now reciprocal rank fusion. Pass
+  `fusion_type="weighted_sum"` for the previous default.
+- `HybridSearchConfig` validates `fts_query_language`
+
 ## [0.2.1] - 2026-03-24
 
 ### Changed

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
 ### Fixed
 - Hybrid search now actually executes. Setting `hybrid_search_config` on the
   vectorstore previously had no effect: searches ran pure vector similarity and
