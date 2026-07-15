@@ -111,3 +111,50 @@ class TestHybridSearchConfig:
 
         vector_results = [("doc2", 0.9)]
         assert len(config.fuse_scores([], vector_results)) == 1
+
+
+class TestMinMaxNormalize:
+    """Test score normalization used before weighted sum fusion."""
+
+    def test_normalizes_to_unit_range(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        results = [("doc1", 10.0), ("doc2", 5.0), ("doc3", 0.0)]
+        normalized = dict(min_max_normalize(results))
+
+        assert normalized["doc1"] == 1.0
+        assert normalized["doc2"] == 0.5
+        assert normalized["doc3"] == 0.0
+
+    def test_empty_input(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        assert min_max_normalize([]) == []
+
+    def test_single_result_maps_to_one(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        assert min_max_normalize([("doc1", 42.0)]) == [("doc1", 1.0)]
+
+    def test_all_equal_scores_map_to_one(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        results = [("doc1", 3.0), ("doc2", 3.0)]
+        assert min_max_normalize(results) == [("doc1", 1.0), ("doc2", 1.0)]
+
+
+class TestFtsLanguageValidation:
+    """The FTS language ends up inside SQL, so it must be strictly validated."""
+
+    def test_valid_languages_accepted(self) -> None:
+        for lang in ("english", "simple", "spanish", "pg_catalog.english"):
+            config = HybridSearchConfig(fts_query_language=lang)
+            assert config.fts_query_language == lang
+
+    def test_injection_attempt_rejected(self) -> None:
+        with pytest.raises(ValueError, match="language"):
+            HybridSearchConfig(fts_query_language="english'); DROP TABLE users; --")
+
+    def test_empty_language_rejected(self) -> None:
+        with pytest.raises(ValueError, match="language"):
+            HybridSearchConfig(fts_query_language="")

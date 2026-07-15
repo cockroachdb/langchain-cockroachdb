@@ -1,5 +1,6 @@
 """Async vector store implementation for CockroachDB with transaction retry support."""
 
+import asyncio
 import uuid
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -11,7 +12,11 @@ from langchain_core.vectorstores import VectorStore
 from sqlalchemy import text
 
 from langchain_cockroachdb.engine import CockroachDBEngine
-from langchain_cockroachdb.hybrid_search_config import HybridSearchConfig
+from langchain_cockroachdb.hybrid_search_config import (
+    FusionType,
+    HybridSearchConfig,
+    min_max_normalize,
+)
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
 
 
@@ -184,6 +189,104 @@ class AsyncCockroachDBVectorStore(VectorStore):
         async with self.engine.engine.begin() as conn:
             await conn.execute(text(sql))
 
+    async def _afts_search(
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict | None = None,
+    ) -> list[tuple[str, float]]:
+        """Run full-text search and return (id, ts_rank score) tuples.
+
+        Requires the table to have a tsvector column, created by passing
+        create_tsvector=True to ainit_vectorstore_table. Uses plainto_tsquery
+        because CockroachDB does not support websearch_to_tsquery.
+
+        Args:
+            query: Query text
+            k: Number of results
+            filter: Metadata filter
+
+        Returns:
+            List of (id, score) tuples ordered by rank, best first
+        """
+        language = (
+            self.hybrid_search_config.fts_query_language if self.hybrid_search_config else "english"
+        )
+        tsvector_column = f"{self.content_column}_tsvector"
+
+        conditions = []
+        ns_filter = self._namespace_filter()
+        if ns_filter:
+            conditions.append(ns_filter)
+        if filter:
+            conditions.append(self._build_filter_clause(filter))
+        conditions.append(f"{tsvector_column} @@ plainto_tsquery('{language}', :fts_query)")
+
+        sql = f"""
+            SELECT {self.id_column},
+                   ts_rank({tsvector_column}, plainto_tsquery('{language}', :fts_query)) AS fts_score
+            FROM {self._fqn}
+            WHERE {" AND ".join(conditions)}
+            ORDER BY fts_score DESC
+            LIMIT {int(k)}
+        """
+
+        async with self.engine.engine.connect() as conn:
+            result = await conn.execute(text(sql), {"fts_query": query})
+            rows = result.fetchall()
+
+        return [(str(row[0]), float(row[1])) for row in rows]
+
+    async def _ahybrid_search_with_score(
+        self,
+        query: str,
+        k: int,
+        filter: dict | None,
+        query_options: CSPANNQueryOptions | None,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Run vector and FTS searches in parallel and fuse the results.
+
+        Both legs fetch a larger candidate pool than k so the fusion has
+        something to work with, then the fused top k is returned. Scores are
+        the fused scores, not raw distances.
+        """
+        config = self.hybrid_search_config
+        assert config is not None
+        fetch_k = kwargs.pop("fetch_k", max(k * 4, 20))
+
+        query_embedding = await self._embeddings.aembed_query(query)
+        vector_results, fts_scores = await asyncio.gather(
+            self.asimilarity_search_with_score_by_vector(
+                query_embedding, k=fetch_k, filter=filter, query_options=query_options, **kwargs
+            ),
+            self._afts_search(query, k=fetch_k, filter=filter),
+        )
+
+        documents_by_id: dict[str, Document] = {}
+        vector_scores: list[tuple[str, float]] = []
+        for doc, distance in vector_results:
+            doc_id = str(doc.id)
+            documents_by_id[doc_id] = doc
+            # Distances sort ascending for every strategy, so negating them gives
+            # a proper "higher is better" score without caring which operator ran
+            vector_scores.append((doc_id, -distance))
+
+        if config.fusion_type == FusionType.WEIGHTED_SUM:
+            vector_scores = min_max_normalize(vector_scores)
+            fts_scores = min_max_normalize(fts_scores)
+
+        fused = config.fuse_scores(fts_scores, vector_scores)[:k]
+
+        missing_ids = [doc_id for doc_id, _ in fused if doc_id not in documents_by_id]
+        if missing_ids:
+            for doc in await self.aget_by_ids(missing_ids):
+                documents_by_id[str(doc.id)] = doc
+
+        return [
+            (documents_by_id[doc_id], score) for doc_id, score in fused if doc_id in documents_by_id
+        ]
+
     async def asimilarity_search_with_score(
         self,
         query: str,
@@ -194,16 +297,26 @@ class AsyncCockroachDBVectorStore(VectorStore):
     ) -> list[tuple[Document, float]]:
         """Search for similar documents with scores.
 
+        When a hybrid_search_config is set, this runs full-text and vector
+        searches in parallel and returns fused scores. Otherwise scores are
+        plain vector distances.
+
         Args:
             query: Query text
             k: Number of results
             filter: Metadata filter
             query_options: C-SPANN query options
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (fetch_k sets the hybrid candidate
+                pool size, default max(k * 4, 20))
 
         Returns:
             List of (document, score) tuples
         """
+        if self.hybrid_search_config is not None:
+            return await self._ahybrid_search_with_score(
+                query, k=k, filter=filter, query_options=query_options, **kwargs
+            )
+
         query_embedding = await self._embeddings.aembed_query(query)
         return await self.asimilarity_search_with_score_by_vector(
             query_embedding, k=k, filter=filter, query_options=query_options, **kwargs

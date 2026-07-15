@@ -63,45 +63,43 @@ async def main() -> None:
     await vectorstore.aadd_texts(documents)
     print(f"   Added {len(documents)} documents")
 
-    print("\n4. Pure vector search...")
-    vector_results = await vectorstore.asimilarity_search("databases for distributed systems", k=3)
+    print("\n4. Hybrid search (vector + FTS, weighted sum fusion)...")
+    results = await vectorstore.asimilarity_search_with_score("keyword matching in documents", k=3)
 
-    print("   Vector search results:")
+    for i, (doc, score) in enumerate(results, 1):
+        print(f"   {i}. [{score:.4f}] {doc.page_content[:60]}...")
+
+    print("\n5. Same query with pure vector search for comparison...")
+    vector_only = AsyncCockroachDBVectorStore(
+        engine=engine,
+        embeddings=embeddings,
+        collection_name=table_name,
+    )
+    vector_results = await vector_only.asimilarity_search("keyword matching in documents", k=3)
+
     for i, doc in enumerate(vector_results, 1):
         print(f"   {i}. {doc.page_content[:60]}...")
 
-    print("\n5. Hybrid search (if fully implemented)...")
-    print("   Note: Full hybrid search requires additional implementation")
-    print("   - FTS query generation")
-    print("   - Score normalization")
-    print("   - Fusion algorithm")
-
-    print("\n6. Different fusion strategies...")
-
-    configs = [
-        (
-            "Weighted Sum (70% vector, 30% FTS)",
-            HybridSearchConfig(
-                vector_weight=0.7,
-                fts_weight=0.3,
-                fusion_type="weighted_sum",
-            ),
+    print("\n6. Reciprocal rank fusion instead of weighted sum...")
+    rrf_store = AsyncCockroachDBVectorStore(
+        engine=engine,
+        embeddings=embeddings,
+        collection_name=table_name,
+        hybrid_search_config=HybridSearchConfig(
+            vector_weight=0.5,
+            fts_weight=0.5,
+            fusion_type="reciprocal_rank_fusion",
         ),
-        (
-            "Reciprocal Rank Fusion",
-            HybridSearchConfig(
-                vector_weight=0.5,
-                fts_weight=0.5,
-                fusion_type="reciprocal_rank_fusion",
-            ),
-        ),
-    ]
+    )
+    rrf_results = await rrf_store.asimilarity_search_with_score("full-text search", k=3)
 
-    for name, config in configs:
-        print(f"\n   {name}:")
-        print(f"   - Vector weight: {config.vector_weight}")
-        print(f"   - FTS weight: {config.fts_weight}")
-        print(f"   - Fusion: {config.fusion_type}")
+    for i, (doc, score) in enumerate(rrf_results, 1):
+        print(f"   {i}. [{score:.4f}] {doc.page_content[:60]}...")
+
+    print("\n7. Tuning the candidate pool with fetch_k...")
+    wide_results = await vectorstore.asimilarity_search("semantic similarity", k=3, fetch_k=50)
+    for i, doc in enumerate(wide_results, 1):
+        print(f"   {i}. {doc.page_content[:60]}...")
 
     print("\n✅ Hybrid search demo complete!")
 

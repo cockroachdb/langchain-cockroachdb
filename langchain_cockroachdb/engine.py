@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from langchain_cockroachdb.hybrid_search_config import validate_fts_language
 from langchain_cockroachdb.retry import async_retry_with_backoff
 
 
@@ -147,6 +148,7 @@ class CockroachDBEngine:
         metadata_column: str = "metadata",
         namespace_column: str | None = None,
         create_tsvector: bool = False,
+        fts_language: str = "english",
         drop_if_exists: bool = False,
     ) -> None:
         """Create vector store table with optional full-text search and namespace.
@@ -163,8 +165,12 @@ class CockroachDBEngine:
             metadata_column: Name of metadata column
             namespace_column: Name of namespace column for multi-tenancy (default: None, disabled)
             create_tsvector: Create TSVECTOR column for FTS
+            fts_language: Text search config for the generated tsvector column
+                (default: english). Must match HybridSearchConfig.fts_query_language
+                when hybrid search is used.
             drop_if_exists: Drop table if it exists
         """
+        validate_fts_language(fts_language)
 
         # Apply retry with instance configuration
         @async_retry_with_backoff(
@@ -205,8 +211,8 @@ class CockroachDBEngine:
                     tsvector_col = f"{content_column}_tsvector"
                     alter_sql = f"""
                         ALTER TABLE {fqn} 
-                        ADD COLUMN IF NOT EXISTS {tsvector_col} TSVECTOR 
-                        GENERATED ALWAYS AS (to_tsvector('english', {content_column})) STORED
+                        ADD COLUMN IF NOT EXISTS {tsvector_col} TSVECTOR
+                        GENERATED ALWAYS AS (to_tsvector('{fts_language}', {content_column})) STORED
                     """
                     await conn.execute(text(alter_sql))
 

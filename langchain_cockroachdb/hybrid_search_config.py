@@ -1,6 +1,55 @@
 """Hybrid search configuration for combining FTS and vector search."""
 
+import re
 from enum import Enum
+
+# Text search configuration names like "english" or "pg_catalog.english".
+# The language name gets inlined into SQL, so keep this strict.
+_LANGUAGE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def validate_fts_language(language: str) -> str:
+    """Validate a text search configuration name for safe use in SQL.
+
+    Args:
+        language: Text search config name, e.g. "english" or "simple"
+
+    Returns:
+        The validated language name
+
+    Raises:
+        ValueError: If the name is not a plain identifier
+    """
+    if not language or not _LANGUAGE_PATTERN.match(language):
+        raise ValueError(
+            f"Invalid FTS language {language!r}. Expected a plain identifier "
+            "like 'english' or 'simple'."
+        )
+    return language
+
+
+def min_max_normalize(results: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    """Rescale scores to [0, 1] so FTS and vector scores can be summed.
+
+    ts_rank scores and vector similarities live on different scales, so a
+    weighted sum is only meaningful after both sides are normalized. When all
+    scores are equal (including a single result) everything maps to 1.0.
+
+    Args:
+        results: List of (id, score) tuples
+
+    Returns:
+        List of (id, score) tuples with scores in [0, 1], original order kept
+    """
+    if not results:
+        return []
+
+    scores = [score for _, score in results]
+    lo, hi = min(scores), max(scores)
+    if hi == lo:
+        return [(doc_id, 1.0) for doc_id, _ in results]
+
+    return [(doc_id, (score - lo) / (hi - lo)) for doc_id, score in results]
 
 
 class FusionType(str, Enum):
@@ -36,7 +85,7 @@ class HybridSearchConfig:
         self.fts_weight = fts_weight
         self.vector_weight = vector_weight
         self.fusion_type = FusionType(fusion_type)
-        self.fts_query_language = fts_query_language
+        self.fts_query_language = validate_fts_language(fts_query_language)
         self.k = k
 
     def fuse_scores(
