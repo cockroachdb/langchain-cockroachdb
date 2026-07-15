@@ -3775,6 +3775,9 @@ Default: None (no namespace filtering, backward compatible).</p>
     <div class="doc doc-contents ">
 
         <p>Search for similar documents with scores.</p>
+<p>When a hybrid_search_config is set, this runs full-text and vector
+searches in parallel and returns fused scores. Otherwise scores are
+plain vector distances.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3861,7 +3864,8 @@ Default: None (no namespace filtering, backward compatible).</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Additional arguments</p>
+                <p>Additional arguments (fetch_k sets the hybrid candidate
+pool size, default max(k * 4, 20))</p>
               </div>
             </td>
             <td>
