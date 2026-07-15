@@ -91,25 +91,23 @@ Combining full-text search with vector similarity.
 ```python
 from langchain_cockroachdb import HybridSearchConfig
 
-# Configure hybrid search
-hybrid_config = HybridSearchConfig(
-    vector_weight=0.5,
-    fts_weight=0.5,
-    fusion_type="weighted_sum",
+# The table needs a tsvector column for FTS
+await engine.ainit_vectorstore_table(
+    table_name="docs",
+    vector_dimension=1536,
+    create_tsvector=True,
 )
 
 vectorstore = AsyncCockroachDBVectorStore(
     engine=engine,
     embeddings=embeddings,
     collection_name="docs",
-    hybrid_search_config=hybrid_config,
+    hybrid_search_config=HybridSearchConfig(),
 )
 
-# Enable FTS
-await vectorstore.aapply_hybrid_search()
-
-# Search with both methods
-results = await vectorstore.ahybrid_search(
+# The regular search methods run FTS and vector search in
+# parallel and fuse the results when a config is set
+results = await vectorstore.asimilarity_search(
     "CockroachDB SERIALIZABLE isolation",
     k=10
 )
@@ -125,12 +123,14 @@ hybrid_config = HybridSearchConfig(
     fusion_type="weighted_sum",
 )
 
-# Reciprocal Rank Fusion
+# Reciprocal Rank Fusion (the default)
 hybrid_config = HybridSearchConfig(
     fusion_type="reciprocal_rank_fusion",
-    rrf_k=60,
+    k=60,
 )
 ```
+
+See the [Hybrid Search Guide](../guides/hybrid-search.md) for fusion details and tuning.
 
 ## Multi-Tenant Patterns
 

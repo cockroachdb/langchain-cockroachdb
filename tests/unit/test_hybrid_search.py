@@ -13,9 +13,24 @@ class TestHybridSearchConfig:
         config = HybridSearchConfig()
         assert config.fts_weight == 0.5
         assert config.vector_weight == 0.5
-        assert config.fusion_type == FusionType.WEIGHTED_SUM
+        # RRF is the default because it is rank based and does not depend on
+        # score scales, which makes it the safer general purpose choice
+        assert config.fusion_type == FusionType.RRF
         assert config.fts_query_language == "english"
         assert config.k == 60
+        assert config.fts_rank_normalization == 0
+
+    def test_fts_rank_normalization_accepted(self) -> None:
+        """Valid ts_rank normalization bitmasks are stored."""
+        for value in (0, 1, 2, 4, 8, 16, 32, 1 | 32, 63):
+            config = HybridSearchConfig(fts_rank_normalization=value)
+            assert config.fts_rank_normalization == value
+
+    def test_fts_rank_normalization_rejects_invalid(self) -> None:
+        """Out of range or non-integer normalization values raise."""
+        for value in (-1, 64, 2.5, "32"):
+            with pytest.raises(ValueError, match="fts_rank_normalization"):
+                HybridSearchConfig(fts_rank_normalization=value)
 
     def test_custom_initialization(self) -> None:
         """Test custom configuration."""
@@ -39,7 +54,9 @@ class TestHybridSearchConfig:
 
     def test_weighted_sum_fusion(self) -> None:
         """Test weighted sum fusion."""
-        config = HybridSearchConfig(fts_weight=0.4, vector_weight=0.6)
+        config = HybridSearchConfig(
+            fts_weight=0.4, vector_weight=0.6, fusion_type=FusionType.WEIGHTED_SUM
+        )
 
         fts_results = [("doc1", 0.8), ("doc2", 0.6), ("doc3", 0.4)]
         vector_results = [("doc1", 0.9), ("doc3", 0.7), ("doc4", 0.5)]
@@ -54,7 +71,9 @@ class TestHybridSearchConfig:
 
     def test_weighted_sum_fusion_no_overlap(self) -> None:
         """Test fusion with no overlapping documents."""
-        config = HybridSearchConfig(fts_weight=0.5, vector_weight=0.5)
+        config = HybridSearchConfig(
+            fts_weight=0.5, vector_weight=0.5, fusion_type=FusionType.WEIGHTED_SUM
+        )
 
         fts_results = [("doc1", 0.8), ("doc2", 0.6)]
         vector_results = [("doc3", 0.9), ("doc4", 0.7)]
@@ -111,3 +130,50 @@ class TestHybridSearchConfig:
 
         vector_results = [("doc2", 0.9)]
         assert len(config.fuse_scores([], vector_results)) == 1
+
+
+class TestMinMaxNormalize:
+    """Test score normalization used before weighted sum fusion."""
+
+    def test_normalizes_to_unit_range(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        results = [("doc1", 10.0), ("doc2", 5.0), ("doc3", 0.0)]
+        normalized = dict(min_max_normalize(results))
+
+        assert normalized["doc1"] == 1.0
+        assert normalized["doc2"] == 0.5
+        assert normalized["doc3"] == 0.0
+
+    def test_empty_input(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        assert min_max_normalize([]) == []
+
+    def test_single_result_maps_to_one(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        assert min_max_normalize([("doc1", 42.0)]) == [("doc1", 1.0)]
+
+    def test_all_equal_scores_map_to_one(self) -> None:
+        from langchain_cockroachdb.hybrid_search_config import min_max_normalize
+
+        results = [("doc1", 3.0), ("doc2", 3.0)]
+        assert min_max_normalize(results) == [("doc1", 1.0), ("doc2", 1.0)]
+
+
+class TestFtsLanguageValidation:
+    """The FTS language ends up inside SQL, so it must be strictly validated."""
+
+    def test_valid_languages_accepted(self) -> None:
+        for lang in ("english", "simple", "spanish", "pg_catalog.english"):
+            config = HybridSearchConfig(fts_query_language=lang)
+            assert config.fts_query_language == lang
+
+    def test_injection_attempt_rejected(self) -> None:
+        with pytest.raises(ValueError, match="language"):
+            HybridSearchConfig(fts_query_language="english'); DROP TABLE users; --")
+
+    def test_empty_language_rejected(self) -> None:
+        with pytest.raises(ValueError, match="language"):
+            HybridSearchConfig(fts_query_language="")

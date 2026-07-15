@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Hybrid search now actually executes. Setting `hybrid_search_config` on the
+  vectorstore previously had no effect: searches ran pure vector similarity and
+  the FTS half never fired (#7). `asimilarity_search_with_score` now runs the
+  vector search and a `ts_rank` full-text search in parallel and fuses the
+  results with the configured fusion method. Uses `plainto_tsquery` since
+  CockroachDB does not support `websearch_to_tsquery`. The query text is passed
+  as a bound parameter.
+
+### Added
+- `fts_language` parameter on `ainit_vectorstore_table` so the generated
+  tsvector column can use a text search configuration other than english. It
+  should match `HybridSearchConfig.fts_query_language`.
+- `fetch_k` keyword argument on hybrid searches to control the candidate pool
+  size fetched from each leg before fusion (default: `max(k * 4, 20)`).
+- Score normalization for weighted sum fusion: vector distances and ts_rank
+  scores are min-max normalized to [0, 1] before weighting, so the two scales
+  are comparable regardless of distance strategy.
+- `fts_rank_normalization` option on `HybridSearchConfig` exposing the ts_rank
+  normalization bitmask, for example 1 or 32 to damp the rank bias toward
+  long documents.
+
+### Changed
+- Default fusion method is now reciprocal rank fusion instead of weighted sum.
+  RRF fuses by rank, so it does not depend on score scales and is the safer
+  general purpose choice. Pass `fusion_type="weighted_sum"` to keep the old
+  behavior. Since hybrid search never executed before this release, no
+  working setup is affected.
+- `HybridSearchConfig` now validates `fts_query_language` against a strict
+  identifier pattern since the value is used in SQL.
+
 ## [0.2.1] - 2026-03-24
 
 ### Changed
