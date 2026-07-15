@@ -168,7 +168,7 @@ class TestHybridSearchExecution:
         self, cockroachdb_engine: CockroachDBEngine
     ) -> None:
         """Weighted sum scores land in [0, 1] and sort descending."""
-        config = HybridSearchConfig()
+        config = HybridSearchConfig(fusion_type=FusionType.WEIGHTED_SUM)
         store = await _make_store(cockroachdb_engine, config)
 
         results = await store.asimilarity_search_with_score("zebra databases", k=4)
@@ -176,6 +176,32 @@ class TestHybridSearchExecution:
         scores = [score for _, score in results]
         assert scores == sorted(scores, reverse=True)
         assert all(0.0 <= s <= 1.0 for s in scores)
+
+    async def test_default_fusion_is_rrf(self, cockroachdb_engine: CockroachDBEngine) -> None:
+        """An untouched config fuses with RRF, so scores are reciprocal ranks."""
+        config = HybridSearchConfig()
+        store = await _make_store(cockroachdb_engine, config)
+
+        results = await store.asimilarity_search_with_score("zebra", k=4)
+
+        assert results
+        # RRF scores with k=60 can never exceed sum of weights / 61
+        assert all(0.0 < score <= 2.0 / 61.0 for _, score in results)
+
+    async def test_fts_rank_normalization(self, cockroachdb_engine: CockroachDBEngine) -> None:
+        """A non-default ts_rank normalization must produce valid SQL."""
+        config = HybridSearchConfig(
+            fts_weight=0.7,
+            vector_weight=0.3,
+            fusion_type=FusionType.WEIGHTED_SUM,
+            fts_rank_normalization=1 | 32,
+        )
+        store = await _make_store(cockroachdb_engine, config)
+
+        results = await store.asimilarity_search("zebra", k=4)
+
+        contents = [doc.page_content for doc in results]
+        assert any("zebra" in c for c in contents)
 
     async def test_custom_fts_language(self, cockroachdb_engine: CockroachDBEngine) -> None:
         """Table and config can both use a non-default text search config."""

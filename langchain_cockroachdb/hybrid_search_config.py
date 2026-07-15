@@ -66,27 +66,40 @@ class HybridSearchConfig:
         self,
         fts_weight: float = 0.5,
         vector_weight: float = 0.5,
-        fusion_type: FusionType = FusionType.WEIGHTED_SUM,
+        fusion_type: FusionType = FusionType.RRF,
         fts_query_language: str = "english",
         k: int = 60,
+        fts_rank_normalization: int = 0,
     ):
         """Initialize hybrid search configuration.
 
         Args:
             fts_weight: Weight for full-text search scores (0-1)
             vector_weight: Weight for vector similarity scores (0-1)
-            fusion_type: Method for combining scores
+            fusion_type: Method for combining scores. RRF is the default
+                because it fuses by rank and is insensitive to score scales.
             fts_query_language: Language for full-text search
             k: Parameter for RRF (typically 60)
+            fts_rank_normalization: ts_rank normalization bitmask (0-63).
+                0 leaves ranks unnormalized. Useful values include 1 (divide
+                by 1 + log of document length) and 32 (rank / (rank + 1)) to
+                damp the bias toward long documents. See the PostgreSQL
+                ts_rank docs for the full list of flags.
         """
         if abs(fts_weight + vector_weight - 1.0) > 0.001:
             raise ValueError("fts_weight + vector_weight must equal 1.0")
+
+        if not isinstance(fts_rank_normalization, int) or isinstance(fts_rank_normalization, bool):
+            raise ValueError("fts_rank_normalization must be an integer bitmask between 0 and 63")
+        if not 0 <= fts_rank_normalization <= 63:
+            raise ValueError("fts_rank_normalization must be an integer bitmask between 0 and 63")
 
         self.fts_weight = fts_weight
         self.vector_weight = vector_weight
         self.fusion_type = FusionType(fusion_type)
         self.fts_query_language = validate_fts_language(fts_query_language)
         self.k = k
+        self.fts_rank_normalization = fts_rank_normalization
 
     def fuse_scores(
         self,

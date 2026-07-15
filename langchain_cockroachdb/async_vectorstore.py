@@ -209,9 +209,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of (id, score) tuples ordered by rank, best first
         """
-        language = (
-            self.hybrid_search_config.fts_query_language if self.hybrid_search_config else "english"
-        )
+        config = self.hybrid_search_config
+        language = config.fts_query_language if config else "english"
+        rank_normalization = config.fts_rank_normalization if config else 0
         tsvector_column = f"{self.content_column}_tsvector"
 
         conditions = []
@@ -224,7 +224,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
 
         sql = f"""
             SELECT {self.id_column},
-                   ts_rank({tsvector_column}, plainto_tsquery('{language}', :fts_query)) AS fts_score
+                   ts_rank({tsvector_column}, plainto_tsquery('{language}', :fts_query),
+                           {int(rank_normalization)}) AS fts_score
             FROM {self._fqn}
             WHERE {" AND ".join(conditions)}
             ORDER BY fts_score DESC

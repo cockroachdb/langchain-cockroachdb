@@ -25,8 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Score normalization for weighted sum fusion: vector distances and ts_rank
   scores are min-max normalized to [0, 1] before weighting, so the two scales
   are comparable regardless of distance strategy.
+- `fts_rank_normalization` option on `HybridSearchConfig` exposing the ts_rank
+  normalization bitmask, for example 1 or 32 to damp the rank bias toward
+  long documents.
 
 ### Changed
+- Default fusion method is now reciprocal rank fusion instead of weighted sum.
+  RRF fuses by rank, so it does not depend on score scales and is the safer
+  general purpose choice. Pass `fusion_type="weighted_sum"` to keep the old
+  behavior. Since hybrid search never executed before this release, no
+  working setup is affected.
 - `HybridSearchConfig` now validates `fts_query_language` against a strict
   identifier pattern since the value is used in SQL.
 
