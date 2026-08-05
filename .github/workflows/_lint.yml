@@ -16,7 +16,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install --system ruff mypy
+          # Pinned so a new linter release cannot break CI on its own.
+          # Bump deliberately and fix new findings in the same PR.
+          uv pip install --system ruff==0.16.1 mypy==1.19.1
 
       - name: Run ruff check
         run: |
