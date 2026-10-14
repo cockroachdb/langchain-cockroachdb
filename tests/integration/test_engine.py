@@ -221,3 +221,43 @@ async def test_repeat_setup_works_with_autocommit_before_ddl_off(engine_factory)
     assert {f"{name}_tenant_id_idx", f"{name}_content_tsvector_idx"} <= indexes
     await engine.adrop_table(name)
     await engine.adrop_table(name)
+
+
+async def test_gssencmode_defaults_to_disable(connection_string: str) -> None:
+    """Verify that library-created connections set gssencmode=disable by default."""
+    engine = CockroachDBEngine.from_connection_string(connection_string)
+
+    async with engine._connect(begin=False, timeout=None, label="gssencmode check") as conn:
+        raw = await conn.get_raw_connection()
+        driver_conn = raw.driver_connection
+
+        # pgconn.info is libpq's PQconninfo() output: a list of ConninfoOption objects
+        conninfo = driver_conn.pgconn.info
+        gssencmode_option = next((opt for opt in conninfo if opt.keyword == b"gssencmode"), None)
+
+        assert gssencmode_option is not None, "gssencmode option not found in connection info"
+        assert gssencmode_option.val == b"disable", (
+            f"Expected gssencmode=disable, got {gssencmode_option.val.decode()}"
+        )
+
+    await engine.aclose()
+
+
+async def test_gssencmode_in_url_overrides_default(connection_string: str) -> None:
+    """Verify that gssencmode in the URL wins over the library default."""
+    url_with_prefer = connection_string + "&gssencmode=prefer"
+    engine = CockroachDBEngine.from_connection_string(url_with_prefer)
+
+    async with engine._connect(begin=False, timeout=None, label="gssencmode check") as conn:
+        raw = await conn.get_raw_connection()
+        driver_conn = raw.driver_connection
+
+        conninfo = driver_conn.pgconn.info
+        gssencmode_option = next((opt for opt in conninfo if opt.keyword == b"gssencmode"), None)
+
+        assert gssencmode_option is not None
+        assert gssencmode_option.val == b"prefer", (
+            f"Expected gssencmode=prefer from URL, got {gssencmode_option.val.decode()}"
+        )
+
+    await engine.aclose()
