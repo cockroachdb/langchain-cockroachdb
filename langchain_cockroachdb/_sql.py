@@ -16,7 +16,7 @@ def validate_identifier(name: str, *, what: str) -> str:
     Table, schema, column and index names are interpolated into SQL, so they
     are limited to letters, digits and underscores.
     """
-    if not isinstance(name, str) or not _IDENTIFIER.match(name):
+    if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name):
         raise ValueError(
             f"Invalid {what} {name!r}: use letters, digits and underscores, "
             "starting with a letter or underscore"

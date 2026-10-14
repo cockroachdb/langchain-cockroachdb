@@ -175,8 +175,14 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         """Apply a vector index (sync); warns if an old index has the wrong operator class."""
         self.engine._run_as_sync(self._apply_vector_index(index, prefix_columns))
 
-    def drop_vector_index(self, index: CSPANNIndex) -> None:
-        """Drop a vector index (sync)."""
+    def drop_vector_index(self, index: CSPANNIndex | None = None) -> None:
+        """Drop a vector index (sync).
+
+        Args:
+            index: Index configuration (defaults to CSPANNIndex() to drop the default-named index)
+        """
+        if index is None:
+            index = CSPANNIndex()
         self.engine._run_as_sync(self._drop_vector_index(index))
 
     @classmethod

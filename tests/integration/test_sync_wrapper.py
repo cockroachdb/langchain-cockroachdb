@@ -192,6 +192,26 @@ class TestCockroachDBVectorStoreSync:
         results = vectorstore.similarity_search("Text", k=5)
         assert len(results) == 3
 
+    def test_from_texts_with_namespace_creates_column_sync(
+        self, sync_engine: CockroachDBEngine
+    ) -> None:
+        """Test that from_texts with namespace creates the namespace column (sync)."""
+        embeddings = DeterministicFakeEmbedding(size=384)
+
+        # from_texts with namespace but no namespace_column should create the column
+        vectorstore = CockroachDBVectorStore.from_texts(
+            texts=["doc1", "doc2"],
+            embedding=embeddings,
+            engine=sync_engine,
+            collection_name="from_texts_namespace_sync_test",
+            namespace="tenant1",
+        )
+
+        # Should be able to write and read
+        assert vectorstore is not None
+        results = vectorstore.similarity_search("doc", k=2)
+        assert len(results) == 2
+
     def test_apply_vector_index_sync(self, sync_vectorstore: CockroachDBVectorStore) -> None:
         """Test applying vector index synchronously."""
         # Add some data first
@@ -205,6 +225,49 @@ class TestCockroachDBVectorStoreSync:
         # Search should still work with index
         results = sync_vectorstore.similarity_search("Doc", k=2)
         assert len(results) == 2
+
+    def test_drop_vector_index_no_arg_sync(
+        self, sync_vectorstore: CockroachDBVectorStore, sync_engine: CockroachDBEngine
+    ) -> None:
+        """Test dropping default-named index without passing index argument (sync)."""
+        from sqlalchemy import text
+
+        # Add some data first
+        texts = ["Doc 1", "Doc 2", "Doc 3"]
+        sync_vectorstore.add_texts(texts)
+
+        # Create an L2 index with default name
+        index = CSPANNIndex(distance_strategy=DistanceStrategy.EUCLIDEAN)
+        sync_vectorstore.apply_vector_index(index)
+
+        # Verify the index exists by checking pg_indexes
+        # For sync, we need to run the async code in the sync wrapper
+        async def check_indexes():
+            async with sync_engine.engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = :schema AND tablename = :table"
+                    ),
+                    {"schema": sync_vectorstore.schema, "table": sync_vectorstore.collection_name},
+                )
+                return [row[0] for row in result.fetchall()]
+
+        indexes_before = sync_engine._run_as_sync(check_indexes())
+
+        # The default index name should exist
+        expected_name = index.get_index_name(
+            sync_vectorstore.collection_name, sync_vectorstore.embedding_column
+        )
+        assert expected_name in indexes_before
+
+        # Drop it without passing an index argument
+        sync_vectorstore.drop_vector_index()
+
+        # Verify it's gone
+        indexes_after = sync_engine._run_as_sync(check_indexes())
+
+        assert expected_name not in indexes_after
 
     def test_batch_operations_sync(self, sync_vectorstore: CockroachDBVectorStore) -> None:
         """Test batch operations with custom batch size synchronously."""

@@ -169,6 +169,34 @@ class TestAsyncCockroachDBVectorStore:
         remaining = await vectorstore.asimilarity_search("", k=10)
         assert len(remaining) == len(sample_texts) - len(delete_ids)
 
+    async def test_long_id_lists(
+        self,
+        vectorstore: AsyncCockroachDBVectorStore,
+    ) -> None:
+        """Test get_by_ids and delete with long id lists (20,500 ids) to verify chunking."""
+        # Insert a few real rows
+        real_texts = ["doc1", "doc2", "doc3", "doc4", "doc5"]
+        real_ids = await vectorstore.aadd_texts(real_texts)
+
+        # Generate 20,500 total ids (mostly non-existent, plus the real ones)
+        # This tests that chunking works (keeping it fast; 65k+ would also work but slower)
+        import uuid
+
+        nonexistent_ids = [str(uuid.uuid4()) for _ in range(20500 - len(real_ids))]
+        all_ids = real_ids + nonexistent_ids
+
+        # get_by_ids should only return the real ones
+        docs = await vectorstore.aget_by_ids(all_ids)
+        assert len(docs) == len(real_ids)
+        assert {d.id for d in docs} == set(real_ids)
+
+        # delete with the long list should remove the real ones
+        await vectorstore.adelete(all_ids)
+
+        # Verify they're gone
+        remaining = await vectorstore.aget_by_ids(real_ids)
+        assert len(remaining) == 0
+
     async def test_aapply_vector_index(
         self,
         vectorstore: AsyncCockroachDBVectorStore,
@@ -183,6 +211,52 @@ class TestAsyncCockroachDBVectorStore:
         )
 
         await vectorstore.aapply_vector_index(index)
+
+    async def test_adrop_vector_index_no_arg(
+        self,
+        vectorstore: AsyncCockroachDBVectorStore,
+        sample_texts: list[str],
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test dropping default-named index without passing index argument."""
+        await vectorstore.aadd_texts(sample_texts)
+
+        # Create an L2 index with default name
+        index = CSPANNIndex(distance_strategy=DistanceStrategy.EUCLIDEAN)
+        await vectorstore.aapply_vector_index(index)
+
+        # Verify the index exists by checking pg_indexes
+        async with cockroachdb_engine.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = :schema AND tablename = :table"
+                ),
+                {"schema": vectorstore.schema, "table": vectorstore.collection_name},
+            )
+            indexes_before = [row[0] for row in result.fetchall()]
+
+        # The default index name should exist
+        expected_name = index.get_index_name(
+            vectorstore.collection_name, vectorstore.embedding_column
+        )
+        assert expected_name in indexes_before
+
+        # Drop it without passing an index argument
+        await vectorstore.adrop_vector_index()
+
+        # Verify it's gone
+        async with cockroachdb_engine.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = :schema AND tablename = :table"
+                ),
+                {"schema": vectorstore.schema, "table": vectorstore.collection_name},
+            )
+            indexes_after = [row[0] for row in result.fetchall()]
+
+        assert expected_name not in indexes_after
 
     async def test_query_with_beam_size(
         self,
@@ -251,6 +325,27 @@ class TestAsyncCockroachDBVectorStore:
 
         results = await vectorstore.asimilarity_search("database", k=3)
         assert len(results) <= 3
+
+    async def test_afrom_texts_with_namespace_creates_column(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that from_texts with namespace creates the namespace column."""
+        embeddings = FakeEmbeddings()
+
+        # from_texts with namespace but no namespace_column should create the column
+        vectorstore = await AsyncCockroachDBVectorStore.afrom_texts(
+            texts=["doc1", "doc2"],
+            embedding=embeddings,
+            engine=cockroachdb_engine,
+            collection_name="from_texts_namespace_test",
+            namespace="tenant1",
+        )
+
+        # Should be able to write and read
+        assert vectorstore is not None
+        results = await vectorstore.asimilarity_search("doc", k=2)
+        assert len(results) == 2
 
     async def test_multiple_distance_strategies(
         self,

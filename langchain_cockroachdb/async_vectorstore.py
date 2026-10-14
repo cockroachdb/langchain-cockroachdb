@@ -31,6 +31,14 @@ from langchain_cockroachdb.retry import RetryPolicy, resolve_retry_policy
 
 logger = logging.getLogger(__name__)
 
+# CockroachDB caps a statement at 65,535 bound parameters. To stay well under
+# that limit when chunking id lists, we use 10,000 ids per chunk.
+_ID_CHUNK = 10_000
+
+# Each inserted row uses 4 parameters (id, content, embedding, metadata), so
+# the maximum batch size is 65,535 // 4 = 16,383 rows.
+_MAX_BATCH_SIZE = 65535 // 4
+
 # Arguments of ainit_vectorstore_table. The schema and column ones also
 # configure the store, so from_texts passes those to both.
 TABLE_ARGS = frozenset(
@@ -52,9 +60,18 @@ SHARED_ARGS = frozenset(
 
 
 def split_from_texts_args(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Split from_texts keyword arguments into table arguments and store arguments."""
+    """Split from_texts keyword arguments into table arguments and store arguments.
+
+    When namespace is given but namespace_column is not, add the default
+    namespace_column to table_args so the table is created with that column.
+    """
     table_args = {k: v for k, v in kwargs.items() if k in TABLE_ARGS}
     store_args = {k: v for k, v in kwargs.items() if k not in TABLE_ARGS or k in SHARED_ARGS}
+
+    # If namespace is given but namespace_column is not, ensure the table gets the column
+    if "namespace" in store_args and "namespace_column" not in kwargs:
+        table_args["namespace_column"] = "namespace"  # Default namespace column name
+
     return table_args, store_args
 
 
@@ -82,6 +99,12 @@ class _Rows:
 def _check_batch_size(batch_size: Any) -> int:
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
+    if batch_size > _MAX_BATCH_SIZE:
+        raise ValueError(
+            f"batch_size {batch_size} exceeds the maximum of {_MAX_BATCH_SIZE}. "
+            f"CockroachDB caps a statement at 65,535 bound parameters, and each "
+            f"inserted row uses 4 parameters."
+        )
     return batch_size
 
 
@@ -282,9 +305,10 @@ class AsyncCockroachDBVectorStore(VectorStore):
                     resolved_ids.append(str(uuid.uuid4()))
         seen = set()
         for doc_id in resolved_ids:
-            if doc_id in seen:
+            normalized = self._normalize_id(doc_id)
+            if normalized in seen:
                 raise ValueError(f"Duplicate id in one add call: {doc_id}")
-            seen.add(doc_id)
+            seen.add(normalized)
         metadata_json = []
         for position, metadata in enumerate(metadatas):
             try:
@@ -521,33 +545,42 @@ class AsyncCockroachDBVectorStore(VectorStore):
     async def _get_by_ids(self, ids: Sequence[str]) -> list[Document]:
         if not ids:
             return []
-        builder = FilterBuilder(self.metadata_column)
-        where = self._where(builder, None, f"{self.id_column} IN :ids")
-        statement = text(
-            f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column} FROM {self._fqn} {where}"
-        ).bindparams(bindparam("ids", expanding=True))
-        rows = await self._execute(
-            statement,
-            dict(builder.params, ids=[str(i) for i in ids]),
-            label=f"get from {self._fqn}",
-            fetch=True,
-        )
-        return [
-            Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}) for row in rows
-        ]
+        # Chunk the ids to stay under the 65,535 parameter limit
+        all_docs: list[Document] = []
+        for i in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[i : i + _ID_CHUNK]
+            builder = FilterBuilder(self.metadata_column)
+            where = self._where(builder, None, f"{self.id_column} IN :ids")
+            statement = text(
+                f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column} FROM {self._fqn} {where}"
+            ).bindparams(bindparam("ids", expanding=True))
+            rows = await self._execute(
+                statement,
+                dict(builder.params, ids=[str(id_val) for id_val in chunk]),
+                label=f"get from {self._fqn}",
+                fetch=True,
+            )
+            all_docs.extend(
+                Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}) for row in rows
+            )
+        return all_docs
 
     async def _delete(self, ids: Sequence[str]) -> None:
-        builder = FilterBuilder(self.metadata_column)
-        where = self._where(builder, None, f"{self.id_column} IN :ids")
-        statement = text(f"DELETE FROM {self._fqn} {where}").bindparams(
-            bindparam("ids", expanding=True)
-        )
-        await self._execute(
-            statement,
-            dict(builder.params, ids=[str(i) for i in ids]),
-            label=f"delete from {self._fqn}",
-            begin=True,
-        )
+        # Chunk the ids to stay under the 65,535 parameter limit
+        # Each chunk is run as its own retried statement; delete stays idempotent
+        for i in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[i : i + _ID_CHUNK]
+            builder = FilterBuilder(self.metadata_column)
+            where = self._where(builder, None, f"{self.id_column} IN :ids")
+            statement = text(f"DELETE FROM {self._fqn} {where}").bindparams(
+                bindparam("ids", expanding=True)
+            )
+            await self._execute(
+                statement,
+                dict(builder.params, ids=[str(id_val) for id_val in chunk]),
+                label=f"delete from {self._fqn}",
+                begin=True,
+            )
 
     async def _apply_vector_index(
         self, index: CSPANNIndex, prefix_columns: list[str] | None
@@ -855,12 +888,14 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """
         await self.engine._run_as_async(self._apply_vector_index(index, prefix_columns))
 
-    async def adrop_vector_index(self, index: CSPANNIndex) -> None:
+    async def adrop_vector_index(self, index: CSPANNIndex | None = None) -> None:
         """Drop a vector index.
 
         Args:
-            index: Index configuration
+            index: Index configuration (defaults to CSPANNIndex() to drop the default-named index)
         """
+        if index is None:
+            index = CSPANNIndex()
         await self.engine._run_as_async(self._drop_vector_index(index))
 
     @classmethod

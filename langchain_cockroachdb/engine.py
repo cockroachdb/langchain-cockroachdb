@@ -397,7 +397,7 @@ class CockroachDBEngine:
             validate_identifier(column, what="column name")
         if namespace_column is not None:
             validate_identifier(namespace_column, what="column name")
-        if not _ID_TYPE.match(id_type):
+        if not _ID_TYPE.fullmatch(id_type):
             raise ValueError(f"Invalid id_type {id_type!r}")
         if (
             isinstance(vector_dimension, bool)

@@ -20,7 +20,7 @@ def validate_fts_language(language: str) -> str:
     Raises:
         ValueError: If the name is not a plain identifier
     """
-    if not language or not _LANGUAGE_PATTERN.match(language):
+    if not language or not _LANGUAGE_PATTERN.fullmatch(language):
         raise ValueError(
             f"Invalid FTS language {language!r}. Expected a plain identifier "
             "like 'english' or 'simple'."
