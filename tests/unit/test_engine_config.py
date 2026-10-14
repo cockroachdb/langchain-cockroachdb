@@ -298,3 +298,15 @@ def test_reset_after_fork_starts_a_fresh_loop_on_demand(monkeypatch) -> None:
         fresh.call_soon_threadsafe(fresh.stop)
         thread.join(5)
         fresh.close()
+
+
+def test_id_type_rejects_trailing_newline() -> None:
+    """Test that id_type validation rejects trailing newlines."""
+    from langchain_cockroachdb.engine import _ID_TYPE
+
+    # Valid id types should match
+    assert _ID_TYPE.fullmatch("UUID")
+    assert _ID_TYPE.fullmatch("VARCHAR(36)")
+
+    # Trailing newline should not match
+    assert _ID_TYPE.fullmatch("UUID\n") is None

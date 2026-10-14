@@ -10,7 +10,9 @@ def test_valid_identifiers(name: str) -> None:
     assert validate_identifier(name, what="table name") == name
 
 
-@pytest.mark.parametrize("name", ["", "2docs", "my-docs", "a b", "t;drop", 'x"y', "a.b", None])
+@pytest.mark.parametrize(
+    "name", ["", "2docs", "my-docs", "a b", "t;drop", 'x"y', "a.b", "docs\n", None]
+)
 def test_invalid_identifiers(name) -> None:
     with pytest.raises(ValueError, match="table name"):
         validate_identifier(name, what="table name")
