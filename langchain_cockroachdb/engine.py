@@ -299,17 +299,27 @@ class CockroachDBEngine:
                 else:
                     yield conn
 
-    async def _run_ddl(self, statements: list[str], *, label: str) -> None:
-        """Run schema statements in one transaction under the retry policy."""
+    async def _run_ddl(
+        self, statements: list[str], *, label: str, policy: RetryPolicy | None = None
+    ) -> None:
+        """Run schema statements, each in its own implicit transaction.
 
-        async def attempt() -> None:
-            async with self._connect(
-                begin=True, timeout=self.retry_policy.ddl_attempt_timeout, label=label
-            ) as conn:
-                for statement in statements:
+        Each statement is retried on its own. CockroachDB commits schema changes
+        immediately even when autocommit_before_ddl is off, so running them in an
+        explicit transaction never made setup atomic and fails on locked tables.
+        """
+        retry = policy or self.retry_policy
+
+        for statement in statements:
+
+            async def attempt() -> None:
+                async with self._connect(
+                    begin=False, timeout=retry.ddl_attempt_timeout, label=label
+                ) as conn:
+                    await conn.execution_options(isolation_level="AUTOCOMMIT")
                     await conn.execute(text(statement))
 
-        await self.retry_policy.arun(attempt, label=label)
+            await retry.arun(attempt, label=label)
 
     async def ainit_vectorstore_table(
         self,

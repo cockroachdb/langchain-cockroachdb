@@ -3,6 +3,7 @@
 import gc
 import os
 import threading
+import uuid
 
 import pytest
 from sqlalchemy import text
@@ -195,3 +196,28 @@ def test_sync_api_works_in_forked_child(connection_string: str) -> None:
 
     engine.drop_table("fork_test")
     engine.close()
+
+
+DDL_OFF = {"options": "-c autocommit_before_ddl=off -c create_table_with_schema_locked=on"}
+
+
+async def test_repeat_setup_works_with_autocommit_before_ddl_off(engine_factory) -> None:
+    # Forcing schema_locked on makes this fail the same way on v25.4, where it defaults off
+    engine = engine_factory(connect_args=DDL_OFF)
+    name = f"ddl_off_{uuid.uuid4().hex[:8]}"
+    for _ in range(2):
+        await engine.ainit_vectorstore_table(
+            name, 8, namespace_column="tenant_id", create_tsvector=True
+        )
+    async with engine.engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = 'public' AND tablename = :table"
+            ),
+            {"table": name},
+        )
+        indexes = {row[0] for row in result}
+    assert {f"{name}_tenant_id_idx", f"{name}_content_tsvector_idx"} <= indexes
+    await engine.adrop_table(name)
+    await engine.adrop_table(name)
