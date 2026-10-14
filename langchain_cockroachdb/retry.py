@@ -54,6 +54,7 @@ TRANSIENT_MESSAGES: tuple[str, ...] = (
     # Lost or refused connections, as worded by libpq, psycopg and CockroachDB
     "server closed the connection unexpectedly",
     "connection already closed",
+    "the connection is closed",
     "the connection is lost",
     "connection socket closed",
     "could not receive data from server",
@@ -67,6 +68,7 @@ TRANSIENT_MESSAGES: tuple[str, ...] = (
     "connection timed out",
     "operation timed out",
     "timeout expired",
+    "i/o timeout",
     "no route to host",
     "network is unreachable",
     # Name resolution during failover

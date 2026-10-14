@@ -163,6 +163,23 @@ class TestClassification:
         )
         assert not is_retryable_error(server_error("XXUUU", "something unrelated"))
 
+    def test_canceled_session_i_o_timeout_is_retryable(self) -> None:
+        """CockroachDB v25.4 sends XXUUU + 'i/o timeout' when a session is canceled."""
+        error = psycopg.InternalError("read tcp 10.88.0.35:26257->10.88.0.35:42564: i/o timeout")
+        error.sqlstate = "XXUUU"
+        assert is_retryable_error(error)
+        assert is_retryable_error(wrapped(error))
+
+    def test_psycopg3_connection_is_closed_is_retryable(self) -> None:
+        """psycopg 3 reports 'the connection is closed' on a dead connection."""
+        assert is_retryable_error(psycopg.OperationalError("the connection is closed"))
+
+    def test_definite_code_beats_i_o_timeout_message(self) -> None:
+        """A definite (non-uncategorized) code vetoes retry even with 'i/o timeout' text."""
+        assert not is_retryable_error(
+            server_error("42601", "read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o timeout")
+        )
+
     def test_definite_code_beats_transient_message(self) -> None:
         """Definite non-retryable code (not uncategorized) vetoes even with transient text."""
         error = wrapped(
