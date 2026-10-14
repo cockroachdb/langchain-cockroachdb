@@ -13,7 +13,12 @@ langchain_cockroachdb/
 ├── indexes.py               # Index abstractions
 ├── hybrid_search_config.py  # Hybrid search configuration
 ├── chat_message_histories.py # Chat persistence
-└── retry.py                 # Retry logic
+├── retry.py                 # Retry logic
+├── _guard.py                # Hang guard (attempt timeout)
+├── _loop.py                 # Background event loop for sync methods
+├── _connection.py           # Connection helpers
+├── _sql.py                  # SQL generation
+└── _filters.py              # Metadata filter translation
 ```
 
 ## Core Components
@@ -60,9 +65,9 @@ await vectorstore.aadd_texts(texts)
 **Purpose:** Synchronous wrapper for async operations
 
 **Implementation:**
-- Runs async methods in background event loop
+- Runs async methods on one background event loop
 - Same API as async version (without `a` prefix)
-- Uses `asyncio.run()` internally
+- Safe from any number of threads and from inside a running event loop
 
 **Pattern:**
 ```python
@@ -91,22 +96,21 @@ async def aadd_texts(texts: list[str]) -> list[str]:
 
 ### Retry Decorators
 
-All operations use retry decorators:
+Each idempotent statement is wrapped by `RetryPolicy.arun`. Connection checkout uses `engine._connect`, which provides the hang guard (attempt timeout):
 
 ```python
-@async_retry_with_backoff(
-    max_attempts=self.retry_max_attempts,
-    initial_backoff=self.retry_initial_backoff,
-    ...
-)
-async def _insert_batch(batch: list) -> None:
-    # Operation with automatic retry
+async def aadd_texts(texts: list[str]) -> list[str]:
+    async with self.engine._connect() as conn:
+        await self.retry_policy.arun(
+            self._insert_batch(conn, batch),
+            label="insert into documents",
+        )
 ```
 
 **Benefits:**
 - Transparent retry logic
-- Configurable per operation
-- Handles 40001 errors automatically
+- Configurable per component
+- Handles transient CockroachDB errors automatically
 
 ### Dependency Injection
 
@@ -180,17 +184,19 @@ Different distance strategies use different operators:
 
 ### Retryable Errors
 
-Automatically retry on:
-- `40001`: Serialization errors
-- Connection errors
-- Timeout errors
+| SQLSTATE | Meaning | Why a retry is safe |
+|---|---|---|
+| `40001` | Serialization failure ("restart transaction") | The transaction did not commit |
+| `40003` | Result is ambiguous | Every write the library issues is idempotent |
+| `08xxx` | Connection exceptions, including CockroachDB sqlproxy's `08C00` | Idempotent writes, and the pool replaces the connection |
+| `57P01` | Node draining or shutting down | Idempotent writes |
+| `58C00` | Range unavailable (CockroachDB) | Usually clears once leases move |
+| `58C01` | Connection failure between CockroachDB nodes | Usually clears once leases move |
+| `53300` | Too many connections | Connection slots free up |
 
-### Non-Retryable Errors
+Errors without a SQLSTATE and CockroachDB's uncategorized codes (`XXUUU`, `XX000`) are matched against known connection-loss phrases.
 
-Fail immediately on:
-- Schema errors
-- Permission errors
-- Data validation errors
+See [Retries and Resilience](../guides/resilience.md) for full details.
 
 ## Testing Strategy
 

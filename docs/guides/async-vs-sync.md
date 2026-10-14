@@ -8,6 +8,10 @@ langchain-cockroachdb provides both async and sync interfaces:
 - **Async (recommended)**: High-performance, I/O concurrency
 - **Sync**: Simple wrapper for scripts and batch jobs
 
+## How Sync Methods Run
+
+Sync methods run their database work on one background event loop, so they are safe from any number of threads and from inside a running event loop. Use one style per engine; the engine logs a warning if it sees both at the same time. Engines that use the built-in background loop are also safe across `os.fork()`: a child process gets a fresh pool and loop.
+
 ## Quick Comparison
 
 | Feature | Async | Sync |

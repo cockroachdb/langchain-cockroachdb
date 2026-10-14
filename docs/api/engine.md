@@ -86,11 +86,13 @@ engine.close()          # Sync
 | `pool_pre_ping` | bool | True | Health check before use |
 | `pool_recycle` | int | 3600 | Recycle connections after (seconds) |
 | `pool_timeout` | float | 30.0 | Wait timeout for connection |
-| `retry_max_attempts` | int | 5 | Maximum retry attempts |
-| `retry_initial_backoff` | float | 0.1 | Initial retry delay |
-| `retry_max_backoff` | float | 10.0 | Maximum retry delay |
-| `retry_backoff_multiplier` | float | 2.0 | Backoff multiplier |
-| `retry_jitter` | bool | True | Add randomization to backoff |
+| `connect_timeout` | int | 10 | Connection timeout in seconds |
+| `retry_policy` | RetryPolicy | None | Retry policy for transient errors |
+| `retry_max_attempts` | int | 5 | Maximum retry attempts (legacy, use retry_policy) |
+| `retry_initial_backoff` | float | 0.1 | Initial retry delay (legacy, use retry_policy) |
+| `retry_max_backoff` | float | 10.0 | Maximum retry delay (legacy, use retry_policy) |
+| `retry_backoff_multiplier` | float | 2.0 | Backoff multiplier (legacy, use retry_policy) |
+| `retry_jitter` | bool | True | Add randomization to backoff (legacy, use retry_policy) |
 
 ## Examples
 

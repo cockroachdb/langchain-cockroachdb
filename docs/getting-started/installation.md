@@ -3,7 +3,8 @@
 ## Requirements
 
 - Python 3.10 or higher
-- CockroachDB 24.2 or higher (for native vector support)
+- CockroachDB v25.4 or later (tested on v25.4 LTS and v26.3)
+- The package uses psycopg 3 only
 
 ## Install from PyPI
 

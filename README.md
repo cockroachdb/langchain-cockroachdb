@@ -26,7 +26,7 @@ Build LLM applications with **CockroachDB's distributed SQL database** and **nat
 
 - 🎯 **Native Vector Support** - CockroachDB's `VECTOR` type
 - 🚀 **C-SPANN Indexes** - Distributed vector indexes optimized for scale
-- 🔄 **Automatic Retries** - Handles serialization errors transparently
+- 🔄 **Automatic Retries** - Retries transient CockroachDB errors (40001, 40003, 08xxx, 57P01, 58C00, 58C01) on every operation
 - ⚡ **Async & Sync APIs** - Choose based on your use case
 - 🏗️ **Distributed by Design** - Built for CockroachDB's architecture
 
@@ -101,11 +101,13 @@ asyncio.run(main())
 - Both `CockroachDBSaver` (sync) and `AsyncCockroachDBSaver`
 - Compatible with LangGraph's `compile(checkpointer=...)` interface
 
-### Reliability
-- Automatic retry logic with exponential backoff
-- Connection pooling with health checks
-- Configurable for different workloads
+### Reliability and Retries
+- Retries transient CockroachDB errors (40001, 40003, 08xxx, 57P01, 58C00, 58C01, 53300) on every operation
+- Configurable `RetryPolicy` with exponential backoff, jitter and optional hang guards
+- Idempotent writes (UPSERTs, ON CONFLICT DO NOTHING) for safe retries
+- Connection pooling with health checks and pre-ping
 - Works with both SERIALIZABLE (default, recommended) and READ COMMITTED isolation
+- See the [Retries and Resilience guide](https://cockroachdb.github.io/langchain-cockroachdb/guides/resilience/)
 
 ### Developer Experience
 - Async-first design for high concurrency
@@ -135,6 +137,7 @@ asyncio.run(main())
 - [Multi-Tenancy](https://cockroachdb.github.io/langchain-cockroachdb/guides/multi-tenancy/)
 - [LangGraph Checkpointer](https://cockroachdb.github.io/langchain-cockroachdb/guides/checkpointer/)
 - [Async vs Sync](https://cockroachdb.github.io/langchain-cockroachdb/guides/async-vs-sync/)
+- [Retries and Resilience](https://cockroachdb.github.io/langchain-cockroachdb/guides/resilience/)
 
 ## Examples
 

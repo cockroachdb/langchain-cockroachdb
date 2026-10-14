@@ -73,6 +73,7 @@ nav:
     - Chat History: guides/chat-history.md
     - LangGraph Checkpointer: guides/checkpointer.md
     - Async vs Sync: guides/async-vs-sync.md
+    - Retries and Resilience: guides/resilience.md
   - Examples:
     - Overview: examples/index.md
     - Basic Usage: examples/basic-usage.md
@@ -85,6 +86,7 @@ nav:
     - Indexes: api/indexes.md
     - Chat History: api/chat-history.md
     - Checkpointer: api/checkpointer.md
+    - Retry: api/retry.md
   - Development:
     - Contributing: development/contributing.md
     - Architecture: development/architecture.md

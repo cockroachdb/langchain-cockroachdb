@@ -16,23 +16,34 @@ engine = CockroachDBEngine.from_connection_string(
     pool_pre_ping=True,              # Health check before use
     pool_recycle=3600,               # Recycle after 1 hour
     pool_timeout=30.0,               # Wait 30s for connection
+    connect_timeout=10,              # Connection timeout (default: 10)
 )
 ```
 
 ### Retry Configuration
 
-All operations automatically retry on transient errors (40001, connection failures):
+Set a `RetryPolicy` on the engine to control which errors are retried and how:
 
 ```python
+from langchain_cockroachdb import (
+    AsyncCockroachDBVectorStore,
+    CockroachDBChatMessageHistory,
+    CockroachDBEngine,
+    RetryPolicy,
+)
+
 engine = CockroachDBEngine.from_connection_string(
-    connection_string,
-    retry_max_attempts=5,            # Max retries (default: 5)
-    retry_initial_backoff=0.1,       # Initial delay in seconds
-    retry_max_backoff=10.0,          # Max delay in seconds
-    retry_backoff_multiplier=2.0,    # Exponential multiplier
-    retry_jitter=True,               # Add randomization
+    "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable",
+    retry_policy=RetryPolicy(max_attempts=8, max_backoff=5.0),
+)
+store = AsyncCockroachDBVectorStore(engine, embeddings, "documents")  # inherits
+history = CockroachDBChatMessageHistory("session-1", engine=engine)  # inherits
+fast_store = AsyncCockroachDBVectorStore(
+    engine, embeddings, "documents", retry_policy=RetryPolicy(max_attempts=2)
 )
 ```
+
+See [Retries and Resilience](../guides/resilience.md) for what is retried and every option.
 
 ## Vector Store Configuration
 
@@ -60,16 +71,16 @@ vectorstore = AsyncCockroachDBVectorStore(
 )
 ```
 
-### Retry Settings (Per-Batch)
+### Retry Settings
+
+The vector store inherits the engine's retry policy. Each insert batch is retried on its own. Override the policy with `retry_policy` or shorthand `retry_*` arguments:
 
 ```python
 vectorstore = AsyncCockroachDBVectorStore(
     engine=engine,
     embeddings=embeddings,
     collection_name="documents",
-    retry_max_attempts=3,            # Per-batch retries
-    retry_initial_backoff=0.1,
-    retry_max_backoff=5.0,
+    retry_policy=RetryPolicy(max_attempts=3, max_backoff=5.0),
 )
 ```
 
@@ -83,8 +94,7 @@ engine = CockroachDBEngine.from_connection_string(
     connection_string,
     pool_size=5,
     max_overflow=10,
-    retry_max_attempts=3,
-    retry_max_backoff=1.0,
+    retry_policy=RetryPolicy(max_attempts=3, max_backoff=1.0),
 )
 
 vectorstore = AsyncCockroachDBVectorStore(
@@ -103,8 +113,7 @@ engine = CockroachDBEngine.from_connection_string(
     connection_string,
     pool_size=20,
     max_overflow=40,
-    retry_max_attempts=10,
-    retry_max_backoff=30.0,
+    retry_policy=RetryPolicy(max_attempts=10, max_backoff=30.0),
 )
 
 vectorstore = AsyncCockroachDBVectorStore(
@@ -112,7 +121,7 @@ vectorstore = AsyncCockroachDBVectorStore(
     embeddings=embeddings,
     collection_name="docs",
     batch_size=100,
-    retry_max_attempts=5,
+    retry_policy=RetryPolicy(max_attempts=5),
 )
 ```
 
@@ -124,8 +133,7 @@ engine = CockroachDBEngine.from_connection_string(
     connection_string,
     pool_size=3,
     max_overflow=5,
-    retry_max_attempts=20,
-    retry_max_backoff=60.0,
+    retry_policy=RetryPolicy(max_attempts=20, max_backoff=60.0),
 )
 
 vectorstore = AsyncCockroachDBVectorStore(
@@ -133,21 +141,29 @@ vectorstore = AsyncCockroachDBVectorStore(
     embeddings=embeddings,
     collection_name="docs",
     batch_size=500,  # Larger batches for throughput
-    retry_max_attempts=10,
+    retry_policy=RetryPolicy(max_attempts=10),
 )
 ```
 
 ### Multi-Region
 
 ```python
-# High latency tolerance
+from langchain_cockroachdb import RETRYABLE_SQLSTATES, RetryPolicy
+
+# Tolerates failovers and high latency
+failover = RetryPolicy(
+    max_attempts=8,
+    max_backoff=5.0,
+    retryable_sqlstates=RETRYABLE_SQLSTATES | {"57014"},
+    attempt_timeout=10,
+)
+
 engine = CockroachDBEngine.from_connection_string(
     connection_string,
     pool_size=15,
     max_overflow=30,
-    retry_max_attempts=15,
-    retry_max_backoff=60.0,
     pool_timeout=60.0,  # Longer timeout
+    retry_policy=failover,
 )
 
 vectorstore = AsyncCockroachDBVectorStore(
@@ -155,7 +171,6 @@ vectorstore = AsyncCockroachDBVectorStore(
     embeddings=embeddings,
     collection_name="docs",
     batch_size=200,  # Moderate batches
-    retry_max_attempts=8,
 )
 ```
 

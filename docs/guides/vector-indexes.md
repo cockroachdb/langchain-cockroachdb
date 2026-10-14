@@ -235,13 +235,16 @@ await vectorstore.aapply_vector_index(index)
 
 ## Index Opclasses
 
-CockroachDB automatically chooses the correct opclass based on distance strategy:
+The index uses the operator class of its distance strategy. The vector store sets this automatically when you call `aapply_vector_index`:
 
 | Distance Strategy | Opclass | Operator |
 |-------------------|---------|----------|
 | COSINE | `vector_cosine_ops` | `<=>` |
 | EUCLIDEAN (L2) | `vector_l2_ops` | `<->` |
 | INNER_PRODUCT | `vector_ip_ops` | `<#>` |
+
+!!! warning "Upgrading from 0.3.x"
+    Indexes created by earlier versions for COSINE or INNER_PRODUCT are `vector_l2_ops` and are not used by those searches. Drop them with `await vectorstore.adrop_vector_index()` and apply again. `aapply_vector_index` logs a warning when it finds a mismatched opclass.
 
 ## Best Practices
 

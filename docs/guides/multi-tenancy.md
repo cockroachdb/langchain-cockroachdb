@@ -108,9 +108,24 @@ docs = await store_a.aget_by_ids([id_2])
 assert len(docs) == 0  # Not visible across namespaces
 ```
 
+### Document ID rules
+
+Document IDs must be unique across all namespaces. A write that reuses another namespace's id raises `ValueError` before anything is written. The library generates random UUIDs for ids, so this only matters for ids you supply.
+
+```python
+# Tenant A adds document with id_1
+await store_a.aadd_texts(["Document A"], ids=[id_1])
+
+# Tenant B tries to add a document with the same id -- rejected
+try:
+    await store_b.aadd_texts(["Document B"], ids=[id_1])
+except ValueError as e:
+    print(e)  # Duplicate id in another namespace
+```
+
 ## Admin Access (No Namespace)
 
-Create a store without a namespace to see all documents across all tenants:
+Create a store without a namespace to see all documents across all tenants. This is the unscoped, admin-style view, and it is intended. The admin store can update rows in any namespace:
 
 ```python
 admin_store = AsyncCockroachDBVectorStore(
@@ -122,6 +137,9 @@ admin_store = AsyncCockroachDBVectorStore(
 
 all_docs = await admin_store.asimilarity_search("AI", k=100)
 # Returns documents from all tenants
+
+# Admin store can also update or delete documents in any namespace
+await admin_store.adelete([id_from_tenant_a])
 ```
 
 ## Performance: C-SPANN Prefix Columns

@@ -69,7 +69,7 @@ history = CockroachDBChatMessageHistory(
     session_id="setup",
     connection_string=connection_string,
 )
-await history._acreate_table_if_not_exists()
+await history.acreate_table_if_not_exists()
 
 # Sync version:
 history.create_table_if_not_exists()
@@ -409,21 +409,24 @@ except Exception as e:
 
 ### 4. Use Connection Pooling
 
+Share one engine across all history instances to reuse connections:
+
 ```python
-# Reuse engine across sessions
-from langchain_cockroachdb import CockroachDBEngine
+from langchain_cockroachdb import CockroachDBEngine, CockroachDBChatMessageHistory
 
 engine = CockroachDBEngine.from_connection_string(
     connection_string,
     pool_size=10,
 )
 
-# Pass engine connection string to history
-history = CockroachDBChatMessageHistory(
-    session_id="user-123",
-    connection_string=connection_string,
-)
+# Pass engine to every history
+history_a = CockroachDBChatMessageHistory("session-a", engine=engine)
+history_b = CockroachDBChatMessageHistory("session-b", engine=engine)
 ```
+
+Each history that is not given an engine opens its own connection pool.
+
+`add_messages` writes all messages atomically and in order. See [Retries and Resilience](resilience.md) for retry configuration.
 
 ## Troubleshooting
 
