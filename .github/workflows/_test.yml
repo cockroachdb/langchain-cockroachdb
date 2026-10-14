@@ -56,6 +56,7 @@ jobs:
               echo "CockroachDB is ready"
               break
             fi
+            [ $i -eq 30 ] && { echo "CockroachDB did not become ready"; docker logs cockroachdb | tail -50; exit 1; }
             sleep 2
           done
           docker exec cockroachdb ./cockroach version

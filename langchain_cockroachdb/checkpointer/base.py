@@ -432,6 +432,7 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                     "checkpoint_id": checkpoint_id,
                 }
             },
+            # Safe: checkpoint from DB has all required Checkpoint keys; we only update channel_values
             cast(
                 Checkpoint,
                 {
