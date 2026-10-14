@@ -86,13 +86,16 @@ def test_sync_saver_raises_non_retryable_errors_once(sync_pool, unsafe_internals
     assert faults.count("insert into checkpoints (") == 1
 
 
-def test_sync_saver_with_a_pool_recovers_from_killed_connections(sync_pool, libpq_url) -> None:
+@pytest.mark.parametrize("delay", [0.0, 0.3], ids=["immediate", "after_300ms"])
+def test_sync_saver_with_a_pool_recovers_from_killed_connections(
+    sync_pool, libpq_url, delay: float
+) -> None:
     app = app_name()
     saver = CockroachDBSaver(sync_pool(app), retry_policy=FAST)
     saver.setup()
     saved = saver.put(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
     assert kill_sessions(libpq_url, app) >= 1
-    time.sleep(0.3)
+    time.sleep(delay)
     assert saver.get_tuple(saved) is not None
 
 
