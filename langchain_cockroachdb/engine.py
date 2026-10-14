@@ -170,7 +170,11 @@ class CockroachDBEngine:
             CockroachDBEngine instance
         """
         url = to_sqlalchemy_url(connection_string)
-        kwargs["connect_args"] = with_connect_timeout(url, kwargs.get("connect_args"), connect_timeout)
+        # Only add connect_timeout for psycopg driver; asyncpg has no such parameter
+        if "+psycopg" in url or ("+asyncpg" not in url and "cockroachdb://" in url):
+            kwargs["connect_args"] = with_connect_timeout(
+                url, kwargs.get("connect_args"), connect_timeout
+            )
         engine = create_async_engine(
             url,
             pool_size=pool_size,

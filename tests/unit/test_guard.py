@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import langchain_cockroachdb._guard as guard_module
 from langchain_cockroachdb._guard import aabandon_after, abandon_after, shutdown_socket
 
 
@@ -30,8 +31,9 @@ def test_shutdown_socket_ignores_bad_descriptors() -> None:
 
 def test_abandon_after_fires_when_the_block_overruns(socket_pair, caplog) -> None:
     a, _ = socket_pair
-    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"), abandon_after(
-        a.fileno(), 0.1, label="slow query"
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        abandon_after(a.fileno(), 0.1, label="slow query"),
     ):
         assert a.recv(1) == b""
     assert "slow query" in caplog.text
@@ -69,3 +71,33 @@ async def test_aabandon_after_is_cancelled_on_exit(socket_pair) -> None:
     await asyncio.sleep(0.2)
     b.sendall(b"y")
     assert a.recv(1) == b"y"
+
+
+def test_no_socket_logs_once(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(guard_module, "_no_socket_logged", False)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        with abandon_after(None, 1.0, label="test"):
+            pass
+        with abandon_after(None, 1.0, label="test"):
+            pass
+    assert caplog.text.count("driver does not expose a socket") == 1
+
+
+async def test_async_no_socket_logs_once(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(guard_module, "_no_socket_logged", False)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        async with aabandon_after(None, 1.0, label="test"):
+            pass
+        async with aabandon_after(None, 1.0, label="test"):
+            pass
+    assert caplog.text.count("driver does not expose a socket") == 1
+
+
+def test_no_socket_does_not_log_when_seconds_is_none(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(guard_module, "_no_socket_logged", False)
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        abandon_after(None, None, label="test"),
+    ):
+        pass
+    assert "driver does not expose a socket" not in caplog.text

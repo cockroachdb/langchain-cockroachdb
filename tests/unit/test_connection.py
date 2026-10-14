@@ -10,9 +10,15 @@ REST = "root@localhost:26257/defaultdb?sslmode=disable"
 @pytest.mark.parametrize(
     "scheme",
     [
-        "cockroachdb", "cockroachdb+psycopg", "cockroachdb+psycopg2",
-        "postgresql", "postgresql+psycopg", "postgresql+psycopg2",
-        "postgres", "postgres+psycopg", "postgres+psycopg2",
+        "cockroachdb",
+        "cockroachdb+psycopg",
+        "cockroachdb+psycopg2",
+        "postgresql",
+        "postgresql+psycopg",
+        "postgresql+psycopg2",
+        "postgres",
+        "postgres+psycopg",
+        "postgres+psycopg2",
     ],
 )
 def test_every_spelling_maps_to_the_psycopg3_dialect(scheme: str) -> None:
@@ -31,13 +37,18 @@ def test_key_value_dsn_passes_through_libpq() -> None:
 
 def test_connect_timeout_is_added_when_missing() -> None:
     assert with_connect_timeout(f"postgresql://{REST}", None, 10.0) == {"connect_timeout": 10}
-    assert with_connect_timeout(f"postgresql://{REST}", {"a": 1}, 2.5) == {"a": 1, "connect_timeout": 3}
+    assert with_connect_timeout(f"postgresql://{REST}", {"a": 1}, 2.5) == {
+        "a": 1,
+        "connect_timeout": 3,
+    }
 
 
 def test_existing_connect_timeout_wins() -> None:
     url = f"postgresql://{REST}&connect_timeout=4"
     assert with_connect_timeout(url, None, 10.0) == {}
-    assert with_connect_timeout(f"postgresql://{REST}", {"connect_timeout": 7}, 10.0) == {"connect_timeout": 7}
+    assert with_connect_timeout(f"postgresql://{REST}", {"connect_timeout": 7}, 10.0) == {
+        "connect_timeout": 7
+    }
     assert with_connect_timeout("host=h connect_timeout=5", None, 10.0) == {}
 
 

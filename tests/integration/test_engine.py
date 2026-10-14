@@ -147,18 +147,50 @@ async def test_invalid_identifiers_are_rejected_before_sql(connection_string: st
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_sync_api_works_in_forked_child(connection_string: str) -> None:
-    engine = CockroachDBEngine.from_connection_string(connection_string)
-    engine.init_vectorstore_table("fork_parent", 3, drop_if_exists=True)
+    import time
+
+    engine = CockroachDBEngine.from_connection_string(
+        connection_string, pool_pre_ping=False, pool_size=1, max_overflow=0
+    )
+    engine.init_vectorstore_table("fork_test", 3, drop_if_exists=True)
+
+    async def get_session_id() -> str:
+        async with engine._connect(begin=False, timeout=None, label="session id check") as conn:
+            result = await conn.execute(text("SHOW session_id"))
+            return result.scalar_one()
+
+    parent_session_id = engine._run_as_sync(get_session_id())
+
     pid = os.fork()
     if pid == 0:
         code = 1
         try:
+            child_session_id = engine._run_as_sync(get_session_id())
+            if child_session_id == parent_session_id:
+                os._exit(99)  # child reused parent session, hook failed
             engine.init_vectorstore_table("fork_child", 3, drop_if_exists=True)
-            gc.collect()  # inherited connections are dropped without touching the parent's sessions
+            engine.drop_table("fork_child")
+            gc.collect()
             code = 0
         finally:
             os._exit(code)
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
-    engine.init_vectorstore_table("fork_parent", 3)  # the parent's pool still works
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        raise AssertionError("child hung")
+
+    exit_code = os.waitstatus_to_exitcode(status)
+    assert exit_code == 0, f"child failed with code {exit_code}"
+
+    session_after_fork = engine._run_as_sync(get_session_id())
+    assert session_after_fork == parent_session_id, "parent session was killed by child"
+
+    engine.drop_table("fork_test")
     engine.close()

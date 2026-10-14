@@ -1,6 +1,7 @@
 """Engine configuration and loop dispatch tests that need no database."""
 
 import asyncio
+import contextlib
 import logging
 import threading
 
@@ -43,16 +44,37 @@ def test_connect_timeout_can_be_disabled_or_overridden(monkeypatch) -> None:
 
 
 def test_flat_retry_arguments_build_the_policy() -> None:
-    engine = CockroachDBEngine.from_connection_string(URL, retry_max_attempts=10, retry_jitter=False)
+    engine = CockroachDBEngine.from_connection_string(
+        URL, retry_max_attempts=10, retry_jitter=False
+    )
     assert engine.retry_policy.max_attempts == 10
     assert engine.retry_max_attempts == 10
     assert engine.retry_jitter is False
     assert engine.retry_initial_backoff == 0.1
 
 
+def test_asyncpg_url_gets_no_connect_timeout(monkeypatch) -> None:
+    captured = {}
+    real = engine_module.create_async_engine
+
+    def spy(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        try:
+            return real(url, **kwargs)
+        except ImportError:
+            pass  # asyncpg not installed, but we captured the kwargs
+
+    monkeypatch.setattr(engine_module, "create_async_engine", spy)
+    with contextlib.suppress(ImportError):
+        CockroachDBEngine.from_connection_string("cockroachdb+asyncpg://root@localhost:1/db")
+    assert "connect_args" not in captured["kwargs"]
+
+
 def test_policy_and_flat_arguments_conflict() -> None:
     with pytest.raises(ValueError):
-        CockroachDBEngine.from_connection_string(URL, retry_policy=RetryPolicy(), retry_max_attempts=3)
+        CockroachDBEngine.from_connection_string(
+            URL, retry_policy=RetryPolicy(), retry_max_attempts=3
+        )
 
 
 def test_sync_runner_serves_many_threads() -> None:
@@ -108,7 +130,9 @@ def test_explicit_loop_receives_sync_and_async_work() -> None:
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
-    engine = CockroachDBEngine.from_engine(create_async_engine("cockroachdb+psycopg://root@localhost:1/db"), loop=loop)
+    engine = CockroachDBEngine.from_engine(
+        create_async_engine("cockroachdb+psycopg://root@localhost:1/db"), loop=loop
+    )
 
     async def which_loop() -> asyncio.AbstractEventLoop:
         return asyncio.get_running_loop()
@@ -139,3 +163,38 @@ def test_mixed_sync_and_async_use_warns_once(caplog) -> None:
     release.set()
     worker.join(5)
     assert caplog.text.count("one style per engine") == 1
+
+
+def test_interruption_cancels_background_work() -> None:
+    from unittest.mock import patch
+
+    from langchain_cockroachdb._loop import run_coroutine_sync
+
+    loop = get_background_loop()
+    cancelled = threading.Event()
+
+    async def long_work() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    original_run_coroutine_threadsafe = asyncio.run_coroutine_threadsafe
+
+    def mock_run_coroutine_threadsafe(coro, target_loop):
+        future = original_run_coroutine_threadsafe(coro, target_loop)
+
+        def raising_result(timeout=None):
+            raise KeyboardInterrupt("simulated")
+
+        future.result = raising_result
+        return future
+
+    with (
+        patch("asyncio.run_coroutine_threadsafe", side_effect=mock_run_coroutine_threadsafe),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_coroutine_sync(long_work(), loop)
+
+    assert cancelled.wait(2), "coroutine did not observe CancelledError"

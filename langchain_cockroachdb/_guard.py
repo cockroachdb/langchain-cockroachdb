@@ -20,6 +20,21 @@ from collections.abc import AsyncIterator, Iterator
 
 logger = logging.getLogger("langchain_cockroachdb.retry")
 
+_no_socket_logged = False
+_no_socket_lock = threading.Lock()
+
+
+def _log_no_socket_once() -> None:
+    """Log once per process when the guard is a no-op because the driver has no socket."""
+    global _no_socket_logged
+    with _no_socket_lock:
+        if not _no_socket_logged:
+            logger.warning(
+                "Hang guard is disabled because the database driver does not expose a socket. "
+                "Use psycopg for full hang protection."
+            )
+            _no_socket_logged = True
+
 
 def shutdown_socket(fileno: int) -> None:
     """Shut down the socket behind ``fileno`` in both directions.
@@ -57,6 +72,8 @@ def abandon_after(fileno: int | None, seconds: float | None, *, label: str) -> I
     after the block has finished and the connection may belong to someone else.
     """
     if fileno is None or seconds is None:
+        if fileno is None and seconds is not None:
+            _log_no_socket_once()
         yield
         return
     lock = threading.Lock()
@@ -84,6 +101,8 @@ async def aabandon_after(
 ) -> AsyncIterator[None]:
     """Async version of :func:`abandon_after`, scheduled on the running loop."""
     if fileno is None or seconds is None:
+        if fileno is None and seconds is not None:
+            _log_no_socket_once()
         yield
         return
     handle = asyncio.get_running_loop().call_later(seconds, _abandon, fileno, seconds, label)

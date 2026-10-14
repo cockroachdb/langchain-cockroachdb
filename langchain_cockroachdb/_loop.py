@@ -51,7 +51,12 @@ def run_coroutine_sync(coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEvent
             "A sync method was called from the event loop that runs it, which would "
             "deadlock; use the async method instead"
         )
-    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result()
+    except BaseException:
+        future.cancel()
+        raise
 
 
 def _reset_after_fork() -> None:
