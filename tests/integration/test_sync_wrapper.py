@@ -245,6 +245,51 @@ class TestCockroachDBVectorStoreSync:
         results = sync_vectorstore.similarity_search("test", k=0)
         assert len(results) == 0
 
+    def test_sync_namespace_rejects_ids_owned_by_another_namespace(
+        self, sync_engine: CockroachDBEngine
+    ) -> None:
+        """Test that adding a document with an id owned by another namespace raises ValueError (sync)."""
+        embeddings = DeterministicFakeEmbedding(size=384)
+        table = "test_sync_ns_reject"
+
+        sync_engine.init_vectorstore_table(
+            table_name=table,
+            vector_dimension=384,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = CockroachDBVectorStore(
+            engine=sync_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = CockroachDBVectorStore(
+            engine=sync_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        # Tenant A adds a document
+        id_x = str(uuid.uuid4())
+        store_a.add_texts(["A original"], ids=[id_x])
+
+        # Tenant B tries to add documents with id_x and id_y
+        id_y = str(uuid.uuid4())
+        with pytest.raises(ValueError, match=str(id_x)):
+            store_b.add_texts(["B attempt", "B other"], ids=[id_x, id_y])
+
+        # Verify A's document is unchanged
+        docs_a = store_a.get_by_ids([id_x])
+        assert len(docs_a) == 1
+        assert docs_a[0].page_content == "A original"
+
+        # Verify B has nothing
+        docs_b = store_b.get_by_ids([id_x, id_y])
+        assert len(docs_b) == 0
+
 
 def test_sync_calls_from_sixteen_threads(sync_vectorstore: CockroachDBVectorStore) -> None:
     sync_vectorstore.add_texts([f"doc {i}" for i in range(20)])
