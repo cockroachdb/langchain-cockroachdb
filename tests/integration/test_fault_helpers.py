@@ -11,7 +11,9 @@ from langchain_cockroachdb import get_sqlstate
 from tests.integration.faults import FaultInjector, PsycopgFaults, hold_row_lock, kill_sessions
 
 
-async def test_fault_injector_raises_the_requested_sqlstate(engine_factory, unsafe_internals) -> None:
+async def test_fault_injector_raises_the_requested_sqlstate(
+    engine_factory, unsafe_internals
+) -> None:
     engine = engine_factory()
     faults = FaultInjector(engine.engine, unsafe_internals=unsafe_internals)
     faults.fail_next("58C01", match="select 42")
@@ -50,7 +52,9 @@ async def test_kill_sessions_breaks_idle_pooled_connections(engine_factory, libp
 async def test_hold_row_lock_makes_writers_wait(engine_factory, libpq_url) -> None:
     engine = engine_factory()
     async with engine.engine.begin() as conn:
-        await conn.execute(text("CREATE TABLE IF NOT EXISTS lock_probe (id INT PRIMARY KEY, v TEXT)"))
+        await conn.execute(
+            text("CREATE TABLE IF NOT EXISTS lock_probe (id INT PRIMARY KEY, v TEXT)")
+        )
         await conn.execute(text("UPSERT INTO lock_probe VALUES (1, 'a')"))
     with hold_row_lock(libpq_url, "UPDATE lock_probe SET v = 'locked' WHERE id = %s", (1,)):
         with pytest.raises(DBAPIError) as info:

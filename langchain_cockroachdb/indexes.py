@@ -108,7 +108,9 @@ class CSPANNIndex:
             sql += f" WITH ({', '.join(with_clauses)})"
         return sql
 
-    def get_drop_index_sql(self, table_name: str, column_name: str, *, schema: str = "public") -> str:
+    def get_drop_index_sql(
+        self, table_name: str, column_name: str, *, schema: str = "public"
+    ) -> str:
         """Generate DROP INDEX SQL.
 
         Args:

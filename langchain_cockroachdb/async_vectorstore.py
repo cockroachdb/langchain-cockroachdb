@@ -145,7 +145,13 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """
         validate_identifier(collection_name, what="collection name")
         validate_identifier(schema, what="schema")
-        for column in (content_column, embedding_column, metadata_column, id_column, namespace_column):
+        for column in (
+            content_column,
+            embedding_column,
+            metadata_column,
+            id_column,
+            namespace_column,
+        ):
             validate_identifier(column, what="column name")
         self.engine = engine
         self._embeddings = embeddings
@@ -216,12 +222,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
         fetch: bool = False,
     ) -> list[Any]:
         """Run one statement under the retry policy and the hang guard."""
-        timeout = self.retry_policy.ddl_attempt_timeout if ddl else self.retry_policy.attempt_timeout
+        timeout = (
+            self.retry_policy.ddl_attempt_timeout if ddl else self.retry_policy.attempt_timeout
+        )
 
         async def attempt() -> list[Any]:
             async with self.engine._connect(
                 begin=begin or bool(settings), timeout=timeout, label=label
             ) as conn:
+                # DDL runs in AUTOCOMMIT mode (implicit transaction) so it commits immediately
+                if ddl:
+                    await conn.execution_options(isolation_level="AUTOCOMMIT")
                 # SET LOCAL ends with the transaction, so nothing leaks into the pool
                 for name, value in (settings or {}).items():
                     validate_identifier(name, what="session setting")
@@ -261,29 +272,47 @@ class AsyncCockroachDBVectorStore(VectorStore):
             raise ValueError(f"Got {len(ids)} ids for {count} texts")
         else:
             resolved_ids = [str(i) if i is not None else str(uuid.uuid4()) for i in ids]
+        seen = set()
+        for doc_id in resolved_ids:
+            if doc_id in seen:
+                raise ValueError(f"Duplicate id in one add call: {doc_id}")
+            seen.add(doc_id)
         metadata_json = []
         for position, metadata in enumerate(metadatas):
             try:
-                metadata_json.append(json.dumps(metadata if metadata is not None else {}))
-            except TypeError as error:
+                metadata_json.append(
+                    json.dumps(metadata if metadata is not None else {}, allow_nan=False)
+                )
+            except (TypeError, ValueError) as error:
                 raise TypeError(
                     f"Metadata for text {position} is not JSON serializable: {error}"
                 ) from error
         batch_size = _check_batch_size(kwargs.get("batch_size", self.batch_size))
         return _Rows(
-            texts, [list(map(float, e)) for e in embeddings], metadata_json, resolved_ids, batch_size
+            texts,
+            [list(map(float, e)) for e in embeddings],
+            metadata_json,
+            resolved_ids,
+            batch_size,
         )
 
     async def _add_embeddings(self, rows: _Rows) -> list[str]:
         for start in range(0, len(rows.texts), rows.batch_size):
             end = start + rows.batch_size
             await self._insert_batch(
-                rows.texts[start:end], rows.embeddings[start:end], rows.metadata_json[start:end], rows.ids[start:end]
+                rows.texts[start:end],
+                rows.embeddings[start:end],
+                rows.metadata_json[start:end],
+                rows.ids[start:end],
             )
         return rows.ids
 
     async def _insert_batch(
-        self, texts: list[str], embeddings: list[list[float]], metadata_json: list[str], ids: list[str]
+        self,
+        texts: list[str],
+        embeddings: list[list[float]],
+        metadata_json: list[str],
+        ids: list[str],
     ) -> None:
         """Upsert one batch; each batch is its own retried transaction."""
         columns = [self.id_column, self.content_column, self.embedding_column, self.metadata_column]
@@ -302,7 +331,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
                     f"metadata{n}": metadata,
                 }
             )
-            values = [f":id{n}", f":content{n}", f"CAST(:embedding{n} AS VECTOR)", f"CAST(:metadata{n} AS JSONB)"]
+            values = [
+                f":id{n}",
+                f":content{n}",
+                f"CAST(:embedding{n} AS VECTOR)",
+                f"CAST(:metadata{n} AS JSONB)",
+            ]
             if self.namespace is not None:
                 values.append(":namespace")
             rows.append("(" + ", ".join(values) + ")")
@@ -328,9 +362,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
             return []
         builder = FilterBuilder(self.metadata_column)
         where = self._where(builder, filter)
-        distance = (
-            f"{self.embedding_column} {self.distance_strategy.get_operator()} CAST(:query_vector AS VECTOR)"
-        )
+        distance = f"{self.embedding_column} {self.distance_strategy.get_operator()} CAST(:query_vector AS VECTOR)"
         extra = f", {self.embedding_column}" if with_embeddings else ""
         sql = (
             f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column}, "
@@ -368,7 +400,10 @@ class AsyncCockroachDBVectorStore(VectorStore):
             f"FROM {self._fqn} {where} ORDER BY fts_score DESC LIMIT {int(k)}"
         )
         rows = await self._execute(
-            text(sql), dict(builder.params, fts_query=query), label=f"full-text search {self._fqn}", fetch=True
+            text(sql),
+            dict(builder.params, fts_query=query),
+            label=f"full-text search {self._fqn}",
+            fetch=True,
         )
         return [(str(row[0]), float(row[1])) for row in rows]
 
@@ -412,19 +447,31 @@ class AsyncCockroachDBVectorStore(VectorStore):
             f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column} FROM {self._fqn} {where}"
         ).bindparams(bindparam("ids", expanding=True))
         rows = await self._execute(
-            statement, dict(builder.params, ids=[str(i) for i in ids]), label=f"get from {self._fqn}", fetch=True
+            statement,
+            dict(builder.params, ids=[str(i) for i in ids]),
+            label=f"get from {self._fqn}",
+            fetch=True,
         )
-        return [Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}) for row in rows]
+        return [
+            Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}) for row in rows
+        ]
 
     async def _delete(self, ids: Sequence[str]) -> None:
         builder = FilterBuilder(self.metadata_column)
         where = self._where(builder, None, f"{self.id_column} IN :ids")
-        statement = text(f"DELETE FROM {self._fqn} {where}").bindparams(bindparam("ids", expanding=True))
+        statement = text(f"DELETE FROM {self._fqn} {where}").bindparams(
+            bindparam("ids", expanding=True)
+        )
         await self._execute(
-            statement, dict(builder.params, ids=[str(i) for i in ids]), label=f"delete from {self._fqn}", begin=True
+            statement,
+            dict(builder.params, ids=[str(i) for i in ids]),
+            label=f"delete from {self._fqn}",
+            begin=True,
         )
 
-    async def _apply_vector_index(self, index: CSPANNIndex, prefix_columns: list[str] | None) -> None:
+    async def _apply_vector_index(
+        self, index: CSPANNIndex, prefix_columns: list[str] | None
+    ) -> None:
         for column in prefix_columns or []:
             validate_identifier(column, what="prefix column")
         name = index.get_index_name(self.collection_name, self.embedding_column)
@@ -433,7 +480,11 @@ class AsyncCockroachDBVectorStore(VectorStore):
                 "SELECT indexdef FROM pg_indexes "
                 "WHERE schemaname = :schema AND tablename = :table AND indexname = :name"
             ),
-            {"schema": self.schema, "table": self.collection_name, "name": name},
+            {
+                "schema": self.schema.lower(),
+                "table": self.collection_name.lower(),
+                "name": name.lower(),
+            },
             label=f"look up vector index {name}",
             fetch=True,
         )
@@ -450,12 +501,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
                 )
             return
         sql = index.get_create_index_sql(
-            self.collection_name, self.embedding_column, schema=self.schema, prefix_columns=prefix_columns
+            self.collection_name,
+            self.embedding_column,
+            schema=self.schema,
+            prefix_columns=prefix_columns,
         )
         await self._execute(text(sql), label=f"create vector index {name}", ddl=True)
 
     async def _drop_vector_index(self, index: CSPANNIndex) -> None:
-        sql = index.get_drop_index_sql(self.collection_name, self.embedding_column, schema=self.schema)
+        sql = index.get_drop_index_sql(
+            self.collection_name, self.embedding_column, schema=self.schema
+        )
         await self._execute(
             text(sql),
             label=f"drop vector index {index.get_index_name(self.collection_name, self.embedding_column)}",
@@ -477,7 +533,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         return [matches[i].document for i in chosen]
 
     @staticmethod
-    def _engine_for(engine: CockroachDBEngine | None, connection_string: str | None) -> CockroachDBEngine:
+    def _engine_for(
+        engine: CockroachDBEngine | None, connection_string: str | None
+    ) -> CockroachDBEngine:
         if engine is not None:
             return engine
         if connection_string is None:
@@ -508,7 +566,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         if not texts_list:
             return []
         embeddings = await self._embeddings.aembed_documents(texts_list)
-        return await self.aadd_embeddings(texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs)
+        return await self.aadd_embeddings(
+            texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs
+        )
 
     async def aadd_embeddings(
         self,
@@ -561,7 +621,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         embedding = await self._embeddings.aembed_query(query)
         if self.hybrid_search_config is not None:
             return await self.engine._run_as_async(
-                self._hybrid_search(query, embedding, k, filter, query_options, kwargs.get("fetch_k"))
+                self._hybrid_search(
+                    query, embedding, k, filter, query_options, kwargs.get("fetch_k")
+                )
             )
         return await self.asimilarity_search_with_score_by_vector(
             embedding, k=k, filter=filter, query_options=query_options
@@ -587,7 +649,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of (document, distance) tuples
         """
-        matches = await self.engine._run_as_async(self._search_by_vector(embedding, k, filter, query_options))
+        matches = await self.engine._run_as_async(
+            self._search_by_vector(embedding, k, filter, query_options)
+        )
         return [(match.document, match.distance) for match in matches]
 
     async def asimilarity_search(
@@ -601,7 +665,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self, embedding: list[float], k: int = 4, filter: dict | None = None, **kwargs: Any
     ) -> list[Document]:
         """Return docs most similar to embedding vector."""
-        results = await self.asimilarity_search_with_score_by_vector(embedding, k=k, filter=filter, **kwargs)
+        results = await self.asimilarity_search_with_score_by_vector(
+            embedding, k=k, filter=filter, **kwargs
+        )
         return [doc for doc, _ in results]
 
     async def amax_marginal_relevance_search(
@@ -642,7 +708,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
     ) -> list[Document]:
         """Max marginal relevance search from a query embedding."""
         matches = await self.engine._run_as_async(
-            self._search_by_vector(embedding, fetch_k, filter, kwargs.get("query_options"), with_embeddings=True)
+            self._search_by_vector(
+                embedding, fetch_k, filter, kwargs.get("query_options"), with_embeddings=True
+            )
         )
         return self._select_mmr(embedding, matches, k, lambda_mult)
 
@@ -669,7 +737,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """Get documents by their IDs (sync)."""
         return self.engine._run_as_sync(self._get_by_ids(ids))
 
-    async def aapply_vector_index(self, index: CSPANNIndex, prefix_columns: list[str] | None = None) -> None:
+    async def aapply_vector_index(
+        self, index: CSPANNIndex, prefix_columns: list[str] | None = None
+    ) -> None:
         """Apply a C-SPANN vector index.
 
         Warns instead of rebuilding when an index with the same name exists
@@ -724,25 +794,37 @@ class AsyncCockroachDBVectorStore(VectorStore):
         resolved = cls._engine_for(engine, connection_string)
         texts = list(texts)
         vectors = await embedding.aembed_documents(texts) if texts else []
-        dimension = len(vectors[0]) if vectors else len(await embedding.aembed_query("dimension probe"))
+        dimension = (
+            len(vectors[0]) if vectors else len(await embedding.aembed_query("dimension probe"))
+        )
         table_args, store_args = split_from_texts_args(kwargs)
         await resolved.ainit_vectorstore_table(collection_name, dimension, **table_args)
-        store = cls(engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args)
+        store = cls(
+            engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args
+        )
         if texts:
             await store.aadd_embeddings(texts, vectors, metadatas=metadatas, ids=ids)
         return store
 
-    def add_texts(self, texts: Iterable[str], metadatas: list[dict] | None = None, **kwargs: Any) -> list[str]:
+    def add_texts(
+        self, texts: Iterable[str], metadatas: list[dict] | None = None, **kwargs: Any
+    ) -> list[str]:
         """Sync wrapper - not implemented for async-only store."""
         raise NotImplementedError("Use aadd_texts, or CockroachDBVectorStore for sync methods")
 
     def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
         """Sync wrapper - not implemented for async-only store."""
-        raise NotImplementedError("Use asimilarity_search, or CockroachDBVectorStore for sync methods")
+        raise NotImplementedError(
+            "Use asimilarity_search, or CockroachDBVectorStore for sync methods"
+        )
 
     @classmethod
     def from_texts(
-        cls, texts: list[str], embedding: Embeddings, metadatas: list[dict] | None = None, **kwargs: Any
+        cls,
+        texts: list[str],
+        embedding: Embeddings,
+        metadatas: list[dict] | None = None,
+        **kwargs: Any,
     ) -> AsyncCockroachDBVectorStore:
         """Sync wrapper - not implemented for async-only store."""
         raise NotImplementedError("Use afrom_texts, or CockroachDBVectorStore for sync methods")

@@ -29,7 +29,9 @@ FAST = RetryPolicy(initial_backoff=0.01, max_backoff=0.05)
 async def make_store(engine, **kwargs) -> AsyncCockroachDBVectorStore:
     table = f"faults_{uuid.uuid4().hex[:8]}"
     await engine.ainit_vectorstore_table(table, DIM, create_tsvector=True)
-    return AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table, **kwargs)
+    return AsyncCockroachDBVectorStore(
+        engine, DeterministicFakeEmbedding(size=DIM), table, **kwargs
+    )
 
 
 @pytest_asyncio.fixture
@@ -68,7 +70,10 @@ async def test_search_get_and_delete_recover(faulty) -> None:
 async def test_hybrid_full_text_leg_recovers(faulty) -> None:
     store, faults = faulty
     hybrid = AsyncCockroachDBVectorStore(
-        store.engine, store.embeddings, store.collection_name, hybrid_search_config=HybridSearchConfig()
+        store.engine,
+        store.embeddings,
+        store.collection_name,
+        hybrid_search_config=HybridSearchConfig(),
     )
     await hybrid.aadd_texts(["cockroach database", "unrelated"])
     faults.fail_next("57P01", match="plainto_tsquery")
@@ -89,7 +94,10 @@ async def test_non_retryable_errors_are_raised_after_one_attempt(faulty, code: s
 async def test_gives_up_after_max_attempts(faulty, caplog) -> None:
     store, faults = faulty
     faults.fail_next("40001", times=5, match="insert into")
-    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"), pytest.raises(Exception) as info:
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        pytest.raises(Exception) as info,
+    ):
         await store.aadd_texts(["hello"])
     assert get_sqlstate(info.value) == "40001"
     assert faults.count("insert into") == 5
@@ -130,7 +138,9 @@ async def test_real_serialization_failure_from_cockroachdb(engine_factory) -> No
 
 async def test_recovers_from_killed_connections(engine_factory, libpq_url) -> None:
     app = f"vs_kill_{uuid.uuid4().hex[:6]}"
-    engine = engine_factory(app, pool_pre_ping=False, pool_size=2, max_overflow=0, retry_policy=FAST)
+    engine = engine_factory(
+        app, pool_pre_ping=False, pool_size=2, max_overflow=0, retry_policy=FAST
+    )
     store = await make_store(engine)
     ids = await store.aadd_texts(["before"])
     assert kill_sessions(libpq_url, app) >= 1
@@ -142,13 +152,20 @@ async def test_recovers_from_killed_connections(engine_factory, libpq_url) -> No
     assert len(await store.asimilarity_search("x", k=5)) == 2
 
 
-async def test_attempt_timeout_recovers_once_the_lock_is_released(engine_factory, libpq_url, caplog) -> None:
-    engine = engine_factory(retry_policy=RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8))
+async def test_attempt_timeout_recovers_once_the_lock_is_released(
+    engine_factory, libpq_url, caplog
+) -> None:
+    engine = engine_factory(
+        retry_policy=RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8)
+    )
     store = await make_store(engine)
     ids = await store.aadd_texts(["original"])
     started = time.monotonic()
     lock_sql = f"UPDATE {store._fqn} SET content = 'locked' WHERE id = %s"
-    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"), hold_row_lock(libpq_url, lock_sql, (ids[0],), release_after=1.2):
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        hold_row_lock(libpq_url, lock_sql, (ids[0],), release_after=1.2),
+    ):
         await store.aadd_texts(["updated"], ids=ids)
     assert time.monotonic() - started >= 1.0
     assert "attempt timeout" in caplog.text
@@ -157,22 +174,32 @@ async def test_attempt_timeout_recovers_once_the_lock_is_released(engine_factory
 
 
 async def test_attempt_timeout_gives_up_with_clear_log(engine_factory, libpq_url, caplog) -> None:
-    engine = engine_factory(retry_policy=RetryPolicy(attempt_timeout=0.3, initial_backoff=0.01, max_attempts=2))
+    engine = engine_factory(
+        retry_policy=RetryPolicy(attempt_timeout=0.3, initial_backoff=0.01, max_attempts=2)
+    )
     store = await make_store(engine)
     ids = await store.aadd_texts(["original"])
     lock_sql = f"UPDATE {store._fqn} SET content = 'locked' WHERE id = %s"
-    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"), hold_row_lock(libpq_url, lock_sql, (ids[0],)), pytest.raises(Exception) as info:
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        hold_row_lock(libpq_url, lock_sql, (ids[0],)),
+        pytest.raises(Exception) as info,
+    ):
         await store.aadd_texts(["updated"], ids=ids)
     assert is_retryable_error(info.value)
     assert caplog.text.count("attempt timeout") == 2
     assert "Giving up" in caplog.text
 
 
-async def test_statement_timeouts_are_not_retried_by_default(engine_factory, libpq_url, unsafe_internals) -> None:
+async def test_statement_timeouts_are_not_retried_by_default(
+    engine_factory, libpq_url, unsafe_internals
+) -> None:
     setup = engine_factory()
     store = await make_store(setup)
     ids = await store.aadd_texts(["original"])
-    engine = engine_factory(connect_args={"options": "-c statement_timeout=300ms"}, retry_policy=FAST)
+    engine = engine_factory(
+        connect_args={"options": "-c statement_timeout=300ms"}, retry_policy=FAST
+    )
     timed = AsyncCockroachDBVectorStore(engine, store.embeddings, store.collection_name)
     faults = FaultInjector(engine.engine, unsafe_internals=unsafe_internals)
     lock_sql = f"UPDATE {store._fqn} SET content = 'locked' WHERE id = %s"
@@ -189,8 +216,12 @@ async def test_statement_timeouts_can_be_opted_in(engine_factory, libpq_url) -> 
     setup = engine_factory()
     store = await make_store(setup)
     ids = await store.aadd_texts(["original"])
-    policy = RetryPolicy(retryable_sqlstates=RETRYABLE_SQLSTATES | {"57014"}, initial_backoff=0.05, max_attempts=10)
-    engine = engine_factory(connect_args={"options": "-c statement_timeout=300ms"}, retry_policy=policy)
+    policy = RetryPolicy(
+        retryable_sqlstates=RETRYABLE_SQLSTATES | {"57014"}, initial_backoff=0.05, max_attempts=10
+    )
+    engine = engine_factory(
+        connect_args={"options": "-c statement_timeout=300ms"}, retry_policy=policy
+    )
     timed = AsyncCockroachDBVectorStore(engine, store.embeddings, store.collection_name)
     lock_sql = f"UPDATE {store._fqn} SET content = 'locked' WHERE id = %s"
     with hold_row_lock(libpq_url, lock_sql, (ids[0],), release_after=1.0):
@@ -203,10 +234,16 @@ def test_vector_store_inherits_and_overrides_the_engine_policy(engine_factory) -
     engine = engine_factory(retry_policy=RetryPolicy(max_attempts=9))
     inherited = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), "t")
     assert inherited.retry_policy is engine.retry_policy
-    overridden = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), "t", retry_max_attempts=2)
+    overridden = AsyncCockroachDBVectorStore(
+        engine, DeterministicFakeEmbedding(size=DIM), "t", retry_max_attempts=2
+    )
     assert overridden.retry_max_attempts == 2
     assert overridden.retry_policy.retryable_sqlstates == engine.retry_policy.retryable_sqlstates
     with pytest.raises(ValueError):
         AsyncCockroachDBVectorStore(
-            engine, DeterministicFakeEmbedding(size=DIM), "t", retry_policy=RetryPolicy(), retry_max_attempts=2
+            engine,
+            DeterministicFakeEmbedding(size=DIM),
+            "t",
+            retry_policy=RetryPolicy(),
+            retry_max_attempts=2,
         )

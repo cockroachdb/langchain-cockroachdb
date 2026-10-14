@@ -49,7 +49,10 @@ class TestCSPANNIndex:
 
     def test_create_sql_custom_schema_and_name(self) -> None:
         sql = CSPANNIndex(name="my_idx").get_create_index_sql("docs", "embedding", schema="app")
-        assert sql == "CREATE VECTOR INDEX IF NOT EXISTS my_idx ON app.docs (embedding vector_cosine_ops)"
+        assert (
+            sql
+            == "CREATE VECTOR INDEX IF NOT EXISTS my_idx ON app.docs (embedding vector_cosine_ops)"
+        )
 
     def test_drop_sql(self) -> None:
         assert (
@@ -61,7 +64,9 @@ class TestCSPANNIndex:
         assert CSPANNIndex().get_index_name("docs", "embedding") == "docs_embedding_vector_idx"
         assert CSPANNIndex(name="x").get_index_name("docs", "embedding") == "x"
 
-    @pytest.mark.parametrize("kwargs", [{"name": "bad name"}, {"min_partition_size": 0}, {"max_partition_size": True}])
+    @pytest.mark.parametrize(
+        "kwargs", [{"name": "bad name"}, {"min_partition_size": 0}, {"max_partition_size": True}]
+    )
     def test_rejects_unsafe_values(self, kwargs: dict) -> None:
         with pytest.raises(ValueError):
             CSPANNIndex(**kwargs)
@@ -72,7 +77,9 @@ class TestCSPANNQueryOptions:
         assert CSPANNQueryOptions().get_session_settings() == {}
 
     def test_beam_size_setting(self) -> None:
-        assert CSPANNQueryOptions(beam_size=64).get_session_settings() == {"vector_search_beam_size": 64}
+        assert CSPANNQueryOptions(beam_size=64).get_session_settings() == {
+            "vector_search_beam_size": 64
+        }
 
     @pytest.mark.parametrize("bad", [0, -1, True, 1.5, "8"])
     def test_rejects_invalid_beam_size(self, bad) -> None:
