@@ -11,7 +11,7 @@ import os
 from langgraph.checkpoint.base import create_checkpoint, empty_checkpoint
 from langgraph.checkpoint.serde.types import TASKS
 
-from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver
+from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver, RetryPolicy
 
 CONNECTION_STRING = os.getenv(
     "COCKROACHDB_URL",
@@ -164,20 +164,16 @@ async def connection_pool_example() -> None:
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool
 
-    from langchain_cockroachdb.checkpointer.async_saver import _sanitize_conn_string
-
-    # Use the built-in helper to normalize cockroachdb:// URLs for raw psycopg.
-    # Raw psycopg only understands postgresql://, so the helper converts
-    # cockroachdb:// -> postgresql:// internally.  Users should always pass
-    # cockroachdb:// URLs; the conversion is an implementation detail.
-    pg_uri = _sanitize_conn_string(CONNECTION_STRING)
+    # Raw psycopg needs a postgresql:// URL; cockroachdb:// is the same server
+    pg_uri = "postgresql://" + CONNECTION_STRING.split("://", 1)[1]
 
     async with AsyncConnectionPool(
         pg_uri,
         max_size=10,
         kwargs={"autocommit": True, "row_factory": dict_row},
     ) as pool:
-        saver = AsyncCockroachDBSaver(pool)
+        # A pool replaces connections that drop; a single connection cannot.
+        saver = AsyncCockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
         await saver.setup()
 
         config = {"configurable": {"thread_id": "pool-demo", "checkpoint_ns": ""}}

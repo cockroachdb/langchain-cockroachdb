@@ -6,7 +6,7 @@ import uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from langchain_cockroachdb import CockroachDBChatMessageHistory
+from langchain_cockroachdb import CockroachDBChatMessageHistory, CockroachDBEngine
 
 CONNECTION_STRING = os.getenv(
     "COCKROACHDB_URL",
@@ -21,13 +21,15 @@ async def main() -> None:
     session_id = str(uuid.uuid4())
 
     print(f"1. Creating chat history for session: {session_id[:8]}...")
+    # One engine (one connection pool and retry policy) shared by every session
+    engine = CockroachDBEngine.from_connection_string(CONNECTION_STRING)
     history = CockroachDBChatMessageHistory(
         session_id=session_id,
-        connection_string=CONNECTION_STRING,
+        engine=engine,
         table_name="example_chat_history",
     )
 
-    await history._acreate_table_if_not_exists()
+    await history.acreate_table_if_not_exists()
     await history.aclear()
 
     print("\n2. Adding conversation messages...")
@@ -40,8 +42,8 @@ async def main() -> None:
         AIMessage(content="Yes! CockroachDB has native VECTOR type support..."),
     ]
 
+    await history.aadd_messages(messages)
     for msg in messages:
-        await history.aadd_message(msg)
         print(f"   Added: {msg.type} - {msg.content[:40]}...")
 
     print("\n3. Retrieving conversation history...")
@@ -56,7 +58,7 @@ async def main() -> None:
     session2_id = str(uuid.uuid4())
     history2 = CockroachDBChatMessageHistory(
         session_id=session2_id,
-        connection_string=CONNECTION_STRING,
+        engine=engine,
         table_name="example_chat_history",
     )
 
@@ -84,8 +86,7 @@ async def main() -> None:
 
     print("\n✅ Chat history demo complete!")
 
-    await history.aclose()
-    await history2.aclose()
+    await engine.aclose()
 
 
 if __name__ == "__main__":
