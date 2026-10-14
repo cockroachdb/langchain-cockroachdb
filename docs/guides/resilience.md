@@ -129,9 +129,9 @@ A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, 
 ## Connection settings
 
 - `connect_timeout` defaults to 10 seconds. A value in the URL or `connect_args` wins; pass `connect_timeout=None` to leave it unset.
-- `pool_pre_ping` (on by default) checks a pooled connection before use, so connections that died while idle are replaced without an error.
-- TCP keepalives detect dead peers on idle connections, for example `?keepalives_idle=30&keepalives_interval=10&keepalives_count=3`.
-- `gssencmode` defaults to `disable` for new connections. CockroachDB has no GSS encryption, and this also avoids a Kerberos lookup that can crash forked workers on macOS. Values in the URL or `connect_args` override it.
+- `pool_pre_ping` (on by default) checks a pooled connection before use, so connections that died while idle are replaced without an error. It only bounds opening a new connection, not pings to existing connections.
+- TCP keepalives detect dead peers on idle connections, for example `?keepalives_idle=30&keepalives_interval=10&keepalives_count=3`. On Linux, `tcp_user_timeout` (in milliseconds, for example `?tcp_user_timeout=10000`) cuts off a pre-ping or query on a connection whose peer went silent, without waiting for the OS retransmission timeout (which can be 15 minutes).
+- `gssencmode` defaults to `disable` for new connections. CockroachDB has no GSS encryption, and this also avoids a Kerberos lookup that can crash forked workers on macOS. Values in the URL or `connect_args` override it. If you build a connection pool yourself (not through the engine's `from_connection_string`), add `gssencmode=disable` to the pool's conninfo or kwargs on macOS with prefork servers.
 
 ## Sync and async
 

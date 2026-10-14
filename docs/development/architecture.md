@@ -96,21 +96,22 @@ async def aadd_texts(texts: list[str]) -> list[str]:
 
 ### Retry Decorators
 
-Each idempotent statement is wrapped by `RetryPolicy.arun`. Connection checkout uses `engine._connect`, which provides the hang guard (attempt timeout):
+Each idempotent statement is wrapped by `RetryPolicy.arun`. The callable passed to `arun` checks out a fresh connection per attempt:
 
 ```python
 async def aadd_texts(texts: list[str]) -> list[str]:
-    async with self.engine._connect() as conn:
-        await self.retry_policy.arun(
-            self._insert_batch(conn, batch),
-            label="insert into documents",
-        )
+    async def attempt():
+        async with self.engine._connect() as conn:
+            return await conn.execute(insert_statement, params)
+    
+    await self.retry_policy.arun(attempt, label="insert into documents")
 ```
 
 **Benefits:**
 - Transparent retry logic
 - Configurable per component
 - Handles transient CockroachDB errors automatically
+- Fresh connection per retry
 
 ### Dependency Injection
 

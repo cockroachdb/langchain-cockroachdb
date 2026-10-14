@@ -15,7 +15,6 @@ tests/
 │   ├── test_engine.py
 │   ├── test_vectorstore.py
 │   ├── test_chat_history.py
-│   ├── test_retry_behavior.py
 │   ├── test_sync_wrapper.py
 │   ├── test_configuration.py
 │   ├── test_fault_helpers.py       # Fault injection utilities
@@ -35,7 +34,7 @@ The `tests/integration/faults.py` module provides three mechanisms for injecting
 
 1. **`FaultInjector`** - for SQLAlchemy async engine (vector store, chat history). Swaps faulted statements for `crdb_internal.force_error` so the server raises the error during normal execution and SQLAlchemy wraps it.
 
-2. **`CheckpointerFaultInjector`** - for raw psycopg connections (checkpointers). Uses `cursor_factory` to check for a pending fault before every cursor execute.
+2. **`PsycopgFaults`** - for raw psycopg connections (checkpointers). Uses `cursor_factory` to check for a pending fault before every cursor execute.
 
 3. **`kill_sessions` and `hold_row_lock`** - helper functions to cancel sessions (simulating node restarts or load balancer resets) and hold row locks (simulating stuck ranges).
 

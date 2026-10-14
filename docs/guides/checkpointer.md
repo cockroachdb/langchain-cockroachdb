@@ -118,6 +118,8 @@ saver = AsyncCockroachDBSaver(pool)
 await saver.setup()
 ```
 
+Pools you build yourself do not get the library's `gssencmode=disable` default. On macOS with prefork servers, add `gssencmode=disable` to the pool's conninfo or kwargs.
+
 ### Factory Method (Recommended)
 
 The simplest approach -- handles connection string conversion, pool setup, and enables prepared statement caching (`prepare_threshold=5`) for query plan reuse:
