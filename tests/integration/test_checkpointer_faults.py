@@ -75,6 +75,31 @@ def test_sync_saver_recovers_from_retryable_errors(sync_pool, unsafe_internals, 
     assert faults.injected == [code] * 5
 
 
+def test_pipeline_mode_saver_recovers_from_retryable_errors(libpq_url, unsafe_internals) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    app = app_name()
+    with CockroachDBSaver.from_conn_string(
+        libpq_url,
+        pipeline=True,
+        retry_policy=FAST,
+        connect_kwargs={"cursor_factory": faults.cursor_class(), "application_name": app},
+    ) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        faults.fail_next("40001", match="insert into checkpoints (")
+        saved = saver.put(config(thread), empty_checkpoint(), {"step": 1}, {})
+        faults.fail_next("40001", match="from checkpoints ")
+        assert saver.get_tuple(saved) is not None
+        faults.fail_next("40001", match="from checkpoints ")
+        assert len(list(saver.list(config(thread)))) == 1
+        faults.fail_next("40001", match="insert into checkpoint_writes")
+        saver.put_writes(saved, [("channel", "value")], task_id="t1")
+        faults.fail_next("40001", match="delete from checkpoints")
+        saver.delete_thread(thread)
+        assert saver.get_tuple(config(thread)) is None
+        assert faults.injected == ["40001"] * 5
+
+
 def test_sync_saver_raises_non_retryable_errors_once(sync_pool, unsafe_internals) -> None:
     faults = PsycopgFaults(unsafe_internals)
     saver = CockroachDBSaver(sync_pool(app_name(), faults), retry_policy=FAST)
@@ -88,7 +113,7 @@ def test_sync_saver_raises_non_retryable_errors_once(sync_pool, unsafe_internals
 
 @pytest.mark.parametrize("delay", [0.0, 0.3], ids=["immediate", "after_300ms"])
 def test_sync_saver_with_a_pool_recovers_from_killed_connections(
-    sync_pool, libpq_url, delay: float
+    sync_pool, libpq_url, delay: float, caplog
 ) -> None:
     app = app_name()
     saver = CockroachDBSaver(sync_pool(app), retry_policy=FAST)
@@ -96,7 +121,10 @@ def test_sync_saver_with_a_pool_recovers_from_killed_connections(
     saved = saver.put(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
     assert kill_sessions(libpq_url, app) >= 1
     time.sleep(delay)
-    assert saver.get_tuple(saved) is not None
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        assert saver.get_tuple(saved) is not None
+    # Assert at least one retry for the get after the kill
+    assert any("Retrying get checkpoint after" in record.message for record in caplog.records)
 
 
 def test_single_connection_saver_does_not_retry_a_dead_connection(libpq_url, caplog) -> None:
@@ -107,12 +135,15 @@ def test_single_connection_saver_does_not_retry_a_dead_connection(libpq_url, cap
         saver.setup()
         assert kill_sessions(libpq_url, app) == 1
         time.sleep(0.3)
+        caplog.clear()
         with (
-            caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.checkpointer.saver"),
+            caplog.at_level(logging.WARNING),
             pytest.raises(psycopg.OperationalError),
         ):
             saver.put(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
-        assert "ConnectionPool" in caplog.text
+        # Assert exactly one "ConnectionPool" warning and no retry
+        assert sum("ConnectionPool" in record.message for record in caplog.records) == 1
+        assert not any("Retrying" in record.message for record in caplog.records)
 
 
 def test_parallel_setup_converges(libpq_url) -> None:
@@ -178,12 +209,30 @@ def test_sync_saver_attempt_timeout_rides_out_a_stuck_write(sync_pool, libpq_url
     assert saver.get_tuple(config(thread)).metadata["step"] == 2
 
 
-def test_from_conn_string_rejects_managed_options(libpq_url) -> None:
+@pytest.mark.parametrize("key", ["autocommit", "row_factory", "prepare_threshold"])
+def test_from_conn_string_rejects_managed_options(libpq_url, key: str) -> None:
     with (
-        pytest.raises(ValueError, match="autocommit"),
-        CockroachDBSaver.from_conn_string(libpq_url, connect_kwargs={"autocommit": False}),
+        pytest.raises(ValueError, match=key),
+        CockroachDBSaver.from_conn_string(libpq_url, connect_kwargs={key: "dummy"}),
     ):
         pass
+
+
+def test_from_conn_string_retries_connect(caplog) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        pytest.raises(psycopg.OperationalError),
+        CockroachDBSaver.from_conn_string(
+            "postgresql://root@localhost:1/defaultdb?sslmode=disable",
+            retry_policy=RetryPolicy(max_attempts=2, initial_backoff=0.01),
+        ),
+    ):
+        pass
+    # Assert exactly one retry warning for the connect label
+    retry_warnings = [
+        r for r in caplog.records if "Retrying connect checkpointer after" in r.message
+    ]
+    assert len(retry_warnings) == 1
 
 
 DDL_OFF_OPTIONS = "-c autocommit_before_ddl=off -c create_table_with_schema_locked=on"

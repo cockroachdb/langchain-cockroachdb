@@ -210,7 +210,7 @@ class RetryPolicy:
         retry_on: Custom predicate that replaces the rules above
         attempt_timeout: Seconds before a hung query or write is abandoned and
             retried; None disables the guard (default: None)
-        ddl_attempt_timeout: Same guard for schema changes (default: None)
+        ddl_attempt_timeout: Same guard, bounds each schema change (default: None)
 
     Example:
         ```python

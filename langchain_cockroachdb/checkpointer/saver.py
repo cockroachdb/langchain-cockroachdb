@@ -9,6 +9,7 @@ DELETEs, so retrying after an ambiguous result is safe.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import logging
 import threading
@@ -68,6 +69,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         pool = ConnectionPool(
             "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
             kwargs={"autocommit": True, "row_factory": dict_row},
+            open=True,
         )
         checkpointer = CockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
         checkpointer.setup()
@@ -135,18 +137,13 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                 yield cls(conn, serde=serde, retry_policy=policy)
 
     def _retry(self, fn: Callable[[], T], *, label: str) -> T:
-        """Run ``fn`` under the retry policy, resynchronizing a pipeline after errors."""
+        """Run ``fn`` under the retry policy."""
+        return self.retry_policy.run(fn, label=label, can_retry=self._can_retry)
 
-        def attempt() -> T:
-            try:
-                return fn()
-            except Exception:
-                if self.pipe is not None:
-                    with contextlib.suppress(Exception):
-                        self.pipe.sync()
-                raise
-
-        return self.retry_policy.run(attempt, label=label, can_retry=self._can_retry)
+    def _sync_pipeline(self) -> None:
+        """Sync pipeline if one is in use. Each statement runs in its own transaction."""
+        if self.pipe:
+            self.pipe.sync()
 
     def _can_retry(self, error: BaseException) -> bool:
         if isinstance(self.conn, Connection) and self.conn.closed:
@@ -166,32 +163,32 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         ON CONFLICT DO NOTHING.
         """
 
-        def migrate() -> None:
+        def init_and_read_version() -> int:
             with self._cursor(
-                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer setup"
+                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer migration 0"
             ) as cur:
                 cur.execute(self.MIGRATIONS[0])
-                # Each statement in its own transaction when using a pipeline, to avoid 57000
-                if self.pipe:
-                    self.pipe.sync()
+                self._sync_pipeline()
                 results = cur.execute("SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1")
-                if self.pipe:
-                    self.pipe.sync()
+                self._sync_pipeline()
                 row = results.fetchone()
-                version = -1 if row is None else row["v"]
-                for v, migration in zip(
-                    range(version + 1, len(self.MIGRATIONS)),
-                    self.MIGRATIONS[version + 1 :],
-                    strict=False,
-                ):
-                    cur.execute(migration)
-                    if self.pipe:
-                        self.pipe.sync()
-                    cur.execute(self.INSERT_MIGRATION_SQL, (v,))
-                    if self.pipe:
-                        self.pipe.sync()
+                return -1 if row is None else row["v"]
 
-        self._retry(migrate, label="checkpointer setup")
+        version = self._retry(init_and_read_version, label="checkpointer migration 0")
+
+        for v in range(version + 1, len(self.MIGRATIONS)):
+
+            def apply_migration(migration_v: int = v) -> None:
+                with self._cursor(
+                    timeout=self.retry_policy.ddl_attempt_timeout,
+                    label=f"checkpointer migration {migration_v}",
+                ) as cur:
+                    cur.execute(self.MIGRATIONS[migration_v])
+                    self._sync_pipeline()
+                    cur.execute(self.INSERT_MIGRATION_SQL, (migration_v,))
+                    self._sync_pipeline()
+
+            self._retry(apply_migration, label=f"checkpointer migration {v}")
 
     def list(
         self,
@@ -223,7 +220,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             params.append(int(limit))
         yield from self._retry(lambda: self._fetch_list(query, params), label="list checkpoints")
 
-    def _fetch_list(self, query: str, params: list[Any]) -> list[CheckpointTuple]:
+    def _fetch_list(self, query: str, params: builtins.list[Any]) -> builtins.list[CheckpointTuple]:
         with self._cursor(
             timeout=self.retry_policy.attempt_timeout, label="list checkpoints"
         ) as cur:
@@ -456,21 +453,23 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         """
         self._validate_ttl_params(ttl_interval, cron)
         statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
-        self._retry(lambda: self._run_ddl(statements, "enable TTL"), label="enable TTL")
+        for statement in statements:
+            self._run_ddl(statement, "enable TTL")
 
     def disable_ttl(self) -> None:
         """Disable CockroachDB row-level TTL on checkpoint tables."""
-        self._retry(
-            lambda: self._run_ddl(list(self.DISABLE_TTL_SQL), "disable TTL"), label="disable TTL"
-        )
+        for statement in self.DISABLE_TTL_SQL:
+            self._run_ddl(statement, "disable TTL")
 
-    def _run_ddl(self, statements: list[str], label: str) -> None:
-        with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
-            for statement in statements:
+    def _run_ddl(self, statement: str, label: str) -> None:
+        """Run a single DDL statement with retry and timeout."""
+
+        def execute() -> None:
+            with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
                 cur.execute(statement)
-                # Each statement in its own transaction when using a pipeline, to avoid 57000
-                if self.pipe:
-                    self.pipe.sync()
+                self._sync_pipeline()
+
+        self._retry(execute, label=label)
 
     @contextmanager
     def _cursor(
@@ -488,9 +487,13 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                     try:
                         with conn.cursor(binary=True, row_factory=dict_row) as cur:
                             yield cur
-                    finally:
                         if pipeline:
                             self.pipe.sync()
+                    except BaseException:
+                        # Resync while still holding the lock, so other threads' queued statements are untouched
+                        with contextlib.suppress(Exception):
+                            self.pipe.sync()
+                        raise
                 elif pipeline:
                     if self.supports_pipeline:
                         with (
