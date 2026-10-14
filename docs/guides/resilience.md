@@ -97,9 +97,11 @@ failover = RetryPolicy(
 
 Statement timeouts are not retried by default because they also fire for genuinely slow queries, and retrying those multiplies load on the queries that are already slow.
 
+On Linux, also add `tcp_user_timeout=10000` to the connection URL. `attempt_timeout` starts only once a connection is checked out, so this is what keeps a pool's pre-ping on a connection to a lost node from hanging for minutes.
+
 ## Cutting off hung attempts
 
-`attempt_timeout` gives each attempt a deadline. When it passes, the library shuts down the connection's socket, so the stuck call fails as a lost connection and the normal retry runs on a fresh connection. It starts once a connection is checked out, so `pool_pre_ping` and connection setup are bounded by `connect_timeout` and TCP keepalives, not by `attempt_timeout`. This works even when the server ignores cancel requests, which CockroachDB can do for a `COMMIT` while a range it wrote to has lost quorum, and it ends reads stalled by a network partition long before the operating system's TCP timeouts would.
+`attempt_timeout` gives each attempt a deadline. When it passes, the library shuts down the connection's socket, so the stuck call fails as a lost connection and the normal retry runs on a fresh connection. It starts once a connection is checked out, so it does not cover getting a connection: `connect_timeout` bounds opening a new one, and a `pool_pre_ping` on a pooled connection whose peer went silent is only cut short by `tcp_user_timeout` (see Connection settings). This works even when the server ignores cancel requests, which CockroachDB can do for a `COMMIT` while a range it wrote to has lost quorum, and it ends reads stalled by a network partition long before the operating system's TCP timeouts would.
 
 It is off by default. Good starting points are 10 to 30 seconds for interactive paths and 60 to 120 seconds for batch work. Schema changes use `ddl_attempt_timeout`, also off by default, which bounds each schema change: one statement in the vector store, chat history and engine setup, and one migration step or one TTL statement in the checkpointers. Building an index on a large table can legitimately take minutes.
 
@@ -129,7 +131,7 @@ A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, 
 ## Connection settings
 
 - `connect_timeout` defaults to 10 seconds. A value in the URL or `connect_args` wins; pass `connect_timeout=None` to leave it unset.
-- `pool_pre_ping` (on by default) checks a pooled connection before use, so connections that died while idle are replaced without an error. It only bounds opening a new connection, not pings to existing connections.
+- `pool_pre_ping` (on by default) checks a pooled connection before use, so connections that died while idle are replaced without an error. A pre-ping on a connection whose peer went silent can wait for the operating system to give up, so pair it with `tcp_user_timeout` below.
 - TCP keepalives detect dead peers on idle connections, for example `?keepalives_idle=30&keepalives_interval=10&keepalives_count=3`. On Linux, `tcp_user_timeout` (in milliseconds, for example `?tcp_user_timeout=10000`) cuts off a pre-ping or query on a connection whose peer went silent, without waiting for the OS retransmission timeout (which can be 15 minutes).
 - `gssencmode` defaults to `disable` for new connections. CockroachDB has no GSS encryption, and this also avoids a Kerberos lookup that can crash forked workers on macOS. Values in the URL or `connect_args` override it. If you build a connection pool yourself (not through the engine's `from_connection_string`), add `gssencmode=disable` to the pool's conninfo or kwargs on macOS with prefork servers.
 
