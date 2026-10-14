@@ -43,11 +43,12 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
             List of IDs
 
         Raises:
-            ValueError: When using a namespace, if any id already belongs to a different
-                namespace. The guarded upsert also raises if a concurrent writer claims
-                an id in another namespace between the check and the write. Rows in the
-                same batch that were in this namespace, and earlier batches, are already
-                committed when this error is raised.
+            ValueError: When using a namespace, if any caller-supplied id already
+                belongs to a different namespace. This check writes nothing. If a
+                concurrent writer claims an id in another namespace between the check
+                and the write, the write also raises. Earlier batches and the batch's
+                other rows (same-namespace updates and new rows) are already committed
+                when this error is raised.
         """
         texts_list = list(texts)
         if not texts_list:
@@ -66,11 +67,12 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         """Add texts with precomputed embeddings (sync).
 
         Raises:
-            ValueError: When using a namespace, if any id already belongs to a different
-                namespace. The guarded upsert also raises if a concurrent writer claims
-                an id in another namespace between the check and the write. Rows in the
-                same batch that were in this namespace, and earlier batches, are already
-                committed when this error is raised.
+            ValueError: When using a namespace, if any caller-supplied id already
+                belongs to a different namespace. This check writes nothing. If a
+                concurrent writer claims an id in another namespace between the check
+                and the write, the write also raises. Earlier batches and the batch's
+                other rows (same-namespace updates and new rows) are already committed
+                when this error is raised.
         """
         rows = self._prepare_rows(list(texts), embeddings, metadatas, ids, kwargs)
         return self.engine._run_as_sync(self._add_embeddings(rows))

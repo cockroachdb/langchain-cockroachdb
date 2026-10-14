@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 from langchain_core.embeddings import Embeddings
+from sqlalchemy import text
 
 from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 from langchain_cockroachdb.engine import CockroachDBEngine
@@ -642,6 +643,175 @@ class TestAsyncCockroachDBVectorStore:
         docs = await store.aget_by_ids([id_x])
         assert len(docs) == 1
         assert docs[0].page_content == "v2"
+
+    async def test_namespace_int8_id_column_does_not_false_error(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Regression test: INT8 id column should not trigger false namespace error."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_int8_id"
+
+        async with cockroachdb_engine._connect(
+            begin=True, timeout=None, label="create int8 table"
+        ) as conn:
+            await conn.execute(
+                text(
+                    f"CREATE TABLE IF NOT EXISTS public.{table} ("
+                    "id INT8 PRIMARY KEY, "
+                    "content TEXT, "
+                    "embedding VECTOR(3), "
+                    "metadata JSONB DEFAULT '{}', "
+                    "namespace TEXT NOT NULL DEFAULT '')"
+                )
+            )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+
+        await store_a.aadd_texts(["doc"], ids=["007"])
+
+        docs = await store_a.aget_by_ids(["007"])
+        assert len(docs) == 1
+        assert docs[0].page_content == "doc"
+
+        async with cockroachdb_engine._connect(
+            begin=True, timeout=None, label="drop int8 table"
+        ) as conn:
+            await conn.execute(text(f"DROP TABLE IF EXISTS public.{table}"))
+
+    async def test_namespace_multi_chunk_check_rejects_before_any_write(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that multi-chunk pre-check rejects before any write."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_multi_chunk"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+            batch_size=1,
+        )
+
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A doc"], ids=[id_x])
+
+        id_y = str(uuid.uuid4())
+        with pytest.raises(ValueError, match=str(id_x)):
+            await store_b.aadd_texts(["B doc Y", "B doc X"], ids=[id_y, id_x])
+
+        assert len(await store_b.aget_by_ids([id_y])) == 0
+        assert len(await store_b.aget_by_ids([id_x])) == 0
+
+    async def test_guarded_upsert_error_does_not_name_successful_rows(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that the guarded upsert error does not name successful rows."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_error_no_success"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A doc"], ids=[id_x])
+
+        id_z = str(uuid.uuid4())
+        emb_x = await embeddings.aembed_documents(["B attempt on X"])
+        emb_z = await embeddings.aembed_documents(["B doc Z"])
+
+        try:
+            await store_b._insert_batch(
+                ["B attempt on X", "B doc Z"],
+                emb_x + emb_z,
+                ["{}", "{}"],
+                [id_x, id_z],
+            )
+            raise AssertionError("Should have raised ValueError")
+        except ValueError as e:
+            assert str(id_x) in str(e)
+            assert str(id_z) not in str(e)
+
+        docs_b = await store_b.aget_by_ids([id_z])
+        assert len(docs_b) == 1
+        assert docs_b[0].page_content == "B doc Z"
+
+    async def test_store_without_namespace_sends_no_namespace_sql(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+        unsafe_internals: bool,
+    ) -> None:
+        """Test that stores without a namespace send no namespace-specific SQL."""
+        from tests.integration.faults import FaultInjector
+
+        embeddings = FakeEmbeddings()
+        table = "test_no_ns_sql"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        injector = FaultInjector(cockroachdb_engine.engine, unsafe_internals=unsafe_internals)
+
+        store = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+        )
+
+        id_x = str(uuid.uuid4())
+        await store.aadd_texts(["v1"], ids=[id_x])
+        await store.aadd_texts(["v2"], ids=[id_x])
+
+        docs = await store.aget_by_ids([id_x])
+        assert len(docs) == 1
+        assert docs[0].page_content == "v2"
+
+        assert injector.count("is distinct from") == 0
+        assert injector.count("returning") == 0
+
+        injector.close()
 
     async def test_amax_marginal_relevance_search_by_vector(
         self, vectorstore, sample_texts

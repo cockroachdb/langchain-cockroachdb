@@ -76,6 +76,7 @@ class _Rows:
     metadata_json: list[str]
     ids: list[str]
     batch_size: int
+    caller_supplied_ids: list[str]
 
 
 def _check_batch_size(batch_size: Any) -> int:
@@ -250,7 +251,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
             clauses.append(builder.build(filter))
         return "WHERE " + " AND ".join(clauses) if clauses else ""
 
-    def _prepare_rows(
+    def _prepare_rows(  # noqa: PLR0912
         self,
         texts: list[str],
         embeddings: Sequence[Sequence[float]],
@@ -266,12 +267,19 @@ class AsyncCockroachDBVectorStore(VectorStore):
             metadatas = [{} for _ in texts]
         elif len(metadatas) != count:
             raise ValueError(f"Got {len(metadatas)} metadatas for {count} texts")
+        caller_supplied: list[str] = []
         if ids is None:
             resolved_ids = [str(uuid.uuid4()) for _ in texts]
         elif len(ids) != count:
             raise ValueError(f"Got {len(ids)} ids for {count} texts")
         else:
-            resolved_ids = [str(i) if i is not None else str(uuid.uuid4()) for i in ids]
+            resolved_ids = []
+            for i in ids:
+                if i is not None:
+                    resolved_ids.append(str(i))
+                    caller_supplied.append(str(i))
+                else:
+                    resolved_ids.append(str(uuid.uuid4()))
         seen = set()
         for doc_id in resolved_ids:
             if doc_id in seen:
@@ -294,23 +302,27 @@ class AsyncCockroachDBVectorStore(VectorStore):
             metadata_json,
             resolved_ids,
             batch_size,
+            caller_supplied,
         )
 
-    def _normalize_id(self, id_str: str) -> str:
+    @staticmethod
+    def _normalize_id(id_str: str) -> str:
         """Normalize id to canonical form for comparison (lowercase UUID if parseable)."""
         try:
-            return str(uuid.UUID(id_str)).lower()
-        except (ValueError, AttributeError):
+            return str(uuid.UUID(id_str))
+        except ValueError:
             return id_str
 
     async def _add_embeddings(self, rows: _Rows) -> list[str]:
-        if self.namespace is not None and rows.ids:
-            for start in range(0, len(rows.ids), rows.batch_size):
+        if self.namespace is not None and rows.caller_supplied_ids:
+            all_conflicting_ids: list[str] = []
+            for start in range(0, len(rows.caller_supplied_ids), rows.batch_size):
                 end = start + rows.batch_size
-                batch_ids = rows.ids[start:end]
+                batch_ids = rows.caller_supplied_ids[start:end]
                 statement = text(
                     f"SELECT {self.id_column} FROM {self._fqn} "
-                    f"WHERE {self.id_column} IN :ids AND {self.namespace_column} <> :namespace"
+                    f"WHERE {self.id_column} IN :ids "
+                    f"AND {self.namespace_column} IS DISTINCT FROM :namespace"
                 ).bindparams(bindparam("ids", expanding=True))
                 conflicting = await self._execute(
                     statement,
@@ -319,13 +331,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
                     fetch=True,
                 )
                 if conflicting:
-                    conflicting_ids = [str(row[0]) for row in conflicting]
-                    sample = conflicting_ids[:5]
-                    suffix = "..." if len(conflicting_ids) > 5 else ""
-                    raise ValueError(
-                        f"{len(conflicting_ids)} ids belong to another namespace in {self._fqn}. "
-                        f"Ids must be unique across namespaces: {', '.join(sample)}{suffix}"
-                    )
+                    all_conflicting_ids.extend(str(row[0]) for row in conflicting)
+            if all_conflicting_ids:
+                count = len(all_conflicting_ids)
+                sample = all_conflicting_ids[:5]
+                suffix = "..." if count > 5 else ""
+                verb = "belongs" if count == 1 else "belong"
+                raise ValueError(
+                    f"{count} {'id' if count == 1 else 'ids'} {verb} to another "
+                    f"namespace in {self._fqn}. Ids must be unique across namespaces: "
+                    f"{', '.join(sample)}{suffix}"
+                )
 
         for start in range(0, len(rows.texts), rows.batch_size):
             end = start + rows.batch_size
@@ -376,7 +392,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
 
         if self.namespace is not None:
             sql = (
-                f"INSERT INTO {self._fqn} AS existing ({', '.join(columns)}) VALUES {', '.join(rows)} "
+                f"INSERT INTO {self._fqn} AS existing ({', '.join(columns)}) "
+                f"VALUES {', '.join(rows)} "
                 f"ON CONFLICT ({self.id_column}) DO UPDATE SET {updates} "
                 f"WHERE existing.{self.namespace_column} = EXCLUDED.{self.namespace_column} "
                 f"RETURNING {self.id_column}"
@@ -384,15 +401,27 @@ class AsyncCockroachDBVectorStore(VectorStore):
             result = await self._execute(
                 text(sql), params, label=f"insert into {self._fqn}", begin=True, fetch=True
             )
-            returned_ids = {self._normalize_id(str(row[0])) for row in result}
-            expected_ids = {self._normalize_id(str(id_str)) for id_str in ids}
-            if returned_ids != expected_ids:
-                skipped = expected_ids - returned_ids
-                skipped_list = sorted(skipped)[:5]
-                suffix = "..." if len(skipped) > 5 else ""
-                raise ValueError(
-                    f"{len(skipped)} ids belong to another namespace: {', '.join(skipped_list)}{suffix}"
-                )
+            if len(result) < len(ids):
+                returned = {self._normalize_id(str(row[0])) for row in result}
+                normalized_batch = {self._normalize_id(str(id_str)): str(id_str) for id_str in ids}
+                skipped_normalized = set(normalized_batch.keys()) - returned
+                if skipped_normalized and len(skipped_normalized) == len(ids) - len(result):
+                    skipped_caller = [normalized_batch[n] for n in sorted(skipped_normalized)]
+                    sample = skipped_caller[:5]
+                    suffix = "..." if len(skipped_caller) > 5 else ""
+                    count = len(skipped_caller)
+                    verb = "belongs" if count == 1 else "belong"
+                    raise ValueError(
+                        f"{count} {'id' if count == 1 else 'ids'} {verb} to another "
+                        f"namespace in {self._fqn}. Ids must be unique across namespaces: "
+                        f"{', '.join(sample)}{suffix}"
+                    )
+                else:
+                    count = len(ids) - len(result)
+                    verb = "was" if count == 1 else "were"
+                    raise ValueError(
+                        f"{count} {'id' if count == 1 else 'ids'} {verb} not written in {self._fqn}"
+                    )
         else:
             sql = (
                 f"INSERT INTO {self._fqn} ({', '.join(columns)}) VALUES {', '.join(rows)} "
@@ -622,11 +651,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
             List of IDs for added texts
 
         Raises:
-            ValueError: When using a namespace, if any id already belongs to a different
-                namespace. The guarded upsert also raises if a concurrent writer claims
-                an id in another namespace between the check and the write. Rows in the
-                same batch that were in this namespace, and earlier batches, are already
-                committed when this error is raised.
+            ValueError: When using a namespace, if any caller-supplied id already
+                belongs to a different namespace. This check writes nothing. If a
+                concurrent writer claims an id in another namespace between the check
+                and the write, the write also raises. Earlier batches and the batch's
+                other rows (same-namespace updates and new rows) are already committed
+                when this error is raised.
         """
         texts_list = list(texts)
         if not texts_list:
@@ -657,11 +687,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
             List of IDs for added texts
 
         Raises:
-            ValueError: When using a namespace, if any id already belongs to a different
-                namespace. The guarded upsert also raises if a concurrent writer claims
-                an id in another namespace between the check and the write. Rows in the
-                same batch that were in this namespace, and earlier batches, are already
-                committed when this error is raised.
+            ValueError: When using a namespace, if any caller-supplied id already
+                belongs to a different namespace. This check writes nothing. If a
+                concurrent writer claims an id in another namespace between the check
+                and the write, the write also raises. Earlier batches and the batch's
+                other rows (same-namespace updates and new rows) are already committed
+                when this error is raised.
         """
         rows = self._prepare_rows(list(texts), embeddings, metadatas, ids, kwargs)
         return await self.engine._run_as_async(self._add_embeddings(rows))
