@@ -11,7 +11,14 @@ from langchain_cockroachdb.indexes import (
     DistanceStrategy,
 )
 from langchain_cockroachdb.retry import (
+    NON_TRANSIENT_MESSAGES,
+    RETRYABLE_SQLSTATE_CLASSES,
+    RETRYABLE_SQLSTATES,
+    TRANSIENT_MESSAGES,
+    UNCATEGORIZED_SQLSTATES,
+    RetryPolicy,
     async_retry_with_backoff,
+    get_sqlstate,
     is_retryable_error,
     sync_retry_with_backoff,
 )
@@ -32,6 +39,13 @@ __all__ = [
     "async_retry_with_backoff",
     "sync_retry_with_backoff",
     "is_retryable_error",
+    "RetryPolicy",
+    "get_sqlstate",
+    "RETRYABLE_SQLSTATES",
+    "RETRYABLE_SQLSTATE_CLASSES",
+    "UNCATEGORIZED_SQLSTATES",
+    "TRANSIENT_MESSAGES",
+    "NON_TRANSIENT_MESSAGES",
 ]
 
 __version__ = "0.3.0"
