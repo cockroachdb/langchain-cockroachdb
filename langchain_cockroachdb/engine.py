@@ -304,15 +304,16 @@ class CockroachDBEngine:
     ) -> None:
         """Run schema statements, each in its own implicit transaction.
 
-        Each statement is retried on its own. CockroachDB commits schema changes
-        immediately even when autocommit_before_ddl is off, so running them in an
-        explicit transaction never made setup atomic and fails on locked tables.
+        Each statement is retried on its own. Under the default autocommit_before_ddl
+        setting, CockroachDB commits each schema change immediately, so an explicit
+        transaction never made setup atomic. With autocommit_before_ddl off, an explicit
+        transaction on a schema_locked table raises 57000.
         """
         retry = policy or self.retry_policy
 
-        for statement in statements:
+        for stmt in statements:
 
-            async def attempt() -> None:
+            async def attempt(statement: str = stmt) -> None:
                 async with self._connect(
                     begin=False, timeout=retry.ddl_attempt_timeout, label=label
                 ) as conn:
