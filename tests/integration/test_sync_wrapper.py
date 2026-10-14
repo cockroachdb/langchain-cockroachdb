@@ -1,42 +1,65 @@
 """Integration tests for sync wrapper (CockroachDBVectorStore)."""
 
-import pytest
-from langchain_core.embeddings import DeterministicFakeEmbedding
+import asyncio
+import threading
+import time
+import uuid
 
-from langchain_cockroachdb import CockroachDBEngine, CockroachDBVectorStore
+import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
+
+from langchain_cockroachdb import CockroachDBEngine, CockroachDBVectorStore, RetryPolicy
 from langchain_cockroachdb.indexes import CSPANNIndex, DistanceStrategy
+from tests.integration.faults import kill_sessions
+
+
+class CountingEmbeddings(Embeddings):
+    """Counts embedding calls so tests can see when the store re-embeds."""
+
+    def __init__(self) -> None:
+        self.inner = DeterministicFakeEmbedding(size=384)
+        self.query_calls = 0
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.inner.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        self.query_calls += 1
+        return self.inner.embed_query(text)
+
+
+@pytest.fixture
+def sync_engine(connection_string: str):
+    """Create sync engine."""
+    engine = CockroachDBEngine.from_connection_string(connection_string)
+    yield engine
+    engine.close()
+
+
+@pytest.fixture
+def sync_vectorstore(sync_engine: CockroachDBEngine):
+    """Create sync vectorstore."""
+    embeddings = DeterministicFakeEmbedding(size=384)
+    table_name = "sync_test_vectors"
+
+    # Initialize table synchronously
+    sync_engine.init_vectorstore_table(
+        table_name=table_name,
+        vector_dimension=384,
+        drop_if_exists=True,
+    )
+
+    vectorstore = CockroachDBVectorStore(
+        engine=sync_engine,
+        embeddings=embeddings,
+        collection_name=table_name,
+    )
+
+    yield vectorstore
 
 
 class TestCockroachDBVectorStoreSync:
     """Test synchronous vectorstore wrapper."""
-
-    @pytest.fixture
-    def sync_engine(self, connection_string: str):
-        """Create sync engine."""
-        engine = CockroachDBEngine.from_connection_string(connection_string)
-        yield engine
-        engine.close()
-
-    @pytest.fixture
-    def sync_vectorstore(self, sync_engine: CockroachDBEngine):
-        """Create sync vectorstore."""
-        embeddings = DeterministicFakeEmbedding(size=384)
-        table_name = "sync_test_vectors"
-
-        # Initialize table synchronously
-        sync_engine.init_vectorstore_table(
-            table_name=table_name,
-            vector_dimension=384,
-            drop_if_exists=True,
-        )
-
-        vectorstore = CockroachDBVectorStore(
-            engine=sync_engine,
-            embeddings=embeddings,
-            collection_name=table_name,
-        )
-
-        yield vectorstore
 
     def test_add_texts_sync(self, sync_vectorstore: CockroachDBVectorStore) -> None:
         """Test adding texts synchronously."""
@@ -221,3 +244,75 @@ class TestCockroachDBVectorStoreSync:
         # Search with invalid parameters should handle gracefully
         results = sync_vectorstore.similarity_search("test", k=0)
         assert len(results) == 0
+
+
+def test_sync_calls_from_sixteen_threads(sync_vectorstore: CockroachDBVectorStore) -> None:
+    sync_vectorstore.add_texts([f"doc {i}" for i in range(20)])
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        for _ in range(15):
+            try:
+                sync_vectorstore.similarity_search("doc", k=3)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+    assert errors == []
+
+
+def test_sync_call_inside_a_running_event_loop(sync_vectorstore: CockroachDBVectorStore) -> None:
+    sync_vectorstore.add_texts(["inside"])
+
+    async def call() -> list:
+        return sync_vectorstore.similarity_search("inside", k=1)
+
+    assert [d.page_content for d in asyncio.run(call())] == ["inside"]
+
+
+def test_from_texts_honors_ids_and_store_arguments(sync_engine: CockroachDBEngine) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(2)]
+    store = CockroachDBVectorStore.from_texts(
+        ["a", "b"],
+        DeterministicFakeEmbedding(size=384),
+        engine=sync_engine,
+        collection_name="from_texts_args",
+        ids=ids,
+        distance_strategy=DistanceStrategy.EUCLIDEAN,
+        batch_size=1,
+        drop_if_exists=True,
+    )
+    assert store.distance_strategy == DistanceStrategy.EUCLIDEAN
+    assert store.batch_size == 1
+    assert sorted(doc.id for doc in store.get_by_ids(ids)) == sorted(ids)
+
+
+def test_mmr_uses_stored_embeddings(sync_engine: CockroachDBEngine) -> None:
+    embeddings = CountingEmbeddings()
+    sync_engine.init_vectorstore_table("mmr_stored", 384, drop_if_exists=True)
+    store = CockroachDBVectorStore(
+        engine=sync_engine, embeddings=embeddings, collection_name="mmr_stored"
+    )
+    store.add_texts(["ml is fun", "ml is great", "databases store data"])
+    embeddings.query_calls = 0
+    assert len(store.max_marginal_relevance_search("ml", k=2, fetch_k=3)) == 2
+    assert embeddings.query_calls == 1
+
+
+def test_sync_api_recovers_from_killed_connections(engine_factory, libpq_url) -> None:
+    app = f"sync_kill_{uuid.uuid4().hex[:6]}"
+    engine = engine_factory(
+        app, pool_pre_ping=False, retry_policy=RetryPolicy(initial_backoff=0.01)
+    )
+    engine.init_vectorstore_table("sync_kill", 384, drop_if_exists=True)
+    store = CockroachDBVectorStore(
+        engine=engine, embeddings=DeterministicFakeEmbedding(size=384), collection_name="sync_kill"
+    )
+    ids = store.add_texts(["before"])
+    assert kill_sessions(libpq_url, app) >= 1
+    time.sleep(0.3)
+    assert [doc.page_content for doc in store.get_by_ids(ids)] == ["before"]

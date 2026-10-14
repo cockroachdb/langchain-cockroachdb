@@ -448,3 +448,13 @@ class TestAsyncCockroachDBVectorStore:
 
         results = await store_all.asimilarity_search("doc", k=10)
         assert len(results) == 2
+
+    async def test_amax_marginal_relevance_search_by_vector(
+        self, vectorstore, sample_texts
+    ) -> None:
+        await vectorstore.aadd_texts(sample_texts)
+        embedding = await vectorstore.embeddings.aembed_query("database")
+        results = await vectorstore.amax_marginal_relevance_search_by_vector(
+            embedding, k=2, fetch_k=5
+        )
+        assert len(results) == 2
