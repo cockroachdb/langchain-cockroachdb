@@ -262,6 +262,7 @@ def test_sync_calls_from_sixteen_threads(sync_vectorstore: CockroachDBVectorStor
         thread.start()
     for thread in threads:
         thread.join(120)
+    assert not any(thread.is_alive() for thread in threads), "a worker thread did not finish"
     assert errors == []
 
 

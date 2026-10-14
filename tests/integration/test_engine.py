@@ -126,6 +126,7 @@ def test_sync_calls_from_many_threads(connection_string: str) -> None:
         thread.start()
     for thread in threads:
         thread.join(60)
+    assert not any(thread.is_alive() for thread in threads), "a worker thread did not finish"
     engine.close()
     assert errors == []
 
