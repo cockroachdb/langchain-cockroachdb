@@ -489,3 +489,43 @@ class TestResolveAndDecorators:
 
         assert await decorated() == "ok"
         assert task.calls == 2
+
+
+def test_sql_parameters_not_in_logs(caplog):
+    """SQL parameters should not appear in retry logs."""
+    import sqlalchemy.exc
+
+    # Create a SQLAlchemy error wrapping a retryable psycopg error
+    orig = psycopg.errors.SerializationFailure("transaction conflict")
+    orig.sqlstate = "40001"
+    
+    # The SQLAlchemy error includes the SQL and params
+    sa_error = sqlalchemy.exc.OperationalError(
+        "INSERT INTO docs (secret) VALUES (:val)",
+        {"val": "SENTINEL-123"},
+        orig,
+    )
+
+    # Run through the retry policy with a fake sleep
+    caplog.set_level(logging.DEBUG)
+    policy = RetryPolicy(max_attempts=2)
+    
+    attempt_count = 0
+    
+    async def attempt():
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise sa_error
+        return "success"
+    
+    # Run the retry
+    import asyncio
+    result = asyncio.run(policy.arun(attempt, label="test"))
+    assert result == "success"
+    
+    # Check that the sentinel does not appear in any log record
+    for record in caplog.records:
+        assert "SENTINEL-123" not in record.getMessage(), (
+            f"SQL parameter leaked in log: {record.getMessage()}"
+        )

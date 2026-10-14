@@ -262,14 +262,21 @@ class TestAsyncCockroachDBVectorStore:
         self,
         vectorstore: AsyncCockroachDBVectorStore,
         sample_texts: list[str],
+        cockroachdb_engine: CockroachDBEngine,
+        unsafe_internals,
     ) -> None:
         """Test query with beam size option."""
+        from tests.integration.faults import FaultInjector
+
         await vectorstore.aadd_texts(sample_texts)
 
         index = CSPANNIndex(distance_strategy=DistanceStrategy.COSINE)
         await vectorstore.aapply_vector_index(index)
 
-        query_options = CSPANNQueryOptions(beam_size=100)
+        # Use FaultInjector to capture SQL statements
+        injector = FaultInjector(cockroachdb_engine.engine, unsafe_internals=unsafe_internals)
+
+        query_options = CSPANNQueryOptions(beam_size=77)
         results = await vectorstore.asimilarity_search_with_score(
             "database",
             k=3,
@@ -277,6 +284,11 @@ class TestAsyncCockroachDBVectorStore:
         )
 
         assert len(results) <= 3
+
+        # Verify that beam_size setting was sent
+        count = injector.count("vector_search_beam_size = 77")
+        injector.close()
+        assert count > 0, "beam_size setting did not reach the database"
 
     async def test_amax_marginal_relevance_search(
         self,
@@ -917,3 +929,70 @@ class TestAsyncCockroachDBVectorStore:
             embedding, k=2, fetch_k=5
         )
         assert len(results) == 2
+
+
+async def test_multi_tenant_search_uses_vector_index(
+    cockroachdb_engine: CockroachDBEngine, connection_string: str
+) -> None:
+    """Multi-tenant search with namespace prefix column uses the vector index."""
+    from langchain_core.embeddings import DeterministicFakeEmbedding
+
+    from langchain_cockroachdb import AsyncCockroachDBVectorStore
+
+    # Create a table with namespace column
+    table_name = "multi_tenant_index_test"
+    await cockroachdb_engine.ainit_vectorstore_table(
+        table_name, 384, namespace_column="namespace", drop_if_exists=True
+    )
+
+    embeddings = DeterministicFakeEmbedding(size=384)
+    vectorstore = AsyncCockroachDBVectorStore(
+        engine=cockroachdb_engine,
+        embeddings=embeddings,
+        collection_name=table_name,
+        namespace="t1",
+    )
+
+    # Insert a handful of rows
+    await vectorstore.aadd_texts(["doc1", "doc2", "doc3", "doc4"])
+
+    # Create C-SPANN index with namespace as prefix column
+    index = CSPANNIndex(distance_strategy=DistanceStrategy.COSINE)
+    await vectorstore.aapply_vector_index(index, prefix_columns=["namespace"])
+
+    # Build the EXPLAIN query the way the store does
+    # Get the embedded query vector
+    query_vector = await embeddings.aembed_query("test query")
+
+    # Build the SQL that _search_by_vector uses
+    from langchain_cockroachdb._sql import vector_literal
+
+    explain_sql = f"""
+    EXPLAIN SELECT id, content, metadata, embedding <=> CAST(:embedding AS VECTOR) AS distance
+    FROM public.{table_name}
+    WHERE namespace = :namespace
+    ORDER BY embedding <=> CAST(:embedding AS VECTOR)
+    LIMIT 4
+    """
+
+    # Execute EXPLAIN with bound parameters (not literals)
+    async with cockroachdb_engine.engine.connect() as conn:
+        from sqlalchemy import text
+
+        result = await conn.execute(
+            text(explain_sql),
+            {"embedding": vector_literal(query_vector), "namespace": "t1"},
+        )
+        plan = "\n".join(row[0] for row in result.fetchall())
+
+    # Assert the plan uses the vector index
+    assert "vector search" in plan.lower(), f"No vector search in plan:\n{plan}"
+    
+    # Assert the index name appears
+    index_name = index.get_index_name(table_name, "embedding")
+    assert index_name in plan, f"Index {index_name} not in plan:\n{plan}"
+    
+    # Assert prefix spans appear (showing namespace constraint)
+    assert "prefix spans" in plan.lower(), f"No prefix spans in plan:\n{plan}"
+
+    await cockroachdb_engine.adrop_table(table_name)

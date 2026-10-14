@@ -148,6 +148,39 @@ class TestVectorStoreConfiguration:
         assert len(ids) == 2
 
     @pytest.mark.asyncio
+    async def test_retry_policy_inheritance_from_engine(
+        self, connection_string: str
+    ) -> None:
+        """Test that vectorstore inherits unspecified policy fields from engine."""
+        from langchain_core.embeddings import DeterministicFakeEmbedding
+
+        from langchain_cockroachdb import AsyncCockroachDBVectorStore, RetryPolicy
+
+        # Build engine with a non-default policy field
+        engine = CockroachDBEngine.from_connection_string(
+            connection_string,
+            retry_policy=RetryPolicy(attempt_timeout=7),
+        )
+        await engine.ainit_vectorstore_table("inherit_test", 384, drop_if_exists=True)
+
+        embeddings = DeterministicFakeEmbedding(size=384)
+
+        # Create store with only retry_max_attempts overridden
+        vectorstore = AsyncCockroachDBVectorStore(
+            engine=engine,
+            embeddings=embeddings,
+            collection_name="inherit_test",
+            retry_max_attempts=2,
+        )
+
+        # Assert that max_attempts is overridden AND attempt_timeout is inherited
+        assert vectorstore.retry_policy.max_attempts == 2
+        assert vectorstore.retry_policy.attempt_timeout == 7
+
+        await engine.adrop_table("inherit_test")
+        await engine.aclose()
+
+    @pytest.mark.asyncio
     async def test_custom_column_names(self, configured_engine: CockroachDBEngine) -> None:
         """Test custom column name configuration."""
         embeddings = DeterministicFakeEmbedding(size=384)
