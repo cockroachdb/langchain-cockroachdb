@@ -1,16 +1,25 @@
 """Async vector store implementation for CockroachDB with transaction retry support."""
 
+from __future__ import annotations
+
 import asyncio
+import json
+import logging
 import uuid
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
-from sqlalchemy import text
+from langchain_core.vectorstores.utils import maximal_marginal_relevance
+from sqlalchemy import bindparam, text
+from sqlalchemy.sql.elements import TextClause
 
+from langchain_cockroachdb._filters import FilterBuilder
+from langchain_cockroachdb._sql import parse_vector, validate_identifier, vector_literal
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import (
     FusionType,
@@ -18,10 +27,71 @@ from langchain_cockroachdb.hybrid_search_config import (
     min_max_normalize,
 )
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
+from langchain_cockroachdb.retry import RetryPolicy, resolve_retry_policy
+
+logger = logging.getLogger(__name__)
+
+# Arguments of ainit_vectorstore_table. The schema and column ones also
+# configure the store, so from_texts passes those to both.
+TABLE_ARGS = frozenset(
+    {
+        "schema",
+        "id_type",
+        "content_column",
+        "embedding_column",
+        "metadata_column",
+        "namespace_column",
+        "create_tsvector",
+        "fts_language",
+        "drop_if_exists",
+    }
+)
+SHARED_ARGS = frozenset(
+    {"schema", "content_column", "embedding_column", "metadata_column", "namespace_column"}
+)
+
+
+def split_from_texts_args(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split from_texts keyword arguments into table arguments and store arguments."""
+    table_args = {k: v for k, v in kwargs.items() if k in TABLE_ARGS}
+    store_args = {k: v for k, v in kwargs.items() if k not in TABLE_ARGS or k in SHARED_ARGS}
+    return table_args, store_args
+
+
+@dataclass
+class _Match:
+    """One search hit before it becomes a public result."""
+
+    document: Document
+    distance: float
+    embedding: list[float] | None = None
+
+
+@dataclass
+class _Rows:
+    """Validated input for an insert, one entry per document."""
+
+    texts: list[str]
+    embeddings: list[list[float]]
+    metadata_json: list[str]
+    ids: list[str]
+    batch_size: int
+
+
+def _check_batch_size(batch_size: Any) -> int:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    return batch_size
 
 
 class AsyncCockroachDBVectorStore(VectorStore):
-    """Async vector store using CockroachDB native VECTOR type and C-SPANN indexes."""
+    """Async vector store using CockroachDB native VECTOR type and C-SPANN indexes.
+
+    Every database call retries transient CockroachDB errors under
+    ``retry_policy``, which defaults to the engine's policy. Every write is
+    an idempotent UPSERT or DELETE, so retrying after an ambiguous result is
+    safe.
+    """
 
     def __init__(
         self,
@@ -39,11 +109,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
         namespace: str | None = None,
         hybrid_search_config: HybridSearchConfig | None = None,
         batch_size: int = 100,
-        retry_max_attempts: int = 3,
-        retry_initial_backoff: float = 0.1,
-        retry_max_backoff: float = 5.0,
-        retry_backoff_multiplier: float = 2.0,
-        retry_jitter: bool = True,
+        retry_policy: RetryPolicy | None = None,
+        retry_max_attempts: int | None = None,
+        retry_initial_backoff: float | None = None,
+        retry_max_backoff: float | None = None,
+        retry_backoff_multiplier: float | None = None,
+        retry_jitter: bool | None = None,
     ):
         """Initialize async vector store.
 
@@ -63,13 +134,19 @@ class AsyncCockroachDBVectorStore(VectorStore):
                 column (created with namespace_column param in ainit_vectorstore_table).
                 Default: None (no namespace filtering, backward compatible).
             hybrid_search_config: Optional hybrid search configuration
-            batch_size: Batch size for inserts - CockroachDB works best with smaller batches (default: 100)
-            retry_max_attempts: Maximum retry attempts for operations (default: 3)
-            retry_initial_backoff: Initial backoff delay in seconds (default: 0.1)
-            retry_max_backoff: Maximum backoff delay in seconds (default: 5.0)
-            retry_backoff_multiplier: Backoff multiplier (default: 2.0)
-            retry_jitter: Add randomization to backoff (default: True)
+            batch_size: Rows per insert statement; CockroachDB works best with
+                smaller VECTOR batches (default: 100)
+            retry_policy: How operations retry (default: the engine's policy)
+            retry_max_attempts: Override for retry_policy.max_attempts
+            retry_initial_backoff: Override for retry_policy.initial_backoff
+            retry_max_backoff: Override for retry_policy.max_backoff
+            retry_backoff_multiplier: Override for retry_policy.backoff_multiplier
+            retry_jitter: Override for retry_policy.jitter (True means 0.5)
         """
+        validate_identifier(collection_name, what="collection name")
+        validate_identifier(schema, what="schema")
+        for column in (content_column, embedding_column, metadata_column, id_column, namespace_column):
+            validate_identifier(column, what="column name")
         self.engine = engine
         self._embeddings = embeddings
         self.collection_name = collection_name
@@ -82,12 +159,16 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self.namespace_column = namespace_column
         self.namespace = namespace
         self.hybrid_search_config = hybrid_search_config
-        self.batch_size = batch_size
-        self.retry_max_attempts = retry_max_attempts
-        self.retry_initial_backoff = retry_initial_backoff
-        self.retry_max_backoff = retry_max_backoff
-        self.retry_backoff_multiplier = retry_backoff_multiplier
-        self.retry_jitter = retry_jitter
+        self.batch_size = _check_batch_size(batch_size)
+        self.retry_policy = resolve_retry_policy(
+            retry_policy,
+            base=engine.retry_policy,
+            max_attempts=retry_max_attempts,
+            initial_backoff=retry_initial_backoff,
+            max_backoff=retry_max_backoff,
+            backoff_multiplier=retry_backoff_multiplier,
+            jitter=retry_jitter,
+        )
         self._fqn = f"{schema}.{collection_name}"
 
     @property
@@ -95,12 +176,315 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """Get embeddings model."""
         return self._embeddings
 
-    def _namespace_filter(self) -> str:
-        """Return a SQL WHERE fragment for namespace filtering, or empty string."""
+    @property
+    def retry_max_attempts(self) -> int:
+        """Shorthand for ``retry_policy.max_attempts``."""
+        return self.retry_policy.max_attempts
+
+    @property
+    def retry_initial_backoff(self) -> float:
+        """Shorthand for ``retry_policy.initial_backoff``."""
+        return self.retry_policy.initial_backoff
+
+    @property
+    def retry_max_backoff(self) -> float:
+        """Shorthand for ``retry_policy.max_backoff``."""
+        return self.retry_policy.max_backoff
+
+    @property
+    def retry_backoff_multiplier(self) -> float:
+        """Shorthand for ``retry_policy.backoff_multiplier``."""
+        return self.retry_policy.backoff_multiplier
+
+    @property
+    def retry_jitter(self) -> bool:
+        """True when ``retry_policy.jitter`` is above zero."""
+        return self.retry_policy.jitter > 0
+
+    # Database work. These coroutines run on whichever loop the engine picks:
+    # the caller's loop for async methods, the background loop for sync ones.
+
+    async def _execute(
+        self,
+        statement: TextClause,
+        params: dict[str, Any] | None = None,
+        *,
+        label: str,
+        begin: bool = False,
+        ddl: bool = False,
+        settings: dict[str, int] | None = None,
+        fetch: bool = False,
+    ) -> list[Any]:
+        """Run one statement under the retry policy and the hang guard."""
+        timeout = self.retry_policy.ddl_attempt_timeout if ddl else self.retry_policy.attempt_timeout
+
+        async def attempt() -> list[Any]:
+            async with self.engine._connect(
+                begin=begin or bool(settings), timeout=timeout, label=label
+            ) as conn:
+                # SET LOCAL ends with the transaction, so nothing leaks into the pool
+                for name, value in (settings or {}).items():
+                    validate_identifier(name, what="session setting")
+                    await conn.execute(text(f"SET LOCAL {name} = {int(value)}"))
+                result = await conn.execute(statement, params or {})
+                return list(result.fetchall()) if fetch else []
+
+        return await self.retry_policy.arun(attempt, label=label)
+
+    def _where(self, builder: FilterBuilder, filter: dict | None, *conditions: str) -> str:
+        clauses = list(conditions)
         if self.namespace is not None:
-            escaped = self.namespace.replace("'", "''")
-            return f"{self.namespace_column} = '{escaped}'"
-        return ""
+            clauses.append(f"{self.namespace_column} = {builder.bind(self.namespace)}")
+        if filter:
+            clauses.append(builder.build(filter))
+        return "WHERE " + " AND ".join(clauses) if clauses else ""
+
+    def _prepare_rows(
+        self,
+        texts: list[str],
+        embeddings: Sequence[Sequence[float]],
+        metadatas: list[dict] | None,
+        ids: Sequence[str | None] | None,
+        kwargs: dict[str, Any],
+    ) -> _Rows:
+        """Validate and serialize everything up front, so bad input writes nothing."""
+        count = len(texts)
+        if len(embeddings) != count:
+            raise ValueError(f"Got {len(embeddings)} embeddings for {count} texts")
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
+        elif len(metadatas) != count:
+            raise ValueError(f"Got {len(metadatas)} metadatas for {count} texts")
+        if ids is None:
+            resolved_ids = [str(uuid.uuid4()) for _ in texts]
+        elif len(ids) != count:
+            raise ValueError(f"Got {len(ids)} ids for {count} texts")
+        else:
+            resolved_ids = [str(i) if i is not None else str(uuid.uuid4()) for i in ids]
+        metadata_json = []
+        for position, metadata in enumerate(metadatas):
+            try:
+                metadata_json.append(json.dumps(metadata if metadata is not None else {}))
+            except TypeError as error:
+                raise TypeError(
+                    f"Metadata for text {position} is not JSON serializable: {error}"
+                ) from error
+        batch_size = _check_batch_size(kwargs.get("batch_size", self.batch_size))
+        return _Rows(
+            texts, [list(map(float, e)) for e in embeddings], metadata_json, resolved_ids, batch_size
+        )
+
+    async def _add_embeddings(self, rows: _Rows) -> list[str]:
+        for start in range(0, len(rows.texts), rows.batch_size):
+            end = start + rows.batch_size
+            await self._insert_batch(
+                rows.texts[start:end], rows.embeddings[start:end], rows.metadata_json[start:end], rows.ids[start:end]
+            )
+        return rows.ids
+
+    async def _insert_batch(
+        self, texts: list[str], embeddings: list[list[float]], metadata_json: list[str], ids: list[str]
+    ) -> None:
+        """Upsert one batch; each batch is its own retried transaction."""
+        columns = [self.id_column, self.content_column, self.embedding_column, self.metadata_column]
+        if self.namespace is not None:
+            columns.append(self.namespace_column)
+        params: dict[str, Any] = {}
+        rows = []
+        for n, (doc_id, content, embedding, metadata) in enumerate(
+            zip(ids, texts, embeddings, metadata_json, strict=True)
+        ):
+            params.update(
+                {
+                    f"id{n}": doc_id,
+                    f"content{n}": content,
+                    f"embedding{n}": vector_literal(embedding),
+                    f"metadata{n}": metadata,
+                }
+            )
+            values = [f":id{n}", f":content{n}", f"CAST(:embedding{n} AS VECTOR)", f"CAST(:metadata{n} AS JSONB)"]
+            if self.namespace is not None:
+                values.append(":namespace")
+            rows.append("(" + ", ".join(values) + ")")
+        if self.namespace is not None:
+            params["namespace"] = self.namespace
+        updates = ", ".join(f"{column} = EXCLUDED.{column}" for column in columns[1:])
+        sql = (
+            f"INSERT INTO {self._fqn} ({', '.join(columns)}) VALUES {', '.join(rows)} "
+            f"ON CONFLICT ({self.id_column}) DO UPDATE SET {updates}"
+        )
+        await self._execute(text(sql), params, label=f"insert into {self._fqn}", begin=True)
+
+    async def _search_by_vector(
+        self,
+        embedding: Sequence[float],
+        k: int,
+        filter: dict | None,
+        query_options: CSPANNQueryOptions | None,
+        *,
+        with_embeddings: bool = False,
+    ) -> list[_Match]:
+        if int(k) <= 0:
+            return []
+        builder = FilterBuilder(self.metadata_column)
+        where = self._where(builder, filter)
+        distance = (
+            f"{self.embedding_column} {self.distance_strategy.get_operator()} CAST(:query_vector AS VECTOR)"
+        )
+        extra = f", {self.embedding_column}" if with_embeddings else ""
+        sql = (
+            f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column}, "
+            f"{distance} AS distance{extra} FROM {self._fqn} {where} "
+            f"ORDER BY {distance} LIMIT {int(k)}"
+        )
+        params = dict(builder.params, query_vector=vector_literal(embedding))
+        settings = query_options.get_session_settings() if query_options else None
+        rows = await self._execute(
+            text(sql), params, label=f"search {self._fqn}", settings=settings or None, fetch=True
+        )
+        return [
+            _Match(
+                Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}),
+                float(row[3]),
+                parse_vector(row[4]) if with_embeddings else None,
+            )
+            for row in rows
+        ]
+
+    async def _fts_search(self, query: str, k: int, filter: dict | None) -> list[tuple[str, float]]:
+        """Full-text search returning (id, ts_rank score), best first.
+
+        Uses plainto_tsquery because CockroachDB has no websearch_to_tsquery.
+        """
+        config = self.hybrid_search_config
+        language = config.fts_query_language if config else "english"
+        normalization = config.fts_rank_normalization if config else 0
+        tsvector = f"{self.content_column}_tsvector"
+        tsquery = f"plainto_tsquery('{language}', :fts_query)"
+        builder = FilterBuilder(self.metadata_column)
+        where = self._where(builder, filter, f"{tsvector} @@ {tsquery}")
+        sql = (
+            f"SELECT {self.id_column}, ts_rank({tsvector}, {tsquery}, {int(normalization)}) AS fts_score "
+            f"FROM {self._fqn} {where} ORDER BY fts_score DESC LIMIT {int(k)}"
+        )
+        rows = await self._execute(
+            text(sql), dict(builder.params, fts_query=query), label=f"full-text search {self._fqn}", fetch=True
+        )
+        return [(str(row[0]), float(row[1])) for row in rows]
+
+    async def _hybrid_search(
+        self,
+        query: str,
+        embedding: Sequence[float],
+        k: int,
+        filter: dict | None,
+        query_options: CSPANNQueryOptions | None,
+        fetch_k: int | None,
+    ) -> list[tuple[Document, float]]:
+        """Run the vector and full-text legs together and fuse their rankings."""
+        config = self.hybrid_search_config
+        assert config is not None
+        pool = fetch_k if fetch_k is not None else max(k * 4, 20)
+        matches, fts_scores = await asyncio.gather(
+            self._search_by_vector(embedding, pool, filter, query_options),
+            self._fts_search(query, pool, filter),
+        )
+        documents = {str(m.document.id): m.document for m in matches}
+        # Distances sort ascending for every strategy, so negating them gives a
+        # "higher is better" score without caring which operator ran
+        vector_scores = [(str(m.document.id), -m.distance) for m in matches]
+        if config.fusion_type == FusionType.WEIGHTED_SUM:
+            vector_scores = min_max_normalize(vector_scores)
+            fts_scores = min_max_normalize(fts_scores)
+        fused = config.fuse_scores(fts_scores, vector_scores)[:k]
+        missing = [doc_id for doc_id, _ in fused if doc_id not in documents]
+        if missing:
+            for doc in await self._get_by_ids(missing):
+                documents[str(doc.id)] = doc
+        return [(documents[doc_id], score) for doc_id, score in fused if doc_id in documents]
+
+    async def _get_by_ids(self, ids: Sequence[str]) -> list[Document]:
+        if not ids:
+            return []
+        builder = FilterBuilder(self.metadata_column)
+        where = self._where(builder, None, f"{self.id_column} IN :ids")
+        statement = text(
+            f"SELECT {self.id_column}, {self.content_column}, {self.metadata_column} FROM {self._fqn} {where}"
+        ).bindparams(bindparam("ids", expanding=True))
+        rows = await self._execute(
+            statement, dict(builder.params, ids=[str(i) for i in ids]), label=f"get from {self._fqn}", fetch=True
+        )
+        return [Document(id=str(row[0]), page_content=row[1], metadata=row[2] or {}) for row in rows]
+
+    async def _delete(self, ids: Sequence[str]) -> None:
+        builder = FilterBuilder(self.metadata_column)
+        where = self._where(builder, None, f"{self.id_column} IN :ids")
+        statement = text(f"DELETE FROM {self._fqn} {where}").bindparams(bindparam("ids", expanding=True))
+        await self._execute(
+            statement, dict(builder.params, ids=[str(i) for i in ids]), label=f"delete from {self._fqn}", begin=True
+        )
+
+    async def _apply_vector_index(self, index: CSPANNIndex, prefix_columns: list[str] | None) -> None:
+        for column in prefix_columns or []:
+            validate_identifier(column, what="prefix column")
+        name = index.get_index_name(self.collection_name, self.embedding_column)
+        existing = await self._execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname = :schema AND tablename = :table AND indexname = :name"
+            ),
+            {"schema": self.schema, "table": self.collection_name, "name": name},
+            label=f"look up vector index {name}",
+            fetch=True,
+        )
+        opclass = index.distance_strategy.get_opclass()
+        if existing:
+            if opclass not in existing[0][0]:
+                logger.warning(
+                    "Vector index %s already exists without %s, so %s searches will not use it. "
+                    "Drop it with adrop_vector_index() and apply it again. Indexes created before "
+                    "langchain-cockroachdb 0.4.0 always used vector_l2_ops.",
+                    name,
+                    opclass,
+                    index.distance_strategy.name,
+                )
+            return
+        sql = index.get_create_index_sql(
+            self.collection_name, self.embedding_column, schema=self.schema, prefix_columns=prefix_columns
+        )
+        await self._execute(text(sql), label=f"create vector index {name}", ddl=True)
+
+    async def _drop_vector_index(self, index: CSPANNIndex) -> None:
+        sql = index.get_drop_index_sql(self.collection_name, self.embedding_column, schema=self.schema)
+        await self._execute(
+            text(sql),
+            label=f"drop vector index {index.get_index_name(self.collection_name, self.embedding_column)}",
+            ddl=True,
+        )
+
+    def _select_mmr(
+        self, embedding: Sequence[float], matches: list[_Match], k: int, lambda_mult: float
+    ) -> list[Document]:
+        """Pick k diverse documents from candidates using their stored embeddings."""
+        if not matches:
+            return []
+        chosen = maximal_marginal_relevance(
+            np.array(embedding, dtype=np.float32),
+            [m.embedding for m in matches],
+            lambda_mult=lambda_mult,
+            k=min(k, len(matches)),
+        )
+        return [matches[i].document for i in chosen]
+
+    @staticmethod
+    def _engine_for(engine: CockroachDBEngine | None, connection_string: str | None) -> CockroachDBEngine:
+        if engine is not None:
+            return engine
+        if connection_string is None:
+            raise ValueError("Either engine or connection_string must be provided")
+        return CockroachDBEngine.from_connection_string(connection_string)
+
+    # Async API
 
     async def aadd_texts(
         self,
@@ -109,7 +493,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         ids: list[str] | None = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add texts to vector store with automatic retry on failures.
+        """Embed and add texts, retrying transient errors per batch.
 
         Args:
             texts: Texts to add
@@ -120,173 +504,34 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of IDs for added texts
         """
-
         texts_list = list(texts)
         if not texts_list:
             return []
-
         embeddings = await self._embeddings.aembed_documents(texts_list)
+        return await self.aadd_embeddings(texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs)
 
-        if metadatas is None:
-            metadatas = [{} for _ in texts_list]
-
-        if ids is None:
-            ids = [str(uuid.uuid4()) for _ in texts_list]
-        else:
-            ids = [id if id is not None else str(uuid.uuid4()) for id in ids]
-
-        batch_size = kwargs.get("batch_size", self.batch_size)
-
-        for i in range(0, len(texts_list), batch_size):
-            batch_texts = texts_list[i : i + batch_size]
-            batch_embeddings = embeddings[i : i + batch_size]
-            batch_metadatas = metadatas[i : i + batch_size]
-            batch_ids = ids[i : i + batch_size]
-
-            await self._insert_batch(batch_texts, batch_embeddings, batch_metadatas, batch_ids)
-
-        return ids
-
-    async def _insert_batch(
+    async def aadd_embeddings(
         self,
-        texts: list[str],
+        texts: Iterable[str],
         embeddings: list[list[float]],
-        metadatas: list[dict],
-        ids: list[str],
-    ) -> None:
-        """Insert a batch of vectors."""
-        import json
-
-        has_ns = self.namespace is not None
-        ns_col = f", {self.namespace_column}" if has_ns else ""
-        ns_escaped = self.namespace.replace("'", "''") if has_ns and self.namespace else ""
-
-        values = []
-        for content, embedding, metadata, doc_id in zip(
-            texts, embeddings, metadatas, ids, strict=True
-        ):
-            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-            escaped_content = content.replace("'", "''")
-            metadata_json = json.dumps(metadata).replace("'", "''")
-            ns_val = f", '{ns_escaped}'" if has_ns else ""
-            values.append(
-                f"('{doc_id}', '{escaped_content}', '{embedding_str}', "
-                f"'{metadata_json}'::jsonb{ns_val})"
-            )
-
-        ns_update = (
-            f", {self.namespace_column} = EXCLUDED.{self.namespace_column}" if has_ns else ""
-        )
-        sql = f"""
-            INSERT INTO {self._fqn} ({self.id_column}, {self.content_column}, {self.embedding_column}, {self.metadata_column}{ns_col})
-            VALUES {",".join(values)}
-            ON CONFLICT ({self.id_column}) DO UPDATE SET
-                {self.content_column} = EXCLUDED.{self.content_column},
-                {self.embedding_column} = EXCLUDED.{self.embedding_column},
-                {self.metadata_column} = EXCLUDED.{self.metadata_column}{ns_update}
-        """
-
-        async with self.engine.engine.begin() as conn:
-            await conn.execute(text(sql))
-
-    async def _afts_search(
-        self,
-        query: str,
-        k: int = 4,
-        filter: dict | None = None,
-    ) -> list[tuple[str, float]]:
-        """Run full-text search and return (id, ts_rank score) tuples.
-
-        Requires the table to have a tsvector column, created by passing
-        create_tsvector=True to ainit_vectorstore_table. Uses plainto_tsquery
-        because CockroachDB does not support websearch_to_tsquery.
+        metadatas: list[dict] | None = None,
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        """Add texts with precomputed embeddings.
 
         Args:
-            query: Query text
-            k: Number of results
-            filter: Metadata filter
+            texts: Texts to add
+            embeddings: One embedding per text
+            metadatas: Optional metadata for each text
+            ids: Optional IDs for texts
+            **kwargs: Additional arguments (batch_size override supported)
 
         Returns:
-            List of (id, score) tuples ordered by rank, best first
+            List of IDs for added texts
         """
-        config = self.hybrid_search_config
-        language = config.fts_query_language if config else "english"
-        rank_normalization = config.fts_rank_normalization if config else 0
-        tsvector_column = f"{self.content_column}_tsvector"
-
-        conditions = []
-        ns_filter = self._namespace_filter()
-        if ns_filter:
-            conditions.append(ns_filter)
-        if filter:
-            conditions.append(self._build_filter_clause(filter))
-        conditions.append(f"{tsvector_column} @@ plainto_tsquery('{language}', :fts_query)")
-
-        sql = f"""
-            SELECT {self.id_column},
-                   ts_rank({tsvector_column}, plainto_tsquery('{language}', :fts_query),
-                           {int(rank_normalization)}) AS fts_score
-            FROM {self._fqn}
-            WHERE {" AND ".join(conditions)}
-            ORDER BY fts_score DESC
-            LIMIT {int(k)}
-        """
-
-        async with self.engine.engine.connect() as conn:
-            result = await conn.execute(text(sql), {"fts_query": query})
-            rows = result.fetchall()
-
-        return [(str(row[0]), float(row[1])) for row in rows]
-
-    async def _ahybrid_search_with_score(
-        self,
-        query: str,
-        k: int,
-        filter: dict | None,
-        query_options: CSPANNQueryOptions | None,
-        **kwargs: Any,
-    ) -> list[tuple[Document, float]]:
-        """Run vector and FTS searches in parallel and fuse the results.
-
-        Both legs fetch a larger candidate pool than k so the fusion has
-        something to work with, then the fused top k is returned. Scores are
-        the fused scores, not raw distances.
-        """
-        config = self.hybrid_search_config
-        assert config is not None
-        fetch_k = kwargs.pop("fetch_k", max(k * 4, 20))
-
-        query_embedding = await self._embeddings.aembed_query(query)
-        vector_results, fts_scores = await asyncio.gather(
-            self.asimilarity_search_with_score_by_vector(
-                query_embedding, k=fetch_k, filter=filter, query_options=query_options, **kwargs
-            ),
-            self._afts_search(query, k=fetch_k, filter=filter),
-        )
-
-        documents_by_id: dict[str, Document] = {}
-        vector_scores: list[tuple[str, float]] = []
-        for doc, distance in vector_results:
-            doc_id = str(doc.id)
-            documents_by_id[doc_id] = doc
-            # Distances sort ascending for every strategy, so negating them gives
-            # a proper "higher is better" score without caring which operator ran
-            vector_scores.append((doc_id, -distance))
-
-        if config.fusion_type == FusionType.WEIGHTED_SUM:
-            vector_scores = min_max_normalize(vector_scores)
-            fts_scores = min_max_normalize(fts_scores)
-
-        fused = config.fuse_scores(fts_scores, vector_scores)[:k]
-
-        missing_ids = [doc_id for doc_id, _ in fused if doc_id not in documents_by_id]
-        if missing_ids:
-            for doc in await self.aget_by_ids(missing_ids):
-                documents_by_id[str(doc.id)] = doc
-
-        return [
-            (documents_by_id[doc_id], score) for doc_id, score in fused if doc_id in documents_by_id
-        ]
+        rows = self._prepare_rows(list(texts), embeddings, metadatas, ids, kwargs)
+        return await self.engine._run_as_async(self._add_embeddings(rows))
 
     async def asimilarity_search_with_score(
         self,
@@ -313,14 +558,13 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             List of (document, score) tuples
         """
+        embedding = await self._embeddings.aembed_query(query)
         if self.hybrid_search_config is not None:
-            return await self._ahybrid_search_with_score(
-                query, k=k, filter=filter, query_options=query_options, **kwargs
+            return await self.engine._run_as_async(
+                self._hybrid_search(query, embedding, k, filter, query_options, kwargs.get("fetch_k"))
             )
-
-        query_embedding = await self._embeddings.aembed_query(query)
         return await self.asimilarity_search_with_score_by_vector(
-            query_embedding, k=k, filter=filter, query_options=query_options, **kwargs
+            embedding, k=k, filter=filter, query_options=query_options
         )
 
     async def asimilarity_search_with_score_by_vector(
@@ -341,89 +585,23 @@ class AsyncCockroachDBVectorStore(VectorStore):
             **kwargs: Additional arguments
 
         Returns:
-            List of (document, score) tuples
+            List of (document, distance) tuples
         """
-        operator = self.distance_strategy.get_operator()
-        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-        conditions = []
-        ns_filter = self._namespace_filter()
-        if ns_filter:
-            conditions.append(ns_filter)
-        if filter:
-            conditions.append(self._build_filter_clause(filter))
-        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
-
-        sql = f"""
-            SELECT {self.id_column}, {self.content_column}, {self.metadata_column},
-                   {self.embedding_column} {operator} '{embedding_str}' AS distance
-            FROM {self._fqn}
-            {where_clause}
-            ORDER BY {self.embedding_column} {operator} '{embedding_str}'
-            LIMIT {k}
-        """
-
-        async with self.engine.engine.connect() as conn:
-            if query_options:
-                for setting, value in query_options.get_session_settings().items():
-                    await conn.execute(text(f"SET {setting} = {value}"))
-
-            result = await conn.execute(text(sql))
-            rows = result.fetchall()
-
-        documents = []
-        for row in rows:
-            doc = Document(
-                id=str(row[0]),
-                page_content=row[1],
-                metadata=row[2] or {},
-            )
-            documents.append((doc, float(row[3])))
-
-        return documents
+        matches = await self.engine._run_as_async(self._search_by_vector(embedding, k, filter, query_options))
+        return [(match.document, match.distance) for match in matches]
 
     async def asimilarity_search(
-        self,
-        query: str,
-        k: int = 4,
-        filter: dict | None = None,
-        **kwargs: Any,
+        self, query: str, k: int = 4, filter: dict | None = None, **kwargs: Any
     ) -> list[Document]:
-        """Search for similar documents.
-
-        Args:
-            query: Query text
-            k: Number of results
-            filter: Metadata filter
-            **kwargs: Additional arguments
-
-        Returns:
-            List of documents
-        """
+        """Search for similar documents."""
         results = await self.asimilarity_search_with_score(query, k=k, filter=filter, **kwargs)
         return [doc for doc, _ in results]
 
     async def asimilarity_search_by_vector(
-        self,
-        embedding: list[float],
-        k: int = 4,
-        filter: dict | None = None,
-        **kwargs: Any,
+        self, embedding: list[float], k: int = 4, filter: dict | None = None, **kwargs: Any
     ) -> list[Document]:
-        """Return docs most similar to embedding vector.
-
-        Args:
-            embedding: Embedding to look up documents similar to.
-            k: Number of results to return.
-            filter: Metadata filter.
-            **kwargs: Additional arguments.
-
-        Returns:
-            List of documents most similar to the query vector.
-        """
-        results = await self.asimilarity_search_with_score_by_vector(
-            embedding, k=k, filter=filter, **kwargs
-        )
+        """Return docs most similar to embedding vector."""
+        results = await self.asimilarity_search_with_score_by_vector(embedding, k=k, filter=filter, **kwargs)
         return [doc for doc, _ in results]
 
     async def amax_marginal_relevance_search(
@@ -435,7 +613,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         filter: dict | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Max marginal relevance search.
+        """Max marginal relevance search using the stored embeddings of the candidates.
 
         Args:
             query: Query text
@@ -443,60 +621,32 @@ class AsyncCockroachDBVectorStore(VectorStore):
             fetch_k: Number of candidates to fetch
             lambda_mult: Diversity parameter (0=max diversity, 1=max relevance)
             filter: Metadata filter
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (query_options supported)
 
         Returns:
             List of documents
         """
-        query_embedding = await self._embeddings.aembed_query(query)
-        candidates = await self.asimilarity_search_with_score_by_vector(
-            query_embedding, k=fetch_k, filter=filter, **kwargs
+        embedding = await self._embeddings.aembed_query(query)
+        return await self.amax_marginal_relevance_search_by_vector(
+            embedding, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult, filter=filter, **kwargs
         )
 
-        if not candidates:
-            return []
-
-        query_vec = np.array(query_embedding)
-        candidate_vecs = []
-        candidate_docs = []
-
-        for doc, _score in candidates:
-            doc_embedding = await self._embeddings.aembed_query(doc.page_content)
-            candidate_vecs.append(doc_embedding)
-            candidate_docs.append(doc)
-
-        selected_indices = [0]
-        selected = [candidate_vecs[0]]
-
-        while len(selected_indices) < min(k, len(candidates)):
-            best_score = -float("inf")
-            best_idx = -1
-
-            for i, vec in enumerate(candidate_vecs):
-                if i in selected_indices:
-                    continue
-
-                relevance = np.dot(query_vec, vec)
-                max_similarity = max(np.dot(vec, s) for s in selected)
-                score = lambda_mult * relevance - (1 - lambda_mult) * max_similarity
-
-                if score > best_score:
-                    best_score = score
-                    best_idx = i
-
-            if best_idx == -1:
-                break
-
-            selected_indices.append(best_idx)
-            selected.append(candidate_vecs[best_idx])
-
-        return [candidate_docs[i] for i in selected_indices]
-
-    async def adelete(
+    async def amax_marginal_relevance_search_by_vector(
         self,
-        ids: list[str] | None = None,
+        embedding: list[float],
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        filter: dict | None = None,
         **kwargs: Any,
-    ) -> bool | None:
+    ) -> list[Document]:
+        """Max marginal relevance search from a query embedding."""
+        matches = await self.engine._run_as_async(
+            self._search_by_vector(embedding, fetch_k, filter, kwargs.get("query_options"), with_embeddings=True)
+        )
+        return self._select_mmr(embedding, matches, k, lambda_mult)
+
+    async def adelete(self, ids: list[str] | None = None, **kwargs: Any) -> bool | None:
         """Delete documents by IDs.
 
         Args:
@@ -508,168 +658,36 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """
         if not ids:
             return True
-
-        ids_str = ",".join(f"'{id}'" for id in ids)
-        ns_filter = self._namespace_filter()
-        ns_clause = f" AND {ns_filter}" if ns_filter else ""
-        sql = f"DELETE FROM {self._fqn} WHERE {self.id_column} IN ({ids_str}){ns_clause}"
-
-        async with self.engine.engine.begin() as conn:
-            await conn.execute(text(sql))
-
+        await self.engine._run_as_async(self._delete(ids))
         return True
 
     async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
-        """Get documents by their IDs.
-
-        Args:
-            ids: List of IDs to retrieve.
-
-        Returns:
-            List of Document objects found.
-        """
-        if not ids:
-            return []
-
-        ids_str = ",".join(f"'{id}'" for id in ids)
-        ns_filter = self._namespace_filter()
-        ns_clause = f" AND {ns_filter}" if ns_filter else ""
-        sql = f"""
-            SELECT {self.id_column}, {self.content_column}, {self.metadata_column}
-            FROM {self._fqn}
-            WHERE {self.id_column} IN ({ids_str}){ns_clause}
-        """
-
-        async with self.engine.engine.connect() as conn:
-            result = await conn.execute(text(sql))
-            rows = result.fetchall()
-
-        return [
-            Document(
-                id=str(row[0]),
-                page_content=row[1],
-                metadata=row[2] or {},
-            )
-            for row in rows
-        ]
+        """Get documents by their IDs (order not guaranteed)."""
+        return await self.engine._run_as_async(self._get_by_ids(ids))
 
     def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
-        """Get documents by their IDs (sync).
+        """Get documents by their IDs (sync)."""
+        return self.engine._run_as_sync(self._get_by_ids(ids))
 
-        Args:
-            ids: List of IDs to retrieve.
+    async def aapply_vector_index(self, index: CSPANNIndex, prefix_columns: list[str] | None = None) -> None:
+        """Apply a C-SPANN vector index.
 
-        Returns:
-            List of Document objects found.
-        """
-        import asyncio
-
-        return asyncio.run(self.aget_by_ids(ids))
-
-    async def aapply_vector_index(
-        self,
-        index: CSPANNIndex,
-        prefix_columns: list[str] | None = None,
-    ) -> None:
-        """Apply C-SPANN vector index.
+        Warns instead of rebuilding when an index with the same name exists
+        with a different operator class.
 
         Args:
             index: Index configuration
             prefix_columns: Optional prefix columns for multi-tenant indexes
         """
-        sql = index.get_create_index_sql(
-            self.collection_name,
-            self.embedding_column,
-            schema=self.schema,
-            prefix_columns=prefix_columns,
-        )
-
-        async with self.engine.engine.begin() as conn:
-            await conn.execute(text(sql))
+        await self.engine._run_as_async(self._apply_vector_index(index, prefix_columns))
 
     async def adrop_vector_index(self, index: CSPANNIndex) -> None:
-        """Drop vector index.
+        """Drop a vector index.
 
         Args:
             index: Index configuration
         """
-        sql = index.get_drop_index_sql(
-            self.collection_name,
-            self.embedding_column,
-            schema=self.schema,
-        )
-
-        async with self.engine.engine.begin() as conn:
-            await conn.execute(text(sql))
-
-    def _build_filter_clause(self, filter: dict) -> str:
-        """Build WHERE clause from filter dictionary.
-
-        Supports operators: $and, $or, $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin
-        """
-        import json
-
-        if not filter:
-            return ""
-
-        if "$and" in filter:
-            clauses = [self._build_filter_clause(f) for f in filter["$and"]]
-            return "(" + " AND ".join(clauses) + ")"
-
-        if "$or" in filter:
-            clauses = [self._build_filter_clause(f) for f in filter["$or"]]
-            return "(" + " OR ".join(clauses) + ")"
-
-        clauses = []
-        for key, value in filter.items():
-            if isinstance(value, dict):
-                for op, op_value in value.items():
-                    clause = self._build_operator_clause(key, op, op_value)
-                    clauses.append(clause)
-            elif isinstance(value, str):
-                json_val = json.dumps(value)
-                clauses.append(f"{self.metadata_column}->'{key}' = '{json_val}'::jsonb")
-            else:
-                clauses.append(f"{self.metadata_column}->'{key}' = '{value}'")
-
-        return " AND ".join(clauses) if clauses else "true"
-
-    def _build_operator_clause(self, key: str, operator: str, value: Any) -> str:
-        """Build operator clause."""
-        import json
-
-        col = f"{self.metadata_column}->'{key}'"
-
-        if operator == "$eq":
-            if isinstance(value, str):
-                json_val = json.dumps(value)
-                return f"{col} = '{json_val}'::jsonb"
-            return f"{col} = '{value}'"
-        elif operator == "$ne":
-            if isinstance(value, str):
-                json_val = json.dumps(value)
-                return f"{col} != '{json_val}'::jsonb"
-            return f"{col} != '{value}'"
-        elif operator == "$gt":
-            return f"({col})::numeric > {value}"
-        elif operator == "$gte":
-            return f"({col})::numeric >= {value}"
-        elif operator == "$lt":
-            return f"({col})::numeric < {value}"
-        elif operator == "$lte":
-            return f"({col})::numeric <= {value}"
-        elif operator == "$in":
-            values = ",".join(
-                f"'{json.dumps(v)}'::jsonb" if isinstance(v, str) else f"'{v}'" for v in value
-            )
-            return f"{col} IN ({values})"
-        elif operator == "$nin":
-            values = ",".join(
-                f"'{json.dumps(v)}'::jsonb" if isinstance(v, str) else f"'{v}'" for v in value
-            )
-            return f"{col} NOT IN ({values})"
-        else:
-            raise ValueError(f"Unsupported operator: {operator}")
+        await self.engine._run_as_async(self._drop_vector_index(index))
 
     @classmethod
     async def afrom_texts(
@@ -677,71 +695,54 @@ class AsyncCockroachDBVectorStore(VectorStore):
         texts: list[str],
         embedding: Embeddings,
         metadatas: list[dict] | None = None,
+        *,
+        ids: list[str] | None = None,
         engine: CockroachDBEngine | None = None,
         connection_string: str | None = None,
         collection_name: str = "langchain_vectors",
         **kwargs: Any,
-    ) -> "AsyncCockroachDBVectorStore":
-        """Create vector store from texts.
+    ) -> AsyncCockroachDBVectorStore:
+        """Create the table if needed, then add texts.
+
+        Table arguments (id_type, create_tsvector, fts_language, drop_if_exists
+        and the schema and column names) go to ainit_vectorstore_table; the
+        rest configure the store.
 
         Args:
             texts: Texts to add
             embedding: Embeddings model
             metadatas: Optional metadata
+            ids: Optional IDs
             engine: CockroachDBEngine instance
             connection_string: Connection string (if engine not provided)
             collection_name: Table name
-            **kwargs: Additional arguments
+            **kwargs: Table and store arguments
 
         Returns:
             AsyncCockroachDBVectorStore instance
         """
-        if engine is None:
-            if connection_string is None:
-                raise ValueError("Either engine or connection_string must be provided")
-            engine = CockroachDBEngine.from_connection_string(connection_string)
-
-        sample_embedding = await embedding.aembed_query("sample")
-        vector_dim = len(sample_embedding)
-
-        await engine.ainit_vectorstore_table(collection_name, vector_dim, **kwargs)
-
-        store = cls(
-            engine=engine,
-            embeddings=embedding,
-            collection_name=collection_name,
-            **kwargs,
-        )
-
-        await store.aadd_texts(texts, metadatas=metadatas)
-
+        resolved = cls._engine_for(engine, connection_string)
+        texts = list(texts)
+        vectors = await embedding.aembed_documents(texts) if texts else []
+        dimension = len(vectors[0]) if vectors else len(await embedding.aembed_query("dimension probe"))
+        table_args, store_args = split_from_texts_args(kwargs)
+        await resolved.ainit_vectorstore_table(collection_name, dimension, **table_args)
+        store = cls(engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args)
+        if texts:
+            await store.aadd_embeddings(texts, vectors, metadatas=metadatas, ids=ids)
         return store
 
-    def add_texts(
-        self,
-        texts: Iterable[str],
-        metadatas: list[dict] | None = None,
-        **kwargs: Any,
-    ) -> list[str]:
+    def add_texts(self, texts: Iterable[str], metadatas: list[dict] | None = None, **kwargs: Any) -> list[str]:
         """Sync wrapper - not implemented for async-only store."""
-        raise NotImplementedError("Use aadd_texts for async vector store")
+        raise NotImplementedError("Use aadd_texts, or CockroachDBVectorStore for sync methods")
 
-    def similarity_search(
-        self,
-        query: str,
-        k: int = 4,
-        **kwargs: Any,
-    ) -> list[Document]:
+    def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
         """Sync wrapper - not implemented for async-only store."""
-        raise NotImplementedError("Use asimilarity_search for async vector store")
+        raise NotImplementedError("Use asimilarity_search, or CockroachDBVectorStore for sync methods")
 
     @classmethod
     def from_texts(
-        cls,
-        texts: list[str],
-        embedding: Embeddings,
-        metadatas: list[dict] | None = None,
-        **kwargs: Any,
-    ) -> "AsyncCockroachDBVectorStore":
+        cls, texts: list[str], embedding: Embeddings, metadatas: list[dict] | None = None, **kwargs: Any
+    ) -> AsyncCockroachDBVectorStore:
         """Sync wrapper - not implemented for async-only store."""
-        raise NotImplementedError("Use afrom_texts for async vector store")
+        raise NotImplementedError("Use afrom_texts, or CockroachDBVectorStore for sync methods")

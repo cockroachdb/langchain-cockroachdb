@@ -2,6 +2,13 @@
 
 from enum import Enum
 
+from langchain_cockroachdb._sql import validate_identifier
+
+
+def _check_positive_int(value: object, what: str) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError(f"{what} must be a positive integer")
+
 
 class DistanceStrategy(str, Enum):
     """Distance strategies for vector similarity."""
@@ -50,10 +57,18 @@ class CSPANNIndex:
             max_partition_size: Maximum partition size for C-SPANN
             name: Optional custom index name
         """
+        if name is not None:
+            validate_identifier(name, what="index name")
+        _check_positive_int(min_partition_size, "min_partition_size")
+        _check_positive_int(max_partition_size, "max_partition_size")
         self.distance_strategy = distance_strategy
         self.min_partition_size = min_partition_size
         self.max_partition_size = max_partition_size
         self.name = name
+
+    def get_index_name(self, table_name: str, column_name: str) -> str:
+        """Name of the index on ``table_name.column_name``."""
+        return self.name or f"{table_name}_{column_name}_vector_idx"
 
     def get_create_index_sql(
         self,
@@ -65,6 +80,10 @@ class CSPANNIndex:
     ) -> str:
         """Generate CREATE VECTOR INDEX SQL.
 
+        The vector column carries the operator class of the distance strategy;
+        without it CockroachDB builds a vector_l2_ops index that cosine and
+        inner product searches cannot use.
+
         Args:
             table_name: Target table name
             column_name: Vector column name
@@ -74,31 +93,22 @@ class CSPANNIndex:
         Returns:
             SQL statement to create the index
         """
-        index_name = self.name or f"{table_name}_{column_name}_vector_idx"
-        fqn = f"{schema}.{table_name}"
-
-        columns = ", ".join(prefix_columns + [column_name]) if prefix_columns else column_name
-
-        sql = f"CREATE VECTOR INDEX IF NOT EXISTS {index_name} ON {fqn} ({columns})"
-
+        vector_column = f"{column_name} {self.distance_strategy.get_opclass()}"
+        columns = ", ".join([*(prefix_columns or []), vector_column])
+        sql = (
+            f"CREATE VECTOR INDEX IF NOT EXISTS {self.get_index_name(table_name, column_name)} "
+            f"ON {schema}.{table_name} ({columns})"
+        )
         with_clauses = []
         if self.min_partition_size is not None:
             with_clauses.append(f"min_partition_size = {self.min_partition_size}")
         if self.max_partition_size is not None:
             with_clauses.append(f"max_partition_size = {self.max_partition_size}")
-
         if with_clauses:
             sql += f" WITH ({', '.join(with_clauses)})"
-
         return sql
 
-    def get_drop_index_sql(
-        self,
-        table_name: str,
-        column_name: str,
-        *,
-        schema: str = "public",
-    ) -> str:
+    def get_drop_index_sql(self, table_name: str, column_name: str, *, schema: str = "public") -> str:
         """Generate DROP INDEX SQL.
 
         Args:
@@ -109,8 +119,7 @@ class CSPANNIndex:
         Returns:
             SQL statement to drop the index
         """
-        index_name = self.name or f"{table_name}_{column_name}_vector_idx"
-        return f"DROP INDEX IF EXISTS {schema}.{index_name}"
+        return f"DROP INDEX IF EXISTS {schema}.{self.get_index_name(table_name, column_name)}"
 
 
 class CSPANNQueryOptions:
@@ -123,6 +132,7 @@ class CSPANNQueryOptions:
             beam_size: Search beam size (higher = more accurate, slower)
                       Default is CockroachDB's vector_search_beam_size setting
         """
+        _check_positive_int(beam_size, "beam_size")
         self.beam_size = beam_size
 
     def get_session_settings(self) -> dict[str, int]:
