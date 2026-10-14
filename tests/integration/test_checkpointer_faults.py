@@ -71,6 +71,11 @@ def test_sync_saver_recovers_from_retryable_errors(sync_pool, unsafe_internals, 
     assert len(list(saver.list(config(thread)))) == 1
     faults.fail_next(code, match="insert into checkpoint_writes")
     saver.put_writes(saved, [("channel", "value")], task_id="t1")
+    writes = saver.get_tuple(saved).pending_writes
+    assert len(writes) == 1
+    assert writes[0][0] == "t1"
+    assert writes[0][1] == "channel"
+    assert writes[0][2] == "value"
     faults.fail_next(code, match="delete from checkpoints")
     saver.delete_thread(thread)
     assert saver.get_tuple(config(thread)) is None
@@ -96,6 +101,11 @@ def test_pipeline_mode_saver_recovers_from_retryable_errors(libpq_url, unsafe_in
         assert len(list(saver.list(config(thread)))) == 1
         faults.fail_next("40001", match="insert into checkpoint_writes")
         saver.put_writes(saved, [("channel", "value")], task_id="t1")
+        writes = saver.get_tuple(saved).pending_writes
+        assert len(writes) == 1
+        assert writes[0][0] == "t1"
+        assert writes[0][1] == "channel"
+        assert writes[0][2] == "value"
         faults.fail_next("40001", match="delete from checkpoints")
         saver.delete_thread(thread)
         assert saver.get_tuple(config(thread)) is None
@@ -189,8 +199,11 @@ def test_list_does_not_hold_the_lock_while_the_caller_iterates(sync_pool) -> Non
     thread = str(uuid.uuid4())
     saver.put(config(thread), empty_checkpoint(), {}, {})
     saver.put(config(thread), empty_checkpoint(), {}, {})
+    count = 0
     for item in saver.list(config(thread)):
         assert saver.get_tuple(item.config) is not None
+        count += 1
+    assert count == 2
 
 
 def test_sync_saver_attempt_timeout_rides_out_a_stuck_write(sync_pool, libpq_url, caplog) -> None:
@@ -310,6 +323,11 @@ async def test_async_saver_recovers_from_retryable_errors(
     assert len([item async for item in saver.alist(config(thread))]) == 1
     faults.fail_next(code, match="insert into checkpoint_writes")
     await saver.aput_writes(saved, [("channel", "value")], task_id="t1")
+    writes = (await saver.aget_tuple(saved)).pending_writes
+    assert len(writes) == 1
+    assert writes[0][0] == "t1"
+    assert writes[0][1] == "channel"
+    assert writes[0][2] == "value"
     faults.fail_next(code, match="delete from checkpoints")
     await saver.adelete_thread(thread)
     assert await saver.aget_tuple(config(thread)) is None
@@ -337,6 +355,11 @@ async def test_pipeline_mode_async_saver_recovers_from_retryable_errors(
         assert len([item async for item in saver.alist(config(thread))]) == 1
         faults.fail_next("40001", match="insert into checkpoint_writes")
         await saver.aput_writes(saved, [("channel", "value")], task_id="t1")
+        writes = (await saver.aget_tuple(saved)).pending_writes
+        assert len(writes) == 1
+        assert writes[0][0] == "t1"
+        assert writes[0][1] == "channel"
+        assert writes[0][2] == "value"
         faults.fail_next("40001", match="delete from checkpoints")
         await saver.adelete_thread(thread)
         assert await saver.aget_tuple(config(thread)) is None
@@ -369,9 +392,7 @@ async def test_async_single_connection_does_not_retry_a_dead_connection(libpq_ur
         await asyncio.sleep(0.3)
         caplog.clear()
         with (
-            caplog.at_level(
-                logging.WARNING, logger="langchain_cockroachdb.checkpointer.async_saver"
-            ),
+            caplog.at_level(logging.WARNING),
             pytest.raises(psycopg.OperationalError),
         ):
             await saver.aput(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
@@ -387,8 +408,11 @@ async def test_alist_does_not_hold_the_lock_while_the_caller_iterates(async_pool
     thread = str(uuid.uuid4())
     await saver.aput(config(thread), empty_checkpoint(), {}, {})
     await saver.aput(config(thread), empty_checkpoint(), {}, {})
+    count = 0
     async for item in saver.alist(config(thread)):
         assert await saver.aget_tuple(item.config) is not None
+        count += 1
+    assert count == 2
 
 
 async def test_async_saver_attempt_timeout_rides_out_a_stuck_write(
@@ -409,6 +433,45 @@ async def test_async_saver_attempt_timeout_rides_out_a_stuck_write(
         await saver.aput(config(thread), checkpoint, {"step": 2}, {})
     assert "attempt timeout" in caplog.text
     assert (await saver.aget_tuple(config(thread))).metadata["step"] == 2
+
+
+async def test_async_saver_raises_non_retryable_errors_once(async_pool, unsafe_internals) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    saver = AsyncCockroachDBSaver(await async_pool(app_name(), faults), retry_policy=FAST)
+    await saver.setup()
+    faults.fail_next("XXA00", match="insert into checkpoints (")
+    with pytest.raises(psycopg.Error) as info:
+        await saver.aput(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
+    assert get_sqlstate(info.value) == "XXA00"
+    assert faults.count("insert into checkpoints (") == 1
+
+
+async def test_async_parallel_setup_converges(libpq_url) -> None:
+    database = f"setup_race_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(libpq_url, autocommit=True) as admin:
+        admin.execute(f"CREATE DATABASE {database}")
+    url = urlsplit(libpq_url)._replace(path=f"/{database}").geturl()
+
+    async def setup_task() -> None:
+        async with AsyncCockroachDBSaver.from_conn_string(
+            url, retry_policy=RetryPolicy(initial_backoff=0.05, max_attempts=10)
+        ) as saver:
+            await saver.setup()
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[setup_task() for _ in range(6)], return_exceptions=True), timeout=180
+        )
+        exceptions = [r for r in results if isinstance(r, BaseException)]
+        assert exceptions == []
+        with psycopg.connect(url, autocommit=True) as conn:
+            versions = [
+                row[0] for row in conn.execute("SELECT v FROM checkpoint_migrations ORDER BY v")
+            ]
+        assert versions == list(range(len(AsyncCockroachDBSaver.MIGRATIONS)))
+    finally:
+        with psycopg.connect(libpq_url, autocommit=True) as admin:
+            admin.execute(f"DROP DATABASE {database} CASCADE")
 
 
 @pytest.mark.parametrize("pipeline", [False, True])

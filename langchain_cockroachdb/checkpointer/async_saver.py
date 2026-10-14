@@ -69,9 +69,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         async with AsyncConnectionPool(
             "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
             kwargs={"autocommit": True, "row_factory": dict_row},
-            open=False,
         ) as pool:
-            await pool.open()
             checkpointer = AsyncCockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
             await checkpointer.setup()
             graph = workflow.compile(checkpointer=checkpointer)
@@ -91,7 +89,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         super().__init__(serde=serde)
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
             raise ValueError(
-                "Pipeline should be used only with a single AsyncConnection, not AsyncConnectionPool."
+                "Pipeline should be used only with a single AsyncConnection, "
+                "not AsyncConnectionPool."
             )
         self.conn = conn
         self.pipe = pipe
@@ -153,7 +152,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         if isinstance(self.conn, AsyncConnection) and self.conn.closed:
             logger.warning(
                 "Not retrying: the checkpointer's only connection is closed and cannot be "
-                "reopened. Pass a psycopg_pool.AsyncConnectionPool so broken connections are replaced."
+                "reopened. Pass a psycopg_pool.AsyncConnectionPool so broken connections "
+                "are replaced."
             )
             return False
         return True
@@ -555,7 +555,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                         if pipeline:
                             await self.pipe.sync()
                     except BaseException:
-                        # Resync while still holding the lock, so other tasks' queued statements are untouched
+                        # Resync while still holding the lock, so other tasks' queued
+                        # statements are untouched
                         with contextlib.suppress(Exception):
                             await self.pipe.sync()
                         raise

@@ -490,7 +490,8 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                         if pipeline:
                             self.pipe.sync()
                     except BaseException:
-                        # Resync while still holding the lock, so other threads' queued statements are untouched
+                        # Resync while still holding the lock, so other threads' queued
+                        # statements are untouched
                         with contextlib.suppress(Exception):
                             self.pipe.sync()
                         raise
