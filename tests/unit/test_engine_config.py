@@ -70,6 +70,38 @@ def test_asyncpg_url_gets_no_connect_timeout(monkeypatch) -> None:
     assert "connect_args" not in captured["kwargs"]
 
 
+def test_asyncpg_url_with_psycopg_in_username_gets_no_connect_timeout(monkeypatch) -> None:
+    captured = {}
+    real = engine_module.create_async_engine
+
+    def spy(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        try:
+            return real(url, **kwargs)
+        except ImportError:
+            pass
+
+    monkeypatch.setattr(engine_module, "create_async_engine", spy)
+    with contextlib.suppress(ImportError):
+        CockroachDBEngine.from_connection_string(
+            "cockroachdb+asyncpg://user+psycopg@localhost:1/db"
+        )
+    assert "connect_args" not in captured["kwargs"]
+
+
+def test_psycopg_url_with_asyncpg_in_password_gets_connect_timeout(monkeypatch) -> None:
+    captured = {}
+    real = engine_module.create_async_engine
+
+    def spy(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        return real(url, **kwargs)
+
+    monkeypatch.setattr(engine_module, "create_async_engine", spy)
+    CockroachDBEngine.from_connection_string("cockroachdb://root:pass+asyncpg@localhost:1/db")
+    assert captured["kwargs"]["connect_args"] == {"connect_timeout": 10}
+
+
 def test_policy_and_flat_arguments_conflict() -> None:
     with pytest.raises(ValueError):
         CockroachDBEngine.from_connection_string(

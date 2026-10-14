@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, TypeVar
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from langchain_cockroachdb._connection import to_sqlalchemy_url, with_connect_timeout
@@ -171,7 +172,7 @@ class CockroachDBEngine:
         """
         url = to_sqlalchemy_url(connection_string)
         # Only add connect_timeout for psycopg driver; asyncpg has no such parameter
-        if "+psycopg" in url or ("+asyncpg" not in url and "cockroachdb://" in url):
+        if make_url(url).get_driver_name() == "psycopg":
             kwargs["connect_args"] = with_connect_timeout(
                 url, kwargs.get("connect_args"), connect_timeout
             )
