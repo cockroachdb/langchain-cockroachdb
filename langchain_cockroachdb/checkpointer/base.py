@@ -28,7 +28,7 @@ from langgraph.checkpoint.serde.types import TASKS
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from langchain_cockroachdb._connection import with_connect_timeout
+from langchain_cockroachdb._connection import with_libpq_defaults
 
 MetadataInput = dict[str, Any] | None
 
@@ -242,7 +242,7 @@ def connection_options(
             f"{', '.join(sorted(managed))} cannot go in connect_kwargs: the checkpointer sets "
             "autocommit and row_factory itself, and prepare_threshold has its own argument"
         )
-    options = with_connect_timeout(conn_string, connect_kwargs, connect_timeout)
+    options = with_libpq_defaults(conn_string, connect_kwargs, connect_timeout)
     options.update(autocommit=True, row_factory=dict_row, prepare_threshold=prepare_threshold)
     return options
 

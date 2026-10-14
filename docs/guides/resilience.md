@@ -131,6 +131,7 @@ A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, 
 - `connect_timeout` defaults to 10 seconds. A value in the URL or `connect_args` wins; pass `connect_timeout=None` to leave it unset.
 - `pool_pre_ping` (on by default) checks a pooled connection before use, so connections that died while idle are replaced without an error.
 - TCP keepalives detect dead peers on idle connections, for example `?keepalives_idle=30&keepalives_interval=10&keepalives_count=3`.
+- `gssencmode` defaults to `disable` for new connections. CockroachDB has no GSS encryption, and this also avoids a Kerberos lookup that can crash forked workers on macOS. Values in the URL or `connect_args` override it.
 
 ## Sync and async
 

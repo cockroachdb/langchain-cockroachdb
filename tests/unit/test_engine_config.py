@@ -27,7 +27,7 @@ def test_url_is_normalized_and_connect_timeout_added(monkeypatch) -> None:
     monkeypatch.setattr(engine_module, "create_async_engine", spy)
     engine = CockroachDBEngine.from_connection_string("postgresql://root@localhost:1/db")
     assert captured["url"] == "cockroachdb+psycopg://root@localhost:1/db"
-    assert captured["kwargs"]["connect_args"] == {"connect_timeout": 10}
+    assert captured["kwargs"]["connect_args"] == {"connect_timeout": 10, "gssencmode": "disable"}
     assert engine.engine.url.drivername == "cockroachdb+psycopg"
 
 
@@ -40,7 +40,11 @@ def test_connect_timeout_can_be_disabled_or_overridden(monkeypatch) -> None:
     CockroachDBEngine.from_connection_string(URL, connect_timeout=None)
     CockroachDBEngine.from_connection_string(URL, connect_args={"connect_timeout": 3})
     CockroachDBEngine.from_connection_string(URL + "&connect_timeout=4")
-    assert [kw["connect_args"] for kw in seen] == [{}, {"connect_timeout": 3}, {}]
+    assert [kw["connect_args"] for kw in seen] == [
+        {"gssencmode": "disable"},
+        {"connect_timeout": 3, "gssencmode": "disable"},
+        {"gssencmode": "disable"},
+    ]
 
 
 def test_flat_retry_arguments_build_the_policy() -> None:
@@ -99,7 +103,7 @@ def test_psycopg_url_with_asyncpg_in_password_gets_connect_timeout(monkeypatch) 
 
     monkeypatch.setattr(engine_module, "create_async_engine", spy)
     CockroachDBEngine.from_connection_string("cockroachdb://root:pass+asyncpg@localhost:1/db")
-    assert captured["kwargs"]["connect_args"] == {"connect_timeout": 10}
+    assert captured["kwargs"]["connect_args"] == {"connect_timeout": 10, "gssencmode": "disable"}
 
 
 def test_policy_and_flat_arguments_conflict() -> None:

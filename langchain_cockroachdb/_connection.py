@@ -11,6 +11,9 @@ from psycopg.conninfo import conninfo_to_dict
 
 SQLALCHEMY_SCHEME = "cockroachdb+psycopg"
 
+# CockroachDB has no GSS encryption; disable it to avoid Kerberos lookups on macOS that crash forked workers
+DEFAULT_GSSENCMODE = "disable"
+
 # Spellings already found in env files and compose files. All of them land on
 # the CockroachDB dialect with the psycopg 3 driver.
 _KNOWN_SCHEMES = frozenset(
@@ -63,6 +66,12 @@ def _url_sets_connect_timeout(url: str) -> bool:
     return "connect_timeout" in conninfo_to_dict(url)
 
 
+def _url_sets_gssencmode(url: str) -> bool:
+    if "://" in url:
+        return "gssencmode" in parse_qs(urlsplit(url).query)
+    return "gssencmode" in conninfo_to_dict(url)
+
+
 def with_connect_timeout(
     url: str, options: Mapping[str, Any] | None, connect_timeout: float | None
 ) -> dict[str, Any]:
@@ -85,4 +94,25 @@ def with_connect_timeout(
     if connect_timeout <= 0:
         raise ValueError("connect_timeout must be positive or None")
     merged["connect_timeout"] = max(1, math.ceil(connect_timeout))
+    return merged
+
+
+def with_libpq_defaults(
+    url: str, options: Mapping[str, Any] | None, connect_timeout: float | None
+) -> dict[str, Any]:
+    """Return connection options with libpq defaults added when nothing sets them.
+
+    Values in the URL or in ``options`` always win.
+
+    Args:
+        url: Connection URL or key/value DSN
+        options: Existing connection options (connect_args), or None
+        connect_timeout: Seconds, or None to leave the timeout unset
+
+    Returns:
+        A new dict of connection options
+    """
+    merged = with_connect_timeout(url, options, connect_timeout)
+    if "gssencmode" not in merged and not _url_sets_gssencmode(url):
+        merged["gssencmode"] = DEFAULT_GSSENCMODE
     return merged

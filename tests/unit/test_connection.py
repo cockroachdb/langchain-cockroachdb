@@ -61,3 +61,34 @@ def test_none_disables_and_options_are_copied() -> None:
 def test_rejects_non_positive_timeout() -> None:
     with pytest.raises(ValueError):
         with_connect_timeout(f"postgresql://{REST}", None, 0)
+
+
+def test_gssencmode_is_added_when_missing() -> None:
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    assert with_libpq_defaults(f"postgresql://{REST}", None, 10.0) == {
+        "connect_timeout": 10,
+        "gssencmode": "disable",
+    }
+
+
+def test_gssencmode_in_url_wins() -> None:
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    url = f"postgresql://{REST}&gssencmode=prefer"
+    assert with_libpq_defaults(url, None, 10.0) == {"connect_timeout": 10}
+
+
+def test_gssencmode_in_options_wins() -> None:
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    options = with_libpq_defaults(f"postgresql://{REST}", {"gssencmode": "require"}, 10.0)
+    assert options["gssencmode"] == "require"
+
+
+def test_gssencmode_added_for_key_value_dsn() -> None:
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    options = with_libpq_defaults("host=localhost port=26257", None, 10.0)
+    assert options["gssencmode"] == "disable"
+    assert options["connect_timeout"] == 10

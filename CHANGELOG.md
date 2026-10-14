@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In pipeline mode, checkpointer `setup()` and `enable_ttl()`/`disable_ttl()` failed with `autocommit_before_ddl` off. That covered a fresh database and an upgrade that adds migrations. Every schema statement now runs in its own implicit transaction.
 - After a session is canceled (`CANCEL SESSION`, or a connection dropped by a load balancer or drain), CockroachDB can answer the next query with SQLSTATE XXUUU "read tcp ...: i/o timeout". v25.4 always does; v26.3 sometimes does. The checkpointers raised it. It is now retried on a fresh connection.
 - In a vector store with a namespace, adding a document whose id already belonged to another namespace overwrote that row and moved it into the writing namespace. Such ids now raise `ValueError` before anything is written, and the upsert never updates a row in another namespace.
+- New connections set `gssencmode=disable` unless the URL or connect args choose otherwise. CockroachDB has no GSS encryption, and this avoids a Kerberos lookup that can crash forked workers on macOS.
 
 ### Changed
 - psycopg 3 only: `psycopg2-binary` is no longer a dependency. Requires `langchain-core` 1.x and caps every dependency at its next major version. Python 3.10 to 3.14.

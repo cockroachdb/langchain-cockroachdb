@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from langchain_cockroachdb._connection import to_sqlalchemy_url, with_connect_timeout
+from langchain_cockroachdb._connection import to_sqlalchemy_url, with_libpq_defaults
 from langchain_cockroachdb._guard import aabandon_after
 from langchain_cockroachdb._loop import get_background_loop, run_coroutine_sync
 from langchain_cockroachdb._sql import validate_identifier
@@ -171,9 +171,9 @@ class CockroachDBEngine:
             CockroachDBEngine instance
         """
         url = to_sqlalchemy_url(connection_string)
-        # Only add connect_timeout for psycopg driver; asyncpg has no such parameter
+        # Only add libpq defaults for psycopg driver; asyncpg has different parameters
         if make_url(url).get_driver_name() == "psycopg":
-            kwargs["connect_args"] = with_connect_timeout(
+            kwargs["connect_args"] = with_libpq_defaults(
                 url, kwargs.get("connect_args"), connect_timeout
             )
         engine = create_async_engine(
