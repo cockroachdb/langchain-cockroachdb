@@ -203,30 +203,94 @@ def test_interruption_cancels_background_work() -> None:
     from langchain_cockroachdb._loop import run_coroutine_sync
 
     loop = get_background_loop()
+    started = threading.Event()
     cancelled = threading.Event()
 
     async def long_work() -> None:
+        started.set()
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             cancelled.set()
             raise
 
-    original_run_coroutine_threadsafe = asyncio.run_coroutine_threadsafe
+    original = asyncio.run_coroutine_threadsafe
 
-    def mock_run_coroutine_threadsafe(coro, target_loop):
-        future = original_run_coroutine_threadsafe(coro, target_loop)
+    def interrupted(coro, target_loop):  # type: ignore[no-untyped-def]
+        future = original(coro, target_loop)
 
-        def raising_result(timeout=None):
+        def raising_result(timeout=None):  # type: ignore[no-untyped-def]
+            # Interrupt only once the work is running on the background loop
+            assert started.wait(5), "background work never started"
             raise KeyboardInterrupt("simulated")
 
         future.result = raising_result
         return future
 
     with (
-        patch("asyncio.run_coroutine_threadsafe", side_effect=mock_run_coroutine_threadsafe),
+        patch("asyncio.run_coroutine_threadsafe", side_effect=interrupted),
         pytest.raises(KeyboardInterrupt),
     ):
         run_coroutine_sync(long_work(), loop)
 
-    assert cancelled.wait(2), "coroutine did not observe CancelledError"
+    assert cancelled.wait(2), "running coroutine did not observe CancelledError"
+
+
+def test_interruption_before_start_never_completes_the_work() -> None:
+    from unittest.mock import patch
+
+    from langchain_cockroachdb._loop import run_coroutine_sync
+
+    loop = get_background_loop()
+    completed = threading.Event()
+
+    async def work() -> None:
+        await asyncio.sleep(0.2)
+        completed.set()
+
+    original = asyncio.run_coroutine_threadsafe
+
+    def interrupted(coro, target_loop):  # type: ignore[no-untyped-def]
+        future = original(coro, target_loop)
+
+        def raising_result(timeout=None):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("simulated")
+
+        future.result = raising_result
+        return future
+
+    with (
+        patch("asyncio.run_coroutine_threadsafe", side_effect=interrupted),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_coroutine_sync(work(), loop)
+
+    # Python 3.12 cancels the task after its first step, 3.13 and later before it;
+    # either way the work must not finish
+    assert not completed.wait(1), "work ran to completion after the caller was interrupted"
+
+
+def test_reset_after_fork_starts_a_fresh_loop_on_demand(monkeypatch) -> None:
+    from langchain_cockroachdb import _loop
+
+    original = _loop.get_background_loop()
+    # Restore the module state after the test, whatever the reset does to it
+    monkeypatch.setattr(_loop, "_lock", _loop._lock)
+    monkeypatch.setattr(_loop, "_loop", _loop._loop)
+    monkeypatch.setattr(_loop, "_thread", _loop._thread)
+
+    _loop._reset_after_fork()
+    assert _loop._loop is None
+    assert _loop._thread is None
+
+    fresh = _loop.get_background_loop()
+    thread = _loop._thread
+    assert thread is not None
+    try:
+        assert fresh is not original
+        future = asyncio.run_coroutine_threadsafe(asyncio.sleep(0, result=7), fresh)
+        assert future.result(5) == 7
+    finally:
+        fresh.call_soon_threadsafe(fresh.stop)
+        thread.join(5)
+        fresh.close()
