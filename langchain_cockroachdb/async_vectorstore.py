@@ -524,9 +524,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """Pick k diverse documents from candidates using their stored embeddings."""
         if not matches:
             return []
+        # MMR requires embeddings; they are always present when with_embeddings=True
+        embeddings = []
+        for m in matches:
+            if m.embedding is None:
+                raise ValueError(
+                    "MMR requires embeddings but got None; ensure with_embeddings=True"
+                )
+            embeddings.append(m.embedding)
         chosen = maximal_marginal_relevance(
             np.array(embedding, dtype=np.float32),
-            [m.embedding for m in matches],
+            embeddings,
             lambda_mult=lambda_mult,
             k=min(k, len(matches)),
         )

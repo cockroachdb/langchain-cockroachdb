@@ -27,4 +27,31 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       python-version: "3.12"
+      coverage: true
+    secrets: inherit
+
+  test-python-3-13:
+    uses: ./.github/workflows/_test.yml
+    with:
+      python-version: "3.13"
+    secrets: inherit
+
+  test-python-3-14:
+    uses: ./.github/workflows/_test.yml
+    with:
+      python-version: "3.14"
+    secrets: inherit
+
+  test-minimum-dependencies:
+    uses: ./.github/workflows/_test.yml
+    with:
+      python-version: "3.10"
+      resolution: "lowest-direct"
+    secrets: inherit
+
+  test-minimum-cockroachdb:
+    uses: ./.github/workflows/_test.yml
+    with:
+      python-version: "3.12"
+      cockroachdb-version: "v25.4.14"
     secrets: inherit

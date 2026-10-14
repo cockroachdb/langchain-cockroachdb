@@ -20,6 +20,7 @@ from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
     BaseCheckpointSaver,
     ChannelVersions,
+    Checkpoint,
     CheckpointTuple,
     get_checkpoint_id,
 )
@@ -431,13 +432,16 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                     "checkpoint_id": checkpoint_id,
                 }
             },
-            {
-                **checkpoint,
-                "channel_values": {
-                    **(checkpoint.get("channel_values") or {}),
-                    **blob_values,
+            cast(
+                Checkpoint,
+                {
+                    **checkpoint,
+                    "channel_values": {
+                        **(checkpoint.get("channel_values") or {}),
+                        **blob_values,
+                    },
                 },
-            },
+            ),
             value["metadata"],
             (
                 {

@@ -139,8 +139,12 @@ class CockroachDBChatMessageHistory(BaseChatMessageHistory):
         return messages
 
     @property
-    def messages(self) -> list[BaseMessage]:
-        """Get all messages for this session."""
+    def messages(self) -> list[BaseMessage]:  # type: ignore[override]
+        """Get all messages for this session.
+
+        Note: BaseChatMessageHistory declares messages as a writable attribute,
+        but we expose it as a read-only property (matching langchain-postgres).
+        """
         return self._crdb._run_as_sync(self._get_messages())
 
     async def aget_messages(self) -> list[BaseMessage]:
