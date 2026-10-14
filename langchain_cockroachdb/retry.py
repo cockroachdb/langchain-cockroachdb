@@ -480,9 +480,11 @@ def async_retry_with_backoff(
     )
 
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        label = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
+
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
-            return await resolved.arun(lambda: func(*args, **kwargs), label=func.__name__)
+            return await resolved.arun(lambda: func(*args, **kwargs), label=label)
 
         return wrapper
 
@@ -509,9 +511,11 @@ def sync_retry_with_backoff(
     )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        label = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
-            return resolved.run(lambda: func(*args, **kwargs), label=func.__name__)
+            return resolved.run(lambda: func(*args, **kwargs), label=label)
 
         return wrapper
 

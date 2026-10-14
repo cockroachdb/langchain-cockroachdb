@@ -163,6 +163,43 @@ class TestClassification:
         )
         assert not is_retryable_error(server_error("XXUUU", "something unrelated"))
 
+    def test_definite_code_beats_transient_message(self) -> None:
+        """Definite non-retryable code (not uncategorized) vetoes even with transient text."""
+        error = wrapped(
+            server_error(
+                "XXA00",
+                "transaction committed but schema change aborted with error: failed to connect to n3",
+            )
+        )
+        assert not is_retryable_error(error)
+
+    def test_non_transient_phrase_vetoes_before_invalidation(self) -> None:
+        """Non-transient veto applies before checking connection_invalidated."""
+        error = wrapped(
+            psycopg.OperationalError("SSL error: certificate verify failed"),
+            connection_invalidated=True,
+        )
+        assert not is_retryable_error(error)
+
+    def test_non_transient_phrase_vetoes_multi_host_password_failure(self) -> None:
+        """Password auth failure in multi-host message vetoes retry."""
+        error = psycopg.OperationalError(
+            'connection failed: connection to server at "10.0.0.1", port 26257 failed: '
+            "Connection refused; "
+            'connection to server at "10.0.0.2", port 26257 failed: '
+            "ERROR: password authentication failed for user bob"
+        )
+        assert not is_retryable_error(error)
+
+    def test_pool_timeout_with_transient_wrapper(self) -> None:
+        """Pool timeout veto applies even under a wrapper with transient text."""
+        try:
+            raise PoolTimeout("couldn't get a connection after 30.00 sec")
+        except PoolTimeout as pool_error:
+            wrapper = RuntimeError("connection timed out while waiting for the pool")
+            wrapper.__cause__ = pool_error
+            assert not is_retryable_error(wrapper)
+
 
 class TestGetSqlstate:
     def test_reads_psycopg2_style_pgcode(self) -> None:
@@ -398,3 +435,40 @@ class TestResolveAndDecorators:
             sync_retry_with_backoff(max_retries=3, policy=RetryPolicy())
         with pytest.raises(ValueError):
             sync_retry_with_backoff(policy=RetryPolicy(), retry_on=lambda e: True)
+
+    def test_sync_decorator_on_functools_partial(self) -> None:
+        """Decorating a functools.partial should not raise AttributeError."""
+        import functools
+
+        calls = []
+
+        def base_fn(prefix: str) -> str:
+            calls.append(1)
+            if len(calls) < 2:
+                raise server_error("40001")
+            return f"{prefix}ok"
+
+        partial_fn = functools.partial(base_fn, "result:")
+        decorated = sync_retry_with_backoff(max_retries=3, initial_backoff=0.001)(partial_fn)
+
+        assert decorated() == "result:ok"
+        assert len(calls) == 2
+
+    async def test_async_decorator_on_callable_instance(self) -> None:
+        """Decorating a callable instance should not raise AttributeError."""
+
+        class CallableTask:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def __call__(self) -> str:
+                self.calls += 1
+                if self.calls < 2:
+                    raise server_error("40001")
+                return "ok"
+
+        task = CallableTask()
+        decorated = async_retry_with_backoff(max_retries=3, initial_backoff=0.001)(task)
+
+        assert await decorated() == "ok"
+        assert task.calls == 2
