@@ -148,9 +148,7 @@ class TestVectorStoreConfiguration:
         assert len(ids) == 2
 
     @pytest.mark.asyncio
-    async def test_retry_policy_inheritance_from_engine(
-        self, connection_string: str
-    ) -> None:
+    async def test_retry_policy_inheritance_from_engine(self, connection_string: str) -> None:
         """Test that vectorstore inherits unspecified policy fields from engine."""
         from langchain_core.embeddings import DeterministicFakeEmbedding
 

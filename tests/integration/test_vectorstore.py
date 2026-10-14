@@ -987,11 +987,11 @@ async def test_multi_tenant_search_uses_vector_index(
 
     # Assert the plan uses the vector index
     assert "vector search" in plan.lower(), f"No vector search in plan:\n{plan}"
-    
+
     # Assert the index name appears
     index_name = index.get_index_name(table_name, "embedding")
     assert index_name in plan, f"Index {index_name} not in plan:\n{plan}"
-    
+
     # Assert prefix spans appear (showing namespace constraint)
     assert "prefix spans" in plan.lower(), f"No prefix spans in plan:\n{plan}"
 
