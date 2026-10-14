@@ -1,5 +1,9 @@
 """Integration tests for CockroachDBEngine."""
 
+import gc
+import os
+import threading
+
 import pytest
 from sqlalchemy import text
 
@@ -104,3 +108,57 @@ class TestCockroachDBEngine:
         assert engine.engine.pool.size() == 5
 
         await engine.aclose()
+
+
+def test_sync_calls_from_many_threads(connection_string: str) -> None:
+    engine = CockroachDBEngine.from_connection_string(connection_string)
+    errors: list[BaseException] = []
+
+    def create(i: int) -> None:
+        try:
+            engine.init_vectorstore_table(f"thread_table_{i}", 3, drop_if_exists=True)
+            engine.drop_table(f"thread_table_{i}")
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=create, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    engine.close()
+    assert errors == []
+
+
+async def test_postgresql_spelling_works(connection_string: str) -> None:
+    url = "postgresql://" + connection_string.split("://", 1)[1]
+    async with CockroachDBEngine.from_connection_string(url) as engine:
+        await engine.ainit_vectorstore_table("spelling_test", 3, drop_if_exists=True)
+
+
+async def test_invalid_identifiers_are_rejected_before_sql(connection_string: str) -> None:
+    async with CockroachDBEngine.from_connection_string(connection_string) as engine:
+        with pytest.raises(ValueError, match="table name"):
+            await engine.ainit_vectorstore_table("bad-name", 3)
+        with pytest.raises(ValueError, match="vector_dimension"):
+            await engine.ainit_vectorstore_table("ok_name", 0)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_sync_api_works_in_forked_child(connection_string: str) -> None:
+    engine = CockroachDBEngine.from_connection_string(connection_string)
+    engine.init_vectorstore_table("fork_parent", 3, drop_if_exists=True)
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            engine.init_vectorstore_table("fork_child", 3, drop_if_exists=True)
+            gc.collect()  # inherited connections are dropped without touching the parent's sessions
+            code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    engine.init_vectorstore_table("fork_parent", 3)  # the parent's pool still works
+    engine.close()
