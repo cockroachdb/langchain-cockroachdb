@@ -58,6 +58,7 @@ def test_flat_retry_arguments_build_the_policy() -> None:
 
 
 def test_asyncpg_url_gets_no_connect_timeout(monkeypatch) -> None:
+    """Asyncpg URLs should not get connect_args (no connect_timeout or gssencmode)."""
     captured = {}
     real = engine_module.create_async_engine
 
@@ -71,6 +72,7 @@ def test_asyncpg_url_gets_no_connect_timeout(monkeypatch) -> None:
     monkeypatch.setattr(engine_module, "create_async_engine", spy)
     with contextlib.suppress(ImportError):
         CockroachDBEngine.from_connection_string("cockroachdb+asyncpg://root@localhost:1/db")
+    # Asyncpg driver doesn't use libpq, so no connect_args should be added
     assert "connect_args" not in captured["kwargs"]
 
 
@@ -125,7 +127,7 @@ def test_sync_runner_serves_many_threads() -> None:
     def call(i: int) -> None:
         results[i] = engine._run_as_sync(work(i))
 
-    threads = [threading.Thread(target=call, args=(i,)) for i in range(16)]
+    threads = [threading.Thread(target=call, args=(i,), daemon=True) for i in range(16)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -179,6 +181,7 @@ def test_explicit_loop_receives_sync_and_async_work() -> None:
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(5)
+        loop.close()
 
 
 def test_mixed_sync_and_async_use_warns_once(caplog) -> None:
@@ -190,14 +193,16 @@ def test_mixed_sync_and_async_use_warns_once(caplog) -> None:
         while not release.is_set():
             await asyncio.sleep(0.01)
 
-    worker = threading.Thread(target=lambda: engine._run_as_sync(slow()))
+    worker = threading.Thread(target=lambda: engine._run_as_sync(slow()), daemon=True)
     worker.start()
-    assert started.wait(5)
-    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.engine"):
-        asyncio.run(engine._run_as_async(asyncio.sleep(0)))
-        asyncio.run(engine._run_as_async(asyncio.sleep(0)))
-    release.set()
-    worker.join(5)
+    try:
+        assert started.wait(5)
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.engine"):
+            asyncio.run(engine._run_as_async(asyncio.sleep(0)))
+            asyncio.run(engine._run_as_async(asyncio.sleep(0)))
+    finally:
+        release.set()
+        worker.join(5)
     assert caplog.text.count("one style per engine") == 1
 
 

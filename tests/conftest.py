@@ -1,7 +1,7 @@
 """Pytest configuration and shared fixtures."""
 
-import contextlib
 import os
+import warnings
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
@@ -174,5 +174,7 @@ def engine_factory(connection_string: str):
 
     yield make
     for engine in engines:
-        with contextlib.suppress(Exception):
+        try:
             engine.close()
+        except Exception as error:
+            warnings.warn(f"engine cleanup failed: {error}", ResourceWarning, stacklevel=2)

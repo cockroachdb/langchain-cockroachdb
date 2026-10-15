@@ -56,12 +56,15 @@ def test_guards_are_disabled_by_none(socket_pair) -> None:
         time.sleep(0.05)
 
 
-async def test_aabandon_after_fires(socket_pair) -> None:
+async def test_aabandon_after_fires(socket_pair, caplog) -> None:
     a, _ = socket_pair
     a.setblocking(False)
-    async with aabandon_after(a.fileno(), 0.1, label="slow async query"):
-        data = await asyncio.get_running_loop().sock_recv(a, 1)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        async with aabandon_after(a.fileno(), 0.1, label="slow async query"):
+            data = await asyncio.get_running_loop().sock_recv(a, 1)
     assert data == b""
+    assert "slow async query" in caplog.text
+    assert "0.1s attempt timeout" in caplog.text
 
 
 async def test_aabandon_after_is_cancelled_on_exit(socket_pair) -> None:
@@ -101,3 +104,12 @@ def test_no_socket_does_not_log_when_seconds_is_none(caplog, monkeypatch) -> Non
     ):
         pass
     assert "driver does not expose a socket" not in caplog.text
+
+
+def test_disabled_guard_leaves_socket_working(socket_pair) -> None:
+    """When the guard is disabled (fileno=None), the socket still works."""
+    a, b = socket_pair
+    with abandon_after(None, 0.01, label="disabled"):
+        pass
+    b.sendall(b"hello")
+    assert a.recv(5) == b"hello"

@@ -136,6 +136,7 @@ async def test_postgresql_spelling_works(connection_string: str) -> None:
     url = "postgresql://" + connection_string.split("://", 1)[1]
     async with CockroachDBEngine.from_connection_string(url) as engine:
         await engine.ainit_vectorstore_table("spelling_test", 3, drop_if_exists=True)
+        await engine.adrop_table("spelling_test")
 
 
 async def test_invalid_identifiers_are_rejected_before_sql(connection_string: str) -> None:
