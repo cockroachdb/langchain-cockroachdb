@@ -271,6 +271,14 @@ class CockroachDBEngine:
                 return await coro
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
             return await asyncio.wrap_future(future)
+        # Check if we're already on the background loop (from a sync call)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is get_background_loop():
+            # Already on the background loop from a sync call, don't track
+            return await coro
         with self._usage("async"):
             return await coro
 
