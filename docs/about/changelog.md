@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-10-14
 
 ### Added
 - `RetryPolicy`: one configurable object for which errors are retried and how, set on the engine and inherited by the vector store and chat history; checkpointers take one too. Exported defaults (`RETRYABLE_SQLSTATES`, `TRANSIENT_MESSAGES`, ...) and `get_sqlstate()`.
