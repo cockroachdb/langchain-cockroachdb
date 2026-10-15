@@ -170,6 +170,7 @@ def _describe(error: BaseException) -> str:
     to find the innermost driver error and describes that instead of the wrapper.
     """
     driver_error = error
+    # The chain runs from the outermost error inward, so the last match is the innermost
     for candidate in _error_chain(error):
         if isinstance(candidate, _driver_error_types()):
             driver_error = candidate

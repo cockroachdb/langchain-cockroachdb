@@ -622,8 +622,10 @@ class TestSQLParameterSafety:
         result = asyncio.run(policy.arun(attempt, label="test"))
         assert result == "success"
 
+        assert caplog.records
         for record in caplog.records:
             assert "SENTINEL-123" not in record.getMessage()
+            assert "INSERT INTO docs" not in record.getMessage()
 
     def test_statement_error_parameters_not_in_transient_match(self) -> None:
         """StatementError parameters must not affect transient-phrase matching."""
