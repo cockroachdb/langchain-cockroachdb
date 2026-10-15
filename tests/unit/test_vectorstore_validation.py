@@ -2,7 +2,7 @@
 
 import pytest
 
-from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
+from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
 
 
 class CountingEmbeddings:
@@ -36,48 +36,36 @@ class TestValidationBeforeEmbedding:
     """Test that aadd_texts validates input before calling the embedding model."""
 
     @pytest.mark.asyncio
-    async def test_duplicate_ids_validated_before_embedding(self, engine_factory) -> None:
+    async def test_duplicate_ids_validated_before_embedding(self) -> None:
         """Duplicate IDs should be rejected before calling aembed_documents."""
         embeddings = CountingEmbeddings()
-        engine = engine_factory()
-        table = "test_validation_duplicates"
-        await engine.ainit_vectorstore_table(table, embeddings.size)
-
+        engine = CockroachDBEngine.from_connection_string("cockroachdb://root@localhost:1/none")
         try:
-            store = AsyncCockroachDBVectorStore(engine, embeddings, table)
+            store = AsyncCockroachDBVectorStore(engine, embeddings, "test_table")
 
-            # Try to add texts with duplicate IDs
             with pytest.raises(ValueError, match="Duplicate id"):
                 await store.aadd_texts(["text1", "text2"], ids=["same-id", "same-id"])
 
-            # Embedding model should not have been called
             assert embeddings.embed_documents_calls == 0
         finally:
-            await engine.adrop_table(table)
+            engine.close()
 
     @pytest.mark.asyncio
-    async def test_mismatched_lengths_validated_before_embedding(self, engine_factory) -> None:
+    async def test_mismatched_lengths_validated_before_embedding(self) -> None:
         """Mismatched lengths should be rejected before calling aembed_documents."""
         embeddings = CountingEmbeddings()
-        engine = engine_factory()
-        table = "test_validation_lengths"
-        await engine.ainit_vectorstore_table(table, embeddings.size)
-
+        engine = CockroachDBEngine.from_connection_string("cockroachdb://root@localhost:1/none")
         try:
-            store = AsyncCockroachDBVectorStore(engine, embeddings, table)
+            store = AsyncCockroachDBVectorStore(engine, embeddings, "test_table")
 
-            # Try to add texts with mismatched metadata length
             with pytest.raises(ValueError, match="Got 1 metadatas for 2 texts"):
                 await store.aadd_texts(["text1", "text2"], metadatas=[{"key": "value"}])
 
-            # Embedding model should not have been called
             assert embeddings.embed_documents_calls == 0
 
-            # Try with mismatched ids length
             with pytest.raises(ValueError, match="Got 1 ids for 2 texts"):
                 await store.aadd_texts(["text1", "text2"], ids=["id1"])
 
-            # Embedding model should still not have been called
             assert embeddings.embed_documents_calls == 0
         finally:
-            await engine.adrop_table(table)
+            engine.close()
