@@ -82,10 +82,11 @@ Thumbs.db
 
 # UV
 uv.lock
-CLAUDE.md
 
 # Performance tests and benchmarks (local only)
 tests/performance/
 *_benchmark_results.txt
 *_results.txt
+
+# Personal notes for AI assistants (CLAUDE.md is shared; this one stays local)
 CLAUDE.local.md
