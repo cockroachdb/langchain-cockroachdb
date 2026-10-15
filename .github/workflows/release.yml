@@ -65,6 +65,8 @@ jobs:
        uses: softprops/action-gh-release@v3
        with:
          tag_name: v${{ inputs.version }}
+         # Tag the commit this run tested and built, not whatever main points to now
+         target_commitish: ${{ github.sha }}
          name: Release v${{ inputs.version }}
          draft: false
          prerelease: false
