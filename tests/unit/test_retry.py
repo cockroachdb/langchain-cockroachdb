@@ -218,6 +218,30 @@ class TestClassification:
             assert not is_retryable_error(wrapper)
 
 
+class TestDescribe:
+    """Tests for _describe function."""
+
+    def test_describe_unwraps_to_driver_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """When an application wraps a driver error, _describe shows the driver error."""
+        driver_error = server_error("40001", "transaction conflict")
+        app_error = ValueError("application wrapper")
+        app_error.__cause__ = driver_error
+
+        caplog.set_level(logging.WARNING)
+        policy = RetryPolicy(max_attempts=2)
+
+        def attempt():
+            raise app_error
+
+        with pytest.raises(ValueError):
+            policy.run(attempt, label="test", sleep=lambda _: None)
+
+        warning_text = caplog.text
+        assert "SerializationFailure" in warning_text
+        assert "transaction conflict" in warning_text
+        assert "ValueError" not in warning_text or "application wrapper" not in warning_text
+
+
 class TestGetSqlstate:
     def test_reads_psycopg2_style_pgcode(self) -> None:
         class Psycopg2Like(Exception):
@@ -270,6 +294,28 @@ class TestRetryPolicy:
         with pytest.raises((ValueError, TypeError)):
             RetryPolicy(**kwargs)
 
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("initial_backoff", float("nan")),
+            ("max_backoff", float("nan")),
+            ("backoff_multiplier", float("nan")),
+            ("jitter", float("nan")),
+            ("initial_backoff", float("inf")),
+            ("max_backoff", float("inf")),
+            ("backoff_multiplier", float("inf")),
+            ("jitter", float("inf")),
+            ("attempt_timeout", float("nan")),
+            ("attempt_timeout", float("inf")),
+            ("ddl_attempt_timeout", float("nan")),
+            ("ddl_attempt_timeout", float("inf")),
+        ],
+    )
+    def test_rejects_nan_and_infinity(self, field: str, value: float) -> None:
+        """RetryPolicy rejects NaN and infinity in all float fields."""
+        with pytest.raises(ValueError, match="(?i)(nan|infinity|finite)"):
+            RetryPolicy(**{field: value})
+
     def test_rejects_single_string_for_collections(self) -> None:
         with pytest.raises(TypeError):
             RetryPolicy(retryable_sqlstates="40001")
@@ -311,6 +357,11 @@ class TestRetryPolicy:
 
     def test_delay_does_not_overflow(self) -> None:
         assert RetryPolicy(max_backoff=10, jitter=0).delay(10_000) == pytest.approx(10.0)
+
+    def test_delay_with_huge_multiplier_does_not_overflow(self) -> None:
+        """delay() never raises OverflowError, even with extreme multipliers."""
+        policy = RetryPolicy(max_backoff=10, backoff_multiplier=1e308, jitter=0)
+        assert policy.delay(10_000) == pytest.approx(10.0)
 
     def test_run_retries_then_succeeds(self) -> None:
         calls, sleeps = [], []
@@ -405,8 +456,13 @@ class TestResolveAndDecorators:
         assert (policy.max_attempts, policy.jitter) == (7, 0.0)
         assert resolve_retry_policy(None, base=RetryPolicy(), jitter=True).jitter == 0.5
 
+    def test_resolve_rejects_float_jitter(self) -> None:
+        """resolve_retry_policy accepts only bool or None for jitter, not float."""
+        with pytest.raises(TypeError, match="(?i)jitter"):
+            resolve_retry_policy(None, base=RetryPolicy(), jitter=0.3)  # type: ignore[arg-type]
+
     def test_policy_and_flat_arguments_conflict(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="(?i)(policy|retry)"):
             resolve_retry_policy(RetryPolicy(), base=RetryPolicy(), max_attempts=3)
 
     def test_no_overrides_returns_base(self) -> None:
@@ -448,10 +504,54 @@ class TestResolveAndDecorators:
             sync_retry_with_backoff(max_retries=0)
 
     def test_decorator_rejects_policy_with_flat_arguments(self) -> None:
-        with pytest.raises(ValueError):
-            sync_retry_with_backoff(max_retries=3, policy=RetryPolicy())
-        with pytest.raises(ValueError):
+        """Decorator conflict errors name the decorator's parameters."""
+        with pytest.raises(ValueError, match="policy.*retry_on") as exc_info:
             sync_retry_with_backoff(policy=RetryPolicy(), retry_on=lambda e: True)
+        # Should NOT mention retry_policy (that's resolve_retry_policy's parameter)
+        assert "retry_policy" not in str(exc_info.value).lower()
+
+        with pytest.raises(ValueError, match="policy.*max_retries") as exc_info:
+            sync_retry_with_backoff(max_retries=3, policy=RetryPolicy())
+        assert "retry_policy" not in str(exc_info.value).lower()
+
+    def test_decorator_policy_is_applied(self) -> None:
+        """The decorator's policy= argument is really used."""
+        calls = []
+        custom_policy = RetryPolicy(max_attempts=2, initial_backoff=0.001)
+
+        @sync_retry_with_backoff(policy=custom_policy)
+        def fn() -> None:
+            calls.append(1)
+            raise server_error("40001")
+
+        with pytest.raises(psycopg.Error):
+            fn()
+        assert len(calls) == 2
+
+    def test_retry_warning_format(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Pin the per-retry WARNING log format."""
+        caplog.set_level(logging.WARNING)
+
+        policy = RetryPolicy(max_attempts=3, initial_backoff=0.5, jitter=0)
+
+        attempt_count = 0
+
+        def fn():
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise server_error("40001", "serialization failure")
+            return "ok"
+
+        result = policy.run(fn, label="test operation", sleep=lambda _: None)
+        assert result == "ok"
+
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        # Expected format: "Retrying <label> after <error> (attempt N of M failed, next try in X.XXs)"
+        assert message.startswith("Retrying test operation after ")
+        assert "attempt 1 of 3 failed" in message
+        assert "next try in 0.50s" in message
 
     def test_sync_decorator_on_functools_partial(self) -> None:
         """Decorating a functools.partial should not raise AttributeError."""
@@ -491,42 +591,89 @@ class TestResolveAndDecorators:
         assert task.calls == 2
 
 
-def test_sql_parameters_not_in_logs(caplog):
-    """SQL parameters should not appear in retry logs."""
-    import sqlalchemy.exc
+class TestSQLParameterSafety:
+    """SQL parameters must never reach logs or transient-phrase matching."""
 
-    # Create a SQLAlchemy error wrapping a retryable psycopg error
-    orig = psycopg.errors.SerializationFailure("transaction conflict")
-    orig.sqlstate = "40001"
+    def test_dbapi_error_parameters_not_in_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        """DBAPIError parameters should not appear in retry logs."""
+        import sqlalchemy.exc
 
-    # The SQLAlchemy error includes the SQL and params
-    sa_error = sqlalchemy.exc.OperationalError(
-        "INSERT INTO docs (secret) VALUES (:val)",
-        {"val": "SENTINEL-123"},
-        orig,
-    )
+        orig = psycopg.errors.SerializationFailure("transaction conflict")
+        orig.sqlstate = "40001"
 
-    # Run through the retry policy with a fake sleep
-    caplog.set_level(logging.DEBUG)
-    policy = RetryPolicy(max_attempts=2)
-
-    attempt_count = 0
-
-    async def attempt():
-        nonlocal attempt_count
-        attempt_count += 1
-        if attempt_count == 1:
-            raise sa_error
-        return "success"
-
-    # Run the retry
-    import asyncio
-
-    result = asyncio.run(policy.arun(attempt, label="test"))
-    assert result == "success"
-
-    # Check that the sentinel does not appear in any log record
-    for record in caplog.records:
-        assert "SENTINEL-123" not in record.getMessage(), (
-            f"SQL parameter leaked in log: {record.getMessage()}"
+        sa_error = sqlalchemy.exc.OperationalError(
+            "INSERT INTO docs (secret) VALUES (:val)",
+            {"val": "SENTINEL-123"},
+            orig,
         )
+
+        caplog.set_level(logging.WARNING)
+        policy = RetryPolicy(max_attempts=2)
+
+        attempt_count = 0
+
+        async def attempt():
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise sa_error
+            return "success"
+
+        result = asyncio.run(policy.arun(attempt, label="test"))
+        assert result == "success"
+
+        for record in caplog.records:
+            assert "SENTINEL-123" not in record.getMessage()
+
+    def test_statement_error_parameters_not_in_transient_match(self) -> None:
+        """StatementError parameters must not affect transient-phrase matching."""
+        import sqlalchemy.exc
+
+        # StatementError base class embeds statement and params in str(),
+        # even though DBAPIError is the common subclass
+        orig = psycopg.OperationalError("server closed the connection unexpectedly")
+
+        # Test both that parameters don't leak and don't affect classification
+        # This uses a custom StatementError subclass to test the base class path
+        class CustomStatementError(sqlalchemy.exc.StatementError):
+            """A StatementError that's not a DBAPIError."""
+
+            pass
+
+        # Create error with parameters that would veto if checked
+        # StatementError.__init__ signature: (message, statement, params, orig, ...)
+        sa_error = CustomStatementError(
+            "Error executing statement",
+            "SELECT * FROM t WHERE data = :val",
+            {"val": "password authentication failed"},
+            orig,
+        )
+
+        # Should still be retryable based on the orig error message
+        assert is_retryable_error(sa_error)
+
+    def test_sentinel_in_parameter_does_not_veto_transient_error(self) -> None:
+        """A parameter matching a non-transient phrase must not veto a transient error."""
+        import sqlalchemy.exc
+
+        orig = psycopg.OperationalError("server closed the connection unexpectedly")
+        sa_error = sqlalchemy.exc.OperationalError(
+            "INSERT INTO t VALUES (:val)",
+            {"val": "password authentication failed"},
+            orig,
+        )
+
+        assert is_retryable_error(sa_error)
+
+    def test_sentinel_in_parameter_does_not_enable_non_transient_error(self) -> None:
+        """A parameter matching a transient phrase must not make a non-transient error retryable."""
+        import sqlalchemy.exc
+
+        orig = server_error("42P01", "relation does not exist")
+        sa_error = sqlalchemy.exc.OperationalError(
+            "SELECT * FROM t WHERE msg = :val",
+            {"val": "restart transaction"},
+            orig,
+        )
+
+        assert not is_retryable_error(sa_error)

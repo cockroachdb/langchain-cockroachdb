@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import importlib
 import logging
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator
@@ -26,7 +27,7 @@ from typing import Any, TypeVar
 
 import psycopg
 from psycopg_pool import PoolTimeout
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, StatementError
 from sqlalchemy.exc import TimeoutError as PoolCheckoutTimeout
 
 logger = logging.getLogger(__name__)
@@ -163,8 +164,15 @@ def _driver_error_types() -> tuple[type[BaseException], ...]:
 
 
 def _describe(error: BaseException) -> str:
-    """One-line description for logs: driver error type, SQLSTATE, first message line."""
-    driver_error = next((e for e in _error_chain(error) if not isinstance(e, DBAPIError)), error)
+    """One-line description for logs: driver error type, SQLSTATE, first message line.
+
+    When an application wraps a driver error, this walks __cause__ and __context__
+    to find the innermost driver error and describes that instead of the wrapper.
+    """
+    driver_error = error
+    for candidate in _error_chain(error):
+        if isinstance(candidate, _driver_error_types()):
+            driver_error = candidate
     code = get_sqlstate(error)
     lines = str(driver_error).strip().splitlines()
     summary = lines[0] if lines else ""
@@ -238,12 +246,24 @@ class RetryPolicy:
     ddl_attempt_timeout: float | None = None
 
     def __post_init__(self) -> None:
+        self._validate_max_attempts()
+        self._validate_numeric_fields()
+        self._validate_timeouts()
+        self._normalize_collections()
+
+    def _validate_max_attempts(self) -> None:
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
             or self.max_attempts < 1
         ):
             raise ValueError("max_attempts must be an integer of at least 1")
+
+    def _validate_numeric_fields(self) -> None:
+        for name in ("initial_backoff", "max_backoff", "backoff_multiplier", "jitter"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, not NaN or infinity")
         if self.initial_backoff < 0:
             raise ValueError("initial_backoff must not be negative")
         if self.max_backoff < self.initial_backoff:
@@ -254,10 +274,17 @@ class RetryPolicy:
             raise TypeError("jitter is a ratio from 0 to 1, for example 0.5 or 0")
         if not 0 <= self.jitter <= 1:
             raise ValueError("jitter must be between 0 and 1")
+
+    def _validate_timeouts(self) -> None:
         for name in ("attempt_timeout", "ddl_attempt_timeout"):
             value = getattr(self, name)
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive or None")
+            if value is not None:
+                if not math.isfinite(value):
+                    raise ValueError(f"{name} must be finite, not NaN or infinity")
+                if value <= 0:
+                    raise ValueError(f"{name} must be positive or None")
+
+    def _normalize_collections(self) -> None:
         for name in (
             "retryable_sqlstates",
             "retryable_sqlstate_classes",
@@ -282,9 +309,10 @@ class RetryPolicy:
             return False
         if any(isinstance(e, (PoolTimeout, PoolCheckoutTimeout)) for e in chain):
             return False
-        # SQLAlchemy's message embeds the statement and its parameters, which
-        # can hold user data, so only driver and application messages count.
-        messages = [str(e).lower() for e in chain if not isinstance(e, DBAPIError)]
+        # SQLAlchemy embeds the statement and its parameters in str(StatementError)
+        # and str(DBAPIError), which can hold user data, so only driver and
+        # application messages count for phrase matching.
+        messages = [str(e).lower() for e in chain if not isinstance(e, StatementError)]
         if any(phrase in m for m in messages for phrase in self.non_transient_messages):
             return False
         if any(getattr(e, "connection_invalidated", False) for e in chain):
@@ -294,7 +322,10 @@ class RetryPolicy:
     def delay(self, retry_number: int, *, rand: Callable[[], float] = random.random) -> float:
         """Seconds to wait before retry ``retry_number`` (0 for the first retry)."""
         exponent = min(max(retry_number, 0), 64)
-        base = min(self.initial_backoff * self.backoff_multiplier**exponent, self.max_backoff)
+        try:
+            base = min(self.initial_backoff * self.backoff_multiplier**exponent, self.max_backoff)
+        except OverflowError:
+            base = self.max_backoff
         return base * (1 - self.jitter * rand())
 
     def run(
@@ -400,7 +431,12 @@ def resolve_retry_policy(
 
     Raises:
         ValueError: If both a policy and flat arguments are given
+        TypeError: If jitter is not bool or None
     """
+    if jitter is not None and not isinstance(jitter, bool):
+        raise TypeError(
+            "jitter must be True, False, or None; for a ratio, use RetryPolicy(jitter=...)"
+        )
     overrides: dict[str, Any] = {
         "max_attempts": max_attempts,
         "initial_backoff": initial_backoff,
@@ -429,6 +465,9 @@ def _decorator_policy(
         raise ValueError("Pass either policy or retry_on, not both")
     if max_retries is not None and max_retries < 1:
         raise ValueError("max_retries must be at least 1")
+    flat_args = [max_retries, initial_backoff, max_backoff, backoff_multiplier, jitter]
+    if policy is not None and any(arg is not None for arg in flat_args):
+        raise ValueError("Pass either policy or max_retries / backoff parameters, not both")
     resolved = resolve_retry_policy(
         policy,
         base=DEFAULT_RETRY_POLICY,
