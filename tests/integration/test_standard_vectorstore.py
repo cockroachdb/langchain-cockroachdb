@@ -10,9 +10,11 @@ from collections.abc import Generator
 
 import pytest
 from langchain_core.vectorstores import VectorStore
-from langchain_tests.integration_tests import VectorStoreIntegrationTests
 
 from langchain_cockroachdb import CockroachDBEngine, CockroachDBVectorStore
+
+langchain_tests = pytest.importorskip("langchain_tests.integration_tests")
+VectorStoreIntegrationTests = langchain_tests.VectorStoreIntegrationTests
 
 
 class TestCockroachDBStandardVectorStore(VectorStoreIntegrationTests):

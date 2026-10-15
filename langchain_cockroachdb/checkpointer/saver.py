@@ -1,17 +1,22 @@
 """Synchronous CockroachDB checkpoint saver for LangGraph.
 
 Provides the same interface as langgraph-checkpoint-postgres PostgresSaver,
-adapted for CockroachDB's isolation levels (SERIALIZABLE default, READ COMMITTED supported)
-and online schema changes.
+adapted for CockroachDB's isolation levels (SERIALIZABLE default, READ COMMITTED
+supported) and online schema changes. Every operation retries transient
+CockroachDB errors under the saver's RetryPolicy. All writes are UPSERTs or
+DELETEs, so retrying after an ambiguous result is safe.
 """
 
 from __future__ import annotations
 
+import builtins
+import contextlib
+import logging
 import threading
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -29,36 +34,46 @@ from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from langchain_cockroachdb._connection import to_libpq_url
+from langchain_cockroachdb._guard import abandon_after
 from langchain_cockroachdb.checkpointer import _internal
-from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver
+from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
+from langchain_cockroachdb.retry import RetryPolicy
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 Conn = _internal.Conn
 
 
 def _sanitize_conn_string(conn_string: str) -> str:
-    """Convert cockroachdb:// URLs to postgresql:// for psycopg compatibility."""
-    if conn_string.startswith("cockroachdb://"):
-        return conn_string.replace("cockroachdb://", "postgresql://", 1)
-    if conn_string.startswith("cockroachdb+psycopg://"):
-        return conn_string.replace("cockroachdb+psycopg://", "postgresql://", 1)
-    return conn_string
+    """Convert any supported URL spelling to postgresql:// for psycopg."""
+    return to_libpq_url(conn_string)
 
 
 class CockroachDBSaver(BaseCockroachDBSaver):
     """Synchronous checkpointer that stores checkpoints in CockroachDB.
 
     Uses raw psycopg3 connections (not SQLAlchemy) for compatibility
-    with LangGraph's checkpointer interface.
+    with LangGraph's checkpointer interface. For production, pass a
+    ``psycopg_pool.ConnectionPool``: it replaces broken connections, while a
+    single connection cannot recover from a dropped connection.
 
     Example:
         ```python
-        from langchain_cockroachdb import CockroachDBSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+        from langchain_cockroachdb import CockroachDBSaver, RetryPolicy
 
-        DB_URI = "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
-        with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
-            checkpointer.setup()
-            # Use with LangGraph
-            graph = workflow.compile(checkpointer=checkpointer)
+        pool = ConnectionPool(
+            "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
+            kwargs={"autocommit": True, "row_factory": dict_row},
+            open=True,
+        )
+        checkpointer = CockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
+        checkpointer.setup()
+        graph = workflow.compile(checkpointer=checkpointer)
         ```
     """
 
@@ -69,6 +84,8 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         conn: _internal.Conn,
         pipe: Pipeline | None = None,
         serde: SerializerProtocol | None = None,
+        *,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         super().__init__(serde=serde)
         if isinstance(conn, ConnectionPool) and pipe is not None:
@@ -79,53 +96,99 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         self.pipe = pipe
         self.lock = threading.Lock()
         self.supports_pipeline = Capabilities().has_pipeline()
+        self.retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     @contextmanager
     def from_conn_string(
-        cls, conn_string: str, *, pipeline: bool = False
+        cls,
+        conn_string: str,
+        *,
+        pipeline: bool = False,
+        serde: SerializerProtocol | None = None,
+        retry_policy: RetryPolicy | None = None,
+        connect_timeout: float | None = 10.0,
+        prepare_threshold: int | None = 5,
+        connect_kwargs: Mapping[str, Any] | None = None,
     ) -> Iterator[CockroachDBSaver]:
-        """Create a new CockroachDBSaver from a connection string.
+        """Create a saver on a single connection.
 
         Args:
-            conn_string: CockroachDB connection string.
-                Supports cockroachdb:// and postgresql:// formats.
-            pipeline: Whether to use Pipeline mode (may not be supported
-                by all CockroachDB versions).
+            conn_string: CockroachDB connection string (cockroachdb://, postgresql:// and similar)
+            pipeline: Whether to use Pipeline mode
+            serde: Custom serializer protocol
+            retry_policy: How operations retry (default: RetryPolicy())
+            connect_timeout: Seconds to wait when connecting, or None (default: 10)
+            prepare_threshold: psycopg prepared statement threshold, None to disable (default: 5)
+            connect_kwargs: Extra psycopg connection options, e.g. application_name
 
         Yields:
             CockroachDBSaver instance.
         """
-        conn_string = _sanitize_conn_string(conn_string)
-        with Connection.connect(
-            conn_string, autocommit=True, prepare_threshold=5, row_factory=dict_row
-        ) as conn:
+        policy = retry_policy or RetryPolicy()
+        url = _sanitize_conn_string(conn_string)
+        options = connection_options(url, connect_kwargs, connect_timeout, prepare_threshold)
+        conn = policy.run(lambda: Connection.connect(url, **options), label="connect checkpointer")
+        with conn:
             if pipeline:
                 with conn.pipeline() as pipe:
-                    yield cls(conn, pipe)
+                    yield cls(conn, pipe, serde=serde, retry_policy=policy)
             else:
-                yield cls(conn)
+                yield cls(conn, serde=serde, retry_policy=policy)
+
+    def _retry(self, fn: Callable[[], T], *, label: str) -> T:
+        """Run ``fn`` under the retry policy."""
+        return self.retry_policy.run(fn, label=label, can_retry=self._can_retry)
+
+    def _sync_pipeline(self) -> None:
+        """Sync pipeline if one is in use. Each statement runs in its own transaction."""
+        if self.pipe:
+            self.pipe.sync()
+
+    def _can_retry(self, error: BaseException) -> bool:
+        if isinstance(self.conn, Connection) and self.conn.closed:
+            logger.warning(
+                "Not retrying: the checkpointer's only connection is closed and cannot be "
+                "reopened. Pass a psycopg_pool.ConnectionPool so broken connections are replaced."
+            )
+            return False
+        return True
 
     def setup(self) -> None:
         """Set up the checkpoint database.
 
-        Creates necessary tables and runs migrations. MUST be called
-        the first time the checkpointer is used.
+        Creates necessary tables and runs migrations. MUST be called the first
+        time the checkpointer is used. Safe to run from several processes at
+        once: every migration is idempotent and versions are recorded with
+        ON CONFLICT DO NOTHING.
         """
-        with self._cursor() as cur:
-            cur.execute(self.MIGRATIONS[0])
-            results = cur.execute("SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1")
-            row = results.fetchone()
-            version = -1 if row is None else row["v"]
-            for v, migration in zip(
-                range(version + 1, len(self.MIGRATIONS)),
-                self.MIGRATIONS[version + 1 :],
-                strict=False,
-            ):
-                cur.execute(migration)
-                cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,))
-            if self.pipe:
-                self.pipe.sync()
+
+        def init_and_read_version() -> int:
+            with self._cursor(
+                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer migration 0"
+            ) as cur:
+                cur.execute(self.MIGRATIONS[0])
+                self._sync_pipeline()
+                results = cur.execute("SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1")
+                self._sync_pipeline()
+                row = results.fetchone()
+                return -1 if row is None else row["v"]
+
+        version = self._retry(init_and_read_version, label="checkpointer migration 0")
+
+        for v in range(version + 1, len(self.MIGRATIONS)):
+
+            def apply_migration(migration_v: int = v) -> None:
+                with self._cursor(
+                    timeout=self.retry_policy.ddl_attempt_timeout,
+                    label=f"checkpointer migration {migration_v}",
+                ) as cur:
+                    cur.execute(self.MIGRATIONS[migration_v])
+                    self._sync_pipeline()
+                    cur.execute(self.INSERT_MIGRATION_SQL, (migration_v,))
+                    self._sync_pipeline()
+
+            self._retry(apply_migration, label=f"checkpointer migration {v}")
 
     def list(
         self,
@@ -136,6 +199,9 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
         """List checkpoints from the database.
+
+        Matching checkpoints are fetched inside one retried call and yielded
+        afterwards, so the saver's lock is not held while the caller iterates.
 
         Args:
             config: Config for filtering checkpoints.
@@ -152,22 +218,23 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         if limit is not None:
             query += " LIMIT %s"
             params.append(int(limit))
+        yield from self._retry(lambda: self._fetch_list(query, params), label="list checkpoints")
 
-        with self._cursor() as cur:
+    def _fetch_list(self, query: str, params: builtins.list[Any]) -> builtins.list[CheckpointTuple]:
+        with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="list checkpoints"
+        ) as cur:
             cur.execute(query, params, binary=True)
             values = cur.fetchall()
             if not values:
-                return
+                return []
 
             if to_migrate := [
                 v for v in values if v["checkpoint"]["v"] < 4 and v["parent_checkpoint_id"]
             ]:
                 cur.execute(
                     self.SELECT_PENDING_SENDS_SQL,
-                    (
-                        values[0]["thread_id"],
-                        [v["parent_checkpoint_id"] for v in to_migrate],
-                    ),
+                    (values[0]["thread_id"], [v["parent_checkpoint_id"] for v in to_migrate]),
                 )
                 grouped_by_parent = defaultdict(list)
                 for value in to_migrate:
@@ -193,11 +260,17 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                 cur.execute(self.SELECT_WRITES_BATCH_SQL, (tid, cns, cids), binary=True)
                 writes_by_id.update(self._load_writes_batch(cur.fetchall()))
 
-            for value in values:
-                cid = value["checkpoint_id"]
-                blob_values = {**(value.get("_blob_values") or {}), **(blobs_by_id.get(cid) or {})}
-                pending_writes = writes_by_id.get(cid, [])
-                yield self._build_checkpoint_tuple(value, blob_values, pending_writes)
+        return [
+            self._build_checkpoint_tuple(
+                value,
+                {
+                    **(value.get("_blob_values") or {}),
+                    **(blobs_by_id.get(value["checkpoint_id"]) or {}),
+                },
+                writes_by_id.get(value["checkpoint_id"], []),
+            )
+            for value in values
+        ]
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database.
@@ -219,27 +292,26 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             where = (
                 "WHERE thread_id = %s AND checkpoint_ns = %s ORDER BY checkpoint_id DESC LIMIT 1"
             )
+        return self._retry(
+            lambda: self._fetch_tuple(where, args, thread_id), label="get checkpoint"
+        )
 
-        with self._cursor() as cur:
+    def _fetch_tuple(
+        self, where: str, args: tuple[Any, ...], thread_id: str
+    ) -> CheckpointTuple | None:
+        with self._cursor(timeout=self.retry_policy.attempt_timeout, label="get checkpoint") as cur:
             cur.execute(self.SELECT_SQL + where, args, binary=True)
             value = cur.fetchone()
             if value is None:
                 return None
-
             if value["checkpoint"]["v"] < 4 and value["parent_checkpoint_id"]:
                 cur.execute(
-                    self.SELECT_PENDING_SENDS_SQL,
-                    (thread_id, [value["parent_checkpoint_id"]]),
+                    self.SELECT_PENDING_SENDS_SQL, (thread_id, [value["parent_checkpoint_id"]])
                 )
                 if sends := cur.fetchone():
                     blob_values: dict[str, Any] = {}
-                    self._migrate_pending_sends(
-                        sends["sends"],
-                        value["checkpoint"],
-                        blob_values,
-                    )
+                    self._migrate_pending_sends(sends["sends"], value["checkpoint"], blob_values)
                     value["_blob_values"] = blob_values
-
             return self._load_checkpoint_tuple_with_cursor(cur, value)
 
     def put(
@@ -267,8 +339,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
 
         copy = checkpoint.copy()
         copy["channel_values"] = copy["channel_values"].copy()
-
-        next_config = {
+        next_config: RunnableConfig = {
             "configurable": {
                 "thread_id": thread_id,
                 "checkpoint_ns": checkpoint_ns,
@@ -283,24 +354,33 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             else:
                 blob_values[k] = copy["channel_values"].pop(k)
 
-        with self._cursor(pipeline=True) as cur:
-            if blob_versions := {k: v for k, v in new_versions.items() if k in blob_values}:
-                cur.executemany(
-                    self.UPSERT_CHECKPOINT_BLOBS_SQL,
-                    self._dump_blobs(thread_id, checkpoint_ns, blob_values, blob_versions),
-                )
-            cur.execute(
-                self.UPSERT_CHECKPOINTS_SQL,
-                (
-                    thread_id,
-                    checkpoint_ns,
-                    checkpoint["id"],
-                    checkpoint_id,
-                    Jsonb(copy),
-                    Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
-                ),
-            )
+        # Serialize once, outside the retry loop and the lock
+        blob_versions = {k: v for k, v in new_versions.items() if k in blob_values}
+        blob_rows = (
+            self._dump_blobs(thread_id, checkpoint_ns, blob_values, blob_versions)
+            if blob_versions
+            else []
+        )
+        checkpoint_row = (
+            thread_id,
+            checkpoint_ns,
+            checkpoint["id"],
+            checkpoint_id,
+            Jsonb(copy),
+            Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
+        )
 
+        def write() -> None:
+            with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="put checkpoint",
+            ) as cur:
+                if blob_rows:
+                    cur.executemany(self.UPSERT_CHECKPOINT_BLOBS_SQL, blob_rows)
+                cur.execute(self.UPSERT_CHECKPOINTS_SQL, checkpoint_row)
+
+        self._retry(write, label="put checkpoint")
         return next_config
 
     def put_writes(
@@ -323,18 +403,24 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             if all(w[0] in WRITES_IDX_MAP for w in writes)
             else self.INSERT_CHECKPOINT_WRITES_SQL
         )
-        with self._cursor(pipeline=True) as cur:
-            cur.executemany(
-                query,
-                self._dump_writes(
-                    config["configurable"]["thread_id"],
-                    config["configurable"]["checkpoint_ns"],
-                    config["configurable"]["checkpoint_id"],
-                    task_id,
-                    task_path,
-                    writes,
-                ),
-            )
+        rows = self._dump_writes(
+            config["configurable"]["thread_id"],
+            config["configurable"]["checkpoint_ns"],
+            config["configurable"]["checkpoint_id"],
+            task_id,
+            task_path,
+            writes,
+        )
+
+        def write() -> None:
+            with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="put checkpoint writes",
+            ) as cur:
+                cur.executemany(query, rows)
+
+        self._retry(write, label="put checkpoint writes")
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes for a thread.
@@ -342,19 +428,18 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         Args:
             thread_id: The thread ID to delete.
         """
-        with self._cursor(pipeline=True) as cur:
-            cur.execute(
-                "DELETE FROM checkpoints WHERE thread_id = %s",
-                (str(thread_id),),
-            )
-            cur.execute(
-                "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
-                (str(thread_id),),
-            )
-            cur.execute(
-                "DELETE FROM checkpoint_writes WHERE thread_id = %s",
-                (str(thread_id),),
-            )
+
+        def delete() -> None:
+            with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="delete thread",
+            ) as cur:
+                cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (str(thread_id),))
+                cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (str(thread_id),))
+                cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (str(thread_id),))
+
+        self._retry(delete, label="delete thread")
 
     def enable_ttl(self, ttl_interval: str = "7 days", cron: str = "@daily") -> None:
         """Enable CockroachDB row-level TTL on checkpoint tables.
@@ -367,43 +452,65 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
         self._validate_ttl_params(ttl_interval, cron)
-        with self._cursor() as cur:
-            for sql_template in self.ENABLE_TTL_SQL:
-                cur.execute(sql_template.format(interval=ttl_interval, cron=cron))
+        statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        for statement in statements:
+            self._run_ddl(statement, "enable TTL")
 
     def disable_ttl(self) -> None:
         """Disable CockroachDB row-level TTL on checkpoint tables."""
-        with self._cursor() as cur:
-            for sql in self.DISABLE_TTL_SQL:
-                cur.execute(sql)
+        for statement in self.DISABLE_TTL_SQL:
+            self._run_ddl(statement, "disable TTL")
+
+    def _run_ddl(self, statement: str, label: str) -> None:
+        """Run a single DDL statement with retry and timeout."""
+
+        def execute() -> None:
+            with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
+                cur.execute(statement)
+                self._sync_pipeline()
+
+        self._retry(execute, label=label)
 
     @contextmanager
-    def _cursor(self, *, pipeline: bool = False) -> Iterator[Cursor[DictRow]]:
-        """Create a database cursor as a context manager."""
+    def _cursor(
+        self,
+        *,
+        pipeline: bool = False,
+        timeout: float | None = None,
+        label: str = "checkpoint operation",
+    ) -> Iterator[Cursor[DictRow]]:
+        """Create a database cursor as a context manager, with the hang guard."""
         with self.lock, _internal.get_connection(self.conn) as conn:
-            if self.pipe:
-                try:
+            fileno = conn.fileno() if timeout is not None else None
+            with abandon_after(fileno, timeout, label=label):
+                if self.pipe:
+                    try:
+                        with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                            yield cur
+                        if pipeline:
+                            self.pipe.sync()
+                    except BaseException:
+                        # Resync while still holding the lock, so other threads' queued
+                        # statements are untouched
+                        with contextlib.suppress(Exception):
+                            self.pipe.sync()
+                        raise
+                elif pipeline:
+                    if self.supports_pipeline:
+                        with (
+                            conn.pipeline(),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                    else:
+                        with (
+                            conn.transaction(),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                else:
                     with conn.cursor(binary=True, row_factory=dict_row) as cur:
                         yield cur
-                finally:
-                    if pipeline:
-                        self.pipe.sync()
-            elif pipeline:
-                if self.supports_pipeline:
-                    with (
-                        conn.pipeline(),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
-                else:
-                    with (
-                        conn.transaction(),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
-            else:
-                with conn.cursor(binary=True, row_factory=dict_row) as cur:
-                    yield cur
 
     def _load_checkpoint_tuple_with_cursor(
         self, cur: Cursor[DictRow], value: DictRow
@@ -414,23 +521,13 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         checkpoint_id = value["checkpoint_id"]
         checkpoint = value["checkpoint"]
 
-        # Fetch blobs via separate query
         cv_pairs = self._get_channel_version_pairs(checkpoint)
         blob_values: dict[str, Any] = value.get("_blob_values") or {}
         if cv_pairs:
-            cur.execute(
-                self.SELECT_BLOBS_SQL,
-                (thread_id, checkpoint_ns, cv_pairs),
-                binary=True,
-            )
+            cur.execute(self.SELECT_BLOBS_SQL, (thread_id, checkpoint_ns, cv_pairs), binary=True)
             blob_values = {**blob_values, **self._load_blobs(cur.fetchall())}
 
-        # Fetch writes via separate query
-        cur.execute(
-            self.SELECT_WRITES_SQL,
-            (thread_id, checkpoint_ns, checkpoint_id),
-            binary=True,
-        )
+        cur.execute(self.SELECT_WRITES_SQL, (thread_id, checkpoint_ns, checkpoint_id), binary=True)
         pending_writes = self._load_writes(cur.fetchall())
 
         return self._build_checkpoint_tuple(value, blob_values, pending_writes)

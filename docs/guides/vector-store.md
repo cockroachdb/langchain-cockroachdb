@@ -150,6 +150,28 @@ results = await vectorstore.asimilarity_search_with_relevance_scores(
 
 ## Filtering
 
+### Supported Operators
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `$eq` | Equals (default) | `{"status": {"$eq": "active"}}` or `{"status": "active"}` |
+| `$ne` | Not equals | `{"status": {"$ne": "archived"}}` |
+| `$lt` | Less than | `{"year": {"$lt": 2024}}` |
+| `$lte` | Less than or equal | `{"year": {"$lte": 2023}}` |
+| `$gt` | Greater than | `{"score": {"$gt": 0.5}}` |
+| `$gte` | Greater than or equal | `{"score": {"$gte": 0.5}}` |
+| `$between` | Between two values | `{"year": {"$between": [2020, 2024]}}` |
+| `$in` | In list | `{"category": {"$in": ["tech", "science"]}}` |
+| `$nin` | Not in list | `{"status": {"$nin": ["draft", "deleted"]}}` |
+| `$exists` | Field exists | `{"optional_field": {"$exists": true}}` |
+| `$like` | SQL LIKE (case-sensitive) | `{"title": {"$like": "%Python%"}}` |
+| `$ilike` | SQL ILIKE (case-insensitive) | `{"title": {"$ilike": "%python%"}}` |
+| `$and` | Logical AND | `{"$and": [{"year": 2024}, {"status": "active"}]}` |
+| `$or` | Logical OR | `{"$or": [{"category": "tech"}, {"category": "science"}]}` |
+| `$not` | Logical NOT | `{"$not": {"status": "archived"}}` |
+
+All values are passed as bound parameters, so apostrophes and other characters need no escaping. Range operators like `$lt`, `$lte`, `$gt`, `$gte` compare numbers numerically and strings as text.
+
 ### Basic Filters
 
 ```python

@@ -118,6 +118,8 @@ saver = AsyncCockroachDBSaver(pool)
 await saver.setup()
 ```
 
+Pools you build yourself do not get the library's `gssencmode=disable` default. On macOS with prefork servers, add `gssencmode=disable` to the pool's conninfo or kwargs.
+
 ### Factory Method (Recommended)
 
 The simplest approach -- handles connection string conversion, pool setup, and enables prepared statement caching (`prepare_threshold=5`) for query plan reuse:
@@ -131,6 +133,31 @@ with CockroachDBSaver.from_conn_string("cockroachdb://root@localhost:26257/defau
 async with AsyncCockroachDBSaver.from_conn_string("cockroachdb://root@localhost:26257/defaultdb") as saver:
     await saver.setup()
 ```
+
+## Retries and Connection Pools
+
+A single connection cannot recover once it drops, so the savers do not retry a dead single connection. Give them a pool, which replaces broken connections:
+
+```python
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from langchain_cockroachdb import CockroachDBSaver, RetryPolicy
+
+with ConnectionPool(
+    "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
+    kwargs={"autocommit": True, "row_factory": dict_row},
+    open=True,
+) as pool:
+    checkpointer = CockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
+    checkpointer.setup()  # safe to run from several processes at once
+```
+
+A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, so it also cannot recover once that connection drops. Use a pool for long-running services.
+
+`setup()` is safe to run from several processes at once and resumes where it stopped if it is interrupted.
+
+`from_conn_string` accepts `retry_policy`, `connect_timeout`, `prepare_threshold` and `connect_kwargs` (for example `{"application_name": "my-service"}`).
 
 ## Core Operations
 
@@ -351,7 +378,7 @@ Blob data is read as raw BYTEA via psycopg3's binary cursor protocol, eliminatin
 
 ### Prepared Statement Caching
 
-The `from_conn_string()` factory sets `prepare_threshold=5`, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths.
+The `from_conn_string()` factory sets `prepare_threshold=5` by default, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths. `prepare_threshold` is configurable via `from_conn_string(prepare_threshold=...)`.
 
 ## CockroachDB-Specific Adaptations
 

@@ -7,10 +7,26 @@ on:
         description: Python version
         required: true
         type: string
+      cockroachdb-version:
+        description: CockroachDB image tag
+        required: false
+        type: string
+        default: "v26.3.2"
+      resolution:
+        description: "highest, or lowest-direct to test the minimum declared versions"
+        required: false
+        type: string
+        default: "highest"
+      coverage:
+        description: Upload coverage
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v7
@@ -21,49 +37,55 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Install dependencies
-        run: |
-          uv pip install --system -e ".[dev]"
+        if: inputs.resolution == 'highest'
+        run: uv pip install --system -e ".[dev]"
 
-      - name: Start CockroachDB
+      - name: Install minimum declared dependency versions
+        if: inputs.resolution == 'lowest-direct'
         run: |
-          docker run -d --name cockroachdb \
-            -p 26257:26257 \
-            -p 8080:8080 \
-            cockroachdb/cockroach:latest \
-            start-single-node --insecure
-          
-          # Wait for CockroachDB to be ready
-          echo "Waiting for CockroachDB to start..."
+          uv pip install --system --resolution lowest-direct -e .
+          uv pip install --system pytest pytest-asyncio pytest-timeout testcontainers
+          python -c "import importlib.metadata as m; [print(p, m.version(p)) for p in ['langchain-core','langgraph-checkpoint','sqlalchemy','sqlalchemy-cockroachdb','psycopg','psycopg-pool','numpy']]"
+
+      - name: Start CockroachDB ${{ inputs.cockroachdb-version }}
+        run: |
+          docker run -d --name cockroachdb -p 26257:26257 \
+            cockroachdb/cockroach:${{ inputs.cockroachdb-version }} start-single-node --insecure
           for i in {1..30}; do
-            if docker exec cockroachdb ./cockroach sql --insecure -e "SELECT 1" 2>/dev/null; then
-              echo "✅ CockroachDB is ready!"
+            if docker exec cockroachdb ./cockroach sql --insecure -e "SELECT 1" >/dev/null 2>&1; then
+              echo "CockroachDB is ready"
               break
             fi
-            echo "Waiting... ($i/30)"
+            [ $i -eq 30 ] && { echo "CockroachDB did not become ready"; docker logs cockroachdb | tail -50; exit 1; }
             sleep 2
           done
-          
-          # Verify it's running
           docker exec cockroachdb ./cockroach version
 
       - name: Run unit tests
-        run: |
-          pytest tests/unit -v --tb=short
+        run: pytest tests/unit -v --tb=short
 
       - name: Run integration tests
         env:
           USE_TESTCONTAINER: "false"
           COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
-        run: |
-          pytest tests/integration -v --tb=short
+        run: pytest tests/integration -v --tb=short
+
+      - name: Run examples end to end
+        if: inputs.resolution == 'highest'
+        env:
+          USE_TESTCONTAINER: "false"
+          COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+        run: pytest tests/e2e -v --tb=short
 
       - name: Generate coverage report
-        if: inputs.python-version == '3.12'
-        run: |
-          pytest tests --cov=langchain_cockroachdb --cov-branch --cov-report=xml --cov-report=html
+        if: inputs.coverage
+        env:
+          USE_TESTCONTAINER: "false"
+          COCKROACHDB_URL: "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+        run: pytest tests/unit tests/integration --cov=langchain_cockroachdb --cov-branch --cov-report=xml
 
       - name: Upload coverage reports to Codecov
-        if: inputs.python-version == '3.12'
+        if: inputs.coverage
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

@@ -6,19 +6,39 @@ Learn how to run and write tests for langchain-cockroachdb.
 
 ```
 tests/
-├── conftest.py              # Shared fixtures
-├── unit/                    # Fast tests, no database
+├── conftest.py                     # Shared fixtures
+├── unit/                           # Fast tests, no database
 │   ├── test_indexes.py
 │   ├── test_hybrid_search.py
 │   └── test_retry.py
-└── integration/             # Tests with CockroachDB
-    ├── test_engine.py
-    ├── test_vectorstore.py
-    ├── test_chat_history.py
-    ├── test_retry_behavior.py
-    ├── test_sync_wrapper.py
-    └── test_configuration.py
+├── integration/                    # Tests with CockroachDB
+│   ├── test_engine.py
+│   ├── test_vectorstore.py
+│   ├── test_chat_history.py
+│   ├── test_sync_wrapper.py
+│   ├── test_configuration.py
+│   ├── test_fault_helpers.py       # Fault injection utilities
+│   ├── test_vectorstore_faults.py  # Vectorstore resilience tests
+│   ├── test_vectorstore_hardening.py # Vectorstore edge cases
+│   ├── test_chat_history_resilience.py # Chat history resilience
+│   ├── test_checkpointer_faults.py # Checkpointer resilience
+│   ├── test_checkpointer_conformance.py # LangGraph standard tests
+│   └── faults.py                   # Fault injection mechanisms
+└── e2e/
+    └── test_examples.py            # End-to-end tests for all examples
 ```
+
+## Fault Injection
+
+The `tests/integration/faults.py` module provides three mechanisms for injecting real CockroachDB faults:
+
+1. **`FaultInjector`** - for SQLAlchemy async engine (vector store, chat history). Swaps faulted statements for `crdb_internal.force_error` so the server raises the error during normal execution and SQLAlchemy wraps it.
+
+2. **`PsycopgFaults`** - for raw psycopg connections (checkpointers). Uses `cursor_factory` to check for a pending fault before every cursor execute.
+
+3. **`kill_sessions` and `hold_row_lock`** - helper functions to cancel sessions (simulating node restarts or load balancer resets) and hold row locks (simulating stuck ranges).
+
+These let tests verify that the retry policy handles real CockroachDB errors exactly as they would appear in production.
 
 ## Running Tests
 

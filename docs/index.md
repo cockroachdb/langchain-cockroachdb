@@ -23,7 +23,7 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 - **Query-Time Tuning**: Adjust beam size for accuracy/speed tradeoff
 
 ### 🏗️ Reliability Features
-- **Automatic Retry Logic**: Handles 40001 serialization errors with exponential backoff
+- **Automatic Retry Logic**: Retries transient CockroachDB errors (40001, 40003, 08xxx, 57P01, 58C00, 58C01) on every operation
 - **Isolation Level Support**: Works with both SERIALIZABLE (default, recommended) and READ COMMITTED
 - **Multi-Tenancy**: [Namespace-based isolation](guides/multi-tenancy.md) with C-SPANN prefix columns
 - **Connection Pooling**: Configurable connection pools with health checks

@@ -19,7 +19,7 @@ class TestCockroachDBChatMessageHistory:
             table_name="test_messages",
         )
 
-        await history._acreate_table_if_not_exists()
+        await history.acreate_table_if_not_exists()
         await history.aclear()
 
         return history
@@ -91,7 +91,7 @@ class TestCockroachDBChatMessageHistory:
             table_name="test_isolation",
         )
 
-        await history1._acreate_table_if_not_exists()
+        await history1.acreate_table_if_not_exists()
         await history1.aclear()
         await history2.aclear()
 

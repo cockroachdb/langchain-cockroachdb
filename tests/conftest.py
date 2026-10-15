@@ -1,14 +1,18 @@
 """Pytest configuration and shared fixtures."""
 
+import contextlib
 import os
 from collections.abc import AsyncGenerator, Generator
+from typing import Any
 
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from testcontainers.core.container import DockerContainer
 
+from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb.engine import CockroachDBEngine
+from tests.integration.faults import supports_unsafe_internals
 
 
 class CockroachDBContainer(DockerContainer):
@@ -139,3 +143,36 @@ def sample_metadatas() -> list[dict]:
         {"source": "docs", "page": 4, "category": "language"},
         {"source": "docs", "page": 5, "category": "database"},
     ]
+
+
+@pytest.fixture(scope="session")
+def libpq_url(connection_string: str) -> str:
+    """Plain postgresql:// URL for tests that open psycopg connections directly."""
+    return to_libpq_url(connection_string)
+
+
+@pytest.fixture(scope="session")
+def unsafe_internals(libpq_url: str) -> bool:
+    """Whether fault injection must enable allow_unsafe_internals first."""
+    return supports_unsafe_internals(libpq_url)
+
+
+@pytest.fixture
+def engine_factory(connection_string: str):
+    """Make CockroachDBEngines tagged with their own application_name; closed after the test."""
+    engines: list[CockroachDBEngine] = []
+
+    def make(application_name: str | None = None, **kwargs: Any) -> CockroachDBEngine:
+        connect_args = dict(kwargs.pop("connect_args", {}))
+        if application_name:
+            connect_args["application_name"] = application_name
+        engine = CockroachDBEngine.from_connection_string(
+            connection_string, connect_args=connect_args, **kwargs
+        )
+        engines.append(engine)
+        return engine
+
+    yield make
+    for engine in engines:
+        with contextlib.suppress(Exception):
+            engine.close()

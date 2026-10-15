@@ -331,6 +331,38 @@ class TestCockroachDBSaverSync:
             assert result is not None
             assert result.checkpoint["id"] == chkpnt["id"]
 
+    def test_gssencmode_defaults_to_disable_from_conn_string(self, connection_string: str) -> None:
+        """Verify that from_conn_string sets gssencmode=disable by default."""
+        database = f"test_{uuid4().hex[:16]}"
+        pg_uri = _pg_uri(connection_string)
+        base_uri = pg_uri.rsplit("/", 1)[0]
+
+        with Connection.connect(pg_uri, autocommit=True) as conn:
+            conn.execute(f"CREATE DATABASE {database}")
+
+        db_uri = (
+            f"{base_uri}/{database}?sslmode=disable"
+            if "sslmode=disable" in pg_uri
+            else f"{base_uri}/{database}?sslmode=verify-full"
+        )
+        crdb_uri = db_uri.replace("postgresql://", "cockroachdb://", 1)
+
+        try:
+            with CockroachDBSaver.from_conn_string(crdb_uri) as saver:
+                # Check the psycopg connection's effective gssencmode
+                if isinstance(saver.conn, Connection):
+                    conninfo = saver.conn.pgconn.info
+                    gssencmode_option = next(
+                        (opt for opt in conninfo if opt.keyword == b"gssencmode"), None
+                    )
+                    assert gssencmode_option is not None
+                    assert gssencmode_option.val == b"disable", (
+                        f"Expected gssencmode=disable, got {gssencmode_option.val.decode()}"
+                    )
+        finally:
+            with Connection.connect(pg_uri, autocommit=True) as conn:
+                conn.execute(f"DROP DATABASE IF EXISTS {database} CASCADE")
+
     @pytest.mark.parametrize("saver_name", ["base", "pool"])
     def test_idempotent_setup(self, connection_string: str, saver_name: str) -> None:
         """Test that setup() can be called multiple times safely."""

@@ -1,5 +1,5 @@
 .PHONY: help install install-uv ensure-uv ensure-venv \
-        test test-unit test-integration test-watch coverage \
+        test test-unit test-integration test-e2e test-watch coverage \
         lint lint-fix format format-check type-check check \
         clean build start-db stop-db restart-db db-shell db-logs \
         examples example-quickstart example-indexes example-hybrid example-filters example-chat \
@@ -64,6 +64,9 @@ test-unit: ensure-venv ## Run unit tests only
 test-integration: ensure-venv ## Run integration tests only
 	@echo "$(BLUE)Running integration tests...$(NC)"
 	@.venv/bin/pytest tests/integration -v
+
+test-e2e: ensure-venv ## Run every example against COCKROACHDB_URL
+	@.venv/bin/pytest tests/e2e -v
 
 test-watch: ensure-venv ## Run tests in watch mode
 	@echo "$(BLUE)Running tests in watch mode...$(NC)"

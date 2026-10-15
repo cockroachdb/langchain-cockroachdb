@@ -30,6 +30,9 @@ python examples/sync_usage.py
 # Retry configuration - production configuration presets
 python examples/retry_configuration.py
 
+# Resilience - real CockroachDB faults, retried automatically
+python examples/resilience.py
+
 # Vector indexes - C-SPANN index creation and tuning
 python examples/vector_indexes.py
 
@@ -74,7 +77,7 @@ Synchronous wrapper for simple scripts:
 
 ### 3. retry_configuration.py (Configuration)
 
-Configuration examples for different workloads:
+Shows RetryPolicy presets, per-component overrides and the multi-region failover policy:
 - Default configuration (development)
 - High-performance configuration (production web apps)
 - Low-latency configuration (single-region)
@@ -85,7 +88,15 @@ Configuration examples for different workloads:
 
 **Good for**: Production deployments, performance tuning, different workload patterns
 
-### 4. vector_indexes.py
+### 4. resilience.py
+
+Injects real CockroachDB errors (40001, 40003, 57P01) and kills pooled connections while the
+vector store, chat history and checkpointer keep working. Shows the WARNING line each retry logs.
+Needs a local cluster you can run admin statements on.
+
+**Good for**: Understanding retry behavior, testing fault tolerance
+
+### 5. vector_indexes.py
 
 Vector index management:
 - Creating C-SPANN indexes
@@ -96,7 +107,7 @@ Vector index management:
 
 **Good for**: Performance optimization, production deployments
 
-### 5. hybrid_search.py
+### 6. hybrid_search.py
 
 Combining FTS and vector search:
 - TSVECTOR column creation
@@ -106,7 +117,7 @@ Combining FTS and vector search:
 
 **Good for**: Best search quality, combining keyword + semantic
 
-### 6. metadata_filtering.py
+### 7. metadata_filtering.py
 
 Advanced metadata queries:
 - Equality and comparison operators
@@ -117,7 +128,7 @@ Advanced metadata queries:
 
 **Good for**: Multi-tenant applications, filtered search
 
-### 7. chat_history.py
+### 8. chat_history.py
 
 Persistent conversation storage:
 - Session management
@@ -127,7 +138,7 @@ Persistent conversation storage:
 
 **Good for**: Chatbots, conversational AI
 
-### 8. checkpointer.py
+### 9. checkpointer.py
 
 LangGraph checkpointer with CockroachDB:
 - Sync and async checkpointer usage
@@ -138,7 +149,7 @@ LangGraph checkpointer with CockroachDB:
 
 **Good for**: LangGraph agents, short-term memory, human-in-the-loop workflows
 
-### 9. multi_tenancy.py
+### 10. multi_tenancy.py
 
 Namespace-based multi-tenancy:
 - Opt-in namespace column creation

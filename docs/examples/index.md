@@ -21,11 +21,12 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 | [hybrid_search.py](advanced-filtering.md#hybrid-search) | Combine FTS + vectors | Fusion strategies |
 | [metadata_filtering.py](advanced-filtering.md) | Complex metadata queries | Advanced filters |
 
-### Configuration
+### Configuration and Resilience
 
 | Example | Description | Features |
 |---------|-------------|----------|
 | [retry_configuration.py](../getting-started/configuration.md#configuration-presets) | Production configurations | Retry logic, connection pooling |
+| [resilience.py](../guides/resilience.md#trying-it) | Fault injection and retries | Real CockroachDB errors, retry behavior |
 
 ### Chat Applications
 

@@ -1,17 +1,22 @@
 """Asynchronous CockroachDB checkpoint saver for LangGraph.
 
 Provides the same interface as langgraph-checkpoint-postgres AsyncPostgresSaver,
-adapted for CockroachDB's isolation levels (SERIALIZABLE default, READ COMMITTED supported)
-and online schema changes.
+adapted for CockroachDB's isolation levels (SERIALIZABLE default, READ COMMITTED
+supported) and online schema changes. Every operation retries transient
+CockroachDB errors under the saver's RetryPolicy. All writes are UPSERTs or
+DELETEs, so retrying after an ambiguous result is safe.
 """
 
 from __future__ import annotations
 
 import asyncio
+import builtins
+import contextlib
+import logging
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -29,35 +34,44 @@ from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from langchain_cockroachdb._connection import to_libpq_url
+from langchain_cockroachdb._guard import aabandon_after
 from langchain_cockroachdb.checkpointer import _ainternal
-from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver
+from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
+from langchain_cockroachdb.retry import RetryPolicy
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 Conn = _ainternal.Conn
 
 
 def _sanitize_conn_string(conn_string: str) -> str:
-    """Convert cockroachdb:// URLs to postgresql:// for psycopg compatibility."""
-    if conn_string.startswith("cockroachdb://"):
-        return conn_string.replace("cockroachdb://", "postgresql://", 1)
-    if conn_string.startswith("cockroachdb+psycopg://"):
-        return conn_string.replace("cockroachdb+psycopg://", "postgresql://", 1)
-    return conn_string
+    """Convert any supported URL spelling to postgresql:// for psycopg."""
+    return to_libpq_url(conn_string)
 
 
 class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     """Asynchronous checkpointer that stores checkpoints in CockroachDB.
 
     Uses raw psycopg3 async connections (not SQLAlchemy) for compatibility
-    with LangGraph's checkpointer interface.
+    with LangGraph's checkpointer interface. For production, pass a
+    ``psycopg_pool.AsyncConnectionPool``: it replaces broken connections,
+    while a single connection cannot recover from a dropped connection.
 
     Example:
         ```python
-        from langchain_cockroachdb import AsyncCockroachDBSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
+        from langchain_cockroachdb import AsyncCockroachDBSaver, RetryPolicy
 
-        DB_URI = "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
-        async with AsyncCockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
+        async with AsyncConnectionPool(
+            "postgresql://root@localhost:26257/defaultdb?sslmode=disable",
+            kwargs={"autocommit": True, "row_factory": dict_row},
+        ) as pool:
+            checkpointer = AsyncCockroachDBSaver(pool, retry_policy=RetryPolicy(max_attempts=8))
             await checkpointer.setup()
-            # Use with LangGraph
             graph = workflow.compile(checkpointer=checkpointer)
         ```
     """
@@ -69,6 +83,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         conn: _ainternal.Conn,
         pipe: AsyncPipeline | None = None,
         serde: SerializerProtocol | None = None,
+        *,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         super().__init__(serde=serde)
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
@@ -81,6 +97,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
         self.supports_pipeline = Capabilities().has_pipeline()
+        self.retry_policy = retry_policy or RetryPolicy()
 
     @classmethod
     @asynccontextmanager
@@ -90,50 +107,94 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         *,
         pipeline: bool = False,
         serde: SerializerProtocol | None = None,
+        retry_policy: RetryPolicy | None = None,
+        connect_timeout: float | None = 10.0,
+        prepare_threshold: int | None = 5,
+        connect_kwargs: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[AsyncCockroachDBSaver]:
-        """Create a new AsyncCockroachDBSaver from a connection string.
+        """Create a saver on a single connection.
 
         Args:
-            conn_string: CockroachDB connection string.
-                Supports cockroachdb:// and postgresql:// formats.
-            pipeline: Whether to use AsyncPipeline mode.
-            serde: Custom serializer protocol.
+            conn_string: CockroachDB connection string (cockroachdb://, postgresql:// and similar)
+            pipeline: Whether to use AsyncPipeline mode
+            serde: Custom serializer protocol
+            retry_policy: How operations retry (default: RetryPolicy())
+            connect_timeout: Seconds to wait when connecting, or None (default: 10)
+            prepare_threshold: psycopg prepared statement threshold, None to disable (default: 5)
+            connect_kwargs: Extra psycopg connection options, e.g. application_name
 
         Yields:
             AsyncCockroachDBSaver instance.
         """
-        conn_string = _sanitize_conn_string(conn_string)
-        async with await AsyncConnection.connect(
-            conn_string, autocommit=True, prepare_threshold=5, row_factory=dict_row
-        ) as conn:
+        policy = retry_policy or RetryPolicy()
+        url = _sanitize_conn_string(conn_string)
+        options = connection_options(url, connect_kwargs, connect_timeout, prepare_threshold)
+        conn = await policy.arun(
+            lambda: AsyncConnection.connect(url, **options), label="connect checkpointer"
+        )
+        async with conn:
             if pipeline:
                 async with conn.pipeline() as pipe:
-                    yield cls(conn=conn, pipe=pipe, serde=serde)
+                    yield cls(conn=conn, pipe=pipe, serde=serde, retry_policy=policy)
             else:
-                yield cls(conn=conn, serde=serde)
+                yield cls(conn=conn, serde=serde, retry_policy=policy)
+
+    async def _retry(self, fn: Callable[[], Awaitable[T]], *, label: str) -> T:
+        """Run ``fn`` under the retry policy."""
+        return await self.retry_policy.arun(fn, label=label, can_retry=self._can_retry)
+
+    async def _sync_pipeline(self) -> None:
+        """Sync pipeline if one is in use. Each statement runs in its own transaction."""
+        if self.pipe:
+            await self.pipe.sync()
+
+    def _can_retry(self, error: BaseException) -> bool:
+        if isinstance(self.conn, AsyncConnection) and self.conn.closed:
+            logger.warning(
+                "Not retrying: the checkpointer's only connection is closed and cannot be "
+                "reopened. Pass a psycopg_pool.AsyncConnectionPool so broken connections "
+                "are replaced."
+            )
+            return False
+        return True
 
     async def setup(self) -> None:
         """Set up the checkpoint database asynchronously.
 
-        Creates necessary tables and runs migrations. MUST be called
-        the first time the checkpointer is used.
+        Creates necessary tables and runs migrations. MUST be called the first
+        time the checkpointer is used. Safe to run from several processes at
+        once: every migration is idempotent and versions are recorded with
+        ON CONFLICT DO NOTHING.
         """
-        async with self._cursor() as cur:
-            await cur.execute(self.MIGRATIONS[0])
-            results = await cur.execute(
-                "SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1"
-            )
-            row = await results.fetchone()
-            version = -1 if row is None else row["v"]
-            for v, migration in zip(
-                range(version + 1, len(self.MIGRATIONS)),
-                self.MIGRATIONS[version + 1 :],
-                strict=False,
-            ):
-                await cur.execute(migration)
-                await cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,))
-            if self.pipe:
-                await self.pipe.sync()
+
+        async def init_and_read_version() -> int:
+            async with self._cursor(
+                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer migration 0"
+            ) as cur:
+                await cur.execute(self.MIGRATIONS[0])
+                await self._sync_pipeline()
+                results = await cur.execute(
+                    "SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1"
+                )
+                await self._sync_pipeline()
+                row = await results.fetchone()
+                return -1 if row is None else row["v"]
+
+        version = await self._retry(init_and_read_version, label="checkpointer migration 0")
+
+        for v in range(version + 1, len(self.MIGRATIONS)):
+
+            async def apply_migration(migration_v: int = v) -> None:
+                async with self._cursor(
+                    timeout=self.retry_policy.ddl_attempt_timeout,
+                    label=f"checkpointer migration {migration_v}",
+                ) as cur:
+                    await cur.execute(self.MIGRATIONS[migration_v])
+                    await self._sync_pipeline()
+                    await cur.execute(self.INSERT_MIGRATION_SQL, (migration_v,))
+                    await self._sync_pipeline()
+
+            await self._retry(apply_migration, label=f"checkpointer migration {v}")
 
     async def alist(
         self,
@@ -144,6 +205,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         limit: int | None = None,
     ) -> AsyncIterator[CheckpointTuple]:
         """List checkpoints from the database asynchronously.
+
+        Matching checkpoints are fetched inside one retried call and yielded
+        afterwards, so the saver's lock is not held while the caller iterates.
 
         Args:
             config: Base configuration for filtering checkpoints.
@@ -160,22 +224,28 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         if limit is not None:
             query += " LIMIT %s"
             params.append(int(limit))
+        for item in await self._retry(
+            lambda: self._fetch_list(query, params), label="list checkpoints"
+        ):
+            yield item
 
-        async with self._cursor() as cur:
+    async def _fetch_list(
+        self, query: str, params: builtins.list[Any]
+    ) -> builtins.list[CheckpointTuple]:
+        async with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="list checkpoints"
+        ) as cur:
             await cur.execute(query, params, binary=True)
             values = await cur.fetchall()
             if not values:
-                return
+                return []
 
             if to_migrate := [
                 v for v in values if v["checkpoint"]["v"] < 4 and v["parent_checkpoint_id"]
             ]:
                 await cur.execute(
                     self.SELECT_PENDING_SENDS_SQL,
-                    (
-                        values[0]["thread_id"],
-                        [v["parent_checkpoint_id"] for v in to_migrate],
-                    ),
+                    (values[0]["thread_id"], [v["parent_checkpoint_id"] for v in to_migrate]),
                 )
                 grouped_by_parent = defaultdict(list)
                 for value in to_migrate:
@@ -188,7 +258,6 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                             value.setdefault("_blob_values", {}),
                         )
 
-            # Batch-fetch blobs and writes grouped by (thread_id, checkpoint_ns)
             groups: dict[tuple[str, str], list[str]] = defaultdict(list)
             for v in values:
                 groups[(v["thread_id"], v["checkpoint_ns"])].append(v["checkpoint_id"])
@@ -205,11 +274,17 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                     await asyncio.to_thread(self._load_writes_batch, await cur.fetchall())
                 )
 
-            for value in values:
-                cid = value["checkpoint_id"]
-                blob_values = {**(value.get("_blob_values") or {}), **(blobs_by_id.get(cid) or {})}
-                pending_writes = writes_by_id.get(cid, [])
-                yield self._build_checkpoint_tuple(value, blob_values, pending_writes)
+        return [
+            self._build_checkpoint_tuple(
+                value,
+                {
+                    **(value.get("_blob_values") or {}),
+                    **(blobs_by_id.get(value["checkpoint_id"]) or {}),
+                },
+                writes_by_id.get(value["checkpoint_id"], []),
+            )
+            for value in values
+        ]
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database asynchronously.
@@ -231,27 +306,28 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             where = (
                 "WHERE thread_id = %s AND checkpoint_ns = %s ORDER BY checkpoint_id DESC LIMIT 1"
             )
+        return await self._retry(
+            lambda: self._fetch_tuple(where, args, thread_id), label="get checkpoint"
+        )
 
-        async with self._cursor() as cur:
+    async def _fetch_tuple(
+        self, where: str, args: tuple[Any, ...], thread_id: str
+    ) -> CheckpointTuple | None:
+        async with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="get checkpoint"
+        ) as cur:
             await cur.execute(self.SELECT_SQL + where, args, binary=True)
             value = await cur.fetchone()
             if value is None:
                 return None
-
             if value["checkpoint"]["v"] < 4 and value["parent_checkpoint_id"]:
                 await cur.execute(
-                    self.SELECT_PENDING_SENDS_SQL,
-                    (thread_id, [value["parent_checkpoint_id"]]),
+                    self.SELECT_PENDING_SENDS_SQL, (thread_id, [value["parent_checkpoint_id"]])
                 )
                 if sends := await cur.fetchone():
                     blob_values: dict[str, Any] = {}
-                    self._migrate_pending_sends(
-                        sends["sends"],
-                        value["checkpoint"],
-                        blob_values,
-                    )
+                    self._migrate_pending_sends(sends["sends"], value["checkpoint"], blob_values)
                     value["_blob_values"] = blob_values
-
             return await self._load_checkpoint_tuple_with_cursor(cur, value)
 
     async def aput(
@@ -279,8 +355,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
 
         copy = checkpoint.copy()
         copy["channel_values"] = copy["channel_values"].copy()
-
-        next_config = {
+        next_config: RunnableConfig = {
             "configurable": {
                 "thread_id": thread_id,
                 "checkpoint_ns": checkpoint_ns,
@@ -295,30 +370,33 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             else:
                 blob_values[k] = copy["channel_values"].pop(k)
 
-        async with self._cursor(pipeline=True) as cur:
-            if blob_versions := {k: v for k, v in new_versions.items() if k in blob_values}:
-                await cur.executemany(
-                    self.UPSERT_CHECKPOINT_BLOBS_SQL,
-                    await asyncio.to_thread(
-                        self._dump_blobs,
-                        thread_id,
-                        checkpoint_ns,
-                        blob_values,
-                        blob_versions,
-                    ),
-                )
-            await cur.execute(
-                self.UPSERT_CHECKPOINTS_SQL,
-                (
-                    thread_id,
-                    checkpoint_ns,
-                    checkpoint["id"],
-                    checkpoint_id,
-                    Jsonb(copy),
-                    Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
-                ),
+        # Serialize once, outside the retry loop and the lock
+        blob_versions = {k: v for k, v in new_versions.items() if k in blob_values}
+        blob_rows = (
+            await asyncio.to_thread(
+                self._dump_blobs, thread_id, checkpoint_ns, blob_values, blob_versions
             )
+            if blob_versions
+            else []
+        )
+        checkpoint_row = (
+            thread_id,
+            checkpoint_ns,
+            checkpoint["id"],
+            checkpoint_id,
+            Jsonb(copy),
+            Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
+        )
 
+        async def write() -> None:
+            async with self._cursor(
+                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="put checkpoint"
+            ) as cur:
+                if blob_rows:
+                    await cur.executemany(self.UPSERT_CHECKPOINT_BLOBS_SQL, blob_rows)
+                await cur.execute(self.UPSERT_CHECKPOINTS_SQL, checkpoint_row)
+
+        await self._retry(write, label="put checkpoint")
         return next_config
 
     async def aput_writes(
@@ -341,7 +419,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             if all(w[0] in WRITES_IDX_MAP for w in writes)
             else self.INSERT_CHECKPOINT_WRITES_SQL
         )
-        params = await asyncio.to_thread(
+        rows = await asyncio.to_thread(
             self._dump_writes,
             config["configurable"]["thread_id"],
             config["configurable"]["checkpoint_ns"],
@@ -350,8 +428,16 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             task_path,
             writes,
         )
-        async with self._cursor(pipeline=True) as cur:
-            await cur.executemany(query, params)
+
+        async def write() -> None:
+            async with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="put checkpoint writes",
+            ) as cur:
+                await cur.executemany(query, rows)
+
+        await self._retry(write, label="put checkpoint writes")
 
     async def adelete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes for a thread.
@@ -359,19 +445,20 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         Args:
             thread_id: The thread ID to delete.
         """
-        async with self._cursor(pipeline=True) as cur:
-            await cur.execute(
-                "DELETE FROM checkpoints WHERE thread_id = %s",
-                (str(thread_id),),
-            )
-            await cur.execute(
-                "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
-                (str(thread_id),),
-            )
-            await cur.execute(
-                "DELETE FROM checkpoint_writes WHERE thread_id = %s",
-                (str(thread_id),),
-            )
+
+        async def delete() -> None:
+            async with self._cursor(
+                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="delete thread"
+            ) as cur:
+                await cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (str(thread_id),))
+                await cur.execute(
+                    "DELETE FROM checkpoint_blobs WHERE thread_id = %s", (str(thread_id),)
+                )
+                await cur.execute(
+                    "DELETE FROM checkpoint_writes WHERE thread_id = %s", (str(thread_id),)
+                )
+
+        await self._retry(delete, label="delete thread")
 
     # Sync wrappers that delegate to async methods via the event loop
     def list(
@@ -450,32 +537,45 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         return asyncio.run_coroutine_threadsafe(self.adelete_thread(thread_id), self.loop).result()
 
     @asynccontextmanager
-    async def _cursor(self, *, pipeline: bool = False) -> AsyncIterator[AsyncCursor[DictRow]]:
-        """Create a database cursor as a context manager."""
+    async def _cursor(
+        self,
+        *,
+        pipeline: bool = False,
+        timeout: float | None = None,
+        label: str = "checkpoint operation",
+    ) -> AsyncIterator[AsyncCursor[DictRow]]:
+        """Create a database cursor as a context manager, with the hang guard."""
         async with self.lock, _ainternal.get_connection(self.conn) as conn:
-            if self.pipe:
-                try:
+            fileno = conn.fileno() if timeout is not None else None
+            async with aabandon_after(fileno, timeout, label=label):
+                if self.pipe:
+                    try:
+                        async with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                            yield cur
+                        if pipeline:
+                            await self.pipe.sync()
+                    except BaseException:
+                        # Resync while still holding the lock, so other tasks' queued
+                        # statements are untouched
+                        with contextlib.suppress(Exception):
+                            await self.pipe.sync()
+                        raise
+                elif pipeline:
+                    if self.supports_pipeline:
+                        async with (
+                            conn.pipeline(),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                    else:
+                        async with (
+                            conn.transaction(),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                else:
                     async with conn.cursor(binary=True, row_factory=dict_row) as cur:
                         yield cur
-                finally:
-                    if pipeline:
-                        await self.pipe.sync()
-            elif pipeline:
-                if self.supports_pipeline:
-                    async with (
-                        conn.pipeline(),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
-                else:
-                    async with (
-                        conn.transaction(),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
-            else:
-                async with conn.cursor(binary=True, row_factory=dict_row) as cur:
-                    yield cur
 
     async def _load_checkpoint_tuple_with_cursor(
         self, cur: AsyncCursor[DictRow], value: DictRow
@@ -486,25 +586,19 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         checkpoint_id = value["checkpoint_id"]
         checkpoint = value["checkpoint"]
 
-        # Fetch blobs via separate query
         cv_pairs = self._get_channel_version_pairs(checkpoint)
         blob_values: dict[str, Any] = value.get("_blob_values") or {}
         if cv_pairs:
             await cur.execute(
-                self.SELECT_BLOBS_SQL,
-                (thread_id, checkpoint_ns, cv_pairs),
-                binary=True,
+                self.SELECT_BLOBS_SQL, (thread_id, checkpoint_ns, cv_pairs), binary=True
             )
             blob_values = {
                 **blob_values,
                 **await asyncio.to_thread(self._load_blobs, await cur.fetchall()),
             }
 
-        # Fetch writes via separate query
         await cur.execute(
-            self.SELECT_WRITES_SQL,
-            (thread_id, checkpoint_ns, checkpoint_id),
-            binary=True,
+            self.SELECT_WRITES_SQL, (thread_id, checkpoint_ns, checkpoint_id), binary=True
         )
         pending_writes = await asyncio.to_thread(self._load_writes, await cur.fetchall())
 
@@ -518,12 +612,23 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
         self._validate_ttl_params(ttl_interval, cron)
-        async with self._cursor() as cur:
-            for sql_template in self.ENABLE_TTL_SQL:
-                await cur.execute(sql_template.format(interval=ttl_interval, cron=cron))
+        statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        for statement in statements:
+            await self._run_ddl(statement, "enable TTL")
 
     async def adisable_ttl(self) -> None:
         """Disable CockroachDB row-level TTL on checkpoint tables."""
-        async with self._cursor() as cur:
-            for sql in self.DISABLE_TTL_SQL:
-                await cur.execute(sql)
+        for statement in self.DISABLE_TTL_SQL:
+            await self._run_ddl(statement, "disable TTL")
+
+    async def _run_ddl(self, statement: str, label: str) -> None:
+        """Run a single DDL statement with retry and timeout."""
+
+        async def execute() -> None:
+            async with self._cursor(
+                timeout=self.retry_policy.ddl_attempt_timeout, label=label
+            ) as cur:
+                await cur.execute(statement)
+                await self._sync_pipeline()
+
+        await self._retry(execute, label=label)

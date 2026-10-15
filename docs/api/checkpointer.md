@@ -20,6 +20,25 @@ Asynchronous checkpointer for LangGraph workflows.
       show_root_heading: true
       show_source: false
 
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `conn` | Connection or Pool | Required | psycopg connection or pool |
+| `retry_policy` | RetryPolicy | None | Retry policy for transient errors |
+| `pipe` | bool | False | Use pipeline mode (single connection) |
+
+### from_conn_string Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `conn_string` | str | Required | Database connection string (cockroachdb:// or postgresql://) |
+| `retry_policy` | RetryPolicy | None | Retry policy for transient errors |
+| `connect_timeout` | float \| None | 10 | Connection timeout in seconds |
+| `prepare_threshold` | int | 5 | Prepared statement threshold |
+| `connect_kwargs` | dict | {} | Additional connection options (e.g. `{"application_name": "my-service"}`) |
+| `pipeline` | bool | False | Use pipeline mode (single connection) |
+
 ## Key Methods
 
 ### Shared (Sync & Async)

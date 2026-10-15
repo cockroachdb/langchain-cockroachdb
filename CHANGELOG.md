@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - Unreleased
+
+### Added
+- `RetryPolicy`: one configurable object for which errors are retried and how, set on the engine and inherited by the vector store and chat history; checkpointers take one too. Exported defaults (`RETRYABLE_SQLSTATES`, `TRANSIENT_MESSAGES`, ...) and `get_sqlstate()`.
+- Retries for 40001, 40003, every 08xxx code, 57P01, 58C00, 58C01 and 53300, plus connection loss reported without a code. Failed logins and SSL or configuration errors are never retried.
+- Optional hang guard (`attempt_timeout`, `ddl_attempt_timeout`) that abandons and retries an attempt the server never answers.
+- `aadd_embeddings`/`add_embeddings`, `amax_marginal_relevance_search_by_vector`, the full langchain-postgres filter grammar (`$between`, `$exists`, `$like`, `$ilike`, `$not`).
+- `CockroachDBChatMessageHistory` accepts a shared `CockroachDBEngine` and has a public `acreate_table_if_not_exists()`.
+- Checkpointer `from_conn_string` options: `retry_policy`, `connect_timeout`, `prepare_threshold`, `connect_kwargs`.
+- `connect_timeout` on `CockroachDBEngine.from_connection_string` (default 10 seconds).
+- `CockroachDBEngine.from_engine(engine, loop=...)`.
+- `postgresql://` and `cockroachdb://` URL spellings are normalized to the psycopg driver.
+- `examples/resilience.py`, end-to-end tests for every example, LangGraph checkpointer conformance tests, and integration tests that inject real CockroachDB faults.
+
+### Fixed
+- Errors were classified by psycopg2's `pgcode`, which psycopg 3 does not set, and by words like "connection" and "timeout" in any exception. Missing tables and statement timeouts were retried.
+- The vector store never applied its retry settings; chat history and both checkpointers had no retries.
+- Sync methods failed under concurrency ("bound to a different event loop") because every call ran its own event loop against a shared pool. They now share one background loop.
+- Metadata filters broke on apostrophes, could carry injected SQL, and failed on boolean and null values. All values are bound parameters now.
+- Vector indexes ignored the distance strategy and were always `vector_l2_ops`, so cosine and inner product searches never used them.
+- `vector_search_beam_size` stayed set on pooled connections after a search.
+- Chat history `add_messages` could leave partial writes and could duplicate messages on retry.
+- MMR re-embedded every candidate through the embeddings API.
+- `from_texts` failed with `ids` or vector store arguments.
+- Concurrent checkpointer `setup()` could fail on a duplicate migration version, and calling the saver while iterating `list()` deadlocked.
+- Running setup a second time failed with SQLSTATE 57000 when `autocommit_before_ddl` was off and the table was schema_locked, which is the default for new tables on v26. This hit `init_vectorstore_table` with `namespace_column` or `create_tsvector`, and chat history `create_table_if_not_exists`. Schema setup now runs one statement per implicit transaction.
+- In pipeline mode, checkpointer `setup()` and `enable_ttl()`/`disable_ttl()` failed with `autocommit_before_ddl` off. That covered a fresh database and an upgrade that adds migrations. Every schema statement now runs in its own implicit transaction.
+- After a session is canceled (`CANCEL SESSION`, or a connection dropped by a load balancer or drain), CockroachDB can answer the next query with SQLSTATE XXUUU "read tcp ...: i/o timeout". v25.4 always does; v26.3 sometimes does. The checkpointers raised it. It is now retried on a fresh connection.
+- In a vector store with a namespace, adding a document whose id already belonged to another namespace overwrote that row and moved it into the writing namespace. Such ids now raise `ValueError` before anything is written, and the upsert never updates a row in another namespace.
+- New connections set `gssencmode=disable` unless the URL or connect args choose otherwise. CockroachDB has no GSS encryption, and this avoids a Kerberos lookup that can crash forked workers on macOS.
+- `adrop_vector_index()` and `drop_vector_index()` can be called without an index to drop the default-named index, as the upgrade note says.
+- `from_texts(namespace=...)` now creates the namespace column.
+- Two spellings of the same UUID in one call are rejected as duplicates.
+
+### Changed
+- psycopg 3 only: `psycopg2-binary` is no longer a dependency. Requires `langchain-core` 1.x and caps every dependency at its next major version. Python 3.10 to 3.14.
+- Supports CockroachDB v25.4 or later; tested on v25.4 LTS and v26.3.
+- The vector store's retry settings default to the engine's (5 attempts) instead of 3.
+- `max_retries < 1` raises `ValueError` instead of never calling the function.
+- Table, schema, column and index names must be plain SQL identifiers.
+- Indexes created by 0.3.x for COSINE or INNER_PRODUCT should be dropped and applied again.
+- `add_texts`/`add_embeddings` reject duplicate ids within one call (`ValueError`), and metadata that is not JSON serializable, including NaN and infinity (`TypeError`). Both checks run before anything is written. They used to fail partway, after earlier batches had committed.
+- Range filters (`$gt`, `$gte`, `$lt`, `$lte`, `$between`) with a string value now compare as text, and only match string fields, like langchain-postgres. In 0.3.0, `{"year": {"$gte": "2020"}}` matched numeric fields; pass a number to compare numerically.
+- Top-level keys next to `$and`/`$or` used to be ignored. They are now combined with AND, so results can narrow.
+- The `retry_*` attributes on the engine and vector store are now read-only properties. Set them through `retry_policy` or the constructor.
+- Chat message ids are generated by the client before the first attempt.
+- `batch_size` is capped at 16,383. Long id lists are split automatically.
+
 ## [0.3.0] - 2026-07-15
 
 ### Fixed

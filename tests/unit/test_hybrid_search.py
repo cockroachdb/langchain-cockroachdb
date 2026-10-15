@@ -177,3 +177,8 @@ class TestFtsLanguageValidation:
     def test_empty_language_rejected(self) -> None:
         with pytest.raises(ValueError, match="language"):
             HybridSearchConfig(fts_query_language="")
+
+    def test_trailing_newline_rejected(self) -> None:
+        """Trailing newline should be rejected to prevent injection."""
+        with pytest.raises(ValueError, match="language"):
+            HybridSearchConfig(fts_query_language="english\n")

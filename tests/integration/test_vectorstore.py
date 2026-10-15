@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 from langchain_core.embeddings import Embeddings
+from sqlalchemy import text
 
 from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 from langchain_cockroachdb.engine import CockroachDBEngine
@@ -168,6 +169,34 @@ class TestAsyncCockroachDBVectorStore:
         remaining = await vectorstore.asimilarity_search("", k=10)
         assert len(remaining) == len(sample_texts) - len(delete_ids)
 
+    async def test_long_id_lists(
+        self,
+        vectorstore: AsyncCockroachDBVectorStore,
+    ) -> None:
+        """Test get_by_ids and delete with long id lists (20,500 ids) to verify chunking."""
+        # Insert a few real rows
+        real_texts = ["doc1", "doc2", "doc3", "doc4", "doc5"]
+        real_ids = await vectorstore.aadd_texts(real_texts)
+
+        # Generate 20,500 total ids (mostly non-existent, plus the real ones)
+        # This tests that chunking works (keeping it fast; 65k+ would also work but slower)
+        import uuid
+
+        nonexistent_ids = [str(uuid.uuid4()) for _ in range(20500 - len(real_ids))]
+        all_ids = real_ids + nonexistent_ids
+
+        # get_by_ids should only return the real ones
+        docs = await vectorstore.aget_by_ids(all_ids)
+        assert len(docs) == len(real_ids)
+        assert {d.id for d in docs} == set(real_ids)
+
+        # delete with the long list should remove the real ones
+        await vectorstore.adelete(all_ids)
+
+        # Verify they're gone
+        remaining = await vectorstore.aget_by_ids(real_ids)
+        assert len(remaining) == 0
+
     async def test_aapply_vector_index(
         self,
         vectorstore: AsyncCockroachDBVectorStore,
@@ -183,18 +212,71 @@ class TestAsyncCockroachDBVectorStore:
 
         await vectorstore.aapply_vector_index(index)
 
+    async def test_adrop_vector_index_no_arg(
+        self,
+        vectorstore: AsyncCockroachDBVectorStore,
+        sample_texts: list[str],
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test dropping default-named index without passing index argument."""
+        await vectorstore.aadd_texts(sample_texts)
+
+        # Create an L2 index with default name
+        index = CSPANNIndex(distance_strategy=DistanceStrategy.EUCLIDEAN)
+        await vectorstore.aapply_vector_index(index)
+
+        # Verify the index exists by checking pg_indexes
+        async with cockroachdb_engine.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = :schema AND tablename = :table"
+                ),
+                {"schema": vectorstore.schema, "table": vectorstore.collection_name},
+            )
+            indexes_before = [row[0] for row in result.fetchall()]
+
+        # The default index name should exist
+        expected_name = index.get_index_name(
+            vectorstore.collection_name, vectorstore.embedding_column
+        )
+        assert expected_name in indexes_before
+
+        # Drop it without passing an index argument
+        await vectorstore.adrop_vector_index()
+
+        # Verify it's gone
+        async with cockroachdb_engine.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = :schema AND tablename = :table"
+                ),
+                {"schema": vectorstore.schema, "table": vectorstore.collection_name},
+            )
+            indexes_after = [row[0] for row in result.fetchall()]
+
+        assert expected_name not in indexes_after
+
     async def test_query_with_beam_size(
         self,
         vectorstore: AsyncCockroachDBVectorStore,
         sample_texts: list[str],
+        cockroachdb_engine: CockroachDBEngine,
+        unsafe_internals,
     ) -> None:
         """Test query with beam size option."""
+        from tests.integration.faults import FaultInjector
+
         await vectorstore.aadd_texts(sample_texts)
 
         index = CSPANNIndex(distance_strategy=DistanceStrategy.COSINE)
         await vectorstore.aapply_vector_index(index)
 
-        query_options = CSPANNQueryOptions(beam_size=100)
+        # Use FaultInjector to capture SQL statements
+        injector = FaultInjector(cockroachdb_engine.engine, unsafe_internals=unsafe_internals)
+
+        query_options = CSPANNQueryOptions(beam_size=77)
         results = await vectorstore.asimilarity_search_with_score(
             "database",
             k=3,
@@ -202,6 +284,11 @@ class TestAsyncCockroachDBVectorStore:
         )
 
         assert len(results) <= 3
+
+        # Verify that beam_size setting was sent
+        count = injector.count("vector_search_beam_size = 77")
+        injector.close()
+        assert count > 0, "beam_size setting did not reach the database"
 
     async def test_amax_marginal_relevance_search(
         self,
@@ -250,6 +337,27 @@ class TestAsyncCockroachDBVectorStore:
 
         results = await vectorstore.asimilarity_search("database", k=3)
         assert len(results) <= 3
+
+    async def test_afrom_texts_with_namespace_creates_column(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that from_texts with namespace creates the namespace column."""
+        embeddings = FakeEmbeddings()
+
+        # from_texts with namespace but no namespace_column should create the column
+        vectorstore = await AsyncCockroachDBVectorStore.afrom_texts(
+            texts=["doc1", "doc2"],
+            embedding=embeddings,
+            engine=cockroachdb_engine,
+            collection_name="from_texts_namespace_test",
+            namespace="tenant1",
+        )
+
+        # Should be able to write and read
+        assert vectorstore is not None
+        results = await vectorstore.asimilarity_search("doc", k=2)
+        assert len(results) == 2
 
     async def test_multiple_distance_strategies(
         self,
@@ -448,3 +556,443 @@ class TestAsyncCockroachDBVectorStore:
 
         results = await store_all.asimilarity_search("doc", k=10)
         assert len(results) == 2
+
+    async def test_namespace_rejects_ids_owned_by_another_namespace(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that adding a document with an id owned by another namespace raises ValueError."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_reject_ids"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        # Tenant A adds a document
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A original"], ids=[id_x])
+
+        # Tenant B tries to add documents with id_x and id_y
+        id_y = str(uuid.uuid4())
+        with pytest.raises(ValueError, match=str(id_x)):
+            await store_b.aadd_texts(["B attempt", "B other"], ids=[id_x, id_y])
+
+        # Verify A's document is unchanged
+        docs_a = await store_a.aget_by_ids([id_x])
+        assert len(docs_a) == 1
+        assert docs_a[0].page_content == "A original"
+
+        # Verify B has nothing (id_y should not be written)
+        docs_b = await store_b.aget_by_ids([id_x, id_y])
+        assert len(docs_b) == 0
+
+    async def test_namespace_reupsert_in_same_namespace_updates(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that upserting in the same namespace updates the content."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_reupsert"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["v1"], ids=[id_x])
+        await store_a.aadd_texts(["v2"], ids=[id_x])
+
+        docs = await store_a.aget_by_ids([id_x])
+        assert len(docs) == 1
+        assert docs[0].page_content == "v2"
+
+    async def test_guarded_upsert_never_crosses_namespaces(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that the guarded upsert rejects cross-namespace writes."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_guarded"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        # Tenant A adds a document
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A doc"], ids=[id_x])
+
+        # Call store B's _insert_batch directly to bypass the check
+        id_z = str(uuid.uuid4())
+        emb_x = await embeddings.aembed_documents(["B attempt on X"])
+        emb_z = await embeddings.aembed_documents(["B doc Z"])
+        with pytest.raises(ValueError, match=str(id_x)):
+            await store_b._insert_batch(
+                ["B attempt on X", "B doc Z"],
+                emb_x + emb_z,
+                ["{}", "{}"],
+                [id_x, id_z],
+            )
+
+        # Verify A's row is unchanged and still in namespace A
+        docs_a = await store_a.aget_by_ids([id_x])
+        assert len(docs_a) == 1
+        assert docs_a[0].page_content == "A doc"
+
+        # Verify Z is in namespace B
+        docs_b = await store_b.aget_by_ids([id_z])
+        assert len(docs_b) == 1
+        assert docs_b[0].page_content == "B doc Z"
+
+    async def test_uppercase_uuid_ids_are_not_reported_as_skipped(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that uppercase UUID ids work correctly without being reported as skipped."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_uppercase"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+
+        # Add document with uppercase UUID
+        id_upper = str(uuid.uuid4()).upper()
+        await store_a.aadd_texts(["v1"], ids=[id_upper])
+
+        # Upsert with new content (should not raise an error)
+        await store_a.aadd_texts(["v2"], ids=[id_upper])
+
+        # Verify content is updated
+        docs = await store_a.aget_by_ids([id_upper])
+        assert len(docs) == 1
+        assert docs[0].page_content == "v2"
+
+    async def test_store_without_namespace_keeps_upsert_behavior(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that stores without a namespace keep the same upsert behavior."""
+        embeddings = FakeEmbeddings()
+        table = "test_no_ns_upsert"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            # no namespace
+        )
+
+        id_x = str(uuid.uuid4())
+        await store.aadd_texts(["v1"], ids=[id_x])
+        await store.aadd_texts(["v2"], ids=[id_x])
+
+        docs = await store.aget_by_ids([id_x])
+        assert len(docs) == 1
+        assert docs[0].page_content == "v2"
+
+    async def test_namespace_int8_id_column_does_not_false_error(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Regression test: INT8 id column should not trigger false namespace error."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_int8_id"
+
+        async with cockroachdb_engine._connect(
+            begin=True, timeout=None, label="create int8 table"
+        ) as conn:
+            await conn.execute(
+                text(
+                    f"CREATE TABLE IF NOT EXISTS public.{table} ("
+                    "id INT8 PRIMARY KEY, "
+                    "content TEXT, "
+                    "embedding VECTOR(3), "
+                    "metadata JSONB DEFAULT '{}', "
+                    "namespace TEXT NOT NULL DEFAULT '')"
+                )
+            )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+
+        await store_a.aadd_texts(["doc"], ids=["007"])
+
+        docs = await store_a.aget_by_ids(["007"])
+        assert len(docs) == 1
+        assert docs[0].page_content == "doc"
+
+        async with cockroachdb_engine._connect(
+            begin=True, timeout=None, label="drop int8 table"
+        ) as conn:
+            await conn.execute(text(f"DROP TABLE IF EXISTS public.{table}"))
+
+    async def test_namespace_multi_chunk_check_rejects_before_any_write(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that multi-chunk pre-check rejects before any write."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_multi_chunk"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+            batch_size=1,
+        )
+
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A doc"], ids=[id_x])
+
+        id_y = str(uuid.uuid4())
+        with pytest.raises(ValueError, match=str(id_x)):
+            await store_b.aadd_texts(["B doc Y", "B doc X"], ids=[id_y, id_x])
+
+        assert len(await store_b.aget_by_ids([id_y])) == 0
+        assert len(await store_b.aget_by_ids([id_x])) == 0
+
+    async def test_guarded_upsert_error_does_not_name_successful_rows(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+    ) -> None:
+        """Test that the guarded upsert error does not name successful rows."""
+        embeddings = FakeEmbeddings()
+        table = "test_ns_error_no_success"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        store_a = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-a",
+        )
+        store_b = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+            namespace="tenant-b",
+        )
+
+        id_x = str(uuid.uuid4())
+        await store_a.aadd_texts(["A doc"], ids=[id_x])
+
+        id_z = str(uuid.uuid4())
+        emb_x = await embeddings.aembed_documents(["B attempt on X"])
+        emb_z = await embeddings.aembed_documents(["B doc Z"])
+
+        try:
+            await store_b._insert_batch(
+                ["B attempt on X", "B doc Z"],
+                emb_x + emb_z,
+                ["{}", "{}"],
+                [id_x, id_z],
+            )
+            raise AssertionError("Should have raised ValueError")
+        except ValueError as e:
+            assert str(id_x) in str(e)
+            assert str(id_z) not in str(e)
+
+        docs_b = await store_b.aget_by_ids([id_z])
+        assert len(docs_b) == 1
+        assert docs_b[0].page_content == "B doc Z"
+
+    async def test_store_without_namespace_sends_no_namespace_sql(
+        self,
+        cockroachdb_engine: CockroachDBEngine,
+        unsafe_internals: bool,
+    ) -> None:
+        """Test that stores without a namespace send no namespace-specific SQL."""
+        from tests.integration.faults import FaultInjector
+
+        embeddings = FakeEmbeddings()
+        table = "test_no_ns_sql"
+
+        await cockroachdb_engine.ainit_vectorstore_table(
+            table_name=table,
+            vector_dimension=3,
+            namespace_column="namespace",
+            drop_if_exists=True,
+        )
+
+        injector = FaultInjector(cockroachdb_engine.engine, unsafe_internals=unsafe_internals)
+
+        store = AsyncCockroachDBVectorStore(
+            engine=cockroachdb_engine,
+            embeddings=embeddings,
+            collection_name=table,
+        )
+
+        id_x = str(uuid.uuid4())
+        await store.aadd_texts(["v1"], ids=[id_x])
+        await store.aadd_texts(["v2"], ids=[id_x])
+
+        docs = await store.aget_by_ids([id_x])
+        assert len(docs) == 1
+        assert docs[0].page_content == "v2"
+
+        assert injector.count("is distinct from") == 0
+        assert injector.count("returning") == 0
+
+        injector.close()
+
+    async def test_amax_marginal_relevance_search_by_vector(
+        self, vectorstore, sample_texts
+    ) -> None:
+        await vectorstore.aadd_texts(sample_texts)
+        embedding = await vectorstore.embeddings.aembed_query("database")
+        results = await vectorstore.amax_marginal_relevance_search_by_vector(
+            embedding, k=2, fetch_k=5
+        )
+        assert len(results) == 2
+
+
+async def test_multi_tenant_search_uses_vector_index(
+    cockroachdb_engine: CockroachDBEngine, connection_string: str
+) -> None:
+    """Multi-tenant search with namespace prefix column uses the vector index."""
+    from langchain_core.embeddings import DeterministicFakeEmbedding
+
+    from langchain_cockroachdb import AsyncCockroachDBVectorStore
+
+    # Create a table with namespace column
+    table_name = "multi_tenant_index_test"
+    await cockroachdb_engine.ainit_vectorstore_table(
+        table_name, 384, namespace_column="namespace", drop_if_exists=True
+    )
+
+    embeddings = DeterministicFakeEmbedding(size=384)
+    vectorstore = AsyncCockroachDBVectorStore(
+        engine=cockroachdb_engine,
+        embeddings=embeddings,
+        collection_name=table_name,
+        namespace="t1",
+    )
+
+    # Insert a handful of rows
+    await vectorstore.aadd_texts(["doc1", "doc2", "doc3", "doc4"])
+
+    # Create C-SPANN index with namespace as prefix column
+    index = CSPANNIndex(distance_strategy=DistanceStrategy.COSINE)
+    await vectorstore.aapply_vector_index(index, prefix_columns=["namespace"])
+
+    # Build the EXPLAIN query the way the store does
+    # Get the embedded query vector
+    query_vector = await embeddings.aembed_query("test query")
+
+    # Build the SQL that _search_by_vector uses
+    from langchain_cockroachdb._sql import vector_literal
+
+    explain_sql = f"""
+    EXPLAIN SELECT id, content, metadata, embedding <=> CAST(:embedding AS VECTOR) AS distance
+    FROM public.{table_name}
+    WHERE namespace = :namespace
+    ORDER BY embedding <=> CAST(:embedding AS VECTOR)
+    LIMIT 4
+    """
+
+    # Execute EXPLAIN with bound parameters (not literals)
+    async with cockroachdb_engine.engine.connect() as conn:
+        from sqlalchemy import text
+
+        result = await conn.execute(
+            text(explain_sql),
+            {"embedding": vector_literal(query_vector), "namespace": "t1"},
+        )
+        plan = "\n".join(row[0] for row in result.fetchall())
+
+    # Assert the plan uses the vector index
+    assert "vector search" in plan.lower(), f"No vector search in plan:\n{plan}"
+
+    # Assert the index name appears
+    index_name = index.get_index_name(table_name, "embedding")
+    assert index_name in plan, f"Index {index_name} not in plan:\n{plan}"
+
+    # Assert prefix spans appear (showing namespace constraint)
+    assert "prefix spans" in plan.lower(), f"No prefix spans in plan:\n{plan}"
+
+    await cockroachdb_engine.adrop_table(table_name)
