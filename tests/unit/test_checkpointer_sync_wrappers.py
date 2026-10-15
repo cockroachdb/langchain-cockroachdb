@@ -37,6 +37,7 @@ class StubSaver(AsyncCockroachDBSaver):
         super().__init__(AsyncConnectionPool("", open=False))
         self.calls: list[str] = []
         self.started = threading.Event()
+        self.cancelled = threading.Event()
         # Seconds every async method waits before it returns, if set
         self.hold: float | None = None
 
@@ -45,7 +46,11 @@ class StubSaver(AsyncCockroachDBSaver):
         self.calls.append(name)
         self.started.set()
         if self.hold is not None:
-            await asyncio.sleep(self.hold)
+            try:
+                await asyncio.sleep(self.hold)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
 
     async def aget_tuple(self, config: Any) -> Any:
         await self._step("aget_tuple")
@@ -258,9 +263,11 @@ def test_sync_methods_fail_when_the_loop_stops_during_a_call(method: str, monkey
     try:
         with pytest.raises(RuntimeError, match="was created on stopped before the call finished"):
             CALLS[method](saver)
-        # The call cancelled its work; let the loop run the cancellation
+        assert not saver.cancelled.is_set()
+        # The call cancelled its work, so the work does not go on if the loop runs again
         thread.join(5)
         loop.run_until_complete(asyncio.sleep(0.1))
+        assert saver.cancelled.is_set()
     finally:
         stopper.join(5)
         _close_loop(loop, thread)

@@ -246,6 +246,7 @@ def messages(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [record.getMessage() for record in caplog.records]
 
 
+@pytest.mark.timeout(10)
 @KINDS
 @pytest.mark.parametrize("phrases", ["default", "none"])
 async def test_pooled_saver_retries_a_write_whose_tls_connection_the_guard_shut(
@@ -345,6 +346,7 @@ async def test_single_connection_saver_does_not_retry_a_broken_connection(
         assert not_retrying == []
 
 
+@pytest.mark.timeout(10)
 @KINDS
 async def test_setup_labels_the_bootstrap_apart_from_migration_0(
     kind: str, caplog: pytest.LogCaptureFixture
