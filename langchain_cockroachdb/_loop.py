@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import inspect
 import os
 import threading
 import time
+import weakref
 from collections.abc import Coroutine, Iterator
 from typing import Any, TypeVar
 
@@ -32,6 +34,12 @@ LOOP_CHECK_INTERVAL = 0.1
 # it, in seconds. A loop whose thread was just started is not running yet for a
 # moment, and a loop can be stopped and run again.
 LOOP_START_TIMEOUT = 1.0
+
+# How long a call first waits before it looks again at a loop passed as loop=
+# that is not running yet, in seconds. The wait doubles up to
+# LOOP_CHECK_INTERVAL. A loop whose thread was just started usually runs within
+# a millisecond, so the call is not held up for a full interval.
+LOOP_START_FIRST_WAIT = 0.001
 
 _ADVICE = (
     "Run that loop in its own thread (for example with loop.run_forever()) for as long "
@@ -50,10 +58,20 @@ _STOPPED_WHILE_WAITING = (
     "The event loop passed as loop= stopped before the call finished. The work may or "
     f"may not have taken effect. {_ADVICE}"
 )
+_FORK_ADVICE = (
+    "Build a new engine in this process, with a loop started in this process, or without loop=."
+)
+_FORKED_LOOP = (
+    "The event loop passed as loop= was running in the parent process when this process "
+    f"was forked. Its copy here can never run, so calls could never finish. {_FORK_ADVICE}"
+)
 
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
+
+# Loops passed as loop= that were running when this process was forked
+_forked_loops: weakref.WeakSet[asyncio.AbstractEventLoop] = weakref.WeakSet()
 
 
 def is_background_loop(loop: asyncio.AbstractEventLoop) -> bool:
@@ -111,32 +129,58 @@ def _refuse_forked_child(owner_pid: int) -> None:
     """Raise unless this is the process that built the engine.
 
     A fork child has a copy of the loop that can still report it is running,
-    but the thread that ran it exists only in the parent.
+    but the thread that ran it exists only in the parent. This check only
+    catches engines built before the fork, because an engine built in the child
+    records the child's pid. refuse_forked_loop covers an engine built in the
+    child on a loop that a live engine was using when the process forked.
     """
     pid = os.getpid()
     if pid != owner_pid:
         raise RuntimeError(
             f"This engine was built with loop= in process {owner_pid}, and this is "
             f"process {pid}, a forked child of it. No thread runs that loop here, so "
-            "the call could never finish. Build a new engine in this process."
+            f"the call could never finish. {_FORK_ADVICE}"
         )
+
+
+def note_forked_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """In a fork child, remember ``loop`` if it was running in the parent.
+
+    Its copy here still reports running but can never run: run_forever()
+    raises "already running". The record holds weak references, so it keeps no
+    loop alive. A loop that cannot be weakly referenced is not recorded.
+    """
+    if loop.is_running():
+        with contextlib.suppress(TypeError):
+            _forked_loops.add(loop)
+
+
+def refuse_forked_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Raise if ``loop`` was running in the parent when this process was forked."""
+    if loop in _forked_loops:
+        raise RuntimeError(_FORKED_LOOP)
 
 
 def _until_running(loop: asyncio.AbstractEventLoop) -> Iterator[float]:
     """Yield how long to sleep while ``loop`` is not running yet.
+
+    The first wait is LOOP_START_FIRST_WAIT, and each one after it doubles, up
+    to LOOP_CHECK_INTERVAL.
 
     Raises:
         RuntimeError: If ``loop`` is closed, or is still not running after
             LOOP_START_TIMEOUT
     """
     deadline = time.monotonic() + LOOP_START_TIMEOUT
+    wait = min(LOOP_START_FIRST_WAIT, LOOP_CHECK_INTERVAL)
     while not loop.is_running():
         if loop.is_closed():
             raise RuntimeError(_CLOSED)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(_NOT_RUNNING)
-        yield min(LOOP_CHECK_INTERVAL, remaining)
+        yield min(wait, remaining)
+        wait = min(wait * 2, LOOP_CHECK_INTERVAL)
 
 
 def _submit(
@@ -205,11 +249,13 @@ def run_on_external_loop(
 
     Raises:
         RuntimeError: If called from ``loop``'s own thread or from a forked
-            child, or if ``loop`` is closed, is not running, or stops before
-            the work finishes
+            child, if ``loop`` was running when this process was forked, or if
+            ``loop`` is closed, is not running, or stops before the work
+            finishes
     """
     try:
         _refuse_forked_child(owner_pid)
+        refuse_forked_loop(loop)
         _refuse_own_loop(loop)
         for delay in _until_running(loop):
             time.sleep(delay)
@@ -242,6 +288,7 @@ async def arun_on_external_loop(
     """
     try:
         _refuse_forked_child(owner_pid)
+        refuse_forked_loop(loop)
         for delay in _until_running(loop):
             await asyncio.sleep(delay)
         future = _submit(coro, loop)

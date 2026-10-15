@@ -27,6 +27,8 @@ from langchain_cockroachdb._loop import (
     arun_on_external_loop,
     get_background_loop,
     is_background_loop,
+    note_forked_loop,
+    refuse_forked_loop,
     run_coroutine_sync,
     run_on_external_loop,
 )
@@ -93,7 +95,13 @@ class CockroachDBEngine:
             retry_max_backoff: Shorthand for RetryPolicy.max_backoff
             retry_backoff_multiplier: Shorthand for RetryPolicy.backoff_multiplier
             retry_jitter: Shorthand for RetryPolicy.jitter (True means 0.5)
+
+        Raises:
+            RuntimeError: If ``loop`` was running in the parent process when
+                this process was forked. Its copy here can never run.
         """
+        if loop is not None:
+            refuse_forked_loop(loop)
         self._engine = engine
         self._loop = loop
         # A loop passed as loop= runs only in this process, so a fork child must not use it
@@ -225,7 +233,8 @@ class CockroachDBEngine:
         calling sync methods here, pass that loop as ``loop`` so all work stays
         on it. Keep that loop running in its thread while the engine is in use.
         A call raises RuntimeError instead of waiting forever if the loop is
-        closed or stops, or in a forked child process.
+        closed or stops, or in a forked child process. In a child, build the
+        engine with a loop started in the child, or without ``loop``.
 
         Args:
             engine: SQLAlchemy AsyncEngine
@@ -239,6 +248,10 @@ class CockroachDBEngine:
 
         Returns:
             CockroachDBEngine instance
+
+        Raises:
+            RuntimeError: If ``loop`` was running in the parent process when
+                this process was forked. Its copy here can never run.
         """
         return cls(
             engine,
@@ -501,11 +514,18 @@ def _after_fork_in_child() -> None:
     ``dispose(close=False)`` drops the inherited connections without closing
     them, and psycopg only finishes a connection in the process that opened
     it, so the parent's sessions keep working.
+
+    It also records each loop passed as loop= that was running in the parent.
+    Its copy can never run here, so a new engine built on it is refused.
     """
-    for engine in list(_ENGINES):
+    engines = list(_ENGINES)
+    for engine in engines:
         engine._usage_lock = threading.Lock()
         engine._active = {"sync": 0, "async": 0}
         engine.engine.sync_engine.dispose(close=False)
+    for engine in engines:
+        if engine._loop is not None:
+            note_forked_loop(engine._loop)
 
 
 if hasattr(os, "register_at_fork"):

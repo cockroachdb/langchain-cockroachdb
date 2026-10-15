@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import warnings
+import weakref
 from collections.abc import Coroutine, Iterator
 from typing import Any, TypeVar
 
@@ -381,9 +382,11 @@ def _lazy_engine() -> AsyncEngine:
     return create_async_engine("cockroachdb+psycopg://root@localhost:1/db")
 
 
-def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
-    """Start a loop in a daemon thread and return once it is running."""
-    loop = asyncio.new_event_loop()
+def _start_loop(
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    """Start a loop (a new one by default) in a daemon thread; return once it runs."""
+    loop = loop or asyncio.new_event_loop()
     running = threading.Event()
     loop.call_soon(running.set)
     thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -403,6 +406,16 @@ def _fast_checks(monkeypatch: pytest.MonkeyPatch, start_timeout: float) -> None:
     """Check the loop often, and give a loop that is not running start_timeout seconds."""
     monkeypatch.setattr(_loop, "LOOP_CHECK_INTERVAL", 0.02)
     monkeypatch.setattr(_loop, "LOOP_START_TIMEOUT", start_timeout)
+
+
+def _isolate_fork_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the test its own engine registry and forked-loop record.
+
+    The test can then run the at-fork hook, as a child process would, without
+    touching other tests' engines or leaving records behind.
+    """
+    monkeypatch.setattr(engine_module, "_ENGINES", weakref.WeakSet())
+    monkeypatch.setattr(_loop, "_forked_loops", weakref.WeakSet())
 
 
 def _run(engine: CockroachDBEngine, coro: Coroutine[Any, Any, T], how: str) -> T:
@@ -478,12 +491,109 @@ def test_loop_engine_fails_fast_in_a_forked_child(build, how, monkeypatch) -> No
     monkeypatch.setattr(os, "getpid", lambda: parent_pid + 1)
     try:
         assert loop.is_running()
-        with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="forked"):
+        with (
+            _no_unawaited_coroutines(),
+            pytest.raises(RuntimeError, match="forked child.*a loop started in this process"),
+        ):
             _close(engine, how)
     finally:
         monkeypatch.undo()
         release.set()
         _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@BUILDERS
+def test_loop_engine_refuses_a_loop_that_was_running_when_the_process_forked(
+    build, monkeypatch
+) -> None:
+    # A child runs the at-fork hook before anything else. Its copy of a loop that
+    # was running in the parent reports running but can never run there, so a new
+    # engine built on it in the child would hang on its first call.
+    _isolate_fork_state(monkeypatch)
+    loop, thread = _start_loop()
+    built_before_fork = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    built_before_fork._active = {"sync": 1, "async": 1}
+    pool_before_fork = built_before_fork.engine.sync_engine.pool
+    try:
+        engine_module._after_fork_in_child()
+        # The hook still does its earlier work: fresh counters and a fresh pool
+        assert built_before_fork._active == {"sync": 0, "async": 0}
+        assert built_before_fork.engine.sync_engine.pool is not pool_before_fork
+        with pytest.raises(
+            RuntimeError,
+            match=r"running in the parent process.*a loop started in this process, or without loop=",
+        ):
+            build(_lazy_engine(), loop=loop)
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_refuses_calls_on_a_loop_that_was_running_when_the_process_forked(
+    how, monkeypatch
+) -> None:
+    # In a real child the pid check refuses this engine first. The pid matches in
+    # this test, so this shows the forked-loop check in the call path on its own.
+    _isolate_fork_state(monkeypatch)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    try:
+        engine_module._after_fork_in_child()
+        with (
+            _no_unawaited_coroutines(),
+            pytest.raises(RuntimeError, match="running in the parent process"),
+        ):
+            _close(engine, how)
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_accepts_a_loop_that_was_not_running_when_the_process_forked(
+    how, monkeypatch
+) -> None:
+    # Only loops that were running at the fork are recorded; this one never ran
+    _isolate_fork_state(monkeypatch)
+    loop = asyncio.new_event_loop()
+    _built_before_fork = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    engine_module._after_fork_in_child()
+    _, thread = _start_loop(loop)
+    try:
+        engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+        assert _run(engine, asyncio.sleep(0, result="ok"), how) == "ok"
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+def test_forked_loop_record_does_not_keep_loops_alive(monkeypatch) -> None:
+    _isolate_fork_state(monkeypatch)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    engine_module._after_fork_in_child()
+    assert loop in _loop._forked_loops
+    _close_loop(loop, thread)
+    gone = weakref.ref(loop)
+    del engine, loop
+    gc.collect()
+    assert gone() is None
+    assert len(_loop._forked_loops) == 0
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_reports_a_loop_that_closed_just_before_the_handoff(how, monkeypatch) -> None:
+    # The loop closes after the running check passed but before the work is
+    # handed over. Skipping the check reproduces that order.
+    loop = asyncio.new_event_loop()
+    loop.close()
+    monkeypatch.setattr(_loop, "_until_running", lambda loop: iter(()))
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="loop= is closed"):
+        _close(engine, how)
 
 
 @pytest.mark.timeout(10)
@@ -549,8 +659,11 @@ def test_loop_engine_fails_when_the_loop_closes_during_a_call(how, monkeypatch, 
     finally:
         closer.join(5)
         _close_loop(loop, thread)
-    # Cancelling a task on a closed loop only makes concurrent.futures log an error
-    assert not [r for r in caplog.records if r.name == "concurrent.futures"]
+    # asyncio reports the task the closed loop left pending, and nothing else may
+    # log an error. Cancelling that task on the closed loop would make
+    # concurrent.futures log one.
+    errors = [r.getMessage().splitlines()[0] for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == ["Task was destroyed but it is pending!"]
 
 
 @pytest.mark.timeout(10)
@@ -623,6 +736,30 @@ def test_loop_engine_waits_for_a_loop_that_is_starting(how, monkeypatch) -> None
 
     try:
         assert _run(engine, which_loop(), how) is loop
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_does_not_hold_up_a_call_while_its_loop_starts(how, monkeypatch) -> None:
+    # Checks are 3 s apart here, so waiting a full interval before looking again
+    # would hold up a call to a loop that starts after 20 ms by 3 s
+    monkeypatch.setattr(_loop, "LOOP_CHECK_INTERVAL", 3.0)
+    monkeypatch.setattr(_loop, "LOOP_START_TIMEOUT", 5.0)
+    loop = asyncio.new_event_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+
+    def start_soon() -> None:
+        time.sleep(0.02)
+        loop.run_forever()
+
+    thread = threading.Thread(target=start_soon, daemon=True)
+    thread.start()
+    try:
+        began = time.monotonic()
+        assert _run(engine, asyncio.sleep(0, result="ok"), how) == "ok"
+        assert time.monotonic() - began < 1.0
     finally:
         _close_loop(loop, thread)
 
