@@ -1,16 +1,25 @@
 """Engine configuration and loop dispatch tests that need no database."""
 
 import asyncio
+import concurrent.futures
 import contextlib
+import gc
 import logging
+import os
 import threading
+import time
+import warnings
+from collections.abc import Coroutine, Iterator
+from typing import Any, TypeVar
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 import langchain_cockroachdb.engine as engine_module
-from langchain_cockroachdb import CockroachDBEngine, RetryPolicy
+from langchain_cockroachdb import CockroachDBEngine, RetryPolicy, _loop
 from langchain_cockroachdb._loop import get_background_loop
+
+T = TypeVar("T")
 
 # Nothing connects in these tests; SQLAlchemy engines are lazy.
 URL = "cockroachdb://root@localhost:1/defaultdb?sslmode=disable"
@@ -356,3 +365,427 @@ def test_id_type_rejects_trailing_newline() -> None:
 
     # Trailing newline should not match
     assert _ID_TYPE.fullmatch("UUID\n") is None
+
+
+# Engines built with loop= send work to a loop the library does not own. These
+# tests close, stop and block real loops. Each one has a timeout, so a call
+# that hangs fails its test instead of hanging the suite.
+
+BUILDERS = pytest.mark.parametrize(
+    "build", [CockroachDBEngine, CockroachDBEngine.from_engine], ids=["init", "from_engine"]
+)
+MODES = pytest.mark.parametrize("how", ["sync", "async"])
+
+
+def _lazy_engine() -> AsyncEngine:
+    return create_async_engine("cockroachdb+psycopg://root@localhost:1/db")
+
+
+def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    """Start a loop in a daemon thread and return once it is running."""
+    loop = asyncio.new_event_loop()
+    running = threading.Event()
+    loop.call_soon(running.set)
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    assert running.wait(5), "the loop did not start"
+    return loop, thread
+
+
+def _close_loop(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+    if not loop.is_closed():
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()
+
+
+def _fast_checks(monkeypatch: pytest.MonkeyPatch, start_timeout: float) -> None:
+    """Check the loop often, and give a loop that is not running start_timeout seconds."""
+    monkeypatch.setattr(_loop, "LOOP_CHECK_INTERVAL", 0.02)
+    monkeypatch.setattr(_loop, "LOOP_START_TIMEOUT", start_timeout)
+
+
+def _run(engine: CockroachDBEngine, coro: Coroutine[Any, Any, T], how: str) -> T:
+    """Run coro through the sync dispatch, or the async one from another loop."""
+    if how == "sync":
+        return engine._run_as_sync(coro)
+    return asyncio.run(engine._run_as_async(coro))
+
+
+def _close(engine: CockroachDBEngine, how: str) -> None:
+    """Call the public close() or aclose()."""
+    if how == "sync":
+        engine.close()
+    else:
+        asyncio.run(engine.aclose())
+
+
+@contextlib.contextmanager
+def _no_unawaited_coroutines() -> Iterator[None]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]
+
+
+@pytest.mark.timeout(10)
+@MODES
+@BUILDERS
+def test_loop_engine_fails_fast_on_a_closed_loop(build, how) -> None:
+    loop = asyncio.new_event_loop()
+    loop.close()
+    engine = build(_lazy_engine(), loop=loop)
+    with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="loop= is closed"):
+        _close(engine, how)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_fails_fast_when_the_loop_is_not_running(how, monkeypatch) -> None:
+    _fast_checks(monkeypatch, start_timeout=0.2)
+    loop = asyncio.new_event_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    ran = threading.Event()
+
+    async def work() -> None:
+        ran.set()
+
+    try:
+        with (
+            _no_unawaited_coroutines(),
+            pytest.raises(RuntimeError, match="loop= is not running"),
+        ):
+            _run(engine, work(), how)
+        # Nothing was left on the loop to run once it starts
+        loop.run_until_complete(asyncio.sleep(0.05))
+        assert not ran.is_set()
+    finally:
+        loop.close()
+
+
+@pytest.mark.timeout(10)
+@MODES
+@BUILDERS
+def test_loop_engine_fails_fast_in_a_forked_child(build, how, monkeypatch) -> None:
+    # In a fork child the copied loop still reports running, but no thread runs
+    # it there. A loop whose thread is stuck in a callback looks the same.
+    loop, thread = _start_loop()
+    release = threading.Event()
+    loop.call_soon_threadsafe(release.wait, 30)
+    engine = build(_lazy_engine(), loop=loop)
+    parent_pid = os.getpid()
+    monkeypatch.setattr(os, "getpid", lambda: parent_pid + 1)
+    try:
+        assert loop.is_running()
+        with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="forked"):
+            _close(engine, how)
+    finally:
+        monkeypatch.undo()
+        release.set()
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_fails_when_the_loop_stops_during_a_call(how, monkeypatch) -> None:
+    _fast_checks(monkeypatch, start_timeout=0.2)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    started, cancelled = threading.Event(), threading.Event()
+
+    async def slow() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    def stop_once_started() -> None:
+        if started.wait(5):
+            loop.call_soon_threadsafe(loop.stop)
+
+    stopper = threading.Thread(target=stop_once_started, daemon=True)
+    stopper.start()
+    try:
+        with pytest.raises(RuntimeError, match="stopped before the call finished"):
+            _run(engine, slow(), how)
+        # The call cancelled its work, so the work does not go on if the loop runs again
+        thread.join(5)
+        loop.run_until_complete(asyncio.sleep(0.1))
+        assert cancelled.is_set()
+    finally:
+        stopper.join(5)
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_fails_when_the_loop_closes_during_a_call(how, monkeypatch, caplog) -> None:
+    # A long grace for a loop that is not running, so the call sees it closed
+    _fast_checks(monkeypatch, start_timeout=5.0)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    started = threading.Event()
+
+    async def slow() -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    def close_once_started() -> None:
+        if started.wait(5):
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(5)
+            loop.close()
+
+    closer = threading.Thread(target=close_once_started, daemon=True)
+    closer.start()
+    try:
+        with pytest.raises(RuntimeError, match="was closed before the call finished"):
+            _run(engine, slow(), how)
+        # The closed loop's pending task is collected here, not during a later test
+        gc.collect()
+    finally:
+        closer.join(5)
+        _close_loop(loop, thread)
+    # Cancelling a task on a closed loop only makes concurrent.futures log an error
+    assert not [r for r in caplog.records if r.name == "concurrent.futures"]
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_closes_work_that_a_closed_loop_never_started(how, monkeypatch) -> None:
+    _fast_checks(monkeypatch, start_timeout=5.0)
+    loop = asyncio.new_event_loop()
+    stuck, submitted, release = threading.Event(), threading.Event(), threading.Event()
+
+    def stuck_then_stop() -> None:
+        # Hold the loop until the call has handed over its work, then stop the
+        # loop before that work gets a turn
+        stuck.set()
+        release.wait(5)
+        loop.stop()
+
+    loop.call_soon(stuck_then_stop)
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+
+    real_submit = asyncio.run_coroutine_threadsafe
+
+    def submit(coro, target_loop):  # type: ignore[no-untyped-def]
+        future = real_submit(coro, target_loop)
+        submitted.set()
+        return future
+
+    def close_after_submit() -> None:
+        if submitted.wait(5):
+            release.set()
+            thread.join(5)
+            loop.close()
+
+    async def work() -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    closer = threading.Thread(target=close_after_submit, daemon=True)
+    closer.start()
+    try:
+        assert stuck.wait(5)
+        with (
+            _no_unawaited_coroutines(),
+            pytest.raises(RuntimeError, match="was closed before the call finished"),
+        ):
+            _run(engine, work(), how)
+    finally:
+        release.set()
+        closer.join(5)
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_waits_for_a_loop_that_is_starting(how, monkeypatch) -> None:
+    _fast_checks(monkeypatch, start_timeout=5.0)
+    loop = asyncio.new_event_loop()
+
+    def start_late() -> None:
+        time.sleep(0.1)
+        loop.run_forever()
+
+    thread = threading.Thread(target=start_late, daemon=True)
+    thread.start()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+
+    async def which_loop() -> asyncio.AbstractEventLoop:
+        return asyncio.get_running_loop()
+
+    try:
+        assert _run(engine, which_loop(), how) is loop
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+@MODES
+def test_loop_engine_keeps_waiting_while_a_stopped_loop_starts_again(how, monkeypatch) -> None:
+    _fast_checks(monkeypatch, start_timeout=5.0)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    started = threading.Event()
+    threads = [thread]
+
+    async def slow() -> str:
+        started.set()
+        await asyncio.sleep(0.3)
+        return "done"
+
+    def stop_and_restart() -> None:
+        if started.wait(5):
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(5)
+            time.sleep(0.2)  # several checks see the loop stopped
+            again = threading.Thread(target=loop.run_forever, daemon=True)
+            threads.append(again)
+            again.start()
+
+    restarter = threading.Thread(target=stop_and_restart, daemon=True)
+    restarter.start()
+    try:
+        assert _run(engine, slow(), how) == "done"
+    finally:
+        restarter.join(5)
+        _close_loop(loop, threads[-1])
+
+
+@pytest.mark.timeout(10)
+def test_loop_engine_waits_out_a_busy_loop(monkeypatch) -> None:
+    # Busy for longer than a stopped loop's grace, which must not count as stopped
+    _fast_checks(monkeypatch, start_timeout=0.2)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    loop.call_soon_threadsafe(time.sleep, 0.5)
+    try:
+        assert engine._run_as_sync(asyncio.sleep(0, result="done")) == "done"
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+def test_loop_engine_refuses_a_sync_call_from_its_own_loop() -> None:
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+
+    async def nested() -> None:
+        engine.close()
+
+    try:
+        with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="deadlock"):
+            asyncio.run_coroutine_threadsafe(nested(), loop).result(timeout=5)
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(30)
+def test_loop_engine_serves_many_threads_without_false_alarms(monkeypatch) -> None:
+    # Frequent checks and a short grace would expose a check that misjudges a
+    # healthy loop
+    _fast_checks(monkeypatch, start_timeout=0.2)
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+
+    async def work(n: int) -> tuple[int, asyncio.AbstractEventLoop]:
+        await asyncio.sleep(0.1)  # several check intervals
+        return n, asyncio.get_running_loop()
+
+    results: dict[int, asyncio.AbstractEventLoop] = {}
+    errors: list[BaseException] = []
+
+    def sync_caller(i: int) -> None:
+        try:
+            for j in range(3):
+                n, ran_on = engine._run_as_sync(work(i * 10 + j))
+                results[n] = ran_on
+        except BaseException as exc:
+            errors.append(exc)
+
+    def async_caller(i: int) -> None:
+        async def calls() -> list[tuple[int, asyncio.AbstractEventLoop]]:
+            return await asyncio.gather(*(engine._run_as_async(work(i * 10 + j)) for j in range(3)))
+
+        try:
+            results.update(asyncio.run(calls()))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=sync_caller if i % 2 else async_caller, args=(i,), daemon=True)
+        for i in range(16)
+    ]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        assert errors == []
+        assert sorted(results) == [i * 10 + j for i in range(16) for j in range(3)]
+        assert all(ran_on is loop for ran_on in results.values())
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+def test_loop_engine_interrupted_sync_call_cancels_its_work(monkeypatch) -> None:
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    started, cancelled = threading.Event(), threading.Event()
+
+    async def slow() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    def interrupted_wait(*args, **kwargs):  # type: ignore[no-untyped-def]
+        assert started.wait(5), "work never started"
+        raise KeyboardInterrupt("simulated")
+
+    monkeypatch.setattr(concurrent.futures, "wait", interrupted_wait)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            engine._run_as_sync(slow())
+        assert cancelled.wait(5), "the work kept running after the caller was interrupted"
+    finally:
+        _close_loop(loop, thread)
+
+
+@pytest.mark.timeout(10)
+def test_loop_engine_cancelled_async_call_cancels_its_work() -> None:
+    loop, thread = _start_loop()
+    engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
+    started, cancelled = threading.Event(), threading.Event()
+
+    async def slow() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def cancel_once_started() -> None:
+        call = asyncio.ensure_future(engine._run_as_async(slow()))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    try:
+        asyncio.run(cancel_once_started())
+        assert cancelled.wait(5), "the work kept running after the caller was cancelled"
+    finally:
+        _close_loop(loop, thread)
