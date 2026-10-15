@@ -94,19 +94,29 @@ def test_gssencmode_added_for_key_value_dsn() -> None:
     assert options["connect_timeout"] == 10
 
 
-def test_with_libpq_defaults_adds_gssencmode_regardless_of_driver() -> None:
-    """with_libpq_defaults adds gssencmode to all URLs.
+def test_engine_asyncpg_url_gets_no_gssencmode(monkeypatch) -> None:
+    """CockroachDBEngine with asyncpg URL must not pass gssencmode to driver."""
+    import contextlib
 
-    It's the caller's responsibility (engine.py) to only call this for psycopg drivers.
-    This test documents that behavior.
-    """
-    from langchain_cockroachdb._connection import with_libpq_defaults
+    import langchain_cockroachdb.engine as engine_module
+    from langchain_cockroachdb import CockroachDBEngine
 
-    # Even asyncpg URLs get gssencmode if you call with_libpq_defaults
-    url = "cockroachdb+asyncpg://root@localhost:26257/defaultdb"
-    options = with_libpq_defaults(url, None, 10.0)
-    assert options["gssencmode"] == "disable"
-    assert options["connect_timeout"] == 10
+    captured = {}
+    real = engine_module.create_async_engine
+
+    def spy(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        try:
+            return real(url, **kwargs)
+        except ImportError:
+            pass
+
+    monkeypatch.setattr(engine_module, "create_async_engine", spy)
+    with contextlib.suppress(ImportError):
+        CockroachDBEngine.from_connection_string("cockroachdb+asyncpg://root@localhost:1/db")
+    assert "connect_args" not in captured["kwargs"], "asyncpg must not get libpq options"
+    url_query = captured["url"].split("?", 1)[1] if "?" in captured["url"] else ""
+    assert "gssencmode" not in url_query, "asyncpg URL must not have gssencmode in query"
 
 
 def test_key_value_dsn_with_gssencmode_keeps_it() -> None:

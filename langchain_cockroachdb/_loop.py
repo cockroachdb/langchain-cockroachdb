@@ -21,6 +21,11 @@ _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
 
 
+def is_background_loop(loop: asyncio.AbstractEventLoop) -> bool:
+    """Check if loop is the background loop without creating it."""
+    return loop is _loop
+
+
 def get_background_loop() -> asyncio.AbstractEventLoop:
     """Return the process-wide loop, starting its daemon thread on first use."""
     global _loop, _thread

@@ -49,11 +49,13 @@ def test_abandon_after_is_cancelled_when_the_block_finishes(socket_pair) -> None
 
 
 def test_guards_are_disabled_by_none(socket_pair) -> None:
-    a, _ = socket_pair
+    a, b = socket_pair
     with abandon_after(None, 0.01, label="x"):
         time.sleep(0.05)
     with abandon_after(a.fileno(), None, label="x"):
         time.sleep(0.05)
+    b.sendall(b"x")
+    assert a.recv(1) == b"x"
 
 
 async def test_aabandon_after_fires(socket_pair, caplog) -> None:
@@ -104,12 +106,3 @@ def test_no_socket_does_not_log_when_seconds_is_none(caplog, monkeypatch) -> Non
     ):
         pass
     assert "driver does not expose a socket" not in caplog.text
-
-
-def test_disabled_guard_leaves_socket_working(socket_pair) -> None:
-    """When the guard is disabled (fileno=None), the socket still works."""
-    a, b = socket_pair
-    with abandon_after(None, 0.01, label="disabled"):
-        pass
-    b.sendall(b"hello")
-    assert a.recv(5) == b"hello"

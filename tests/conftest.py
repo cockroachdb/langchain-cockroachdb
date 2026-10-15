@@ -177,4 +177,4 @@ def engine_factory(connection_string: str):
         try:
             engine.close()
         except Exception as error:
-            warnings.warn(f"engine cleanup failed: {error}", ResourceWarning, stacklevel=2)
+            warnings.warn(f"engine cleanup failed: {error!r}", UserWarning, stacklevel=1)

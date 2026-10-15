@@ -164,6 +164,22 @@ async def test_async_runner_stays_on_the_callers_loop() -> None:
     assert await engine._run_as_async(which_loop()) is asyncio.get_running_loop()
 
 
+async def test_async_calls_do_not_create_background_loop(monkeypatch) -> None:
+    """Async calls must not reach get_background_loop (would create idle thread)."""
+    engine = CockroachDBEngine.from_connection_string(URL)
+
+    def raise_if_called():
+        raise AssertionError("async call must not create background loop")
+
+    monkeypatch.setattr(engine_module, "get_background_loop", raise_if_called)
+
+    async def work() -> str:
+        return "ok"
+
+    result = await engine._run_as_async(work())
+    assert result == "ok"
+
+
 def test_explicit_loop_receives_sync_and_async_work() -> None:
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -204,6 +220,31 @@ def test_mixed_sync_and_async_use_warns_once(caplog) -> None:
         release.set()
         worker.join(5)
     assert caplog.text.count("one style per engine") == 1
+
+
+def test_sync_call_to_async_method_does_not_warn(caplog) -> None:
+    """Sync call to a public async method (aclose) must not trigger false mixed-use warning."""
+    engine = CockroachDBEngine.from_connection_string(URL)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.engine"):
+        engine._run_as_sync(engine.aclose())
+    assert "one style per engine" not in caplog.text
+
+
+def test_invalid_retry_max_attempts_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match="max_attempts must be an integer of at least 1"):
+        CockroachDBEngine.from_connection_string(URL, retry_max_attempts=0)
+
+
+def test_invalid_retry_jitter_fails_at_construction() -> None:
+    with pytest.raises(
+        TypeError, match="jitter must be True, False, or None; for a ratio, use RetryPolicy"
+    ):
+        CockroachDBEngine.from_connection_string(URL, retry_jitter=0.3)  # type: ignore[arg-type]
+
+
+def test_invalid_retry_initial_backoff_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match="initial_backoff must not be negative"):
+        CockroachDBEngine.from_connection_string(URL, retry_initial_backoff=-1.0)
 
 
 def test_interruption_cancels_background_work() -> None:

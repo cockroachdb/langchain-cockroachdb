@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 from langchain_cockroachdb._connection import to_sqlalchemy_url, with_libpq_defaults
 from langchain_cockroachdb._guard import aabandon_after
-from langchain_cockroachdb._loop import get_background_loop, run_coroutine_sync
+from langchain_cockroachdb._loop import get_background_loop, is_background_loop, run_coroutine_sync
 from langchain_cockroachdb._sql import validate_identifier
 from langchain_cockroachdb.hybrid_search_config import validate_fts_language
 from langchain_cockroachdb.retry import RetryPolicy, resolve_retry_policy
@@ -271,13 +271,8 @@ class CockroachDBEngine:
                 return await coro
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
             return await asyncio.wrap_future(future)
-        # Check if we're already on the background loop (from a sync call)
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-        if current_loop is get_background_loop():
-            # Already on the background loop from a sync call, don't track
+        current_loop = asyncio.get_running_loop()
+        if is_background_loop(current_loop):
             return await coro
         with self._usage("async"):
             return await coro
