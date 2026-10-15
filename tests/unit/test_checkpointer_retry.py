@@ -24,6 +24,7 @@ from psycopg_pool import AsyncConnectionPool, ConnectionPool
 from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver, RetryPolicy
 
 TLS_EOF = "consuming input failed: SSL error: unexpected eof while reading"
+SERVER_CLOSED = "consuming input failed: server closed the connection unexpectedly"
 UNKNOWN = "lost contact with the server in a way no phrase list knows"
 FAST = {"initial_backoff": 0.01, "max_backoff": 0.05}
 CONFIG = {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
@@ -230,6 +231,13 @@ async def put(kind: str, conn: Any, policy: RetryPolicy) -> dict[str, Any]:
     return await saver.aput(CONFIG, empty_checkpoint(), {}, {})
 
 
+async def setup(kind: str, conn: Any, policy: RetryPolicy) -> None:
+    if kind == "sync":
+        CockroachDBSaver(conn, retry_policy=policy).setup()
+    else:
+        await AsyncCockroachDBSaver(conn, retry_policy=policy).setup()
+
+
 def server_error(code: str, message: str) -> psycopg.Error:
     return pg_errors.lookup(code)(message)
 
@@ -335,3 +343,29 @@ async def test_single_connection_saver_does_not_retry_a_broken_connection(
     else:
         # The broken flag only counts for a pool, so this error is not retryable
         assert not_retrying == []
+
+
+@KINDS
+async def test_setup_labels_the_bootstrap_apart_from_migration_0(
+    kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The bootstrap (create the migrations table, read the version) gets stuck
+    # once, then migration 0 fails once
+    stuck = connection(kind, psycopg.OperationalError(SERVER_CLOSED), breaks=True, stuck=True)
+    bootstrap = connection(kind)
+    migration_0 = connection(kind, server_error("40001", "restart transaction"))
+    connections = pool(kind, stuck, bootstrap, migration_0)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        await setup(kind, connections, RetryPolicy(ddl_attempt_timeout=0.2, **FAST))
+    assert "SELECT v FROM checkpoint_migrations" in bootstrap.statements[1]
+    assert migration_0.statements == [CockroachDBSaver.MIGRATIONS[0]]
+    logged = messages(caplog)
+    assert any("checkpointer setup ran longer than its 0.2s attempt timeout" in m for m in logged)
+    assert any(
+        m.startswith(f"Retrying checkpointer setup after OperationalError: {SERVER_CLOSED}")
+        for m in logged
+    )
+    migration_0_retries = [m for m in logged if m.startswith("Retrying checkpointer migration 0")]
+    assert len(migration_0_retries) == 1
+    assert "SerializationFailure (SQLSTATE 40001)" in migration_0_retries[0]
+    assert not any("checkpointer migration 0 ran longer" in m for m in logged)

@@ -169,7 +169,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
 
         async def init_and_read_version() -> int:
             async with self._cursor(
-                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer migration 0"
+                timeout=self.retry_policy.ddl_attempt_timeout, label="checkpointer setup"
             ) as cur:
                 await cur.execute(self.MIGRATIONS[0])
                 await self._sync_pipeline()
@@ -180,7 +180,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                 row = await results.fetchone()
                 return -1 if row is None else row["v"]
 
-        version = await self._retry(init_and_read_version, label="checkpointer migration 0")
+        version = await self._retry(init_and_read_version, label="checkpointer setup")
 
         for v in range(version + 1, len(self.MIGRATIONS)):
 
