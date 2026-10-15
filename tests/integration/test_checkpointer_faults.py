@@ -717,7 +717,7 @@ def sync_saver_for(mode: str, libpq_url: str, sync_pool, cursor_factory):
 
 @contextlib.asynccontextmanager
 async def async_saver_for(mode: str, libpq_url: str, async_pool, cursor_factory):
-    """async_saver_for is sync_saver_for for the async saver."""
+    """The async version of sync_saver_for."""
     app = app_name()
     if mode == "pool":
         pool = await async_pool(app, cursor_factory=cursor_factory, max_size=1)
@@ -745,7 +745,7 @@ def sync_write(saver: CockroachDBSaver, operation: str, thread: str):
 
 
 async def async_write(saver: AsyncCockroachDBSaver, operation: str, thread: str):
-    """async_write is sync_write for the async saver; the write is a coroutine function."""
+    """The async version of sync_write; the write it returns is a coroutine function."""
     checkpoint, versions = checkpoint_with_blobs()
     if operation == "put":
         return lambda: saver.aput(config(thread), checkpoint, {}, versions)
@@ -868,6 +868,7 @@ def test_sync_saver_attempt_timeout_rides_out_a_stuck_transaction(
     ):
         saver.put(config(thread), checkpoint, {"step": 2}, versions)
     assert "attempt timeout" in caplog.text
+    assert saver.conn.get_stats().get("returns_bad", 0) >= 1
     if phrases == "none":
         assert_retried_for_the_broken_flag(caplog, "put checkpoint")
     saved = saver.get_tuple(config(thread))
@@ -892,6 +893,7 @@ async def test_async_saver_attempt_timeout_rides_out_a_stuck_transaction(
     ):
         await saver.aput(config(thread), checkpoint, {"step": 2}, versions)
     assert "attempt timeout" in caplog.text
+    assert saver.conn.get_stats().get("returns_bad", 0) >= 1
     if phrases == "none":
         assert_retried_for_the_broken_flag(caplog, "put checkpoint")
     saved = await saver.aget_tuple(config(thread))
