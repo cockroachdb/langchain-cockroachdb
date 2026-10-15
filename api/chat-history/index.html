@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1336,6 +1364,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.acreate_table_if_not_exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        acreate_table_if_not_exists
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.add_message" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1407,6 +1446,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parameters
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#key-methods" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1452,6 +1502,34 @@
     
   
     Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
   
 
     
@@ -1850,6 +1928,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.acreate_table_if_not_exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        acreate_table_if_not_exists
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.add_message" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1921,6 +2010,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parameters
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#key-methods" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1984,6 +2084,11 @@
 
 
         <p>Chat message history stored in CockroachDB.</p>
+<p>Pass a shared <code>CockroachDBEngine</code> to reuse one connection pool and one
+retry policy across sessions. With only a connection string the history
+opens and owns its own engine, which <code>close()</code> or <code>aclose()</code> releases.</p>
+<p>Messages get ids generated here and are written with ON CONFLICT DO
+NOTHING, so retrying after an ambiguous result never duplicates them.</p>
 
 
 
@@ -2020,6 +2125,8 @@
     <div class="doc doc-contents ">
 
         <p>Get all messages for this session.</p>
+<p>Note: BaseChatMessageHistory declares messages as a writable attribute,
+but we expose it as a read-only property (matching langchain-postgres).</p>
 
     </div>
 
@@ -2039,7 +2146,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Cleanup on deletion.</p>
+        <p>Release an owned engine that was never closed, without blocking.</p>
 
 
     </div>
@@ -2050,7 +2157,7 @@
 
 
 <h3 id="langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.__init__" class="doc doc-heading">
-            <code class="highlight language-python"><span class="fm">__init__</span><span class="p">(</span><span class="n">session_id</span><span class="p">,</span> <span class="n">connection_string</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">engine</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">table_name</span><span class="o">=</span><span class="s1">&#39;message_store&#39;</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">&#39;public&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="fm">__init__</span><span class="p">(</span><span class="n">session_id</span><span class="p">,</span> <span class="n">connection_string</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">engine</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">table_name</span><span class="o">=</span><span class="s1">'message_store'</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">'public'</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.__init__" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -2096,7 +2203,7 @@
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Database connection string</p>
+                <p>Database connection string, used when no engine is given</p>
               </div>
             </td>
             <td>
@@ -2108,11 +2215,11 @@
                 <code>engine</code>
             </td>
             <td>
-                  <code><span title="sqlalchemy.ext.asyncio.AsyncEngine">AsyncEngine</span> | None</code>
+                  <code><a class="autorefs autorefs-internal" title="langchain_cockroachdb.engine.CockroachDBEngine" href="../engine/#langchain_cockroachdb.engine.CockroachDBEngine">CockroachDBEngine</a> | <span title="sqlalchemy.ext.asyncio.AsyncEngine">AsyncEngine</span> | None</code>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Existing async engine</p>
+                <p>Shared CockroachDBEngine (recommended) or a SQLAlchemy AsyncEngine</p>
               </div>
             </td>
             <td>
@@ -2149,6 +2256,27 @@
             </td>
             <td>
                   <code>&#39;public&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>retry_policy</code>
+            </td>
+            <td>
+                  <code><a class="autorefs autorefs-internal" title="RetryPolicy
+
+
+  
+      dataclass
+   (langchain_cockroachdb.retry.RetryPolicy)" href="../retry/#langchain_cockroachdb.retry.RetryPolicy">RetryPolicy</a> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>How operations retry (default: the engine's policy)</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
             </td>
           </tr>
       </tbody>
@@ -2196,7 +2324,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Add multiple messages (async).</p>
+        <p>Add messages atomically, in order (async).</p>
 
 
     </div>
@@ -2240,7 +2368,29 @@
 
     <div class="doc doc-contents ">
 
-        <p>Close engine if we own it.</p>
+        <p>Close the engine if this history created it.</p>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.acreate_table_if_not_exists" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">acreate_table_if_not_exists</span><span class="p">()</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.chat_message_histories.CockroachDBChatMessageHistory.acreate_table_if_not_exists" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Create the message table and its session index if they do not exist.</p>
 
 
     </div>
@@ -2276,7 +2426,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Add multiple messages.</p>
+        <p>Add messages atomically, in order.</p>
 
 
     </div>
@@ -2334,7 +2484,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Close engine (sync).</p>
+        <p>Close the engine if this history created it (sync).</p>
 
 
     </div>
@@ -2352,7 +2502,7 @@
 
     <div class="doc doc-contents ">
 
-        <p>Create table (sync wrapper).</p>
+        <p>Create table (sync).</p>
 
 
     </div>
@@ -2365,7 +2515,50 @@
 
     </div>
 
-</div><h2 id="key-methods">Key Methods<a class="headerlink" href="#key-methods" title="Permanent link">&para;</a></h2>
+</div><h2 id="parameters">Parameters<a class="headerlink" href="#parameters" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session_id</code></td>
+<td>str</td>
+<td>Required</td>
+<td>Session or thread identifier</td>
+</tr>
+<tr>
+<td><code>connection_string</code></td>
+<td>str</td>
+<td>None</td>
+<td>Database connection string (if engine not provided)</td>
+</tr>
+<tr>
+<td><code>engine</code></td>
+<td>CockroachDBEngine</td>
+<td>None</td>
+<td>Shared engine instance</td>
+</tr>
+<tr>
+<td><code>table_name</code></td>
+<td>str</td>
+<td>"message_store"</td>
+<td>Table name for messages</td>
+</tr>
+<tr>
+<td><code>retry_policy</code></td>
+<td>RetryPolicy</td>
+<td>None</td>
+<td>Retry policy (inherits from engine if not set)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="key-methods">Key Methods<a class="headerlink" href="#key-methods" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
@@ -2387,12 +2580,24 @@
 <td>Add any message type</td>
 </tr>
 <tr>
+<td><code>add_messages()</code></td>
+<td>Add multiple messages atomically</td>
+</tr>
+<tr>
 <td><code>clear()</code></td>
 <td>Clear session history</td>
 </tr>
 <tr>
 <td><code>messages</code></td>
 <td>Get all messages</td>
+</tr>
+<tr>
+<td><code>acreate_table_if_not_exists()</code></td>
+<td>Create table if needed (async)</td>
+</tr>
+<tr>
+<td><code>create_table_if_not_exists()</code></td>
+<td>Create table if needed (sync)</td>
 </tr>
 </tbody>
 </table>

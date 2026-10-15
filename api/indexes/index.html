@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1263,6 +1291,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.indexes.CSPANNIndex.get_index_name" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_index_name
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1381,6 +1420,34 @@
     
   
     Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
   
 
     
@@ -1734,6 +1801,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.indexes.CSPANNIndex.get_index_name" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_index_name
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1966,7 +2044,7 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
 
 
 <h3 id="langchain_cockroachdb.indexes.CSPANNIndex.get_create_index_sql" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">get_create_index_sql</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">column_name</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">&#39;public&#39;</span><span class="p">,</span> <span class="n">prefix_columns</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">get_create_index_sql</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">column_name</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">'public'</span><span class="p">,</span> <span class="n">prefix_columns</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.indexes.CSPANNIndex.get_create_index_sql" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -1974,6 +2052,9 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
     <div class="doc doc-contents ">
 
         <p>Generate CREATE VECTOR INDEX SQL.</p>
+<p>The vector column carries the operator class of the distance strategy;
+without it CockroachDB builds a vector_l2_ops index that cosine and
+inner product searches cannot use.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2086,7 +2167,7 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
 
 
 <h3 id="langchain_cockroachdb.indexes.CSPANNIndex.get_drop_index_sql" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">get_drop_index_sql</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">column_name</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">&#39;public&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">get_drop_index_sql</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">column_name</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="s1">'public'</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.indexes.CSPANNIndex.get_drop_index_sql" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -2180,6 +2261,24 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
           </tr>
       </tbody>
     </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.indexes.CSPANNIndex.get_index_name" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">get_index_name</span><span class="p">(</span><span class="n">table_name</span><span class="p">,</span> <span class="n">column_name</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.indexes.CSPANNIndex.get_index_name" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Name of the index on <code>table_name.column_name</code>.</p>
 
 
     </div>

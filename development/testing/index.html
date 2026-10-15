@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1233,6 +1261,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1424,6 +1480,17 @@
     <span class="md-ellipsis">
       
         Test Structure
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fault-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fault Injection
       
     </span>
   </a>
@@ -1979,6 +2046,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#fault-injection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fault Injection
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#running-tests" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2380,19 +2458,41 @@
 <p>Learn how to run and write tests for langchain-cockroachdb.</p>
 <h2 id="test-structure">Test Structure<a class="headerlink" href="#test-structure" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>tests/
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── conftest.py              # Shared fixtures
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── unit/                    # Fast tests, no database
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── conftest.py                     # Shared fixtures
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── unit/                           # Fast tests, no database
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>│   ├── test_indexes.py
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>│   ├── test_hybrid_search.py
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>│   └── test_retry.py
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>└── integration/             # Tests with CockroachDB
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    ├── test_engine.py
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    ├── test_vectorstore.py
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    ├── test_chat_history.py
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    ├── test_retry_behavior.py
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    ├── test_sync_wrapper.py
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    └── test_configuration.py
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>├── integration/                    # Tests with CockroachDB
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>│   ├── test_engine.py
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>│   ├── test_vectorstore.py
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>│   ├── test_chat_history.py
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>│   ├── test_sync_wrapper.py
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>│   ├── test_configuration.py
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>│   ├── test_fault_helpers.py       # Fault injection utilities
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>│   ├── test_vectorstore_faults.py  # Vectorstore resilience tests
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>│   ├── test_vectorstore_hardening.py # Vectorstore edge cases
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>│   ├── test_chat_history_resilience.py # Chat history resilience
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>│   ├── test_checkpointer_faults.py # Checkpointer resilience
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>│   ├── test_checkpointer_conformance.py # LangGraph standard tests
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>│   └── faults.py                   # Fault injection mechanisms
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>└── e2e/
+<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>    └── test_examples.py            # End-to-end tests for all examples
 </code></pre></div>
+<h2 id="fault-injection">Fault Injection<a class="headerlink" href="#fault-injection" title="Permanent link">&para;</a></h2>
+<p>The <code>tests/integration/faults.py</code> module provides three mechanisms for injecting real CockroachDB faults:</p>
+<ol>
+<li>
+<p><strong><code>FaultInjector</code></strong> - for SQLAlchemy async engine (vector store, chat history). Swaps faulted statements for <code>crdb_internal.force_error</code> so the server raises the error during normal execution and SQLAlchemy wraps it.</p>
+</li>
+<li>
+<p><strong><code>PsycopgFaults</code></strong> - for raw psycopg connections (checkpointers). Uses <code>cursor_factory</code> to check for a pending fault before every cursor execute.</p>
+</li>
+<li>
+<p><strong><code>kill_sessions</code> and <code>hold_row_lock</code></strong> - helper functions to cancel sessions (simulating node restarts or load balancer resets) and hold row locks (simulating stuck ranges).</p>
+</li>
+</ol>
+<p>These let tests verify that the retry policy handles real CockroachDB errors exactly as they would appear in production.</p>
 <h2 id="running-tests">Running Tests<a class="headerlink" href="#running-tests" title="Permanent link">&para;</a></h2>
 <h3 id="all-tests">All Tests<a class="headerlink" href="#all-tests" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>make<span class="w"> </span><span class="nb">test</span>
@@ -2433,23 +2533,23 @@
 <a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>
 <a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="k">class</span><span class="w"> </span><span class="nc">TestCSPANNIndex</span><span class="p">:</span>
 <a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">test_index_creation</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Test creating C-SPANN index configuration.&quot;&quot;&quot;</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">        </span><span class="sd">"""Test creating C-SPANN index configuration."""</span>
 <a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>        <span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">(</span>
-<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;test_index&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>            <span class="n">name</span><span class="o">=</span><span class="s2">"test_index"</span><span class="p">,</span>
 <a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>            <span class="n">distance_strategy</span><span class="o">=</span><span class="n">DistanceStrategy</span><span class="o">.</span><span class="n">COSINE</span><span class="p">,</span>
 <a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>        <span class="p">)</span>
 <a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>
-<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>        <span class="k">assert</span> <span class="n">index</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;test_index&quot;</span>
+<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>        <span class="k">assert</span> <span class="n">index</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">"test_index"</span>
 <a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a>        <span class="k">assert</span> <span class="n">index</span><span class="o">.</span><span class="n">distance_strategy</span> <span class="o">==</span> <span class="n">DistanceStrategy</span><span class="o">.</span><span class="n">COSINE</span>
 <a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a>
 <a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">test_index_sql_generation</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Test SQL generation for index creation.&quot;&quot;&quot;</span>
+<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">        </span><span class="sd">"""Test SQL generation for index creation."""</span>
 <a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a>        <span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
-<a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>        <span class="n">sql</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">get_create_sql</span><span class="p">(</span><span class="s2">&quot;table&quot;</span><span class="p">,</span> <span class="s2">&quot;embedding&quot;</span><span class="p">)</span>
+<a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>        <span class="n">sql</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">get_create_sql</span><span class="p">(</span><span class="s2">"table"</span><span class="p">,</span> <span class="s2">"embedding"</span><span class="p">)</span>
 <a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a>
-<a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a>        <span class="k">assert</span> <span class="s2">&quot;CREATE VECTOR INDEX&quot;</span> <span class="ow">in</span> <span class="n">sql</span>
-<a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a>        <span class="k">assert</span> <span class="s2">&quot;table&quot;</span> <span class="ow">in</span> <span class="n">sql</span>
-<a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a>        <span class="k">assert</span> <span class="s2">&quot;embedding&quot;</span> <span class="ow">in</span> <span class="n">sql</span>
+<a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a>        <span class="k">assert</span> <span class="s2">"CREATE VECTOR INDEX"</span> <span class="ow">in</span> <span class="n">sql</span>
+<a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a>        <span class="k">assert</span> <span class="s2">"table"</span> <span class="ow">in</span> <span class="n">sql</span>
+<a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a>        <span class="k">assert</span> <span class="s2">"embedding"</span> <span class="ow">in</span> <span class="n">sql</span>
 </code></pre></div>
 <h3 id="integration-test-example">Integration Test Example<a class="headerlink" href="#integration-test-example" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pytest</span>
@@ -2459,11 +2559,11 @@
 <a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="k">class</span><span class="w"> </span><span class="nc">TestVectorStore</span><span class="p">:</span>
 <a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>    <span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">asyncio</span>
 <a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">test_add_and_search</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">connection_string</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Test adding documents and searching.&quot;&quot;&quot;</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="w">        </span><span class="sd">"""Test adding documents and searching."""</span>
 <a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>        <span class="c1"># Setup</span>
 <a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>        <span class="n">engine</span> <span class="o">=</span> <span class="n">CockroachDBEngine</span><span class="o">.</span><span class="n">from_connection_string</span><span class="p">(</span><span class="n">connection_string</span><span class="p">)</span>
 <a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>        <span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">ainit_vectorstore_table</span><span class="p">(</span>
-<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>            <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;test_docs&quot;</span><span class="p">,</span>
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>            <span class="n">table_name</span><span class="o">=</span><span class="s2">"test_docs"</span><span class="p">,</span>
 <a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>            <span class="n">vector_dimension</span><span class="o">=</span><span class="mi">384</span><span class="p">,</span>
 <a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>            <span class="n">drop_if_exists</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
 <a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>        <span class="p">)</span>
@@ -2472,16 +2572,16 @@
 <a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a>        <span class="n">vectorstore</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-8-19" name="__codelineno-8-19" href="#__codelineno-8-19"></a>            <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
 <a id="__codelineno-8-20" name="__codelineno-8-20" href="#__codelineno-8-20"></a>            <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-8-21" name="__codelineno-8-21" href="#__codelineno-8-21"></a>            <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;test_docs&quot;</span><span class="p">,</span>
+<a id="__codelineno-8-21" name="__codelineno-8-21" href="#__codelineno-8-21"></a>            <span class="n">collection_name</span><span class="o">=</span><span class="s2">"test_docs"</span><span class="p">,</span>
 <a id="__codelineno-8-22" name="__codelineno-8-22" href="#__codelineno-8-22"></a>        <span class="p">)</span>
 <a id="__codelineno-8-23" name="__codelineno-8-23" href="#__codelineno-8-23"></a>
 <a id="__codelineno-8-24" name="__codelineno-8-24" href="#__codelineno-8-24"></a>        <span class="c1"># Test</span>
-<a id="__codelineno-8-25" name="__codelineno-8-25" href="#__codelineno-8-25"></a>        <span class="n">texts</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;doc1&quot;</span><span class="p">,</span> <span class="s2">&quot;doc2&quot;</span><span class="p">,</span> <span class="s2">&quot;doc3&quot;</span><span class="p">]</span>
+<a id="__codelineno-8-25" name="__codelineno-8-25" href="#__codelineno-8-25"></a>        <span class="n">texts</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"doc1"</span><span class="p">,</span> <span class="s2">"doc2"</span><span class="p">,</span> <span class="s2">"doc3"</span><span class="p">]</span>
 <a id="__codelineno-8-26" name="__codelineno-8-26" href="#__codelineno-8-26"></a>        <span class="n">ids</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span>
 <a id="__codelineno-8-27" name="__codelineno-8-27" href="#__codelineno-8-27"></a>
 <a id="__codelineno-8-28" name="__codelineno-8-28" href="#__codelineno-8-28"></a>        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">==</span> <span class="mi">3</span>
 <a id="__codelineno-8-29" name="__codelineno-8-29" href="#__codelineno-8-29"></a>
-<a id="__codelineno-8-30" name="__codelineno-8-30" href="#__codelineno-8-30"></a>        <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">&quot;doc1&quot;</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<a id="__codelineno-8-30" name="__codelineno-8-30" href="#__codelineno-8-30"></a>        <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">"doc1"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
 <a id="__codelineno-8-31" name="__codelineno-8-31" href="#__codelineno-8-31"></a>
 <a id="__codelineno-8-32" name="__codelineno-8-32" href="#__codelineno-8-32"></a>        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span>
 <a id="__codelineno-8-33" name="__codelineno-8-33" href="#__codelineno-8-33"></a>        <span class="k">assert</span> <span class="n">results</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">page_content</span> <span class="ow">in</span> <span class="n">texts</span>
@@ -2494,24 +2594,24 @@
 <p>Available in <code>conftest.py</code>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
 <a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">def</span><span class="w"> </span><span class="nf">connection_string</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Get CockroachDB connection string.&quot;&quot;&quot;</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">    </span><span class="sd">"""Get CockroachDB connection string."""</span>
 <a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>        <span class="s2">&quot;COCKROACHDB_URL&quot;</span><span class="p">,</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>        <span class="s2">&quot;cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&quot;</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>        <span class="s2">"COCKROACHDB_URL"</span><span class="p">,</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>        <span class="s2">"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"</span>
 <a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>    <span class="p">)</span>
 <a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>
 <a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
 <a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">engine</span><span class="p">(</span><span class="n">connection_string</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Get CockroachDB engine.&quot;&quot;&quot;</span>
+<a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="w">    </span><span class="sd">"""Get CockroachDB engine."""</span>
 <a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a>    <span class="n">engine</span> <span class="o">=</span> <span class="n">CockroachDBEngine</span><span class="o">.</span><span class="n">from_connection_string</span><span class="p">(</span><span class="n">connection_string</span><span class="p">)</span>
 <a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a>    <span class="k">yield</span> <span class="n">engine</span>
 <a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a>    <span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">aclose</span><span class="p">()</span>
 <a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a>
 <a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
 <a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">vectorstore</span><span class="p">(</span><span class="n">engine</span><span class="p">:</span> <span class="n">CockroachDBEngine</span><span class="p">):</span>
-<a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Get vector store with test table.&quot;&quot;&quot;</span>
+<a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="w">    </span><span class="sd">"""Get vector store with test table."""</span>
 <a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a>    <span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">ainit_vectorstore_table</span><span class="p">(</span>
-<a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a>        <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;test_vectors&quot;</span><span class="p">,</span>
+<a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a>        <span class="n">table_name</span><span class="o">=</span><span class="s2">"test_vectors"</span><span class="p">,</span>
 <a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a>        <span class="n">vector_dimension</span><span class="o">=</span><span class="mi">384</span><span class="p">,</span>
 <a id="__codelineno-9-22" name="__codelineno-9-22" href="#__codelineno-9-22"></a>        <span class="n">drop_if_exists</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
 <a id="__codelineno-9-23" name="__codelineno-9-23" href="#__codelineno-9-23"></a>    <span class="p">)</span>
@@ -2520,7 +2620,7 @@
 <a id="__codelineno-9-26" name="__codelineno-9-26" href="#__codelineno-9-26"></a>    <span class="n">vs</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-9-27" name="__codelineno-9-27" href="#__codelineno-9-27"></a>        <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
 <a id="__codelineno-9-28" name="__codelineno-9-28" href="#__codelineno-9-28"></a>        <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-9-29" name="__codelineno-9-29" href="#__codelineno-9-29"></a>        <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;test_vectors&quot;</span><span class="p">,</span>
+<a id="__codelineno-9-29" name="__codelineno-9-29" href="#__codelineno-9-29"></a>        <span class="n">collection_name</span><span class="o">=</span><span class="s2">"test_vectors"</span><span class="p">,</span>
 <a id="__codelineno-9-30" name="__codelineno-9-30" href="#__codelineno-9-30"></a>    <span class="p">)</span>
 <a id="__codelineno-9-31" name="__codelineno-9-31" href="#__codelineno-9-31"></a>
 <a id="__codelineno-9-32" name="__codelineno-9-32" href="#__codelineno-9-32"></a>    <span class="k">yield</span> <span class="n">vs</span>
@@ -2538,21 +2638,21 @@
 <h3 id="2-test-one-thing">2. Test One Thing<a class="headerlink" href="#2-test-one-thing" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="c1"># Good: Tests one behavior</span>
 <a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">test_add_texts_returns_ids</span><span class="p">():</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">ids</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">&quot;doc1&quot;</span><span class="p">])</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">ids</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">"doc1"</span><span class="p">])</span>
 <a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
 <a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>
 <a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="c1"># Bad: Tests multiple behaviors</span>
 <a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">test_vectorstore</span><span class="p">():</span>
-<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>    <span class="n">ids</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">&quot;doc1&quot;</span><span class="p">])</span>
-<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>    <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">&quot;doc1&quot;</span><span class="p">)</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>    <span class="n">ids</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">"doc1"</span><span class="p">])</span>
+<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>    <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">"doc1"</span><span class="p">)</span>
 <a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>    <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">adelete</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span>
 <a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>    <span class="c1"># Too much in one test</span>
 </code></pre></div>
 <h3 id="3-use-fixtures">3. Use Fixtures<a class="headerlink" href="#3-use-fixtures" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Good: Uses fixture</span>
 <a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">test_search</span><span class="p">(</span><span class="n">vectorstore</span><span class="p">):</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>    <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">&quot;doc1&quot;</span><span class="p">])</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>    <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">&quot;doc1&quot;</span><span class="p">)</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>    <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">([</span><span class="s2">"doc1"</span><span class="p">])</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>    <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">"doc1"</span><span class="p">)</span>
 <a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
 <a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>
 <a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="c1"># Bad: Setup in test</span>
@@ -2606,7 +2706,7 @@
 <a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="w">    </span><span class="nt">runs-on</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ubuntu-latest</span>
 <a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="w">    </span><span class="nt">strategy</span><span class="p">:</span>
 <a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="w">      </span><span class="nt">matrix</span><span class="p">:</span>
-<a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="w">        </span><span class="nt">python-version</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;3.10&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;3.11&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;3.12&quot;</span><span class="p p-Indicator">]</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="w">        </span><span class="nt">python-version</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"3.10"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"3.11"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"3.12"</span><span class="p p-Indicator">]</span>
 <a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="w">    </span><span class="nt">steps</span><span class="p">:</span>
 <a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/checkout@v4</span>
 <a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Setup Python</span>

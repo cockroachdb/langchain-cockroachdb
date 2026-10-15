@@ -18,7 +18,7 @@
         <link rel="prev" href="../chat-history/">
       
       
-        <link rel="next" href="../../development/contributing/">
+        <link rel="next" href="../retry/">
       
       
         
@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1584,6 +1612,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parameters
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Parameters">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from_conn_string-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        from_conn_string Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#key-methods" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1648,6 +1704,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -2258,6 +2342,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parameters
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Parameters">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from_conn_string-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        from_conn_string Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#key-methods" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2363,18 +2475,25 @@
 
         <p>Synchronous checkpointer that stores checkpoints in CockroachDB.</p>
 <p>Uses raw psycopg3 connections (not SQLAlchemy) for compatibility
-with LangGraph's checkpointer interface.</p>
+with LangGraph's checkpointer interface. For production, pass a
+<code>psycopg_pool.ConnectionPool</code>: it replaces broken connections, while a
+single connection cannot recover from a dropped connection.</p>
 
 
 <details class="example" open>
   <summary>Example</summary>
-  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">DB_URI</span> <span class="o">=</span> <span class="s2">&quot;cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&quot;</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">with</span> <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">checkpointer</span><span class="p">:</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="c1"># Use with LangGraph</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
+  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">pool</span> <span class="o">=</span> <span class="n">ConnectionPool</span><span class="p">(</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="nb">open</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">)</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">checkpointer</span> <span class="o">=</span> <span class="n">CockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
 </code></pre></div>
 </details>
 
@@ -2469,7 +2588,7 @@ with LangGraph's checkpointer interface.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">&#39;7 days&#39;</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">&#39;@daily&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">'7 days'</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">'@daily'</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.enable_ttl" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -2536,7 +2655,7 @@ background CockroachDB job on the specified cron schedule.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.from_conn_string" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">from_conn_string</span><span class="p">(</span><span class="n">conn_string</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">pipeline</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">from_conn_string</span><span class="p">(</span><span class="n">conn_string</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">pipeline</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">serde</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">connect_timeout</span><span class="o">=</span><span class="mf">10.0</span><span class="p">,</span> <span class="n">prepare_threshold</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">connect_kwargs</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
 
   <span class="doc doc-labels">
       <small class="doc doc-label doc-label-classmethod"><code>classmethod</code></small>
@@ -2547,7 +2666,7 @@ background CockroachDB job on the specified cron schedule.</p>
 
     <div class="doc doc-contents ">
 
-        <p>Create a new CockroachDBSaver from a connection string.</p>
+        <p>Create a saver on a single connection.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2570,8 +2689,7 @@ background CockroachDB job on the specified cron schedule.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>CockroachDB connection string.
-Supports cockroachdb:// and postgresql:// formats.</p>
+                <p>CockroachDB connection string (cockroachdb://, postgresql:// and similar)</p>
               </div>
             </td>
             <td>
@@ -2587,12 +2705,96 @@ Supports cockroachdb:// and postgresql:// formats.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Whether to use Pipeline mode (may not be supported
-by all CockroachDB versions).</p>
+                <p>Whether to use Pipeline mode</p>
               </div>
             </td>
             <td>
                   <code>False</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>serde</code>
+            </td>
+            <td>
+                  <code><span title="langgraph.checkpoint.serde.base.SerializerProtocol">SerializerProtocol</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Custom serializer protocol</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>retry_policy</code>
+            </td>
+            <td>
+                  <code><a class="autorefs autorefs-internal" title="RetryPolicy
+
+
+  
+      dataclass
+   (langchain_cockroachdb.retry.RetryPolicy)" href="../retry/#langchain_cockroachdb.retry.RetryPolicy">RetryPolicy</a> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>How operations retry (default: RetryPolicy())</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>connect_timeout</code>
+            </td>
+            <td>
+                  <code><span title="float">float</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Seconds to wait when connecting, or None (default: 10)</p>
+              </div>
+            </td>
+            <td>
+                  <code>10.0</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>prepare_threshold</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>psycopg prepared statement threshold, None to disable (default: 5)</p>
+              </div>
+            </td>
+            <td>
+                  <code>5</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>connect_kwargs</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Mapping">Mapping</span>[<span title="str">str</span>, <span title="typing.Any">Any</span>] | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Extra psycopg connection options, e.g. application_name</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
             </td>
           </tr>
       </tbody>
@@ -2710,6 +2912,8 @@ by all CockroachDB versions).</p>
     <div class="doc doc-contents ">
 
         <p>List checkpoints from the database.</p>
+<p>Matching checkpoints are fetched inside one retried call and yielded
+afterwards, so the saver's lock is not held while the caller iterates.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2942,7 +3146,7 @@ by all CockroachDB versions).</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.put_writes" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">put_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">put_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">''</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.put_writes" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -3047,8 +3251,10 @@ by all CockroachDB versions).</p>
     <div class="doc doc-contents ">
 
         <p>Set up the checkpoint database.</p>
-<p>Creates necessary tables and runs migrations. MUST be called
-the first time the checkpointer is used.</p>
+<p>Creates necessary tables and runs migrations. MUST be called the first
+time the checkpointer is used. Safe to run from several processes at
+once: every migration is idempotent and versions are recorded with
+ON CONFLICT DO NOTHING.</p>
 
 
     </div>
@@ -3084,18 +3290,24 @@ the first time the checkpointer is used.</p>
 
         <p>Asynchronous checkpointer that stores checkpoints in CockroachDB.</p>
 <p>Uses raw psycopg3 async connections (not SQLAlchemy) for compatibility
-with LangGraph's checkpointer interface.</p>
+with LangGraph's checkpointer interface. For production, pass a
+<code>psycopg_pool.AsyncConnectionPool</code>: it replaces broken connections,
+while a single connection cannot recover from a dropped connection.</p>
 
 
 <details class="example" open>
   <summary>Example</summary>
-  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncCockroachDBSaver</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">DB_URI</span> <span class="o">=</span> <span class="s2">&quot;cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&quot;</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncCockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">checkpointer</span><span class="p">:</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="k">await</span> <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="c1"># Use with LangGraph</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
+  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncConnectionPool</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncConnectionPool</span><span class="p">(</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">)</span> <span class="k">as</span> <span class="n">pool</span><span class="p">:</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">checkpointer</span> <span class="o">=</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="k">await</span> <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
 </code></pre></div>
 </details>
 
@@ -3198,7 +3410,7 @@ with LangGraph's checkpointer interface.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aenable_ttl" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">aenable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">&#39;7 days&#39;</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">&#39;@daily&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">aenable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s1">'7 days'</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s1">'@daily'</span><span class="p">)</span></code>
 
   <span class="doc doc-labels">
       <small class="doc doc-label doc-label-async"><code>async</code></small>
@@ -3355,6 +3567,8 @@ with LangGraph's checkpointer interface.</p>
     <div class="doc doc-contents ">
 
         <p>List checkpoints from the database asynchronously.</p>
+<p>Matching checkpoints are fetched inside one retried call and yielded
+afterwards, so the saver's lock is not held while the caller iterates.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3591,7 +3805,7 @@ with LangGraph's checkpointer interface.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aput_writes" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">aput_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">aput_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">''</span><span class="p">)</span></code>
 
   <span class="doc doc-labels">
       <small class="doc doc-label doc-label-async"><code>async</code></small>
@@ -3710,7 +3924,7 @@ with LangGraph's checkpointer interface.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.from_conn_string" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">from_conn_string</span><span class="p">(</span><span class="n">conn_string</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">pipeline</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">serde</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">from_conn_string</span><span class="p">(</span><span class="n">conn_string</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">pipeline</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">serde</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">connect_timeout</span><span class="o">=</span><span class="mf">10.0</span><span class="p">,</span> <span class="n">prepare_threshold</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">connect_kwargs</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></code>
 
   <span class="doc doc-labels">
       <small class="doc doc-label doc-label-async"><code>async</code></small>
@@ -3722,7 +3936,7 @@ with LangGraph's checkpointer interface.</p>
 
     <div class="doc doc-contents ">
 
-        <p>Create a new AsyncCockroachDBSaver from a connection string.</p>
+        <p>Create a saver on a single connection.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3745,8 +3959,7 @@ with LangGraph's checkpointer interface.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>CockroachDB connection string.
-Supports cockroachdb:// and postgresql:// formats.</p>
+                <p>CockroachDB connection string (cockroachdb://, postgresql:// and similar)</p>
               </div>
             </td>
             <td>
@@ -3762,7 +3975,7 @@ Supports cockroachdb:// and postgresql:// formats.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Whether to use AsyncPipeline mode.</p>
+                <p>Whether to use AsyncPipeline mode</p>
               </div>
             </td>
             <td>
@@ -3778,7 +3991,76 @@ Supports cockroachdb:// and postgresql:// formats.</p>
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Custom serializer protocol.</p>
+                <p>Custom serializer protocol</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>retry_policy</code>
+            </td>
+            <td>
+                  <code><a class="autorefs autorefs-internal" title="RetryPolicy
+
+
+  
+      dataclass
+   (langchain_cockroachdb.retry.RetryPolicy)" href="../retry/#langchain_cockroachdb.retry.RetryPolicy">RetryPolicy</a> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>How operations retry (default: RetryPolicy())</p>
+              </div>
+            </td>
+            <td>
+                  <code>None</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>connect_timeout</code>
+            </td>
+            <td>
+                  <code><span title="float">float</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Seconds to wait when connecting, or None (default: 10)</p>
+              </div>
+            </td>
+            <td>
+                  <code>10.0</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>prepare_threshold</code>
+            </td>
+            <td>
+                  <code><span title="int">int</span> | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>psycopg prepared statement threshold, None to disable (default: 5)</p>
+              </div>
+            </td>
+            <td>
+                  <code>5</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>connect_kwargs</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Mapping">Mapping</span>[<span title="str">str</span>, <span title="typing.Any">Any</span>] | None</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Extra psycopg connection options, e.g. application_name</p>
               </div>
             </td>
             <td>
@@ -3874,7 +4156,7 @@ Supports cockroachdb:// and postgresql:// formats.</p>
 
 
 <h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.put_writes" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">put_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">put_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">writes</span><span class="p">,</span> <span class="n">task_id</span><span class="p">,</span> <span class="n">task_path</span><span class="o">=</span><span class="s1">''</span><span class="p">)</span></code>
 
 <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.put_writes" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -3904,8 +4186,10 @@ Supports cockroachdb:// and postgresql:// formats.</p>
     <div class="doc doc-contents ">
 
         <p>Set up the checkpoint database asynchronously.</p>
-<p>Creates necessary tables and runs migrations. MUST be called
-the first time the checkpointer is used.</p>
+<p>Creates necessary tables and runs migrations. MUST be called the first
+time the checkpointer is used. Safe to run from several processes at
+once: every migration is idempotent and versions are recorded with
+ON CONFLICT DO NOTHING.</p>
 
 
     </div>
@@ -3918,7 +4202,87 @@ the first time the checkpointer is used.</p>
 
     </div>
 
-</div><h2 id="key-methods">Key Methods<a class="headerlink" href="#key-methods" title="Permanent link">&para;</a></h2>
+</div><h2 id="parameters">Parameters<a class="headerlink" href="#parameters" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>conn</code></td>
+<td>Connection or Pool</td>
+<td>Required</td>
+<td>psycopg connection or pool</td>
+</tr>
+<tr>
+<td><code>retry_policy</code></td>
+<td>RetryPolicy</td>
+<td>None</td>
+<td>Retry policy for transient errors</td>
+</tr>
+<tr>
+<td><code>pipe</code></td>
+<td>bool</td>
+<td>False</td>
+<td>Use pipeline mode (single connection)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="from_conn_string-options">from_conn_string Options<a class="headerlink" href="#from_conn_string-options" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>conn_string</code></td>
+<td>str</td>
+<td>Required</td>
+<td>Database connection string (cockroachdb:// or postgresql://)</td>
+</tr>
+<tr>
+<td><code>retry_policy</code></td>
+<td>RetryPolicy</td>
+<td>None</td>
+<td>Retry policy for transient errors</td>
+</tr>
+<tr>
+<td><code>connect_timeout</code></td>
+<td>float | None</td>
+<td>10</td>
+<td>Connection timeout in seconds</td>
+</tr>
+<tr>
+<td><code>prepare_threshold</code></td>
+<td>int</td>
+<td>5</td>
+<td>Prepared statement threshold</td>
+</tr>
+<tr>
+<td><code>connect_kwargs</code></td>
+<td>dict</td>
+<td>{}</td>
+<td>Additional connection options (e.g. <code>{"application_name": "my-service"}</code>)</td>
+</tr>
+<tr>
+<td><code>pipeline</code></td>
+<td>bool</td>
+<td>False</td>
+<td>Use pipeline mode (single connection)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="key-methods">Key Methods<a class="headerlink" href="#key-methods" title="Permanent link">&para;</a></h2>
 <h3 id="shared-sync-async">Shared (Sync &amp; Async)<a class="headerlink" href="#shared-sync-async" title="Permanent link">&para;</a></h3>
 <table>
 <thead>

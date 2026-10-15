@@ -15,7 +15,7 @@
         <link rel="canonical" href="https://cockroachdb.github.io/langchain-cockroachdb/examples/">
       
       
-        <link rel="prev" href="../guides/async-vs-sync/">
+        <link rel="prev" href="../guides/resilience/">
       
       
         <link rel="next" href="basic-usage/">
@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -996,10 +1024,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#configuration" class="md-nav__link">
+  <a href="#configuration-and-resilience" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configuration
+        Configuration and Resilience
       
     </span>
   </a>
@@ -1466,6 +1494,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1796,10 +1852,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#configuration" class="md-nav__link">
+  <a href="#configuration-and-resilience" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configuration
+        Configuration and Resilience
       
     </span>
   </a>
@@ -2017,7 +2073,7 @@
 </tr>
 </tbody>
 </table>
-<h3 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h3>
+<h3 id="configuration-and-resilience">Configuration and Resilience<a class="headerlink" href="#configuration-and-resilience" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
 <tr>
@@ -2031,6 +2087,11 @@
 <td><a href="../getting-started/configuration/#configuration-presets">retry_configuration.py</a></td>
 <td>Production configurations</td>
 <td>Retry logic, connection pooling</td>
+</tr>
+<tr>
+<td><a href="../guides/resilience/#trying-it">resilience.py</a></td>
+<td>Fault injection and retries</td>
+<td>Real CockroachDB errors, retry behavior</td>
 </tr>
 </tbody>
 </table>
@@ -2100,12 +2161,12 @@
 </li>
 <li>
 <p><strong>Set connection string (optional):</strong>
-   <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">COCKROACHDB_URL</span><span class="o">=</span><span class="s2">&quot;cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&quot;</span>
+   <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">COCKROACHDB_URL</span><span class="o">=</span><span class="s2">"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"</span>
 </code></pre></div></p>
 </li>
 <li>
 <p><strong>Set OpenAI key (for some examples):</strong>
-   <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_API_KEY</span><span class="o">=</span><span class="s2">&quot;your-key-here&quot;</span>
+   <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_API_KEY</span><span class="o">=</span><span class="s2">"your-key-here"</span>
 </code></pre></div></p>
 </li>
 </ol>

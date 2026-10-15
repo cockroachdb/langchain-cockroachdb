@@ -1097,6 +1097,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1486,6 +1514,34 @@
     
   
     Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
   
 
     
@@ -2058,7 +2114,7 @@
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
 <a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="c1"># create_tsvector=True adds the tsvector column and GIN index</span>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">ainit_vectorstore_table</span><span class="p">(</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;documents&quot;</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">"documents"</span><span class="p">,</span>
 <a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="n">vector_dimension</span><span class="o">=</span><span class="mi">1536</span><span class="p">,</span>
 <a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="n">create_tsvector</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
 <a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="p">)</span>
@@ -2066,14 +2122,14 @@
 <a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="n">vectorstore</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
 <a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;documents&quot;</span><span class="p">,</span>
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">"documents"</span><span class="p">,</span>
 <a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>    <span class="n">hybrid_search_config</span><span class="o">=</span><span class="n">HybridSearchConfig</span><span class="p">(),</span>
 <a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="p">)</span>
 </code></pre></div>
 <p>Behind the scenes the table gets:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">documents</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">ADD</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">content_tsvector</span><span class="w"> </span><span class="n">TSVECTOR</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">GENERATED</span><span class="w"> </span><span class="n">ALWAYS</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="p">(</span><span class="n">to_tsvector</span><span class="p">(</span><span class="s1">&#39;english&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">))</span><span class="w"> </span><span class="n">STORED</span><span class="p">;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">GENERATED</span><span class="w"> </span><span class="n">ALWAYS</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="p">(</span><span class="n">to_tsvector</span><span class="p">(</span><span class="s1">'english'</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">))</span><span class="w"> </span><span class="n">STORED</span><span class="p">;</span>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
 <a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">GIN</span><span class="w"> </span><span class="p">(</span><span class="n">content_tsvector</span><span class="p">);</span>
 </code></pre></div>
@@ -2081,7 +2137,7 @@
 <p>Once the config is set, the normal search methods do hybrid search transparently. There is no separate hybrid method to call:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Runs FTS and vector search in parallel, fuses, returns top k</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s2">&quot;distributed databases performance&quot;</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s2">"distributed databases performance"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">)</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="k">for</span> <span class="n">doc</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
@@ -2089,17 +2145,17 @@
 </code></pre></div>
 <p>With scores (these are fused scores, not raw distances):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search_with_score</span><span class="p">(</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="s2">&quot;CockroachDB scalability&quot;</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="s2">"CockroachDB scalability"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="p">)</span>
 <a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="k">for</span> <span class="n">doc</span><span class="p">,</span> <span class="n">score</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">score</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">doc</span><span class="o">.</span><span class="n">page_content</span><span class="p">[:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">score</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">doc</span><span class="o">.</span><span class="n">page_content</span><span class="p">[:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 </code></pre></div>
 <p>Metadata filters apply to both the FTS and vector sides:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="s2">&quot;database query&quot;</span><span class="p">,</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="s2">"database query"</span><span class="p">,</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="nb">filter</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;category&quot;</span><span class="p">:</span> <span class="s2">&quot;tech&quot;</span><span class="p">,</span> <span class="s2">&quot;year&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;$gte&quot;</span><span class="p">:</span> <span class="mi">2023</span><span class="p">}},</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="nb">filter</span><span class="o">=</span><span class="p">{</span><span class="s2">"category"</span><span class="p">:</span> <span class="s2">"tech"</span><span class="p">,</span> <span class="s2">"year"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"$gte"</span><span class="p">:</span> <span class="mi">2023</span><span class="p">}},</span>
 <a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="p">)</span>
 </code></pre></div>
 <p>The sync store works the same way:</p>
@@ -2108,10 +2164,10 @@
 <a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">store</span> <span class="o">=</span> <span class="n">CockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
 <a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;documents&quot;</span><span class="p">,</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">"documents"</span><span class="p">,</span>
 <a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="n">hybrid_search_config</span><span class="o">=</span><span class="n">HybridSearchConfig</span><span class="p">(),</span>
 <a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="p">)</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">results</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">similarity_search</span><span class="p">(</span><span class="s2">&quot;distributed databases&quot;</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">results</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">similarity_search</span><span class="p">(</span><span class="s2">"distributed databases"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="fusion-strategies">Fusion Strategies<a class="headerlink" href="#fusion-strategies" title="Permanent link">&para;</a></h2>
 <h3 id="reciprocal-rank-fusion-default">Reciprocal Rank Fusion (default)<a class="headerlink" href="#reciprocal-rank-fusion-default" title="Permanent link">&para;</a></h3>
@@ -2119,7 +2175,7 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>score(doc) = sum(weight / (k + rank(doc))) over both searches
 </code></pre></div>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>    <span class="n">fusion_type</span><span class="o">=</span><span class="s2">&quot;reciprocal_rank_fusion&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>    <span class="n">fusion_type</span><span class="o">=</span><span class="s2">"reciprocal_rank_fusion"</span><span class="p">,</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="n">k</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>  <span class="c1"># RRF constant, higher spreads the top ranks less</span>
 <a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="p">)</span>
 </code></pre></div>
@@ -2136,7 +2192,7 @@ It is also what most search engines default to for hybrid retrieval.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>final_score = vector_weight * vector_score + fts_weight * fts_score
 </code></pre></div>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>    <span class="n">fusion_type</span><span class="o">=</span><span class="s2">&quot;weighted_sum&quot;</span><span class="p">,</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>    <span class="n">fusion_type</span><span class="o">=</span><span class="s2">"weighted_sum"</span><span class="p">,</span>
 <a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>    <span class="n">vector_weight</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span>  <span class="c1"># emphasize semantic similarity</span>
 <a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="n">fts_weight</span><span class="o">=</span><span class="mf">0.3</span><span class="p">,</span>     <span class="c1"># some weight for keywords</span>
 <a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="p">)</span>
@@ -2162,7 +2218,7 @@ It is also what most search engines default to for hybrid retrieval.</p>
 <p>Each search fetches a candidate pool before fusion, <code>max(k * 4, 20)</code> by
 default. Fetch more when you want fusion to consider a wider net:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="s2">&quot;query&quot;</span><span class="p">,</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="s2">"query"</span><span class="p">,</span>
 <a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>       <span class="c1"># return top 10 after fusion</span>
 <a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="n">fetch_k</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="c1"># but pull top 50 from each search first</span>
 <a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="p">)</span>
@@ -2178,13 +2234,13 @@ passed straight through to <code>ts_rank</code> to damp that:</p>
 <p>The tsvector column and the query must use the same text search
 configuration. Set it in both places:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">ainit_vectorstore_table</span><span class="p">(</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;documents&quot;</span><span class="p">,</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">"documents"</span><span class="p">,</span>
 <a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    <span class="n">vector_dimension</span><span class="o">=</span><span class="mi">1536</span><span class="p">,</span>
 <a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="n">create_tsvector</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">fts_language</span><span class="o">=</span><span class="s2">&quot;spanish&quot;</span><span class="p">,</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">fts_language</span><span class="o">=</span><span class="s2">"spanish"</span><span class="p">,</span>
 <a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="p">)</span>
 <a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>
-<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span><span class="n">fts_query_language</span><span class="o">=</span><span class="s2">&quot;spanish&quot;</span><span class="p">)</span>
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span><span class="n">fts_query_language</span><span class="o">=</span><span class="s2">"spanish"</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="cockroachdb-specifics">CockroachDB specifics<a class="headerlink" href="#cockroachdb-specifics" title="Permanent link">&para;</a></h2>
 <ul>
@@ -2209,13 +2265,13 @@ configuration. Set it in both places:</p>
 the column manually following the SQL shown in Setup.</p>
 <h3 id="poor-hybrid-results">Poor hybrid results<a class="headerlink" href="#poor-hybrid-results" title="Permanent link">&para;</a></h3>
 <p>Try the other fusion strategy first, then adjust weights:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span><span class="n">fusion_type</span><span class="o">=</span><span class="s2">&quot;weighted_sum&quot;</span><span class="p">,</span> <span class="n">vector_weight</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">fts_weight</span><span class="o">=</span><span class="mf">0.2</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">HybridSearchConfig</span><span class="p">(</span><span class="n">fusion_type</span><span class="o">=</span><span class="s2">"weighted_sum"</span><span class="p">,</span> <span class="n">vector_weight</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">fts_weight</span><span class="o">=</span><span class="mf">0.2</span><span class="p">)</span>
 </code></pre></div>
 <p>If long documents dominate, set <code>fts_rank_normalization=1</code> or <code>1 | 32</code>.</p>
 <h3 id="no-fts-influence-on-results">No FTS influence on results<a class="headerlink" href="#no-fts-influence-on-results" title="Permanent link">&para;</a></h3>
 <p><code>plainto_tsquery</code> ANDs all terms, so multi-word queries only produce FTS hits
 for documents containing every term. Check what the query parses to:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">plainto_tsquery</span><span class="p">(</span><span class="s1">&#39;english&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;your query here&#39;</span><span class="p">);</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">plainto_tsquery</span><span class="p">(</span><span class="s1">'english'</span><span class="p">,</span><span class="w"> </span><span class="s1">'your query here'</span><span class="p">);</span>
 </code></pre></div>
 <h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
 <ul>

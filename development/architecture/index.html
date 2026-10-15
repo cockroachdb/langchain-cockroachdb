@@ -831,6 +831,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1233,6 +1261,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1597,17 +1653,6 @@
     <span class="md-ellipsis">
       
         Retryable Errors
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#non-retryable-errors" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Non-Retryable Errors
       
     </span>
   </a>
@@ -2168,17 +2213,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#non-retryable-errors" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Non-Retryable Errors
-      
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -2365,7 +2399,12 @@
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>├── indexes.py               # Index abstractions
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>├── hybrid_search_config.py  # Hybrid search configuration
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>├── chat_message_histories.py # Chat persistence
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>└── retry.py                 # Retry logic
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>├── retry.py                 # Retry logic
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>├── _guard.py                # Hang guard (attempt timeout)
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>├── _loop.py                 # Background event loop for sync methods
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>├── _connection.py           # Connection helpers
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>├── _sql.py                  # SQL generation
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>└── _filters.py              # Metadata filter translation
 </code></pre></div>
 <h2 id="core-components">Core Components<a class="headerlink" href="#core-components" title="Permanent link">&para;</a></h2>
 <h3 id="cockroachdbengine">CockroachDBEngine<a class="headerlink" href="#cockroachdbengine" title="Permanent link">&para;</a></h3>
@@ -2391,16 +2430,16 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">vectorstore</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;docs&quot;</span><span class="p">,</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">"docs"</span><span class="p">,</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="p">)</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span>
 </code></pre></div></p>
 <h3 id="cockroachdbvectorstore">CockroachDBVectorStore<a class="headerlink" href="#cockroachdbvectorstore" title="Permanent link">&para;</a></h3>
 <p><strong>Purpose:</strong> Synchronous wrapper for async operations</p>
 <p><strong>Implementation:</strong>
-- Runs async methods in background event loop
+- Runs async methods on one background event loop
 - Same API as async version (without <code>a</code> prefix)
-- Uses <code>asyncio.run()</code> internally</p>
+- Safe from any number of threads and from inside a running event loop</p>
 <p><strong>Pattern:</strong>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">vectorstore</span> <span class="o">=</span> <span class="n">CockroachDBVectorStore</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>  <span class="c1"># Sync</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">vectorstore</span><span class="o">.</span><span class="n">add_texts</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span>  <span class="c1"># No await</span>
@@ -2419,25 +2458,25 @@
 - Better resource utilization
 - Natural fit for modern Python</p>
 <h3 id="retry-decorators">Retry Decorators<a class="headerlink" href="#retry-decorators" title="Permanent link">&para;</a></h3>
-<p>All operations use retry decorators:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nd">@async_retry_with_backoff</span><span class="p">(</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="n">max_attempts</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">retry_max_attempts</span><span class="p">,</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">initial_backoff</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">retry_initial_backoff</span><span class="p">,</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="o">...</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="p">)</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_insert_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="c1"># Operation with automatic retry</span>
+<p>Each idempotent statement is wrapped by <code>RetryPolicy.arun</code>. The callable passed to <code>arun</code> checks out a fresh connection per attempt:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">aadd_texts</span><span class="p">(</span><span class="n">texts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">attempt</span><span class="p">():</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>        <span class="k">async</span> <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">_connect</span><span class="p">()</span> <span class="k">as</span> <span class="n">conn</span><span class="p">:</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>            <span class="k">return</span> <span class="k">await</span> <span class="n">conn</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">insert_statement</span><span class="p">,</span> <span class="n">params</span><span class="p">)</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">retry_policy</span><span class="o">.</span><span class="n">arun</span><span class="p">(</span><span class="n">attempt</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"insert into documents"</span><span class="p">)</span>
 </code></pre></div>
 <p><strong>Benefits:</strong>
 - Transparent retry logic
-- Configurable per operation
-- Handles 40001 errors automatically</p>
+- Configurable per component
+- Handles transient CockroachDB errors automatically
+- Fresh connection per retry</p>
 <h3 id="dependency-injection">Dependency Injection<a class="headerlink" href="#dependency-injection" title="Permanent link">&para;</a></h3>
 <p>Engine is injected into vector store:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">vectorstore</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
 <a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>  <span class="c1"># Injected dependency</span>
 <a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">&quot;docs&quot;</span><span class="p">,</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">"docs"</span><span class="p">,</span>
 <a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="p">)</span>
 </code></pre></div>
 <p><strong>Benefits:</strong>
@@ -2467,11 +2506,11 @@
 <h2 id="sql-generation">SQL Generation<a class="headerlink" href="#sql-generation" title="Permanent link">&para;</a></h2>
 <h3 id="filter-translation">Filter Translation<a class="headerlink" href="#filter-translation" title="Permanent link">&para;</a></h3>
 <p>Metadata filters are translated to SQL:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nb">filter</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;category&quot;</span><span class="p">:</span> <span class="s2">&quot;tech&quot;</span><span class="p">,</span> <span class="s2">&quot;year&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;$gte&quot;</span><span class="p">:</span> <span class="mi">2023</span><span class="p">}}</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nb">filter</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"category"</span><span class="p">:</span> <span class="s2">"tech"</span><span class="p">,</span> <span class="s2">"year"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"$gte"</span><span class="p">:</span> <span class="mi">2023</span><span class="p">}}</span>
 <a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>
 <a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="c1"># Becomes:</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">WHERE</span> <span class="n">metadata</span><span class="o">-&gt;&gt;</span><span class="s1">&#39;category&#39;</span> <span class="o">=</span> <span class="s1">&#39;tech&#39;</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>  <span class="n">AND</span> <span class="n">CAST</span><span class="p">(</span><span class="n">metadata</span><span class="o">-&gt;&gt;</span><span class="s1">&#39;year&#39;</span> <span class="n">AS</span> <span class="n">INTEGER</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">2023</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">WHERE</span> <span class="n">metadata</span><span class="o">-&gt;&gt;</span><span class="s1">'category'</span> <span class="o">=</span> <span class="s1">'tech'</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>  <span class="n">AND</span> <span class="n">CAST</span><span class="p">(</span><span class="n">metadata</span><span class="o">-&gt;&gt;</span><span class="s1">'year'</span> <span class="n">AS</span> <span class="n">INTEGER</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">2023</span>
 </code></pre></div>
 <h3 id="distance-operators">Distance Operators<a class="headerlink" href="#distance-operators" title="Permanent link">&para;</a></h3>
 <p>Different distance strategies use different operators:</p>
@@ -2503,15 +2542,54 @@
 </table>
 <h2 id="error-handling">Error Handling<a class="headerlink" href="#error-handling" title="Permanent link">&para;</a></h2>
 <h3 id="retryable-errors">Retryable Errors<a class="headerlink" href="#retryable-errors" title="Permanent link">&para;</a></h3>
-<p>Automatically retry on:
-- <code>40001</code>: Serialization errors
-- Connection errors
-- Timeout errors</p>
-<h3 id="non-retryable-errors">Non-Retryable Errors<a class="headerlink" href="#non-retryable-errors" title="Permanent link">&para;</a></h3>
-<p>Fail immediately on:
-- Schema errors
-- Permission errors
-- Data validation errors</p>
+<table>
+<thead>
+<tr>
+<th>SQLSTATE</th>
+<th>Meaning</th>
+<th>Why a retry is safe</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>40001</code></td>
+<td>Serialization failure ("restart transaction")</td>
+<td>The transaction did not commit</td>
+</tr>
+<tr>
+<td><code>40003</code></td>
+<td>Result is ambiguous</td>
+<td>Every write the library issues is idempotent</td>
+</tr>
+<tr>
+<td><code>08xxx</code></td>
+<td>Connection exceptions, including CockroachDB sqlproxy's <code>08C00</code></td>
+<td>Idempotent writes, and the pool replaces the connection</td>
+</tr>
+<tr>
+<td><code>57P01</code></td>
+<td>Node draining or shutting down</td>
+<td>Idempotent writes</td>
+</tr>
+<tr>
+<td><code>58C00</code></td>
+<td>Range unavailable (CockroachDB)</td>
+<td>Usually clears once leases move</td>
+</tr>
+<tr>
+<td><code>58C01</code></td>
+<td>Connection failure between CockroachDB nodes</td>
+<td>Usually clears once leases move</td>
+</tr>
+<tr>
+<td><code>53300</code></td>
+<td>Too many connections</td>
+<td>Connection slots free up</td>
+</tr>
+</tbody>
+</table>
+<p>Errors without a SQLSTATE and CockroachDB's uncategorized codes (<code>XXUUU</code>, <code>XX000</code>) are matched against known connection-loss phrases.</p>
+<p>See <a href="../../guides/resilience/">Retries and Resilience</a> for full details.</p>
 <h2 id="testing-strategy">Testing Strategy<a class="headerlink" href="#testing-strategy" title="Permanent link">&para;</a></h2>
 <h3 id="unit-tests">Unit Tests<a class="headerlink" href="#unit-tests" title="Permanent link">&para;</a></h3>
 <p>Test logic without database:
@@ -2555,8 +2633,8 @@
 <h3 id="custom-distance-functions">Custom Distance Functions<a class="headerlink" href="#custom-distance-functions" title="Permanent link">&para;</a></h3>
 <p>Extend with custom distance strategies:
 <div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">class</span><span class="w"> </span><span class="nc">CustomDistance</span><span class="p">(</span><span class="n">DistanceStrategy</span><span class="p">):</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="n">name</span> <span class="o">=</span> <span class="s2">&quot;custom&quot;</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">operator</span> <span class="o">=</span> <span class="s2">&quot;custom_op&quot;</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="n">name</span> <span class="o">=</span> <span class="s2">"custom"</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">operator</span> <span class="o">=</span> <span class="s2">"custom_op"</span>
 </code></pre></div></p>
 <h3 id="custom-filters">Custom Filters<a class="headerlink" href="#custom-filters" title="Permanent link">&para;</a></h3>
 <p>Extend filter translator for custom operators:
