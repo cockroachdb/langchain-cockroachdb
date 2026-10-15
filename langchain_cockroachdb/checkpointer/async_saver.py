@@ -13,8 +13,17 @@ import asyncio
 import builtins
 import contextlib
 import logging
+import os
 from collections import defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
@@ -36,6 +45,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._guard import aabandon_after
+from langchain_cockroachdb._loop import LoopMessages, run_on_external_loop
 from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
 from langchain_cockroachdb.retry import RetryPolicy
@@ -45,6 +55,41 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 Conn = _ainternal.Conn
+
+_OWN_LOOP = (
+    "Synchronous calls to AsyncCockroachDBSaver are only allowed from a "
+    "different thread. From the main thread, use the async interface."
+)
+
+# What the sync methods say when they give up on the saver's event loop
+_SAVER_LOOP = "The event loop this AsyncCockroachDBSaver was created on"
+_SAVER_ADVICE = (
+    "Call the sync methods from other threads while that loop runs, or use "
+    "CockroachDBSaver in sync code."
+)
+_NEW_SAVER = "Create a new saver in this process."
+_LOOP_MESSAGES = LoopMessages(
+    closed=f"{_SAVER_LOOP} is closed. {_SAVER_ADVICE}",
+    not_running=f"{_SAVER_LOOP} is not running, so the call would wait forever. {_SAVER_ADVICE}",
+    closed_while_waiting=(
+        f"{_SAVER_LOOP} was closed before the call finished. The work may or may not "
+        f"have taken effect. {_SAVER_ADVICE}"
+    ),
+    stopped_while_waiting=(
+        f"{_SAVER_LOOP} stopped before the call finished. The work may or may not have "
+        f"taken effect. {_SAVER_ADVICE}"
+    ),
+    forked_loop=(
+        f"{_SAVER_LOOP} was running in the parent process when this process was forked. "
+        f"Its copy here can never run, so calls could never finish. {_NEW_SAVER}"
+    ),
+    forked_child=(
+        "This AsyncCockroachDBSaver was created in process {owner_pid}, and this is "
+        "process {pid}, a forked child of it. No thread runs its event loop here, so "
+        "the call could never finish. "
+    )
+    + _NEW_SAVER,
+)
 
 
 def _sanitize_conn_string(conn_string: str) -> str:
@@ -59,6 +104,12 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     with LangGraph's checkpointer interface. For production, pass a
     ``psycopg_pool.AsyncConnectionPool``: it replaces broken connections,
     while a single connection cannot recover from a dropped connection.
+
+    The sync methods (``get_tuple``, ``put`` and the others) run the async
+    ones on the event loop the saver was created on, so call them from other
+    threads while that loop runs. From the loop itself they raise
+    ``asyncio.InvalidStateError``. When the loop is closed or stops, or in a
+    forked child, they raise ``RuntimeError`` instead of waiting forever.
 
     Example:
         ```python
@@ -96,6 +147,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         self.pipe = pipe
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
+        self._pid = os.getpid()
         self.supports_pipeline = Capabilities().has_pipeline()
         self.retry_policy = retry_policy or RetryPolicy()
 
@@ -460,7 +512,27 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
 
         await self._retry(delete, label="delete thread")
 
-    # Sync wrappers that delegate to async methods via the event loop
+    # Sync wrappers that run the async methods on the loop the saver was created
+    # on and wait for them, so they are for other threads
+    def _run_sync(self, coro: Coroutine[Any, Any, T]) -> T:
+        """Run ``coro`` on the saver's loop and wait for the result.
+
+        Raises:
+            asyncio.InvalidStateError: If called from that loop, where waiting
+                would deadlock
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or if this is a forked child of the
+                process that created the saver
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self.loop:
+            coro.close()
+            raise asyncio.InvalidStateError(_OWN_LOOP)
+        return run_on_external_loop(coro, self.loop, owner_pid=self._pid, messages=_LOOP_MESSAGES)
+
     def list(
         self,
         config: RunnableConfig | None,
@@ -470,35 +542,26 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
         """List checkpoints (sync wrapper for alist)."""
-        try:
-            if asyncio.get_running_loop() is self.loop:
-                raise asyncio.InvalidStateError(
-                    "Synchronous calls to AsyncCockroachDBSaver are only allowed from a "
-                    "different thread. From the main thread, use the async interface."
-                )
-        except RuntimeError:
-            pass
-        aiter_ = self.alist(config, filter=filter, before=before, limit=limit)
-        while True:
-            try:
-                yield asyncio.run_coroutine_threadsafe(
-                    anext(aiter_),  # type: ignore[arg-type]
-                    self.loop,
-                ).result()
-            except StopAsyncIteration:
-                break
+        yield from self._run_sync(
+            self._alist_all(config, filter=filter, before=before, limit=limit)
+        )
+
+    async def _alist_all(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None,
+        before: RunnableConfig | None,
+        limit: int | None,
+    ) -> builtins.list[CheckpointTuple]:
+        """Collect what alist yields, so list() goes to the loop once."""
+        return [
+            item async for item in self.alist(config, filter=filter, before=before, limit=limit)
+        ]
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple (sync wrapper for aget_tuple)."""
-        try:
-            if asyncio.get_running_loop() is self.loop:
-                raise asyncio.InvalidStateError(
-                    "Synchronous calls to AsyncCockroachDBSaver are only allowed from a "
-                    "different thread. From the main thread, use the async interface."
-                )
-        except RuntimeError:
-            pass
-        return asyncio.run_coroutine_threadsafe(self.aget_tuple(config), self.loop).result()
+        return self._run_sync(self.aget_tuple(config))
 
     def put(
         self,
@@ -508,9 +571,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint (sync wrapper for aput)."""
-        return asyncio.run_coroutine_threadsafe(
-            self.aput(config, checkpoint, metadata, new_versions), self.loop
-        ).result()
+        return self._run_sync(self.aput(config, checkpoint, metadata, new_versions))
 
     def put_writes(
         self,
@@ -520,21 +581,11 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         task_path: str = "",
     ) -> None:
         """Store intermediate writes (sync wrapper for aput_writes)."""
-        return asyncio.run_coroutine_threadsafe(
-            self.aput_writes(config, writes, task_id, task_path), self.loop
-        ).result()
+        return self._run_sync(self.aput_writes(config, writes, task_id, task_path))
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete thread (sync wrapper for adelete_thread)."""
-        try:
-            if asyncio.get_running_loop() is self.loop:
-                raise asyncio.InvalidStateError(
-                    "Synchronous calls to AsyncCockroachDBSaver are only allowed from a "
-                    "different thread. From the main thread, use the async interface."
-                )
-        except RuntimeError:
-            pass
-        return asyncio.run_coroutine_threadsafe(self.adelete_thread(thread_id), self.loop).result()
+        return self._run_sync(self.adelete_thread(thread_id))
 
     @asynccontextmanager
     async def _cursor(

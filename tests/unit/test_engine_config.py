@@ -590,7 +590,7 @@ def test_loop_engine_reports_a_loop_that_closed_just_before_the_handoff(how, mon
     # handed over. Skipping the check reproduces that order.
     loop = asyncio.new_event_loop()
     loop.close()
-    monkeypatch.setattr(_loop, "_until_running", lambda loop: iter(()))
+    monkeypatch.setattr(_loop, "_until_running", lambda loop, messages: iter(()))
     engine = CockroachDBEngine.from_engine(_lazy_engine(), loop=loop)
     with _no_unawaited_coroutines(), pytest.raises(RuntimeError, match="loop= is closed"):
         _close(engine, how)

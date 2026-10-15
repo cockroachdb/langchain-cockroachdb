@@ -8,7 +8,8 @@ concurrency. All sync calls now run on this one loop instead.
 An engine built with ``loop=`` sends its work to that loop. The library does
 not own it, so a call checks that it is running, and raises instead of waiting
 forever when the loop is closed or stops, or when the call comes from a forked
-child.
+child. The sync methods of AsyncCockroachDBSaver do the same with the loop the
+saver was created on.
 """
 
 from __future__ import annotations
@@ -22,21 +23,22 @@ import threading
 import time
 import weakref
 from collections.abc import Coroutine, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 T = TypeVar("T")
 
-# How often a call waiting on a loop passed as loop= checks that the loop is
-# still running, in seconds.
+# How often a call waiting on a loop the library does not own checks that the
+# loop is still running, in seconds.
 LOOP_CHECK_INTERVAL = 0.1
 
-# How long a loop passed as loop= may be not running before calls give up on
-# it, in seconds. A loop whose thread was just started is not running yet for a
-# moment, and a loop can be stopped and run again.
+# How long a loop the library does not own may be not running before calls
+# give up on it, in seconds. A loop whose thread was just started is not
+# running yet for a moment, and a loop can be stopped and run again.
 LOOP_START_TIMEOUT = 1.0
 
-# How long a call first waits before it looks again at a loop passed as loop=
-# that is not running yet, in seconds. The wait doubles up to
+# How long a call first waits before it looks again at a loop the library does
+# not own that is not running yet, in seconds. The wait doubles up to
 # LOOP_CHECK_INTERVAL. A loop whose thread was just started usually runs within
 # a millisecond, so the call is not held up for a full interval.
 LOOP_START_FIRST_WAIT = 0.001
@@ -64,6 +66,35 @@ _FORK_ADVICE = (
 _FORKED_LOOP = (
     "The event loop passed as loop= was running in the parent process when this process "
     f"was forked. Its copy here can never run, so calls could never finish. {_FORK_ADVICE}"
+)
+_FORKED_CHILD = (
+    "This engine was built with loop= in process {owner_pid}, and this is process {pid}, "
+    "a forked child of it. No thread runs that loop here, so the call could never finish. "
+) + _FORK_ADVICE
+
+
+@dataclass(frozen=True)
+class LoopMessages:
+    """What a call says when it gives up on a loop the library does not own.
+
+    forked_child is formatted with owner_pid and pid.
+    """
+
+    closed: str
+    not_running: str
+    closed_while_waiting: str
+    stopped_while_waiting: str
+    forked_loop: str
+    forked_child: str
+
+
+ENGINE_LOOP_MESSAGES = LoopMessages(
+    closed=_CLOSED,
+    not_running=_NOT_RUNNING,
+    closed_while_waiting=_CLOSED_WHILE_WAITING,
+    stopped_while_waiting=_STOPPED_WHILE_WAITING,
+    forked_loop=_FORKED_LOOP,
+    forked_child=_FORKED_CHILD,
 )
 
 _lock = threading.Lock()
@@ -125,8 +156,8 @@ def run_coroutine_sync(coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEvent
         raise
 
 
-def _refuse_forked_child(owner_pid: int) -> None:
-    """Raise unless this is the process that built the engine.
+def _refuse_forked_child(owner_pid: int, messages: LoopMessages) -> None:
+    """Raise unless this is the process that built the engine or the saver.
 
     A fork child has a copy of the loop that can still report it is running,
     but the thread that ran it exists only in the parent. This check only
@@ -136,11 +167,7 @@ def _refuse_forked_child(owner_pid: int) -> None:
     """
     pid = os.getpid()
     if pid != owner_pid:
-        raise RuntimeError(
-            f"This engine was built with loop= in process {owner_pid}, and this is "
-            f"process {pid}, a forked child of it. No thread runs that loop here, so "
-            f"the call could never finish. {_FORK_ADVICE}"
-        )
+        raise RuntimeError(messages.forked_child.format(owner_pid=owner_pid, pid=pid))
 
 
 def note_forked_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -155,13 +182,15 @@ def note_forked_loop(loop: asyncio.AbstractEventLoop) -> None:
             _forked_loops.add(loop)
 
 
-def refuse_forked_loop(loop: asyncio.AbstractEventLoop) -> None:
+def refuse_forked_loop(
+    loop: asyncio.AbstractEventLoop, messages: LoopMessages = ENGINE_LOOP_MESSAGES
+) -> None:
     """Raise if ``loop`` was running in the parent when this process was forked."""
     if loop in _forked_loops:
-        raise RuntimeError(_FORKED_LOOP)
+        raise RuntimeError(messages.forked_loop)
 
 
-def _until_running(loop: asyncio.AbstractEventLoop) -> Iterator[float]:
+def _until_running(loop: asyncio.AbstractEventLoop, messages: LoopMessages) -> Iterator[float]:
     """Yield how long to sleep while ``loop`` is not running yet.
 
     The first wait is LOOP_START_FIRST_WAIT, and each one after it doubles, up
@@ -175,16 +204,16 @@ def _until_running(loop: asyncio.AbstractEventLoop) -> Iterator[float]:
     wait = min(LOOP_START_FIRST_WAIT, LOOP_CHECK_INTERVAL)
     while not loop.is_running():
         if loop.is_closed():
-            raise RuntimeError(_CLOSED)
+            raise RuntimeError(messages.closed)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(_NOT_RUNNING)
+            raise RuntimeError(messages.not_running)
         yield min(wait, remaining)
         wait = min(wait * 2, LOOP_CHECK_INTERVAL)
 
 
 def _submit(
-    coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEventLoop
+    coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEventLoop, messages: LoopMessages
 ) -> concurrent.futures.Future[T]:
     """Hand ``coro`` to ``loop``, which may have closed since it was checked."""
     try:
@@ -192,20 +221,21 @@ def _submit(
     except RuntimeError:
         if not loop.is_closed():
             raise
-        raise RuntimeError(_CLOSED) from None
+        raise RuntimeError(messages.closed) from None
 
 
 class _LoopWatch:
-    """Notice when a loop passed as loop= goes away while a call waits on it."""
+    """Notice when a loop the library does not own goes away while a call waits on it."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, messages: LoopMessages) -> None:
         self._loop = loop
+        self._messages = messages
         self._stopped_since: float | None = None
 
     def problem(self) -> str | None:
         """Return why the call should stop waiting, or None to keep waiting."""
         if self._loop.is_closed():
-            return _CLOSED_WHILE_WAITING
+            return self._messages.closed_while_waiting
         if self._loop.is_running():
             self._stopped_since = None
             return None
@@ -213,7 +243,7 @@ class _LoopWatch:
         if self._stopped_since is None:
             self._stopped_since = now
         elif now - self._stopped_since >= LOOP_START_TIMEOUT:
-            return _STOPPED_WHILE_WAITING
+            return self._messages.stopped_while_waiting
         return None
 
 
@@ -235,17 +265,23 @@ def _give_up(
 
 
 def run_on_external_loop(
-    coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEventLoop, *, owner_pid: int
+    coro: Coroutine[Any, Any, T],
+    loop: asyncio.AbstractEventLoop,
+    *,
+    owner_pid: int,
+    messages: LoopMessages = ENGINE_LOOP_MESSAGES,
 ) -> T:
-    """Run ``coro`` on a loop passed as loop= and block until it finishes.
+    """Run ``coro`` on a loop the library does not own and block until it finishes.
 
     Unlike run_coroutine_sync, this never waits forever. It checks the loop
     before handing over the work, and every LOOP_CHECK_INTERVAL while waiting.
 
     Args:
         coro: The work to run
-        loop: The loop passed as loop=
-        owner_pid: The process that built the engine
+        loop: The loop passed as loop=, or the loop an AsyncCockroachDBSaver
+            was created on
+        owner_pid: The process that built the engine or the saver
+        messages: What to say when giving up (default: the engine's, for loop=)
 
     Raises:
         RuntimeError: If called from ``loop``'s own thread or from a forked
@@ -254,16 +290,16 @@ def run_on_external_loop(
             finishes
     """
     try:
-        _refuse_forked_child(owner_pid)
-        refuse_forked_loop(loop)
+        _refuse_forked_child(owner_pid, messages)
+        refuse_forked_loop(loop, messages)
         _refuse_own_loop(loop)
-        for delay in _until_running(loop):
+        for delay in _until_running(loop, messages):
             time.sleep(delay)
-        future = _submit(coro, loop)
+        future = _submit(coro, loop, messages)
     except BaseException:
         coro.close()
         raise
-    watch = _LoopWatch(loop)
+    watch = _LoopWatch(loop, messages)
     try:
         while True:
             done, _ = concurrent.futures.wait((future,), timeout=LOOP_CHECK_INTERVAL)
@@ -279,24 +315,28 @@ def run_on_external_loop(
 
 
 async def arun_on_external_loop(
-    coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEventLoop, *, owner_pid: int
+    coro: Coroutine[Any, Any, T],
+    loop: asyncio.AbstractEventLoop,
+    *,
+    owner_pid: int,
+    messages: LoopMessages = ENGINE_LOOP_MESSAGES,
 ) -> T:
-    """Run ``coro`` on a loop passed as loop=, from a coroutine on another loop.
+    """Run ``coro`` on a loop the library does not own, from a coroutine on another loop.
 
     The async version of run_on_external_loop. Waiting does not block the
     caller's loop, and cancelling the caller cancels the work.
     """
     try:
-        _refuse_forked_child(owner_pid)
-        refuse_forked_loop(loop)
-        for delay in _until_running(loop):
+        _refuse_forked_child(owner_pid, messages)
+        refuse_forked_loop(loop, messages)
+        for delay in _until_running(loop, messages):
             await asyncio.sleep(delay)
-        future = _submit(coro, loop)
+        future = _submit(coro, loop, messages)
     except BaseException:
         coro.close()
         raise
     outcome = asyncio.wrap_future(future)
-    watch = _LoopWatch(loop)
+    watch = _LoopWatch(loop, messages)
     try:
         while True:
             done, _ = await asyncio.wait({outcome}, timeout=LOOP_CHECK_INTERVAL)
