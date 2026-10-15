@@ -8,10 +8,14 @@ see exactly what they would see in production:
   balancer reset
 - an open transaction holding a row's write intent makes writers wait, the way
   a stuck range does
+
+Interruption is the one client-side fault: it stops a write between
+statements, the way a cancelled task or a crashed caller does.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import threading
 import time
@@ -149,6 +153,67 @@ class PsycopgFaults(_Faults):
         if self.unsafe_internals:
             await psycopg.AsyncCursor.execute(cursor, "SET allow_unsafe_internals = true")
         await psycopg.AsyncCursor.execute(cursor, FORCE_ERROR, _fault_params(code))
+
+
+class Interruption:
+    """Stops the client partway through a write, after earlier statements were queued.
+
+    Once armed, the next statement containing ``match`` (case-insensitive) is
+    interrupted; executemany sends its first row first. Pass
+    ``cursor_factory=interruption.cursor_class()`` (or the async variant) to the
+    connection or pool. The sync cursor raises RuntimeError("interrupted"). The
+    async cursor sets ``reached`` and waits until the test cancels its task.
+    """
+
+    def __init__(self, match: str) -> None:
+        self.match = match.lower()
+        self.armed = False
+        self.reached: asyncio.Event | None = None
+
+    def _due(self, query: Any) -> bool:
+        if self.armed and self.match in str(query).lower():
+            self.armed = False
+            return True
+        return False
+
+    async def _wait_for_cancel(self) -> None:
+        assert self.reached is not None, "set reached to an asyncio.Event first"
+        self.reached.set()
+        await asyncio.Event().wait()
+
+    def cursor_class(self) -> type[psycopg.Cursor[Any]]:
+        interruption = self
+
+        class InterruptingCursor(psycopg.Cursor):  # type: ignore[type-arg]
+            def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
+                if interruption._due(query):
+                    raise RuntimeError("interrupted")
+                return super().execute(query, params, **kwargs)
+
+            def executemany(self, query, params_seq, **kwargs):  # type: ignore[no-untyped-def,override]
+                if interruption._due(query):
+                    super().executemany(query, list(params_seq)[:1], **kwargs)
+                    raise RuntimeError("interrupted")
+                return super().executemany(query, params_seq, **kwargs)
+
+        return InterruptingCursor
+
+    def async_cursor_class(self) -> type[psycopg.AsyncCursor[Any]]:
+        interruption = self
+
+        class InterruptingAsyncCursor(psycopg.AsyncCursor):  # type: ignore[type-arg]
+            async def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
+                if interruption._due(query):
+                    await interruption._wait_for_cancel()
+                return await super().execute(query, params, **kwargs)
+
+            async def executemany(self, query, params_seq, **kwargs):  # type: ignore[no-untyped-def,override]
+                if interruption._due(query):
+                    await super().executemany(query, list(params_seq)[:1], **kwargs)
+                    await interruption._wait_for_cancel()
+                return await super().executemany(query, params_seq, **kwargs)
+
+        return InterruptingAsyncCursor
 
 
 def kill_sessions(libpq_url: str, application_name: str) -> int:

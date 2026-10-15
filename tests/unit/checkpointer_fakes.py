@@ -28,30 +28,60 @@ def close_sockets() -> None:
         _sockets.pop().close()
 
 
+class Block:
+    """A pipeline or transaction block that records when it opens and closes.
+
+    The close event names the error that left the block, or is None when the
+    block finished cleanly. A transaction that closes with an error is one
+    psycopg rolls back.
+    """
+
+    def __init__(self, events: list[tuple[str, ...]], name: str) -> None:
+        self.events = events
+        self.name = name
+
+    def __enter__(self) -> None:
+        self.events.append((self.name, "open"))
+
+    def __exit__(self, exc_type: type[BaseException] | None, *rest: object) -> None:
+        self.events.append((self.name, "close", exc_type.__name__ if exc_type else None))
+
+    async def __aenter__(self) -> None:
+        self.__enter__()
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *rest: object) -> None:
+        self.__exit__(exc_type)
+
+
 class FakeConnection:
     """A psycopg connection with only the parts the savers use.
 
-    The first statement fails with ``error`` when one is given. With ``stuck``
-    it first waits until the hang guard shuts down the connection's socket.
-    With ``breaks``, psycopg's broken flag is set as the error is raised, the
-    way libpq marks a connection it lost. ``on_statement`` is called with each
-    statement as it runs (awaited for the async fakes), so a test can hold an
-    operation inside its connection.
+    Statement number ``fail_at`` (the first by default) fails with ``error``
+    when one is given. With ``stuck`` it first waits until the hang guard
+    shuts down the connection's socket. With ``breaks``, psycopg's broken flag
+    is set as the error is raised, the way libpq marks a connection it lost.
+    ``on_statement`` is called with each statement as it runs (awaited for the
+    async fakes), so a test can hold an operation inside its connection.
+    ``events`` records statements and the pipeline and transaction blocks
+    around them, in order.
     """
 
     def __init__(
         self,
         error: BaseException | None = None,
         *,
+        fail_at: int = 1,
         breaks: bool = False,
         stuck: bool = False,
         on_statement: Callable[[str], Any] | None = None,
     ) -> None:
         self.error = error
+        self.fail_at = fail_at
         self.breaks = breaks
         self.stuck = stuck
         self.on_statement = on_statement
         self.statements: list[str] = []
+        self.events: list[tuple[str, ...]] = []
         self._broken = False
         self._socket: socket.socket | None = None
 
@@ -69,11 +99,11 @@ class FakeConnection:
             _sockets.extend((self._socket, peer))
         return self._socket.fileno()
 
-    def pipeline(self) -> contextlib.nullcontext[None]:
-        return contextlib.nullcontext()
+    def pipeline(self) -> Block:
+        return Block(self.events, "pipeline")
 
-    def transaction(self) -> contextlib.nullcontext[None]:
-        return contextlib.nullcontext()
+    def transaction(self) -> Block:
+        return Block(self.events, "transaction")
 
     def cursor(self, **kwargs: Any) -> FakeCursor:
         return FakeCursor(self)
@@ -81,7 +111,8 @@ class FakeConnection:
     def _record(self, query: Any) -> bool:
         """Record a statement; True if it is the one that fails."""
         self.statements.append(str(query))
-        return self.error is not None and len(self.statements) == 1
+        self.events.append(("statement", str(query)))
+        return self.error is not None and len(self.statements) == self.fail_at
 
     def _fail(self) -> None:
         self._broken = self.breaks
@@ -220,23 +251,44 @@ class FakeAsyncPool(AsyncConnectionPool):
 
 
 class FakePipe:
-    """The saver-wide pipeline of a saver made with ``pipeline=True``. Counts syncs."""
+    """The saver-wide pipeline of a saver made with ``pipeline=True``.
 
-    def __init__(self) -> None:
+    Counts syncs, adds them to ``events`` when given, and calls ``on_sync``.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[str, ...]] | None = None,
+        on_sync: Callable[[], None] | None = None,
+    ) -> None:
+        self.events = events
+        self.on_sync = on_sync
         self.syncs = 0
 
     def sync(self) -> None:
         self.syncs += 1
+        if self.events is not None:
+            self.events.append(("sync",))
+        if self.on_sync is not None:
+            self.on_sync()
 
 
 class FakeAsyncPipe:
     """FakePipe for the async saver."""
 
-    def __init__(self) -> None:
-        self.syncs = 0
+    def __init__(
+        self,
+        events: list[tuple[str, ...]] | None = None,
+        on_sync: Callable[[], None] | None = None,
+    ) -> None:
+        self._pipe = FakePipe(events, on_sync)
+
+    @property
+    def syncs(self) -> int:
+        return self._pipe.syncs
 
     async def sync(self) -> None:
-        self.syncs += 1
+        self._pipe.sync()
 
 
 def connection(kind: str, error: BaseException | None = None, **kwargs: Any) -> FakeConnection:

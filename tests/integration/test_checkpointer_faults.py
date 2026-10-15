@@ -1,6 +1,7 @@
 """Checkpointers survive real CockroachDB faults."""
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import re
@@ -13,6 +14,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 from langgraph.checkpoint.base import empty_checkpoint
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
@@ -24,6 +26,7 @@ from langchain_cockroachdb import (
     get_sqlstate,
 )
 from tests.integration.faults import (
+    Interruption,
     PsycopgFaults,
     hold_row_lock,
     kill_sessions,
@@ -84,11 +87,19 @@ def pool_options(application_name: str) -> dict:
 def sync_pool(libpq_url):
     pools: list[ConnectionPool] = []
 
-    def make(application_name: str, faults: PsycopgFaults | None = None) -> ConnectionPool:
+    def make(
+        application_name: str,
+        faults: PsycopgFaults | None = None,
+        *,
+        cursor_factory: type[psycopg.Cursor] | None = None,
+        max_size: int = 4,
+    ) -> ConnectionPool:
         options = pool_options(application_name)
         if faults is not None:
             options["cursor_factory"] = faults.cursor_class()
-        pool = ConnectionPool(libpq_url, min_size=1, max_size=4, kwargs=options, open=True)
+        if cursor_factory is not None:
+            options["cursor_factory"] = cursor_factory
+        pool = ConnectionPool(libpq_url, min_size=1, max_size=max_size, kwargs=options, open=True)
         pools.append(pool)
         return pool
 
@@ -370,12 +381,20 @@ async def async_pool(libpq_url):
     pools: list[AsyncConnectionPool] = []
 
     async def make(
-        application_name: str, faults: PsycopgFaults | None = None
+        application_name: str,
+        faults: PsycopgFaults | None = None,
+        *,
+        cursor_factory: type[psycopg.AsyncCursor] | None = None,
+        max_size: int = 4,
     ) -> AsyncConnectionPool:
         options = pool_options(application_name)
         if faults is not None:
             options["cursor_factory"] = faults.async_cursor_class()
-        pool = AsyncConnectionPool(libpq_url, min_size=1, max_size=4, kwargs=options, open=False)
+        if cursor_factory is not None:
+            options["cursor_factory"] = cursor_factory
+        pool = AsyncConnectionPool(
+            libpq_url, min_size=1, max_size=max_size, kwargs=options, open=False
+        )
         await pool.open()
         pools.append(pool)
         return pool
@@ -633,3 +652,248 @@ async def test_async_from_conn_string_retries_connect(caplog) -> None:
         r for r in caplog.records if "Retrying connect checkpointer after" in r.message
     ]
     assert len(retry_warnings) == 1
+
+
+# One transaction per write. A write with several statements (put with
+# channel blobs, put_writes with several writes, delete_thread) commits all of
+# them or none, even when the caller stops partway through. A failed
+# transaction is rolled back before the connection is used again.
+
+WRITE_MODES = pytest.mark.parametrize("mode", ["pool", "connection", "pipeline"])
+# Where each write is interrupted: after at least one of its statements was queued
+INTERRUPTED_AT = {
+    "put": "insert into checkpoints (",
+    "put_writes": "insert into checkpoint_writes",
+    "delete_thread": "delete from checkpoint_blobs",
+}
+# Rows in checkpoints, checkpoint_blobs and checkpoint_writes after each write
+ROWS_AFTER = {"put": (1, 1, 0), "put_writes": (1, 1, 3), "delete_thread": (0, 0, 0)}
+CHANNEL_VALUES = {"messages": ["hello"], "count": 1}
+
+
+def checkpoint_with_blobs() -> tuple[dict, dict[str, str]]:
+    """A checkpoint whose put writes a blob row and then the checkpoint row."""
+    checkpoint = empty_checkpoint()
+    versions = {"messages": "1", "count": "1"}
+    checkpoint["channel_values"] = dict(CHANNEL_VALUES)
+    checkpoint["channel_versions"] = dict(versions)
+    return checkpoint, versions
+
+
+def rows(libpq_url: str, thread: str) -> tuple[int, ...]:
+    """How many rows ``thread`` has in each checkpoint table."""
+    tables = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+    with psycopg.connect(libpq_url, autocommit=True) as conn:
+        return tuple(
+            conn.execute(
+                sql.SQL("SELECT count(*) FROM {} WHERE thread_id = %s").format(
+                    sql.Identifier(table)
+                ),
+                (thread,),
+            ).fetchone()[0]
+            for table in tables
+        )
+
+
+@contextlib.contextmanager
+def sync_saver_for(mode: str, libpq_url: str, sync_pool, cursor_factory):
+    """A sync saver on a pool of one connection, a single connection, or a pipeline.
+
+    A pool of one makes every retry and every later call reuse the connection.
+    """
+    app = app_name()
+    if mode == "pool":
+        pool = sync_pool(app, cursor_factory=cursor_factory, max_size=1)
+        yield CockroachDBSaver(pool, retry_policy=FAST)
+        return
+    with CockroachDBSaver.from_conn_string(
+        libpq_url,
+        pipeline=mode == "pipeline",
+        retry_policy=FAST,
+        connect_kwargs={"cursor_factory": cursor_factory, "application_name": app},
+    ) as saver:
+        yield saver
+
+
+@contextlib.asynccontextmanager
+async def async_saver_for(mode: str, libpq_url: str, async_pool, cursor_factory):
+    """async_saver_for is sync_saver_for for the async saver."""
+    app = app_name()
+    if mode == "pool":
+        pool = await async_pool(app, cursor_factory=cursor_factory, max_size=1)
+        yield AsyncCockroachDBSaver(pool, retry_policy=FAST)
+        return
+    async with AsyncCockroachDBSaver.from_conn_string(
+        libpq_url,
+        pipeline=mode == "pipeline",
+        retry_policy=FAST,
+        connect_kwargs={"cursor_factory": cursor_factory, "application_name": app},
+    ) as saver:
+        yield saver
+
+
+def sync_write(saver: CockroachDBSaver, operation: str, thread: str):
+    """Set up what ``operation`` needs on ``thread`` and return the write itself."""
+    checkpoint, versions = checkpoint_with_blobs()
+    if operation == "put":
+        return lambda: saver.put(config(thread), checkpoint, {}, versions)
+    saved = saver.put(config(thread), checkpoint, {}, versions)
+    saver.put_writes(saved, [("a", 1)], task_id="t0")
+    if operation == "put_writes":
+        return lambda: saver.put_writes(saved, [("b", 2), ("c", 3)], task_id="t1")
+    return lambda: saver.delete_thread(thread)
+
+
+async def async_write(saver: AsyncCockroachDBSaver, operation: str, thread: str):
+    """async_write is sync_write for the async saver; the write is a coroutine function."""
+    checkpoint, versions = checkpoint_with_blobs()
+    if operation == "put":
+        return lambda: saver.aput(config(thread), checkpoint, {}, versions)
+    saved = await saver.aput(config(thread), checkpoint, {}, versions)
+    await saver.aput_writes(saved, [("a", 1)], task_id="t0")
+    if operation == "put_writes":
+        return lambda: saver.aput_writes(saved, [("b", 2), ("c", 3)], task_id="t1")
+    return lambda: saver.adelete_thread(thread)
+
+
+@WRITE_MODES
+@pytest.mark.parametrize("operation", list(INTERRUPTED_AT))
+def test_sync_saver_leaves_nothing_behind_when_a_write_is_interrupted(
+    sync_pool, libpq_url, mode: str, operation: str
+) -> None:
+    interruption = Interruption(INTERRUPTED_AT[operation])
+    with sync_saver_for(mode, libpq_url, sync_pool, interruption.cursor_class()) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        write = sync_write(saver, operation, thread)
+        before = rows(libpq_url, thread)
+        interruption.armed = True
+        with pytest.raises(RuntimeError, match="interrupted"):
+            write()
+        assert rows(libpq_url, thread) == before
+        # The rollback left the connection clean, so the same write now commits
+        write()
+        assert rows(libpq_url, thread) == ROWS_AFTER[operation]
+
+
+@WRITE_MODES
+@pytest.mark.parametrize("operation", list(INTERRUPTED_AT))
+async def test_async_saver_leaves_nothing_behind_when_a_write_is_cancelled(
+    async_pool, libpq_url, mode: str, operation: str
+) -> None:
+    interruption = Interruption(INTERRUPTED_AT[operation])
+    async with async_saver_for(
+        mode, libpq_url, async_pool, interruption.async_cursor_class()
+    ) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        write = await async_write(saver, operation, thread)
+        before = rows(libpq_url, thread)
+        interruption.reached = asyncio.Event()
+        interruption.armed = True
+        task = asyncio.create_task(write())
+        await asyncio.wait_for(interruption.reached.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert rows(libpq_url, thread) == before
+        await write()
+        assert rows(libpq_url, thread) == ROWS_AFTER[operation]
+
+
+def assert_retried_on_a_clean_connection(caplog: pytest.LogCaptureFixture, saver) -> None:
+    """The failed transaction was rolled back before its connection was used again.
+
+    psycopg_pool warns "rolling back returned connection" when it gets back a
+    connection still inside a transaction, and counts the broken ones it drops.
+    """
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(m.startswith("Retrying put checkpoint after SerializationFailure") for m in messages)
+    assert not any("rolling back returned connection" in m for m in messages)
+    if isinstance(saver.conn, (ConnectionPool, AsyncConnectionPool)):
+        assert saver.conn.get_stats().get("returns_bad", 0) == 0
+
+
+@WRITE_MODES
+def test_sync_saver_retries_a_failed_transaction_on_a_clean_connection(
+    sync_pool, libpq_url, unsafe_internals, caplog, mode: str
+) -> None:
+    # 40001 on the checkpoint row, after the blob row of the same transaction
+    faults = PsycopgFaults(unsafe_internals)
+    with sync_saver_for(mode, libpq_url, sync_pool, faults.cursor_class()) as saver:
+        saver.setup()
+        checkpoint, versions = checkpoint_with_blobs()
+        faults.fail_next("40001", match="insert into checkpoints (")
+        with caplog.at_level(logging.WARNING):
+            saved = saver.put(config(str(uuid.uuid4())), checkpoint, {}, versions)
+        assert faults.injected == ["40001"]
+        # The retry ran the whole transaction again
+        assert faults.count("insert into checkpoint_blobs") == 2
+        assert_retried_on_a_clean_connection(caplog, saver)
+        assert saver.get_tuple(saved).checkpoint["channel_values"] == CHANNEL_VALUES
+
+
+@WRITE_MODES
+async def test_async_saver_retries_a_failed_transaction_on_a_clean_connection(
+    async_pool, libpq_url, unsafe_internals, caplog, mode: str
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    async with async_saver_for(mode, libpq_url, async_pool, faults.async_cursor_class()) as saver:
+        await saver.setup()
+        checkpoint, versions = checkpoint_with_blobs()
+        faults.fail_next("40001", match="insert into checkpoints (")
+        with caplog.at_level(logging.WARNING):
+            saved = await saver.aput(config(str(uuid.uuid4())), checkpoint, {}, versions)
+        assert faults.injected == ["40001"]
+        assert faults.count("insert into checkpoint_blobs") == 2
+        assert_retried_on_a_clean_connection(caplog, saver)
+        assert (await saver.aget_tuple(saved)).checkpoint["channel_values"] == CHANNEL_VALUES
+
+
+@pytest.mark.parametrize("phrases", ["default", "none"])
+def test_sync_saver_attempt_timeout_rides_out_a_stuck_transaction(
+    sync_pool, libpq_url, caplog, phrases: str
+) -> None:
+    # The put also writes a blob row, so the guard shuts the socket inside an
+    # open transaction. The pool drops the broken connection, and the retry
+    # runs the whole transaction on a new one.
+    saver = CockroachDBSaver(sync_pool(app_name()), retry_policy=with_phrases(STUCK_WRITE, phrases))
+    saver.setup()
+    thread = str(uuid.uuid4())
+    checkpoint, versions = checkpoint_with_blobs()
+    saver.put(config(thread), checkpoint, {"step": 1}, versions)
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        hold_row_lock(libpq_url, LOCK_SQL, (thread,), release_after=1.2),
+    ):
+        saver.put(config(thread), checkpoint, {"step": 2}, versions)
+    assert "attempt timeout" in caplog.text
+    if phrases == "none":
+        assert_retried_for_the_broken_flag(caplog, "put checkpoint")
+    saved = saver.get_tuple(config(thread))
+    assert saved.metadata["step"] == 2
+    assert saved.checkpoint["channel_values"] == CHANNEL_VALUES
+
+
+@pytest.mark.parametrize("phrases", ["default", "none"])
+async def test_async_saver_attempt_timeout_rides_out_a_stuck_transaction(
+    async_pool, libpq_url, caplog, phrases: str
+) -> None:
+    saver = AsyncCockroachDBSaver(
+        await async_pool(app_name()), retry_policy=with_phrases(STUCK_WRITE, phrases)
+    )
+    await saver.setup()
+    thread = str(uuid.uuid4())
+    checkpoint, versions = checkpoint_with_blobs()
+    await saver.aput(config(thread), checkpoint, {"step": 1}, versions)
+    with (
+        caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+        hold_row_lock(libpq_url, LOCK_SQL, (thread,), release_after=1.2),
+    ):
+        await saver.aput(config(thread), checkpoint, {"step": 2}, versions)
+    assert "attempt timeout" in caplog.text
+    if phrases == "none":
+        assert_retried_for_the_broken_flag(caplog, "put checkpoint")
+    saved = await saver.aget_tuple(config(thread))
+    assert saved.metadata["step"] == 2
+    assert saved.checkpoint["channel_values"] == CHANNEL_VALUES

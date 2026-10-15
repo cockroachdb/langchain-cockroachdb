@@ -106,7 +106,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     while a single connection cannot recover from a dropped connection.
 
     On a pool, operations run concurrently, each on its own pooled
-    connection. On a single connection they run one at a time.
+    connection. On a single connection they run one at a time. A write with
+    several statements runs them in one transaction, so it is saved completely
+    or not at all, even when the caller is cancelled partway through.
 
     The sync methods (``get_tuple``, ``put`` and the others) run the async
     ones on the event loop the saver was created on, so call them from other
@@ -446,7 +448,10 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
 
         async def write() -> None:
             async with self._cursor(
-                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="put checkpoint"
+                pipeline=True,
+                transaction=bool(blob_rows),
+                timeout=self.retry_policy.attempt_timeout,
+                label="put checkpoint",
             ) as cur:
                 if blob_rows:
                     await cur.executemany(self.UPSERT_CHECKPOINT_BLOBS_SQL, blob_rows)
@@ -488,6 +493,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         async def write() -> None:
             async with self._cursor(
                 pipeline=True,
+                transaction=len(rows) > 1,
                 timeout=self.retry_policy.attempt_timeout,
                 label="put checkpoint writes",
             ) as cur:
@@ -504,7 +510,10 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
 
         async def delete() -> None:
             async with self._cursor(
-                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="delete thread"
+                pipeline=True,
+                transaction=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="delete thread",
             ) as cur:
                 await cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (str(thread_id),))
                 await cur.execute(
@@ -603,23 +612,44 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             return contextlib.nullcontext()
         return self.lock
 
+    @staticmethod
+    def _transaction(
+        conn: AsyncConnection[DictRow], transaction: bool
+    ) -> contextlib.AbstractAsyncContextManager[object]:
+        """``conn.transaction()`` if the statements must commit together, else nothing."""
+        return conn.transaction() if transaction else contextlib.nullcontext()
+
     @asynccontextmanager
     async def _cursor(
         self,
         *,
         pipeline: bool = False,
+        transaction: bool = False,
         timeout: float | None = None,
         label: str = "checkpoint operation",
     ) -> AsyncIterator[AsyncCursor[DictRow]]:
-        """Create a database cursor as a context manager, with the hang guard."""
+        """Create a database cursor as a context manager, with the hang guard.
+
+        ``pipeline`` sends the statements together, in pipeline mode when libpq
+        has it. ``transaction`` runs them in one explicit transaction. If an
+        error, a cancellation or anything else stops the block partway through,
+        psycopg rolls the transaction back, so no statement of it is left
+        committed and the connection is clean for the next attempt. Without it,
+        the sync that ends a pipeline commits whatever was sent. A single
+        statement commits on its own and needs no transaction.
+        """
         async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             async with aabandon_after(fileno, timeout, label=label):
                 if self.pipe:
                     try:
-                        async with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                        async with (
+                            self._transaction(conn, transaction),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
                             yield cur
-                        if pipeline:
+                        # A transaction syncs the pipeline itself as it ends
+                        if pipeline and not transaction:
                             await self.pipe.sync()
                     except BaseException:
                         # A pipeline only exists on a single connection, so the lock is
@@ -628,21 +658,20 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                         with contextlib.suppress(Exception):
                             await self.pipe.sync()
                         raise
-                elif pipeline:
-                    if self.supports_pipeline:
-                        async with (
-                            conn.pipeline(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                    else:
-                        async with (
-                            conn.transaction(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
+                elif pipeline and self.supports_pipeline:
+                    # The transaction goes around the pipeline: BEGIN, the batch and
+                    # COMMIT take three round trips, one less than the other way round
+                    async with (
+                        self._transaction(conn, transaction),
+                        conn.pipeline(),
+                        conn.cursor(binary=True, row_factory=dict_row) as cur,
+                    ):
+                        yield cur
                 else:
-                    async with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                    async with (
+                        self._transaction(conn, transaction),
+                        conn.cursor(binary=True, row_factory=dict_row) as cur,
+                    ):
                         yield cur
 
     async def _load_checkpoint_tuple_with_cursor(

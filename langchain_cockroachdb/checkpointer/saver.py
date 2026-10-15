@@ -61,7 +61,9 @@ class CockroachDBSaver(BaseCockroachDBSaver):
     single connection cannot recover from a dropped connection.
 
     On a pool, operations run concurrently, each on its own pooled
-    connection. On a single connection they run one at a time.
+    connection. On a single connection they run one at a time. A write with
+    several statements runs them in one transaction, so it is saved completely
+    or not at all, even when the caller stops partway through.
 
     Example:
         ```python
@@ -377,6 +379,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         def write() -> None:
             with self._cursor(
                 pipeline=True,
+                transaction=bool(blob_rows),
                 timeout=self.retry_policy.attempt_timeout,
                 label="put checkpoint",
             ) as cur:
@@ -419,6 +422,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         def write() -> None:
             with self._cursor(
                 pipeline=True,
+                transaction=len(rows) > 1,
                 timeout=self.retry_policy.attempt_timeout,
                 label="put checkpoint writes",
             ) as cur:
@@ -436,6 +440,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         def delete() -> None:
             with self._cursor(
                 pipeline=True,
+                transaction=True,
                 timeout=self.retry_policy.attempt_timeout,
                 label="delete thread",
             ) as cur:
@@ -487,23 +492,44 @@ class CockroachDBSaver(BaseCockroachDBSaver):
             return contextlib.nullcontext()
         return self.lock
 
+    @staticmethod
+    def _transaction(
+        conn: Connection[DictRow], transaction: bool
+    ) -> contextlib.AbstractContextManager[object]:
+        """``conn.transaction()`` if the statements must commit together, else nothing."""
+        return conn.transaction() if transaction else contextlib.nullcontext()
+
     @contextmanager
     def _cursor(
         self,
         *,
         pipeline: bool = False,
+        transaction: bool = False,
         timeout: float | None = None,
         label: str = "checkpoint operation",
     ) -> Iterator[Cursor[DictRow]]:
-        """Create a database cursor as a context manager, with the hang guard."""
+        """Create a database cursor as a context manager, with the hang guard.
+
+        ``pipeline`` sends the statements together, in pipeline mode when libpq
+        has it. ``transaction`` runs them in one explicit transaction. If an
+        error, a cancellation or anything else stops the block partway through,
+        psycopg rolls the transaction back, so no statement of it is left
+        committed and the connection is clean for the next attempt. Without it,
+        the sync that ends a pipeline commits whatever was sent. A single
+        statement commits on its own and needs no transaction.
+        """
         with self._operation_lock(), _internal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             with abandon_after(fileno, timeout, label=label):
                 if self.pipe:
                     try:
-                        with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                        with (
+                            self._transaction(conn, transaction),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
                             yield cur
-                        if pipeline:
+                        # A transaction syncs the pipeline itself as it ends
+                        if pipeline and not transaction:
                             self.pipe.sync()
                     except BaseException:
                         # A pipeline only exists on a single connection, so the lock is
@@ -512,21 +538,20 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                         with contextlib.suppress(Exception):
                             self.pipe.sync()
                         raise
-                elif pipeline:
-                    if self.supports_pipeline:
-                        with (
-                            conn.pipeline(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                    else:
-                        with (
-                            conn.transaction(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
+                elif pipeline and self.supports_pipeline:
+                    # The transaction goes around the pipeline: BEGIN, the batch and
+                    # COMMIT take three round trips, one less than the other way round
+                    with (
+                        self._transaction(conn, transaction),
+                        conn.pipeline(),
+                        conn.cursor(binary=True, row_factory=dict_row) as cur,
+                    ):
+                        yield cur
                 else:
-                    with conn.cursor(binary=True, row_factory=dict_row) as cur:
+                    with (
+                        self._transaction(conn, transaction),
+                        conn.cursor(binary=True, row_factory=dict_row) as cur,
+                    ):
                         yield cur
 
     def _load_checkpoint_tuple_with_cursor(
