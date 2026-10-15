@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 _sockets: list[socket.socket] = []
@@ -53,6 +54,13 @@ class Block:
         self.__exit__(exc_type)
 
 
+class FakeInfo:
+    """The part of psycopg's ConnectionInfo the savers read."""
+
+    def __init__(self) -> None:
+        self.transaction_status = TransactionStatus.IDLE
+
+
 class FakeConnection:
     """A psycopg connection with only the parts the savers use.
 
@@ -62,9 +70,15 @@ class FakeConnection:
     is set as the error is raised, the way libpq marks a connection it lost.
     ``on_statement`` is called with each statement as it runs (awaited for the
     async fakes), so a test can hold an operation inside its connection.
-    ``events`` records statements and the pipeline and transaction blocks
-    around them, in order.
+    ``events`` records statements, rollbacks and the pipeline and transaction
+    blocks around them, in order.
+
+    BEGIN, COMMIT, a failing statement and rollback() move
+    ``info.transaction_status`` the way they move libpq's. The server answers
+    COMMIT with ``commit_answer``.
     """
+
+    autocommit = True
 
     def __init__(
         self,
@@ -74,16 +88,23 @@ class FakeConnection:
         breaks: bool = False,
         stuck: bool = False,
         on_statement: Callable[[str], Any] | None = None,
+        commit_answer: str = "COMMIT",
     ) -> None:
         self.error = error
         self.fail_at = fail_at
         self.breaks = breaks
         self.stuck = stuck
         self.on_statement = on_statement
+        self.commit_answer = commit_answer
         self.statements: list[str] = []
         self.events: list[tuple[str, ...]] = []
+        self._info = FakeInfo()
         self._broken = False
         self._socket: socket.socket | None = None
+
+    @property
+    def info(self) -> FakeInfo:
+        return self._info
 
     @property
     def broken(self) -> bool:
@@ -112,12 +133,25 @@ class FakeConnection:
         """Record a statement; True if it is the one that fails."""
         self.statements.append(str(query))
         self.events.append(("statement", str(query)))
+        if str(query) == "BEGIN":
+            self._info.transaction_status = TransactionStatus.INTRANS
+        elif str(query) == "COMMIT":
+            self._info.transaction_status = TransactionStatus.IDLE
         return self.error is not None and len(self.statements) == self.fail_at
 
     def _fail(self) -> None:
         self._broken = self.breaks
+        if self._info.transaction_status == TransactionStatus.INTRANS:
+            self._info.transaction_status = TransactionStatus.INERROR
         assert self.error is not None
         raise self.error
+
+    def _roll_back(self) -> None:
+        self.events.append(("rollback",))
+        self._info.transaction_status = TransactionStatus.IDLE
+
+    def rollback(self) -> None:
+        self._roll_back()
 
     def run(self, query: Any) -> None:
         fails = self._record(query)
@@ -140,6 +174,9 @@ class FakeAsyncConnection(FakeConnection):
     def cursor(self, **kwargs: Any) -> FakeAsyncCursor:
         return FakeAsyncCursor(self)
 
+    async def rollback(self) -> None:
+        self._roll_back()
+
     async def arun(self, query: Any) -> None:
         fails = self._record(query)
         if self.on_statement is not None:
@@ -161,10 +198,14 @@ class FakeSingleAsyncConnection(FakeAsyncConnection, psycopg.AsyncConnection):
 
 
 class FakeCursor:
-    """Runs statements on a fake connection. Reads find an empty database."""
+    """Runs statements on a fake connection. Reads find an empty database.
+
+    ``statusmessage`` is the command tag of the last statement it ran.
+    """
 
     def __init__(self, conn: FakeConnection) -> None:
         self._conn = conn
+        self._last: str | None = None
 
     def __enter__(self) -> FakeCursor:
         return self
@@ -172,11 +213,21 @@ class FakeCursor:
     def __exit__(self, *exc_info: object) -> None:
         return None
 
+    @property
+    def statusmessage(self) -> str | None:
+        if self._last is None:
+            return None
+        if self._last == "COMMIT":
+            return self._conn.commit_answer
+        return self._last.split()[0].upper()
+
     def execute(self, query: Any, params: Any = None, **kwargs: Any) -> FakeCursor:
+        self._last = str(query).strip()
         self._conn.run(query)
         return self
 
     def executemany(self, query: Any, params_seq: Any, **kwargs: Any) -> None:
+        self._last = str(query).strip()
         self._conn.run(query)
 
     def fetchone(self) -> None:
@@ -186,11 +237,12 @@ class FakeCursor:
         return []
 
 
-class FakeAsyncCursor:
+class FakeAsyncCursor(FakeCursor):
     """FakeCursor for the async saver."""
 
     def __init__(self, conn: FakeAsyncConnection) -> None:
-        self._conn = conn
+        super().__init__(conn)
+        self._aconn = conn
 
     async def __aenter__(self) -> FakeAsyncCursor:
         return self
@@ -199,11 +251,13 @@ class FakeAsyncCursor:
         return None
 
     async def execute(self, query: Any, params: Any = None, **kwargs: Any) -> FakeAsyncCursor:
-        await self._conn.arun(query)
+        self._last = str(query).strip()
+        await self._aconn.arun(query)
         return self
 
     async def executemany(self, query: Any, params_seq: Any, **kwargs: Any) -> None:
-        await self._conn.arun(query)
+        self._last = str(query).strip()
+        await self._aconn.arun(query)
 
     async def fetchone(self) -> None:
         return None

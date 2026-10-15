@@ -655,13 +655,15 @@ async def test_async_from_conn_string_retries_connect(caplog) -> None:
 
 
 # One transaction per write. A write with several statements (put with
-# channel blobs, put_writes with several writes, delete_thread) commits all of
-# them or none, even when the caller stops partway through. A failed
-# transaction is rolled back before the connection is used again.
+# channel blobs, put_writes with several writes, delete_thread) sends BEGIN,
+# its statements and COMMIT as one batch. It commits all of them or none, even
+# when the caller stops partway through, and a failed transaction is rolled
+# back before the connection is used again.
 
 WRITE_MODES = pytest.mark.parametrize("mode", ["pool", "connection", "pipeline"])
-# Where each write is interrupted: after at least one of its statements was queued
-INTERRUPTED_AT = {
+# Where each write is stopped: a statement sent after BEGIN and at least one
+# other statement of the write, or for put_writes its only one
+STOP_AT = {
     "put": "insert into checkpoints (",
     "put_writes": "insert into checkpoint_writes",
     "delete_thread": "delete from checkpoint_blobs",
@@ -756,32 +758,47 @@ async def async_write(saver: AsyncCockroachDBSaver, operation: str, thread: str)
     return lambda: saver.adelete_thread(thread)
 
 
+def assert_left_clean(caplog: pytest.LogCaptureFixture, saver) -> None:
+    """The saver rolled back the stopped transaction itself.
+
+    psycopg_pool warns "rolling back returned connection" when it gets back a
+    connection still inside a transaction, and counts the broken ones it drops.
+    """
+    assert not any("rolling back returned connection" in r.getMessage() for r in caplog.records)
+    if isinstance(saver.conn, (ConnectionPool, AsyncConnectionPool)):
+        assert saver.conn.get_stats().get("returns_bad", 0) == 0
+    else:
+        assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
 @WRITE_MODES
-@pytest.mark.parametrize("operation", list(INTERRUPTED_AT))
+@pytest.mark.parametrize("operation", list(STOP_AT))
 def test_sync_saver_leaves_nothing_behind_when_a_write_is_interrupted(
-    sync_pool, libpq_url, mode: str, operation: str
+    sync_pool, libpq_url, caplog, mode: str, operation: str
 ) -> None:
-    interruption = Interruption(INTERRUPTED_AT[operation])
+    interruption = Interruption(STOP_AT[operation])
     with sync_saver_for(mode, libpq_url, sync_pool, interruption.cursor_class()) as saver:
         saver.setup()
         thread = str(uuid.uuid4())
         write = sync_write(saver, operation, thread)
         before = rows(libpq_url, thread)
         interruption.armed = True
-        with pytest.raises(RuntimeError, match="interrupted"):
+        with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="interrupted"):
             write()
         assert rows(libpq_url, thread) == before
+        assert_left_clean(caplog, saver)
         # The rollback left the connection clean, so the same write now commits
         write()
         assert rows(libpq_url, thread) == ROWS_AFTER[operation]
 
 
 @WRITE_MODES
-@pytest.mark.parametrize("operation", list(INTERRUPTED_AT))
+@pytest.mark.parametrize("operation", list(STOP_AT))
 async def test_async_saver_leaves_nothing_behind_when_a_write_is_cancelled(
-    async_pool, libpq_url, mode: str, operation: str
+    async_pool, libpq_url, caplog, mode: str, operation: str
 ) -> None:
-    interruption = Interruption(INTERRUPTED_AT[operation])
+    # The cancellation lands between BEGIN and COMMIT, with earlier statements sent
+    interruption = Interruption(STOP_AT[operation])
     async with async_saver_for(
         mode, libpq_url, async_pool, interruption.async_cursor_class()
     ) as saver:
@@ -791,14 +808,143 @@ async def test_async_saver_leaves_nothing_behind_when_a_write_is_cancelled(
         before = rows(libpq_url, thread)
         interruption.reached = asyncio.Event()
         interruption.armed = True
-        task = asyncio.create_task(write())
-        await asyncio.wait_for(interruption.reached.wait(), 10)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        with caplog.at_level(logging.WARNING):
+            task = asyncio.create_task(write())
+            await asyncio.wait_for(interruption.reached.wait(), 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
         assert rows(libpq_url, thread) == before
+        assert_left_clean(caplog, saver)
         await write()
         assert rows(libpq_url, thread) == ROWS_AFTER[operation]
+
+
+@WRITE_MODES
+@pytest.mark.parametrize("operation", list(STOP_AT))
+def test_sync_saver_leaves_nothing_behind_when_a_statement_in_the_batch_fails(
+    sync_pool, libpq_url, unsafe_internals, caplog, mode: str, operation: str
+) -> None:
+    # A server error after BEGIN that the retry policy does not retry
+    faults = PsycopgFaults(unsafe_internals)
+    with sync_saver_for(mode, libpq_url, sync_pool, faults.cursor_class()) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        write = sync_write(saver, operation, thread)
+        before = rows(libpq_url, thread)
+        faults.fail_next("XXA00", match=STOP_AT[operation])
+        with caplog.at_level(logging.WARNING), pytest.raises(psycopg.Error) as info:
+            write()
+        assert get_sqlstate(info.value) == "XXA00"
+        assert rows(libpq_url, thread) == before
+        assert_left_clean(caplog, saver)
+        write()
+        assert rows(libpq_url, thread) == ROWS_AFTER[operation]
+
+
+@WRITE_MODES
+@pytest.mark.parametrize("operation", list(STOP_AT))
+async def test_async_saver_leaves_nothing_behind_when_a_statement_in_the_batch_fails(
+    async_pool, libpq_url, unsafe_internals, caplog, mode: str, operation: str
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    async with async_saver_for(mode, libpq_url, async_pool, faults.async_cursor_class()) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        write = await async_write(saver, operation, thread)
+        before = rows(libpq_url, thread)
+        faults.fail_next("XXA00", match=STOP_AT[operation])
+        with caplog.at_level(logging.WARNING), pytest.raises(psycopg.Error) as info:
+            await write()
+        assert get_sqlstate(info.value) == "XXA00"
+        assert rows(libpq_url, thread) == before
+        assert_left_clean(caplog, saver)
+        await write()
+        assert rows(libpq_url, thread) == ROWS_AFTER[operation]
+
+
+@WRITE_MODES
+def test_sync_saver_write_batch_is_retried_by_cockroachdb(
+    sync_pool, libpq_url, unsafe_internals, caplog, mode: str
+) -> None:
+    # BEGIN, the statements and COMMIT reach the server as one batch, so
+    # CockroachDB retries the batch itself and the saver sees no error.
+    # force_retry fails the transaction until it is 500 ms old, so the write
+    # cannot finish sooner; had the server not retried, the saver would have.
+    faults = PsycopgFaults(unsafe_internals)
+    with sync_saver_for(mode, libpq_url, sync_pool, faults.cursor_class()) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            saver.put(config(thread), checkpoint, {}, versions)
+        assert time.monotonic() - start >= 0.5
+        assert not any("Retrying" in record.getMessage() for record in caplog.records)
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+@WRITE_MODES
+async def test_async_saver_write_batch_is_retried_by_cockroachdb(
+    async_pool, libpq_url, unsafe_internals, caplog, mode: str
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    async with async_saver_for(mode, libpq_url, async_pool, faults.async_cursor_class()) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            await saver.aput(config(thread), checkpoint, {}, versions)
+        assert time.monotonic() - start >= 0.5
+        assert not any("Retrying" in record.getMessage() for record in caplog.records)
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+def test_sync_pipeline_saver_retries_a_write_that_follows_a_read(
+    libpq_url, unsafe_internals, caplog
+) -> None:
+    # On a saver-wide pipeline a read leaves its implicit transaction open until
+    # the next sync, and the next write's BEGIN joins it. CockroachDB cannot
+    # retry that batch itself, because the read's results already reached the
+    # client, so the retry error reaches the saver, which rolls back and retries.
+    faults = PsycopgFaults(unsafe_internals)
+    with sync_saver_for("pipeline", libpq_url, None, faults.cursor_class()) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        assert saver.get_tuple(config(thread)) is None
+        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            saver.put(config(thread), checkpoint, {}, versions)
+        retries = [
+            r.getMessage() for r in caplog.records if "Retrying put checkpoint" in r.getMessage()
+        ]
+        assert len(retries) == 1
+        assert "SQLSTATE 40001" in retries[0]
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+async def test_async_pipeline_saver_retries_a_write_that_follows_a_read(
+    libpq_url, unsafe_internals, caplog
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    async with async_saver_for("pipeline", libpq_url, None, faults.async_cursor_class()) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        assert await saver.aget_tuple(config(thread)) is None
+        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            await saver.aput(config(thread), checkpoint, {}, versions)
+        retries = [
+            r.getMessage() for r in caplog.records if "Retrying put checkpoint" in r.getMessage()
+        ]
+        assert len(retries) == 1
+        assert "SQLSTATE 40001" in retries[0]
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
 
 
 def assert_retried_on_a_clean_connection(caplog: pytest.LogCaptureFixture, saver) -> None:

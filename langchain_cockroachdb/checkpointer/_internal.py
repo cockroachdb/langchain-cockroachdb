@@ -7,11 +7,29 @@ from contextlib import contextmanager
 from typing import Any, TypeAlias
 
 import psycopg
-from psycopg import AsyncConnection, Connection
+from psycopg import AsyncConnection, AsyncCursor, Connection, Cursor
+from psycopg.pq import TransactionStatus
 from psycopg.rows import DictRow
 from psycopg_pool import ConnectionPool
 
 Conn: TypeAlias = Connection[DictRow] | ConnectionPool[Connection[DictRow]]
+
+# What libpq reports while a transaction is open, or failed and not yet rolled back
+OPEN_TRANSACTION = frozenset({TransactionStatus.INTRANS, TransactionStatus.INERROR})
+
+
+def check_committed(cursor: Cursor[Any] | AsyncCursor[Any]) -> None:
+    """Raise unless the server answered the COMMIT that ``cursor`` sent with COMMIT.
+
+    CockroachDB answers COMMIT in a failed transaction with ROLLBACK and no
+    error. A write sends COMMIT in the same pipeline batch as its statements,
+    so the server skips it after any failure and the failure itself is
+    raised. This makes sure a COMMIT never reports success for a rollback.
+    """
+    if cursor.statusmessage != "COMMIT":
+        raise psycopg.errors.InFailedSqlTransaction(
+            f"the server answered COMMIT with {cursor.statusmessage!r}, so the write was not saved"
+        )
 
 
 def flag_broken_connection(

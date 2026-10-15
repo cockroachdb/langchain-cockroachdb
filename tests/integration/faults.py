@@ -28,6 +28,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 FORCE_ERROR = "SELECT crdb_internal.force_error(%(fault_code)s, %(fault_message)s)"
+FORCE_RETRY = "SELECT crdb_internal.force_retry(CAST(%(interval)s AS INTERVAL))"
 
 
 def supports_unsafe_internals(libpq_url: str) -> bool:
@@ -51,8 +52,30 @@ class _Faults:
         self.unsafe_internals = unsafe_internals
         self._lock = threading.Lock()
         self._pending: list[tuple[str, str | None]] = []
+        self._retries: list[tuple[str, str]] = []
         self.statements: list[str] = []
         self.injected: list[str] = []
+
+    def server_retry_next(self, match: str, *, interval: str = "500ms") -> None:
+        """Make CockroachDB retry the transaction of the next statement containing ``match``.
+
+        crdb_internal.force_retry runs just before that statement, in the same
+        batch, and fails the transaction with retry errors until it is
+        ``interval`` old. When CockroachDB can retry the batch itself, the
+        client sees no error and the statement takes at least ``interval``.
+        Only PsycopgFaults injects these.
+        """
+        with self._lock:
+            self._retries.append((match.lower(), interval))
+
+    def _take_retry(self, statement: str) -> str | None:
+        lowered = statement.lower()
+        with self._lock:
+            for index, (match, interval) in enumerate(self._retries):
+                if match in lowered:
+                    del self._retries[index]
+                    return interval
+        return None
 
     def fail_next(self, sqlstate: str, *, times: int = 1, match: str | None = None) -> None:
         """Make the next ``times`` statements containing ``match`` fail with ``sqlstate``."""
@@ -107,7 +130,8 @@ class PsycopgFaults(_Faults):
     """Fault injection for raw psycopg connections (checkpointers).
 
     Pass ``cursor_factory=faults.cursor_class()`` (or the async variant) to the
-    connection or pool so every cursor checks for a pending fault first.
+    connection or pool so every cursor checks for a pending fault, or a
+    pending server retry, first.
     """
 
     def cursor_class(self) -> type[psycopg.Cursor[Any]]:
@@ -115,10 +139,12 @@ class PsycopgFaults(_Faults):
 
         class FaultyCursor(psycopg.Cursor):  # type: ignore[type-arg]
             def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
+                faults._retry_if_due(self, query)
                 faults._raise_if_due(self, query)
                 return super().execute(query, params, **kwargs)
 
             def executemany(self, query, params_seq, **kwargs):  # type: ignore[no-untyped-def,override]
+                faults._retry_if_due(self, query)
                 faults._raise_if_due(self, query)
                 return super().executemany(query, params_seq, **kwargs)
 
@@ -129,14 +155,32 @@ class PsycopgFaults(_Faults):
 
         class FaultyAsyncCursor(psycopg.AsyncCursor):  # type: ignore[type-arg]
             async def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
+                await faults._aretry_if_due(self, query)
                 await faults._araise_if_due(self, query)
                 return await super().execute(query, params, **kwargs)
 
             async def executemany(self, query, params_seq, **kwargs):  # type: ignore[no-untyped-def,override]
+                await faults._aretry_if_due(self, query)
                 await faults._araise_if_due(self, query)
                 return await super().executemany(query, params_seq, **kwargs)
 
         return FaultyAsyncCursor
+
+    def _retry_if_due(self, cursor: psycopg.Cursor[Any], query: Any) -> None:
+        interval = self._take_retry(query if isinstance(query, str) else str(query))
+        if interval is None:
+            return
+        if self.unsafe_internals:
+            psycopg.Cursor.execute(cursor, "SET allow_unsafe_internals = true")
+        psycopg.Cursor.execute(cursor, FORCE_RETRY, {"interval": interval})
+
+    async def _aretry_if_due(self, cursor: psycopg.AsyncCursor[Any], query: Any) -> None:
+        interval = self._take_retry(query if isinstance(query, str) else str(query))
+        if interval is None:
+            return
+        if self.unsafe_internals:
+            await psycopg.AsyncCursor.execute(cursor, "SET allow_unsafe_internals = true")
+        await psycopg.AsyncCursor.execute(cursor, FORCE_RETRY, {"interval": interval})
 
     def _raise_if_due(self, cursor: psycopg.Cursor[Any], query: Any) -> None:
         code = self._take(query if isinstance(query, str) else str(query))

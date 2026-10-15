@@ -46,7 +46,7 @@ from psycopg_pool import AsyncConnectionPool
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._guard import aabandon_after
 from langchain_cockroachdb._loop import LoopMessages, run_on_external_loop
-from langchain_cockroachdb.checkpointer import _ainternal
+from langchain_cockroachdb.checkpointer import _ainternal, _internal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
 from langchain_cockroachdb.retry import RetryPolicy
 
@@ -619,6 +619,22 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """``conn.transaction()`` if the statements must commit together, else nothing."""
         return conn.transaction() if transaction else contextlib.nullcontext()
 
+    async def _discard_open_transaction(self, conn: AsyncConnection[DictRow]) -> None:
+        """Roll back a transaction that a stopped write batch left open.
+
+        On an autocommit connection only a write batch opens a transaction, so
+        one that is still open, or failed, was stopped between BEGIN and
+        COMMIT. Errors are ignored: a connection that broke cannot roll back,
+        and the pool replaces it.
+        """
+        if not conn.autocommit or conn.info.transaction_status not in _internal.OPEN_TRANSACTION:
+            return
+        with contextlib.suppress(Exception):
+            await conn.rollback()
+            if self.pipe:
+                # In pipeline mode the ROLLBACK waits in the queue until a sync
+                await self.pipe.sync()
+
     @asynccontextmanager
     async def _cursor(
         self,
@@ -631,36 +647,70 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """Create a database cursor as a context manager, with the hang guard.
 
         ``pipeline`` sends the statements together, in pipeline mode when libpq
-        has it. ``transaction`` runs them in one explicit transaction. If an
-        error, a cancellation or anything else stops the block partway through,
-        psycopg rolls the transaction back, so no statement of it is left
-        committed and the connection is clean for the next attempt. Without it,
-        the sync that ends a pipeline commits whatever was sent. A single
+        has it. ``transaction`` makes them commit together: without it, the sync
+        that ends a pipeline commits whatever was sent, even when the block
+        stopped partway through. On an autocommit connection in pipeline mode,
+        BEGIN, the statements and COMMIT go to the server as one batch. That
+        takes one round trip, and CockroachDB can retry the whole batch itself.
+        If the block stops between BEGIN and COMMIT, a cancellation included,
+        the transaction is rolled back before the connection is used again.
+        Other connections use psycopg's ``conn.transaction()``. A single
         statement commits on its own and needs no transaction.
         """
         async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             async with aabandon_after(fileno, timeout, label=label):
+                # Covers a rollback that was itself interrupted
+                await self._discard_open_transaction(conn)
+                batched = (
+                    transaction
+                    and conn.autocommit
+                    and (bool(self.pipe) or (pipeline and self.supports_pipeline))
+                )
                 if self.pipe:
                     try:
                         async with (
-                            self._transaction(conn, transaction),
+                            conn.cursor() as tx,
                             conn.cursor(binary=True, row_factory=dict_row) as cur,
                         ):
-                            yield cur
-                        # A transaction syncs the pipeline itself as it ends
-                        if pipeline and not transaction:
-                            await self.pipe.sync()
+                            if batched:
+                                await tx.execute("BEGIN", prepare=False)
+                            async with self._transaction(conn, transaction and not batched):
+                                yield cur
+                            if batched:
+                                await tx.execute("COMMIT", prepare=False)
+                            # psycopg's transaction syncs the pipeline itself as it ends
+                            if pipeline and (batched or not transaction):
+                                await self.pipe.sync()
+                            if batched:
+                                _internal.check_committed(tx)
                     except BaseException:
                         # A pipeline only exists on a single connection, so the lock is
                         # held here. Resync before releasing it, so other tasks' queued
-                        # statements are untouched
+                        # statements are untouched, and roll back what a stopped batch
+                        # left open
                         with contextlib.suppress(Exception):
                             await self.pipe.sync()
+                        await self._discard_open_transaction(conn)
                         raise
+                elif batched:
+                    async with (
+                        conn.cursor() as tx,
+                        conn.cursor(binary=True, row_factory=dict_row) as cur,
+                    ):
+                        try:
+                            # The pipeline's sync sends the whole batch at once
+                            async with conn.pipeline():
+                                await tx.execute("BEGIN", prepare=False)
+                                yield cur
+                                await tx.execute("COMMIT", prepare=False)
+                        except BaseException:
+                            await self._discard_open_transaction(conn)
+                            raise
+                        _internal.check_committed(tx)
                 elif pipeline and self.supports_pipeline:
-                    # The transaction goes around the pipeline: BEGIN, the batch and
-                    # COMMIT take three round trips, one less than the other way round
+                    # psycopg's transaction, for a connection not in autocommit mode,
+                    # goes around the pipeline, which saves a round trip
                     async with (
                         self._transaction(conn, transaction),
                         conn.pipeline(),
