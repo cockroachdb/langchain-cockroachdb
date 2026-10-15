@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -165,6 +166,28 @@ def kill_sessions(libpq_url: str, application_name: str) -> int:
                 ).format(sql.Literal(application_name))
             )
     return len(rows)
+
+
+def wait_for_statement(
+    libpq_url: str, application_name: str, match: str, *, timeout: float = 10.0
+) -> None:
+    """Wait until a session opened with ``application_name`` runs a statement containing ``match``.
+
+    The match is case-insensitive. Raises AssertionError after ``timeout`` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    with psycopg.connect(libpq_url, autocommit=True) as admin:
+        while True:
+            row = admin.execute(
+                "SELECT count(*) FROM [SHOW CLUSTER STATEMENTS] "
+                "WHERE application_name = %s AND query ILIKE %s",
+                (application_name, f"%{match}%"),
+            ).fetchone()
+            if row is not None and row[0] > 0:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"no {application_name} statement matching {match!r} ran")
+            time.sleep(0.05)
 
 
 @contextlib.contextmanager

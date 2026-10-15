@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import psycopg
@@ -34,15 +34,23 @@ class FakeConnection:
     The first statement fails with ``error`` when one is given. With ``stuck``
     it first waits until the hang guard shuts down the connection's socket.
     With ``breaks``, psycopg's broken flag is set as the error is raised, the
-    way libpq marks a connection it lost.
+    way libpq marks a connection it lost. ``on_statement`` is called with each
+    statement as it runs (awaited for the async fakes), so a test can hold an
+    operation inside its connection.
     """
 
     def __init__(
-        self, error: BaseException | None = None, *, breaks: bool = False, stuck: bool = False
+        self,
+        error: BaseException | None = None,
+        *,
+        breaks: bool = False,
+        stuck: bool = False,
+        on_statement: Callable[[str], Any] | None = None,
     ) -> None:
         self.error = error
         self.breaks = breaks
         self.stuck = stuck
+        self.on_statement = on_statement
         self.statements: list[str] = []
         self._broken = False
         self._socket: socket.socket | None = None
@@ -81,7 +89,10 @@ class FakeConnection:
         raise self.error
 
     def run(self, query: Any) -> None:
-        if self._record(query):
+        fails = self._record(query)
+        if self.on_statement is not None:
+            self.on_statement(str(query))
+        if fails:
             if self.stuck:
                 # Blocks until the hang guard shuts the socket down
                 assert self._guarded_socket().recv(1) == b""
@@ -99,7 +110,10 @@ class FakeAsyncConnection(FakeConnection):
         return FakeAsyncCursor(self)
 
     async def arun(self, query: Any) -> None:
-        if self._record(query):
+        fails = self._record(query)
+        if self.on_statement is not None:
+            await self.on_statement(str(query))
+        if fails:
             if self.stuck:
                 sock = self._guarded_socket()
                 sock.setblocking(False)
@@ -168,16 +182,19 @@ class FakeAsyncCursor:
 
 
 class FakePool(ConnectionPool):
-    """A pool that hands out the given connections in order, then healthy ones."""
+    """A pool that hands out the given connections in order, then ones from ``factory``."""
 
-    def __init__(self, *connections: FakeConnection) -> None:
+    def __init__(
+        self, *connections: FakeConnection, factory: Callable[[], FakeConnection] = FakeConnection
+    ) -> None:
         super().__init__("", open=False)
         self.scripted = list(connections)
+        self.factory = factory
         self.handed_out: list[FakeConnection] = []
 
     @contextlib.contextmanager
     def connection(self, timeout: float | None = None) -> Iterator[Any]:
-        conn = self.scripted.pop(0) if self.scripted else FakeConnection()
+        conn = self.scripted.pop(0) if self.scripted else self.factory()
         self.handed_out.append(conn)
         yield conn
 
@@ -185,16 +202,41 @@ class FakePool(ConnectionPool):
 class FakeAsyncPool(AsyncConnectionPool):
     """FakePool for the async saver."""
 
-    def __init__(self, *connections: FakeAsyncConnection) -> None:
+    def __init__(
+        self,
+        *connections: FakeAsyncConnection,
+        factory: Callable[[], FakeAsyncConnection] = FakeAsyncConnection,
+    ) -> None:
         super().__init__("", open=False)
         self.scripted = list(connections)
+        self.factory = factory
         self.handed_out: list[FakeAsyncConnection] = []
 
     @contextlib.asynccontextmanager
     async def connection(self, timeout: float | None = None) -> AsyncIterator[Any]:
-        conn = self.scripted.pop(0) if self.scripted else FakeAsyncConnection()
+        conn = self.scripted.pop(0) if self.scripted else self.factory()
         self.handed_out.append(conn)
         yield conn
+
+
+class FakePipe:
+    """The saver-wide pipeline of a saver made with ``pipeline=True``. Counts syncs."""
+
+    def __init__(self) -> None:
+        self.syncs = 0
+
+    def sync(self) -> None:
+        self.syncs += 1
+
+
+class FakeAsyncPipe:
+    """FakePipe for the async saver."""
+
+    def __init__(self) -> None:
+        self.syncs = 0
+
+    async def sync(self) -> None:
+        self.syncs += 1
 
 
 def connection(kind: str, error: BaseException | None = None, **kwargs: Any) -> FakeConnection:

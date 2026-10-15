@@ -105,6 +105,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     ``psycopg_pool.AsyncConnectionPool``: it replaces broken connections,
     while a single connection cannot recover from a dropped connection.
 
+    On a pool, operations run concurrently, each on its own pooled
+    connection. On a single connection they run one at a time.
+
     The sync methods (``get_tuple``, ``put`` and the others) run the async
     ones on the event loop the saver was created on, so call them from other
     threads while that loop runs. From the loop itself they raise
@@ -127,6 +130,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         ```
     """
 
+    # Runs operations one at a time on a single connection; a pool needs no lock
     lock: asyncio.Lock
 
     def __init__(
@@ -259,7 +263,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """List checkpoints from the database asynchronously.
 
         Matching checkpoints are fetched inside one retried call and yielded
-        afterwards, so the saver's lock is not held while the caller iterates.
+        afterwards, so no connection or lock is held while the caller iterates.
 
         Args:
             config: Base configuration for filtering checkpoints.
@@ -587,6 +591,18 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """Delete thread (sync wrapper for adelete_thread)."""
         return self._run_sync(self.adelete_thread(thread_id))
 
+    def _operation_lock(self) -> contextlib.AbstractAsyncContextManager[object]:
+        """The lock an operation holds while it uses the connection.
+
+        A single connection runs one operation at a time. A pool gives every
+        operation its own connection, so pooled operations take no lock and run
+        concurrently. What they share is the pool, which is safe for concurrent
+        tasks, and attributes that are only set in __init__.
+        """
+        if isinstance(self.conn, AsyncConnectionPool):
+            return contextlib.nullcontext()
+        return self.lock
+
     @asynccontextmanager
     async def _cursor(
         self,
@@ -596,7 +612,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         label: str = "checkpoint operation",
     ) -> AsyncIterator[AsyncCursor[DictRow]]:
         """Create a database cursor as a context manager, with the hang guard."""
-        async with self.lock, _ainternal.get_connection(self.conn) as conn:
+        async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             async with aabandon_after(fileno, timeout, label=label):
                 if self.pipe:
@@ -606,7 +622,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                         if pipeline:
                             await self.pipe.sync()
                     except BaseException:
-                        # Resync while still holding the lock, so other tasks' queued
+                        # A pipeline only exists on a single connection, so the lock is
+                        # held here. Resync before releasing it, so other tasks' queued
                         # statements are untouched
                         with contextlib.suppress(Exception):
                             await self.pipe.sync()

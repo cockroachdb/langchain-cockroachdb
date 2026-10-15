@@ -60,6 +60,9 @@ class CockroachDBSaver(BaseCockroachDBSaver):
     ``psycopg_pool.ConnectionPool``: it replaces broken connections, while a
     single connection cannot recover from a dropped connection.
 
+    On a pool, operations run concurrently, each on its own pooled
+    connection. On a single connection they run one at a time.
+
     Example:
         ```python
         from psycopg.rows import dict_row
@@ -77,6 +80,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         ```
     """
 
+    # Runs operations one at a time on a single connection; a pool needs no lock
     lock: threading.Lock
 
     def __init__(
@@ -201,7 +205,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         """List checkpoints from the database.
 
         Matching checkpoints are fetched inside one retried call and yielded
-        afterwards, so the saver's lock is not held while the caller iterates.
+        afterwards, so no connection or lock is held while the caller iterates.
 
         Args:
             config: Config for filtering checkpoints.
@@ -471,6 +475,18 @@ class CockroachDBSaver(BaseCockroachDBSaver):
 
         self._retry(execute, label=label)
 
+    def _operation_lock(self) -> contextlib.AbstractContextManager[object]:
+        """The lock an operation holds while it uses the connection.
+
+        A single connection runs one operation at a time. A pool gives every
+        operation its own connection, so pooled operations take no lock and run
+        concurrently. What they share is the pool, which is thread-safe, and
+        attributes that are only set in __init__.
+        """
+        if isinstance(self.conn, ConnectionPool):
+            return contextlib.nullcontext()
+        return self.lock
+
     @contextmanager
     def _cursor(
         self,
@@ -480,7 +496,7 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         label: str = "checkpoint operation",
     ) -> Iterator[Cursor[DictRow]]:
         """Create a database cursor as a context manager, with the hang guard."""
-        with self.lock, _internal.get_connection(self.conn) as conn:
+        with self._operation_lock(), _internal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             with abandon_after(fileno, timeout, label=label):
                 if self.pipe:
@@ -490,7 +506,8 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                         if pipeline:
                             self.pipe.sync()
                     except BaseException:
-                        # Resync while still holding the lock, so other threads' queued
+                        # A pipeline only exists on a single connection, so the lock is
+                        # held here. Resync before releasing it, so other threads' queued
                         # statements are untouched
                         with contextlib.suppress(Exception):
                             self.pipe.sync()

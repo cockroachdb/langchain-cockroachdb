@@ -23,7 +23,12 @@ from langchain_cockroachdb import (
     RetryPolicy,
     get_sqlstate,
 )
-from tests.integration.faults import PsycopgFaults, hold_row_lock, kill_sessions
+from tests.integration.faults import (
+    PsycopgFaults,
+    hold_row_lock,
+    kill_sessions,
+    wait_for_statement,
+)
 
 FAST = RetryPolicy(initial_backoff=0.01, max_backoff=0.05)
 STUCK_WRITE = RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8)
@@ -268,6 +273,35 @@ def test_sync_saver_attempt_timeout_rides_out_a_stuck_write(
     assert saver.get_tuple(config(thread)).metadata["step"] == 2
 
 
+@pytest.mark.timeout(60)
+def test_pooled_sync_saver_writes_other_threads_while_one_write_waits(sync_pool, libpq_url) -> None:
+    # Each operation runs on its own pooled connection, so a write that waits on
+    # a locked row holds up nothing else
+    app = app_name()
+    saver = CockroachDBSaver(sync_pool(app), retry_policy=FAST)
+    saver.setup()
+    waiting, other = str(uuid.uuid4()), str(uuid.uuid4())
+    checkpoint = empty_checkpoint()
+    saver.put(config(waiting), checkpoint, {"step": 1}, {})
+    with hold_row_lock(libpq_url, LOCK_SQL, (waiting,), release_after=30):
+        writer = threading.Thread(
+            target=saver.put, args=(config(waiting), checkpoint, {"step": 2}, {}), daemon=True
+        )
+        writer.start()
+        wait_for_statement(libpq_url, app, "insert into checkpoints")
+        second = threading.Thread(
+            target=saver.put, args=(config(other), empty_checkpoint(), {}, {}), daemon=True
+        )
+        second.start()
+        second.join(10)
+        assert not second.is_alive(), "the second write waited for the blocked one"
+        assert writer.is_alive()
+    writer.join(30)
+    assert not writer.is_alive()
+    assert saver.get_tuple(config(waiting)).metadata["step"] == 2
+    assert saver.get_tuple(config(other)) is not None
+
+
 @pytest.mark.parametrize("key", ["autocommit", "row_factory", "prepare_threshold"])
 def test_from_conn_string_rejects_managed_options(libpq_url, key: str) -> None:
     with (
@@ -482,6 +516,26 @@ async def test_async_saver_attempt_timeout_rides_out_a_stuck_write(
     if phrases == "none":
         assert_retried_for_the_broken_flag(caplog, "put checkpoint")
     assert (await saver.aget_tuple(config(thread))).metadata["step"] == 2
+
+
+@pytest.mark.timeout(60)
+async def test_pooled_async_saver_writes_other_threads_while_one_write_waits(
+    async_pool, libpq_url
+) -> None:
+    app = app_name()
+    saver = AsyncCockroachDBSaver(await async_pool(app), retry_policy=FAST)
+    await saver.setup()
+    waiting, other = str(uuid.uuid4()), str(uuid.uuid4())
+    checkpoint = empty_checkpoint()
+    await saver.aput(config(waiting), checkpoint, {"step": 1}, {})
+    with hold_row_lock(libpq_url, LOCK_SQL, (waiting,), release_after=30):
+        writer = asyncio.create_task(saver.aput(config(waiting), checkpoint, {"step": 2}, {}))
+        await asyncio.to_thread(wait_for_statement, libpq_url, app, "insert into checkpoints")
+        await asyncio.wait_for(saver.aput(config(other), empty_checkpoint(), {}, {}), 10)
+        assert not writer.done()
+    await asyncio.wait_for(writer, 30)
+    assert (await saver.aget_tuple(config(waiting))).metadata["step"] == 2
+    assert await saver.aget_tuple(config(other)) is not None
 
 
 async def test_async_saver_raises_non_retryable_errors_once(async_pool, unsafe_internals) -> None:
