@@ -139,6 +139,8 @@ A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, 
 
 Async methods run on your event loop. Sync methods run their database work on one background event loop, so they are safe from any number of threads and from inside a running event loop. Use one style per engine; the engine logs a warning if it sees both at the same time. Engines that use the built-in background loop are also safe across `os.fork()`: a child process gets a fresh pool and loop.
 
+An engine built with `loop=` (`CockroachDBEngine(engine, loop=...)` or `CockroachDBEngine.from_engine(engine, loop=...)`) sends its sync calls, and async calls from other event loops, to that loop. Keep the loop running in its thread while the engine is in use. If the loop is closed, is not running, or stops while a call waits on it, the call raises `RuntimeError` instead of waiting forever. A loop that is not running gets about a second to start, or to start again, before calls give up. When a call gives up after its work started, the work may or may not have taken effect. The library's writes are safe to retry (see [Idempotency](#idempotency)). The loop's thread does not survive `os.fork()`, so in a child process such an engine raises `RuntimeError` too. Build a new engine in the child.
+
 ## Watching retries
 
 Each retry logs one WARNING on the `langchain_cockroachdb.retry` logger:
