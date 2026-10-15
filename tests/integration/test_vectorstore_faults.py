@@ -247,3 +247,68 @@ def test_vector_store_inherits_and_overrides_the_engine_policy(engine_factory) -
             retry_policy=RetryPolicy(),
             retry_max_attempts=2,
         )
+
+
+async def test_hybrid_search_fts_leg_retries_and_recovers(faulty) -> None:
+    """Full-text search leg retries transient errors and hybrid search succeeds."""
+    store, faults = faulty
+    hybrid = AsyncCockroachDBVectorStore(
+        store.engine,
+        store.embeddings,
+        store.collection_name,
+        hybrid_search_config=HybridSearchConfig(),
+    )
+    await hybrid.aadd_texts(["cockroach database", "unrelated"])
+    faults.fail_next("40001", match="plainto_tsquery")
+    results = await hybrid.asimilarity_search("cockroach", k=2)
+    assert len(results) > 0
+    assert faults.count("plainto_tsquery") == 2
+    assert faults.injected == ["40001"]
+
+
+async def test_opclass_mismatch_warning_does_not_change_index(engine_factory, caplog) -> None:
+    """After the opclass mismatch warning, the existing index is unchanged."""
+    from langchain_cockroachdb import CSPANNIndex, DistanceStrategy
+
+    engine = engine_factory()
+    table = f"opclass_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    await store.aadd_texts(["a"])
+    await store.aapply_vector_index(CSPANNIndex(distance_strategy=DistanceStrategy.EUCLIDEAN))
+    index_name = f"{table}_embedding_vector_idx"
+    async with engine.engine.connect() as conn:
+        indexdef_before = (
+            await conn.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = :name"),
+                {"name": index_name},
+            )
+        ).scalar()
+    assert "vector_l2_ops" in indexdef_before
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(distance_strategy=DistanceStrategy.COSINE))
+    assert any("vector_cosine_ops" in record.message for record in caplog.records)
+    async with engine.engine.connect() as conn:
+        indexdef_after = (
+            await conn.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = :name"),
+                {"name": index_name},
+            )
+        ).scalar()
+    assert indexdef_after == indexdef_before
+    assert "vector_l2_ops" in indexdef_after
+    await engine.adrop_table(table)
+
+
+async def test_ambiguous_commit_does_not_duplicate_rows(faulty) -> None:
+    """Write applies on server, client sees ambiguous error, retry doesn't duplicate."""
+    store, faults = faulty
+    faults.fail_next("40003", match="insert into")
+    ids = await store.aadd_texts(["once"])
+    assert faults.injected == ["40003"]
+    assert faults.count("insert into") == 2
+    async with store.engine.engine.connect() as conn:
+        count = (await conn.execute(text(f"SELECT count(*) FROM {store._fqn}"))).scalar()
+    assert count == 1
+    [doc] = await store.aget_by_ids(ids)
+    assert doc.page_content == "once"

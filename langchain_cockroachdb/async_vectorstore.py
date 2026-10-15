@@ -274,6 +274,48 @@ class AsyncCockroachDBVectorStore(VectorStore):
             clauses.append(builder.build(filter))
         return "WHERE " + " AND ".join(clauses) if clauses else ""
 
+    def _validate_inputs(
+        self,
+        count: int,
+        metadatas: list[dict] | None,
+        ids: Sequence[str | None] | None,
+    ) -> tuple[list[dict], list[str], list[str]]:
+        """Validate inputs that don't require embeddings.
+
+        Returns:
+            Tuple of (metadatas, resolved_ids, caller_supplied_ids)
+        """
+        validated_metadatas: list[dict]
+        if metadatas is None:
+            validated_metadatas = [{} for _ in range(count)]
+        elif len(metadatas) != count:
+            raise ValueError(f"Got {len(metadatas)} metadatas for {count} texts")
+        else:
+            validated_metadatas = metadatas
+
+        caller_supplied: list[str] = []
+        if ids is None:
+            resolved_ids = [str(uuid.uuid4()) for _ in range(count)]
+        elif len(ids) != count:
+            raise ValueError(f"Got {len(ids)} ids for {count} texts")
+        else:
+            resolved_ids = []
+            for i in ids:
+                if i is not None:
+                    resolved_ids.append(str(i))
+                    caller_supplied.append(str(i))
+                else:
+                    resolved_ids.append(str(uuid.uuid4()))
+
+        seen = set()
+        for doc_id in resolved_ids:
+            normalized = self._normalize_id(doc_id)
+            if normalized in seen:
+                raise ValueError(f"Duplicate id in one add call: {doc_id}")
+            seen.add(normalized)
+
+        return validated_metadatas, resolved_ids, caller_supplied
+
     def _prepare_rows(  # noqa: PLR0912
         self,
         texts: list[str],
@@ -286,31 +328,11 @@ class AsyncCockroachDBVectorStore(VectorStore):
         count = len(texts)
         if len(embeddings) != count:
             raise ValueError(f"Got {len(embeddings)} embeddings for {count} texts")
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        elif len(metadatas) != count:
-            raise ValueError(f"Got {len(metadatas)} metadatas for {count} texts")
-        caller_supplied: list[str] = []
-        if ids is None:
-            resolved_ids = [str(uuid.uuid4()) for _ in texts]
-        elif len(ids) != count:
-            raise ValueError(f"Got {len(ids)} ids for {count} texts")
-        else:
-            resolved_ids = []
-            for i in ids:
-                if i is not None:
-                    resolved_ids.append(str(i))
-                    caller_supplied.append(str(i))
-                else:
-                    resolved_ids.append(str(uuid.uuid4()))
-        seen = set()
-        for doc_id in resolved_ids:
-            normalized = self._normalize_id(doc_id)
-            if normalized in seen:
-                raise ValueError(f"Duplicate id in one add call: {doc_id}")
-            seen.add(normalized)
+        validated_metadatas, resolved_ids, caller_supplied = self._validate_inputs(
+            count, metadatas, ids
+        )
         metadata_json = []
-        for position, metadata in enumerate(metadatas):
+        for position, metadata in enumerate(validated_metadatas):
             try:
                 metadata_json.append(
                     json.dumps(metadata if metadata is not None else {}, allow_nan=False)
@@ -603,7 +625,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
         )
         opclass = index.distance_strategy.get_opclass()
         if existing:
-            if opclass not in existing[0][0]:
+            indexdef = existing[0][0]
+            if opclass not in indexdef:
                 logger.warning(
                     "Vector index %s already exists without %s, so %s searches will not use it. "
                     "Drop it with adrop_vector_index() and apply it again. Indexes created before "
@@ -611,6 +634,28 @@ class AsyncCockroachDBVectorStore(VectorStore):
                     name,
                     opclass,
                     index.distance_strategy.name,
+                )
+            differences = []
+            if prefix_columns:
+                for col in prefix_columns:
+                    if f"({col}," not in indexdef and f"({col} " not in indexdef:
+                        differences.append(f"prefix column {col}")
+            if (
+                index.min_partition_size is not None
+                and f"min_partition_size = {index.min_partition_size}" not in indexdef
+            ):
+                differences.append(f"min_partition_size = {index.min_partition_size}")
+            if (
+                index.max_partition_size is not None
+                and f"max_partition_size = {index.max_partition_size}" not in indexdef
+            ):
+                differences.append(f"max_partition_size = {index.max_partition_size}")
+            if differences:
+                logger.warning(
+                    "Vector index %s already exists but differs in: %s. "
+                    "Drop it with adrop_vector_index() and apply it again.",
+                    name,
+                    ", ".join(differences),
                 )
             return
         sql = index.get_create_index_sql(
@@ -694,6 +739,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         texts_list = list(texts)
         if not texts_list:
             return []
+        self._validate_inputs(len(texts_list), metadatas, ids)
         embeddings = await self._embeddings.aembed_documents(texts_list)
         return await self.aadd_embeddings(
             texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs
