@@ -1,6 +1,7 @@
 """Checkpointers survive real CockroachDB faults."""
 
 import asyncio
+import dataclasses
 import logging
 import threading
 import time
@@ -18,6 +19,9 @@ from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver, Retry
 from tests.integration.faults import PsycopgFaults, hold_row_lock, kill_sessions
 
 FAST = RetryPolicy(initial_backoff=0.01, max_backoff=0.05)
+# No transient phrases: an error without a retryable SQLSTATE is retried only
+# because psycopg reports its pooled connection broken
+FAST_WITHOUT_PHRASES = dataclasses.replace(FAST, transient_messages=())
 RETRYABLE_CODES = ["40001", "40003", "57P01", "58C01", "08006"]
 # A real change, so the open transaction holds a write intent that blocks the saver's UPSERT
 LOCK_SQL = "UPDATE checkpoints SET metadata = '{}' WHERE thread_id = %s"
@@ -139,6 +143,20 @@ def test_sync_saver_with_a_pool_recovers_from_killed_connections(
     assert any("Retrying get checkpoint after" in record.message for record in caplog.records)
 
 
+def test_sync_pooled_saver_retries_when_psycopg_reports_the_connection_broken(
+    sync_pool, libpq_url, caplog
+) -> None:
+    app = app_name()
+    saver = CockroachDBSaver(sync_pool(app), retry_policy=FAST_WITHOUT_PHRASES)
+    saver.setup()
+    saved = saver.put(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
+    assert kill_sessions(libpq_url, app) >= 1
+    time.sleep(0.3)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        assert saver.get_tuple(saved) is not None
+    assert any("Retrying get checkpoint after" in record.message for record in caplog.records)
+
+
 def test_single_connection_saver_does_not_retry_a_dead_connection(libpq_url, caplog) -> None:
     app = app_name()
     with CockroachDBSaver.from_conn_string(
@@ -206,11 +224,17 @@ def test_list_does_not_hold_the_lock_while_the_caller_iterates(sync_pool) -> Non
     assert count == 2
 
 
-def test_sync_saver_attempt_timeout_rides_out_a_stuck_write(sync_pool, libpq_url, caplog) -> None:
-    saver = CockroachDBSaver(
-        sync_pool(app_name()),
-        retry_policy=RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8),
-    )
+def stuck_write_policy(phrases: str) -> RetryPolicy:
+    """With "none", only psycopg's broken flag can make the abandoned write retryable."""
+    policy = RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8)
+    return dataclasses.replace(policy, transient_messages=()) if phrases == "none" else policy
+
+
+@pytest.mark.parametrize("phrases", ["default", "none"])
+def test_sync_saver_attempt_timeout_rides_out_a_stuck_write(
+    sync_pool, libpq_url, caplog, phrases: str
+) -> None:
+    saver = CockroachDBSaver(sync_pool(app_name()), retry_policy=stuck_write_policy(phrases))
     saver.setup()
     thread = str(uuid.uuid4())
     checkpoint = empty_checkpoint()
@@ -382,6 +406,20 @@ async def test_async_saver_with_a_pool_recovers_from_killed_connections(
     assert any("Retrying get checkpoint after" in record.message for record in caplog.records)
 
 
+async def test_async_pooled_saver_retries_when_psycopg_reports_the_connection_broken(
+    async_pool, libpq_url, caplog
+) -> None:
+    app = app_name()
+    saver = AsyncCockroachDBSaver(await async_pool(app), retry_policy=FAST_WITHOUT_PHRASES)
+    await saver.setup()
+    saved = await saver.aput(config(str(uuid.uuid4())), empty_checkpoint(), {}, {})
+    assert kill_sessions(libpq_url, app) >= 1
+    await asyncio.sleep(0.3)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        assert await saver.aget_tuple(saved) is not None
+    assert any("Retrying get checkpoint after" in record.message for record in caplog.records)
+
+
 async def test_async_single_connection_does_not_retry_a_dead_connection(libpq_url, caplog) -> None:
     app = app_name()
     async with AsyncCockroachDBSaver.from_conn_string(
@@ -415,12 +453,12 @@ async def test_alist_does_not_hold_the_lock_while_the_caller_iterates(async_pool
     assert count == 2
 
 
+@pytest.mark.parametrize("phrases", ["default", "none"])
 async def test_async_saver_attempt_timeout_rides_out_a_stuck_write(
-    async_pool, libpq_url, caplog
+    async_pool, libpq_url, caplog, phrases: str
 ) -> None:
     saver = AsyncCockroachDBSaver(
-        await async_pool(app_name()),
-        retry_policy=RetryPolicy(attempt_timeout=0.5, initial_backoff=0.05, max_attempts=8),
+        await async_pool(app_name()), retry_policy=stuck_write_policy(phrases)
     )
     await saver.setup()
     thread = str(uuid.uuid4())

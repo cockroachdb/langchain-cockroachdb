@@ -109,6 +109,8 @@ class TestClassification:
             "the connection is lost",
             "connection socket closed",
             "SSL SYSCALL error: EOF detected",
+            # OpenSSL 3, when the hang guard or the network drops a TLS connection
+            "consuming input failed: SSL error: unexpected eof while reading",
             "failed to resolve host 'db': [Errno 8] nodename nor servname provided, or not known",
             "server is not accepting clients, try another node",
             "sorry, too many clients already",
@@ -125,6 +127,10 @@ class TestClassification:
             "ERROR:  password authentication failed for user bob",
             "connection failed: server does not support SSL, but SSL was required",
             "SSL error: certificate verify failed",
+            # TLS handshake failures stay final next to the dropped-connection wording
+            "SSL error: wrong version number",
+            "SSL error: sslv3 alert handshake failure",
+            "SSL error: tlsv1 alert unknown ca",
             'invalid connection option "nope"',
             'database "missing" does not exist',
             "permission denied for database app",

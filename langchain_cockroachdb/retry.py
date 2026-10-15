@@ -63,6 +63,7 @@ TRANSIENT_MESSAGES: tuple[str, ...] = (
     "ssl connection has been closed unexpectedly",
     "ssl syscall error",
     "eof detected",
+    "unexpected eof while reading",
     "connection refused",
     "connection reset by peer",
     "broken pipe",
@@ -316,6 +317,8 @@ class RetryPolicy:
         messages = [str(e).lower() for e in chain if not isinstance(e, StatementError)]
         if any(phrase in m for m in messages for phrase in self.non_transient_messages):
             return False
+        # SQLAlchemy sets this after it discards a connection that broke. The
+        # checkpointers set it when psycopg reports a pooled connection broken.
         if any(getattr(e, "connection_invalidated", False) for e in chain):
             return True
         return any(phrase in m for m in messages for phrase in self.transient_messages)
