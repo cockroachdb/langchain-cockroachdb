@@ -92,3 +92,30 @@ def test_gssencmode_added_for_key_value_dsn() -> None:
     options = with_libpq_defaults("host=localhost port=26257", None, 10.0)
     assert options["gssencmode"] == "disable"
     assert options["connect_timeout"] == 10
+
+
+def test_with_libpq_defaults_adds_gssencmode_regardless_of_driver() -> None:
+    """with_libpq_defaults adds gssencmode to all URLs.
+
+    It's the caller's responsibility (engine.py) to only call this for psycopg drivers.
+    This test documents that behavior.
+    """
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    # Even asyncpg URLs get gssencmode if you call with_libpq_defaults
+    url = "cockroachdb+asyncpg://root@localhost:26257/defaultdb"
+    options = with_libpq_defaults(url, None, 10.0)
+    assert options["gssencmode"] == "disable"
+    assert options["connect_timeout"] == 10
+
+
+def test_key_value_dsn_with_gssencmode_keeps_it() -> None:
+    """A key/value DSN that already sets gssencmode should not override it."""
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    dsn = "host=localhost port=26257 dbname=defaultdb gssencmode=require"
+    options = with_libpq_defaults(dsn, None, 10.0)
+    # Should not add gssencmode to options when DSN already has it
+    assert "gssencmode" not in options
+    # But connect_timeout should still be added
+    assert options["connect_timeout"] == 10
