@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- Checkpointers on a psycopg_pool pool now run operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. Before, every operation in the process waited on one lock, which on a multi-region cluster capped a saver at a few operations per second. A saver on a single connection (including `pipeline=True`) still runs one operation at a time. Concurrency is bounded by the pool's `max_size`; when every connection is busy, operations wait for the pool (30 s by default) and a `PoolTimeout` is not retried. On a 9-node, 3-region CockroachDB cluster with 16 agents sharing one pooled saver, throughput went from 0.27 turns per second (median turn 55 s) in 0.4.0 to about 7.5 turns per second (median turn about 1.2 s) in 0.4.1.
+- Checkpointers on a psycopg_pool pool now run operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. Before, every operation in the process waited on one lock, which on a multi-region cluster capped a saver at a few operations per second. A saver on a single connection (including `pipeline=True`) still runs one operation at a time. Concurrency is bounded by the pool's `max_size`; when every connection is busy, operations wait for the pool (30 s by default) and a `PoolTimeout` is not retried. On a 9-node, 3-region CockroachDB cluster (Docker, with simulated cross-region latency and a stubbed model) with 16 LangGraph agents sharing one pooled saver, throughput went from 0.27 turns per second (median turn 55 s) in 0.4.0 to about 7.5 turns per second (median turn about 1.2 s) in 0.4.1.
 
 ### Fixed
 
