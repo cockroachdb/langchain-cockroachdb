@@ -2718,7 +2718,7 @@
 </table>
 <div class="admonition warning">
 <p class="admonition-title">Upgrading from 0.3.x</p>
-<p>Indexes created by earlier versions for COSINE or INNER_PRODUCT are <code>vector_l2_ops</code> and are not used by those searches. Drop them with <code>await vectorstore.adrop_vector_index()</code> and apply again. <code>aapply_vector_index</code> logs a warning when it finds a mismatched opclass.</p>
+<p>Indexes created by earlier versions for COSINE or INNER_PRODUCT are <code>vector_l2_ops</code> and are not used by those searches. Drop them with <code>await vectorstore.adrop_vector_index()</code> and apply again. <code>aapply_vector_index</code> logs a warning when it finds a mismatched opclass, different prefix columns, or a partition size other than one you set. Applying the same index again logs nothing.</p>
 </div>
 <h2 id="best-practices">Best Practices<a class="headerlink" href="#best-practices" title="Permanent link">&para;</a></h2>
 <h3 id="1-create-index-after-bulk-insert">1. Create Index After Bulk Insert<a class="headerlink" href="#1-create-index-after-bulk-insert" title="Permanent link">&para;</a></h3>

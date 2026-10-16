@@ -1044,6 +1044,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#atomic-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atomic Writes
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2283,6 +2294,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#atomic-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atomic Writes
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2620,7 +2642,7 @@
 <p>Use <code>postgresql://</code> (not <code>cockroachdb://</code>) when creating raw psycopg connections directly. The <code>from_conn_string()</code> factory handles this conversion automatically.</p>
 </div>
 <h3 id="connection-pool">Connection Pool<a class="headerlink" href="#connection-pool" title="Permanent link">&para;</a></h3>
-<p>Best for web applications and high-concurrency workloads:</p>
+<p>Best for web applications and high-concurrency workloads. A saver on a pool runs operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. A saver on a single connection runs operations one at a time, so long-running services should use a pool. A shared pooled saver runs as many operations at once as the pool has connections, so set <code>max_size</code> for the number of agents you expect to run at the same time. psycopg_pool's default <code>max_size</code> equals <code>min_size</code>, which defaults to 4. When every connection is busy, an operation waits up to the pool's <code>timeout</code> and then raises <code>PoolTimeout</code>, which is not retried. For example:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span>
@@ -2720,6 +2742,9 @@
 <h3 id="storing-intermediate-writes">Storing Intermediate Writes<a class="headerlink" href="#storing-intermediate-writes" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">saver</span><span class="o">.</span><span class="n">put_writes</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="p">[(</span><span class="s2">"channel_name"</span><span class="p">,</span> <span class="n">value</span><span class="p">)],</span> <span class="n">task_id</span><span class="o">=</span><span class="s2">"task-1"</span><span class="p">)</span>
 </code></pre></div>
+<h3 id="atomic-writes">Atomic Writes<a class="headerlink" href="#atomic-writes" title="Permanent link">&para;</a></h3>
+<p><code>put</code> with channel blobs, <code>put_writes</code> with several writes, and <code>delete_thread</code> send BEGIN, their statements and COMMIT as one batch, so each write is saved completely or not at all, even when the caller is cancelled or fails partway. A write still takes one round trip, and CockroachDB can still retry it on the server. Single-statement writes are unchanged.</p>
+<p>On a single connection that the caller also uses, a write made inside a transaction the caller opened joins it as a savepoint, so the caller's commit or rollback decides. The saver never rolls back a transaction it did not open, and an error inside the caller's transaction is raised at once, without retries, so the caller's own retry loop can restart the whole transaction.</p>
 <h2 id="langgraph-integration">LangGraph Integration<a class="headerlink" href="#langgraph-integration" title="Permanent link">&para;</a></h2>
 <h3 id="chatbot-with-memory">Chatbot with Memory<a class="headerlink" href="#chatbot-with-memory" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChatOpenAI</span>

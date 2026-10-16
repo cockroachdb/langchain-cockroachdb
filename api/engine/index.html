@@ -2425,7 +2425,10 @@ Ignored when the URL or connect_args already set one (default: 10.0)</p>
         <p>Wrap an existing AsyncEngine.</p>
 <p>If you also use <code>engine</code> directly from your own event loop while
 calling sync methods here, pass that loop as <code>loop</code> so all work stays
-on it.</p>
+on it. Keep that loop running in its thread while the engine is in use.
+A call raises RuntimeError instead of waiting forever if the loop is
+closed or stops, or in a forked child process. In a child, build the
+engine with a loop started in the child, or without <code>loop</code>.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2592,6 +2595,30 @@ on it.</p>
             <td>
               <div class="doc-md-description">
                 <p>CockroachDBEngine instance</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+<p><span class="doc-section-title">Raises:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="RuntimeError">RuntimeError</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>If <code>loop</code> was running in the parent process when
+this process was forked. Its copy here can never run.</p>
               </div>
             </td>
           </tr>

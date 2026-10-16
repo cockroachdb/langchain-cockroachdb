@@ -2478,6 +2478,13 @@
 with LangGraph's checkpointer interface. For production, pass a
 <code>psycopg_pool.ConnectionPool</code>: it replaces broken connections, while a
 single connection cannot recover from a dropped connection.</p>
+<p>On a pool, operations run concurrently, each on its own pooled
+connection. On a single connection they run one at a time. A write with
+several statements runs them in one transaction, so it is saved completely
+or not at all, even when the caller stops partway through. On a single
+connection the caller also uses, an operation inside a transaction the
+caller opened joins that transaction, and its errors are raised at once,
+not retried, so the caller can retry the whole transaction.</p>
 
 
 <details class="example" open>
@@ -2913,7 +2920,7 @@ background CockroachDB job on the specified cron schedule.</p>
 
         <p>List checkpoints from the database.</p>
 <p>Matching checkpoints are fetched inside one retried call and yielded
-afterwards, so the saver's lock is not held while the caller iterates.</p>
+afterwards, so no connection or lock is held while the caller iterates.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3293,6 +3300,18 @@ ON CONFLICT DO NOTHING.</p>
 with LangGraph's checkpointer interface. For production, pass a
 <code>psycopg_pool.AsyncConnectionPool</code>: it replaces broken connections,
 while a single connection cannot recover from a dropped connection.</p>
+<p>On a pool, operations run concurrently, each on its own pooled
+connection. On a single connection they run one at a time. A write with
+several statements runs them in one transaction, so it is saved completely
+or not at all, even when the caller is cancelled partway through. On a
+single connection the caller also uses, an operation inside a transaction
+the caller opened joins that transaction, and its errors are raised at
+once, not retried, so the caller can retry the whole transaction.</p>
+<p>The sync methods (<code>get_tuple</code>, <code>put</code> and the others) run the async
+ones on the event loop the saver was created on, so call them from other
+threads while that loop runs. From the loop itself they raise
+<code>asyncio.InvalidStateError</code>. When the loop is closed or stops, or in a
+forked child, they raise <code>RuntimeError</code> instead of waiting forever.</p>
 
 
 <details class="example" open>
@@ -3568,7 +3587,7 @@ while a single connection cannot recover from a dropped connection.</p>
 
         <p>List checkpoints from the database asynchronously.</p>
 <p>Matching checkpoints are fetched inside one retried call and yielded
-afterwards, so the saver's lock is not held while the caller iterates.</p>
+afterwards, so no connection or lock is held while the caller iterates.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>

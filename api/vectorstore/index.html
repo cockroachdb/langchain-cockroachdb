@@ -3520,8 +3520,10 @@ when this error is raised.</p>
     <div class="doc doc-contents ">
 
         <p>Apply a C-SPANN vector index.</p>
-<p>Warns instead of rebuilding when an index with the same name exists
-with a different operator class.</p>
+<p>When an index with the same name exists, it is left alone. A WARNING
+names each difference from the requested index: the operator class,
+the prefix columns (order and count) and any partition size you set.
+Applying the same index again logs nothing.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -4772,7 +4774,7 @@ when this error is raised.</p>
 
     <div class="doc doc-contents ">
 
-        <p>Apply a vector index (sync); warns if an old index has the wrong operator class.</p>
+        <p>Apply a vector index (sync); warns if an existing index of that name differs.</p>
 
 
     </div>

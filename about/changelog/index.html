@@ -1576,6 +1576,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#041-unreleased" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [0.4.1] - Unreleased
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[0.4.1] - Unreleased">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#040-2026-10-14" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1599,7 +1638,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed" class="md-nav__link">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1638,7 +1677,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixed_1" class="md-nav__link">
+  <a href="#fixed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1874,6 +1913,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#041-unreleased" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [0.4.1] - Unreleased
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[0.4.1] - Unreleased">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#040-2026-10-14" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1897,7 +1975,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed" class="md-nav__link">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1936,7 +2014,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixed_1" class="md-nav__link">
+  <a href="#fixed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -2115,6 +2193,25 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased"><a href="https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.1...HEAD">Unreleased</a><a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<h2 id="041-unreleased">[0.4.1] - Unreleased<a class="headerlink" href="#041-unreleased" title="Permanent link">&para;</a></h2>
+<h3 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Checkpointers on a psycopg_pool pool now run operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. Before, every operation in the process waited on one lock, which on a multi-region cluster capped a saver at a few operations per second. A saver on a single connection (including <code>pipeline=True</code>) still runs one operation at a time. Concurrency is bounded by the pool's <code>max_size</code>; when every connection is busy, operations wait for the pool (30 s by default) and a <code>PoolTimeout</code> is not retried. On a 9-node, 3-region CockroachDB cluster (Docker, with simulated cross-region latency and a stubbed model) with 16 LangGraph agents sharing one pooled saver, throughput went from 0.27 turns per second (median turn 55 s) in 0.4.0 to about 7.5 turns per second (median turn about 1.2 s) in 0.4.1.</li>
+</ul>
+<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>put</code> with channel blobs, <code>put_writes</code> with several writes, and <code>delete_thread</code> now send BEGIN, their statements and COMMIT as one batch, so each write is saved completely or not at all, even when the caller is cancelled or fails partway. Before, an interrupted write could leave blob rows without their checkpoint, part of a task's pending writes (which LangGraph treats as a finished task), or a half-deleted thread. A write still takes one round trip, and CockroachDB can still retry it on the server. Single-statement writes are unchanged. Connections not in autocommit mode use psycopg's <code>conn.transaction()</code> (the docs already require <code>autocommit=True</code>).</li>
+<li>On a single connection that the caller also uses, a write made inside a transaction the caller opened joins it as a savepoint, so the caller's commit or rollback decides. The saver never rolls back a transaction it did not open, and an error inside the caller's transaction is raised at once, without retries, so the caller's own retry loop can restart the whole transaction.</li>
+<li>Pooled checkpointers retry when psycopg reports the connection broken, even when the error text is unfamiliar. This fixed checkpointer retries over TLS: on CockroachDB Cloud a dropped connection reads "SSL error: unexpected eof while reading" (OpenSSL 3), which was not recognized, so a pooled saver gave up instead of retrying. That wording is now also in <code>TRANSIENT_MESSAGES</code>. A definite SQLSTATE still decides first, as on the SQLAlchemy path.</li>
+<li><code>AsyncCockroachDBSaver</code>'s sync methods raise a clear <code>RuntimeError</code> instead of hanging when the saver's loop is closed, stopped, or the process forked, and they cancel the abandoned work. <code>put</code> and <code>put_writes</code> called from the saver's own loop thread now raise <code>InvalidStateError</code> instead of deadlocking (the other sync methods already did).</li>
+<li>Engines built with <code>loop=</code> (<code>CockroachDBEngine(engine, loop=...)</code> or <code>CockroachDBEngine.from_engine(engine, loop=...)</code>) fail fast with a clear <code>RuntimeError</code> instead of hanging when that loop is closed, never started, stops or closes during a call, or the process forked (including an engine rebuilt in a child around the parent's loop). A loop that has not started yet gets a short grace period (<code>LOOP_START_TIMEOUT</code>, 1 s).</li>
+<li><code>RetryPolicy</code> rejects NaN and infinity in its numeric fields, and <code>delay()</code> can no longer overflow for large attempt numbers or multipliers.</li>
+<li>The flat <code>jitter</code> / <code>retry_jitter</code> argument now raises <code>TypeError</code> for anything other than <code>True</code>, <code>False</code>, <code>0</code> or <code>1</code>. It used to be read by truthiness, so 0.3 became a jitter of 0.5. Use <code>RetryPolicy(jitter=...)</code> for a ratio.</li>
+<li>Retry warnings name the underlying driver error when an application wraps it, and never include SQL text or parameter values.</li>
+<li><code>aadd_texts</code>, <code>add_texts</code>, <code>afrom_texts</code> and <code>from_texts</code> validate input (lengths, ids, duplicates, metadata JSON and <code>batch_size</code>) before calling the embedding model, so invalid input no longer pays for embedding calls. The namespace conflict check is a database query and still runs after embedding.</li>
+<li>Applying a vector index whose name already exists with different prefix columns (order or count) or a different partition size you set now logs a WARNING naming each difference, like the existing opclass warning, instead of doing nothing silently. Applying the same index again logs nothing. A partition size you leave unset accepts whatever the index has.</li>
+<li>Checkpointer setup logs its bootstrap step as "checkpointer setup" instead of a second "checkpointer migration 0".</li>
+</ul>
 <h2 id="040-2026-10-14">[0.4.0] - 2026-10-14<a class="headerlink" href="#040-2026-10-14" title="Permanent link">&para;</a></h2>
 <h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
 <ul>
@@ -2129,7 +2226,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li><code>postgresql://</code> and <code>cockroachdb://</code> URL spellings are normalized to the psycopg driver.</li>
 <li><code>examples/resilience.py</code>, end-to-end tests for every example, LangGraph checkpointer conformance tests, and integration tests that inject real CockroachDB faults.</li>
 </ul>
-<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Errors were classified by psycopg2's <code>pgcode</code>, which psycopg 3 does not set, and by words like "connection" and "timeout" in any exception. Missing tables and statement timeouts were retried.</li>
 <li>The vector store never applied its retry settings; chat history and both checkpointers had no retries.</li>
@@ -2166,7 +2263,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li><code>batch_size</code> is capped at 16,383. Long id lists are split automatically.</li>
 </ul>
 <h2 id="030-2026-07-15">[0.3.0] - 2026-07-15<a class="headerlink" href="#030-2026-07-15" title="Permanent link">&para;</a></h2>
-<h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_2">Fixed<a class="headerlink" href="#fixed_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Hybrid search now actually executes. Setting <code>hybrid_search_config</code>
   previously had no effect: only vector similarity ran and the FTS half never
