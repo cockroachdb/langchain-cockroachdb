@@ -86,7 +86,7 @@ saver.setup()
 
 ### Connection Pool
 
-Best for web applications and high-concurrency workloads. A saver on a pool runs operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. A saver on a single connection runs operations one at a time, so long-running services should use a pool:
+Best for web applications and high-concurrency workloads. A saver on a pool runs operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. A saver on a single connection runs operations one at a time, so long-running services should use a pool. A shared pooled saver runs as many operations at once as the pool has connections, so set `max_size` for the number of agents you expect to run at the same time. psycopg_pool's default `max_size` equals `min_size`, which defaults to 4. When every connection is busy, an operation waits up to the pool's `timeout` and then raises `PoolTimeout`, which is not retried. For example:
 
 ```python
 from psycopg_pool import ConnectionPool
