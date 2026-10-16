@@ -53,6 +53,7 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         texts_list = list(texts)
         if not texts_list:
             return []
+        self._validate_inputs(len(texts_list), metadatas, ids, kwargs)
         embeddings = self._embeddings.embed_documents(texts_list)
         return self.add_embeddings(texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs)
 
@@ -172,7 +173,7 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
     def apply_vector_index(
         self, index: CSPANNIndex, prefix_columns: list[str] | None = None
     ) -> None:
-        """Apply a vector index (sync); warns if an old index has the wrong operator class."""
+        """Apply a vector index (sync); warns if an existing index of that name differs."""
         self.engine._run_as_sync(self._apply_vector_index(index, prefix_columns))
 
     def drop_vector_index(self, index: CSPANNIndex | None = None) -> None:
@@ -215,13 +216,15 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         """
         resolved = cls._engine_for(engine, connection_string)
         texts = list(texts)
-        vectors = embedding.embed_documents(texts) if texts else []
-        dimension = len(vectors[0]) if vectors else len(embedding.embed_query("dimension probe"))
         table_args, store_args = split_from_texts_args(kwargs)
-        resolved.init_vectorstore_table(collection_name, dimension, **table_args)
         store = cls(
             engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args
         )
+        if texts:
+            store._validate_inputs(len(texts), metadatas, ids)
+        vectors = embedding.embed_documents(texts) if texts else []
+        dimension = len(vectors[0]) if vectors else len(embedding.embed_query("dimension probe"))
+        resolved.init_vectorstore_table(collection_name, dimension, **table_args)
         if texts:
             store.add_embeddings(texts, vectors, metadatas=metadatas, ids=ids)
         return store

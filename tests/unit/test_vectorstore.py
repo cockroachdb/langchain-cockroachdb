@@ -52,8 +52,8 @@ class TestIdNormalization:
             def _normalize_id(id_str):
                 return AsyncCockroachDBVectorStore._normalize_id(id_str)
 
-            def _validate_inputs(self, count, metadatas, ids):
-                return AsyncCockroachDBVectorStore._validate_inputs(self, count, metadatas, ids)
+            def _validate_inputs(self, *args):
+                return AsyncCockroachDBVectorStore._validate_inputs(self, *args)
 
         mock_store = MinimalStore()
 
