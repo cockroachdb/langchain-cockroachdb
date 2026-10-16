@@ -167,8 +167,14 @@ def _driver_error_types() -> tuple[type[BaseException], ...]:
 def _describe(error: BaseException) -> str:
     """One-line description for logs: driver error type, SQLSTATE, first message line.
 
-    When an application wraps a driver error, this walks __cause__ and __context__
-    to find the innermost driver error and describes that instead of the wrapper.
+    When an application wraps a driver error, this follows the chain that
+    ``_error_chain`` walks (SQLAlchemy's ``orig`` and explicit ``__cause__``,
+    not ``__context__``) to the innermost driver error and describes that
+    instead of the wrapper.
+
+    A SQLAlchemy ``StatementError`` with no driver error inside is described
+    by its class and SQLSTATE only, because its message can carry the SQL
+    and its parameters.
     """
     driver_error = error
     # The chain runs from the outermost error inward, so the last match is the innermost
@@ -176,9 +182,11 @@ def _describe(error: BaseException) -> str:
         if isinstance(candidate, _driver_error_types()):
             driver_error = candidate
     code = get_sqlstate(error)
+    where = f" (SQLSTATE {code})" if code else ""
+    if isinstance(driver_error, StatementError):
+        return f"{type(driver_error).__name__}{where}"
     lines = str(driver_error).strip().splitlines()
     summary = lines[0] if lines else ""
-    where = f" (SQLSTATE {code})" if code else ""
     return f"{type(driver_error).__name__}{where}: {summary}"
 
 
@@ -430,16 +438,24 @@ def resolve_retry_policy(
     max_backoff: float | None = None,
     backoff_multiplier: float | None = None,
     jitter: bool | None = None,
+    jitter_name: str = "retry_jitter",
 ) -> RetryPolicy:
     """Combine an explicit policy, or flat ``retry_*`` arguments, with a base policy.
 
+    ``jitter`` is an on or off switch: True or 1 means a ratio of 0.5, False
+    or 0 means none. ``jitter_name`` is the argument's name in error messages.
+
     Raises:
         ValueError: If both a policy and flat arguments are given
-        TypeError: If jitter is not bool or None
+        TypeError: If jitter is not None, True, False, 0 or 1
     """
-    if jitter is not None and not isinstance(jitter, bool):
+    # The ints 0 and 1 are accepted so callers who passed them keep working
+    if jitter is not None and not (
+        isinstance(jitter, bool) or (type(jitter) is int and jitter in (0, 1))
+    ):
         raise TypeError(
-            "jitter must be True, False, or None; for a ratio, use RetryPolicy(jitter=...)"
+            f"{jitter_name} must be True, False, 0 or 1, not {jitter!r}; "
+            "for a ratio, use RetryPolicy(jitter=...)"
         )
     overrides: dict[str, Any] = {
         "max_attempts": max_attempts,
@@ -480,6 +496,7 @@ def _decorator_policy(
         max_backoff=max_backoff,
         backoff_multiplier=backoff_multiplier,
         jitter=jitter,
+        jitter_name="jitter",
     )
     return dataclasses.replace(resolved, retry_on=retry_on) if retry_on is not None else resolved
 

@@ -467,6 +467,21 @@ class TestResolveAndDecorators:
         with pytest.raises(TypeError, match="(?i)jitter"):
             resolve_retry_policy(None, base=RetryPolicy(), jitter=0.3)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(("value", "ratio"), [(0, 0.0), (1, 0.5)])
+    def test_resolve_accepts_zero_and_one(self, value, ratio) -> None:
+        assert resolve_retry_policy(None, base=RetryPolicy(), jitter=value).jitter == ratio
+
+    @pytest.mark.parametrize("value", [0.3, 1.0, 0.0, 2, "1"])
+    def test_decorators_name_their_jitter_argument(self, value) -> None:
+        for decorator in (async_retry_with_backoff, sync_retry_with_backoff):
+            with pytest.raises(TypeError, match=r"^jitter must be .*RetryPolicy\(jitter=\.\.\.\)"):
+                decorator(jitter=value)
+
+    @pytest.mark.parametrize("value", [0, 1])
+    def test_decorators_accept_zero_and_one(self, value) -> None:
+        sync_retry_with_backoff(jitter=value)(lambda: None)
+        async_retry_with_backoff(jitter=value)
+
     def test_policy_and_flat_arguments_conflict(self) -> None:
         with pytest.raises(ValueError, match="(?i)(policy|retry)"):
             resolve_retry_policy(RetryPolicy(), base=RetryPolicy(), max_attempts=3)
@@ -632,6 +647,41 @@ class TestSQLParameterSafety:
         for record in caplog.records:
             assert "SENTINEL-123" not in record.getMessage()
             assert "INSERT INTO docs" not in record.getMessage()
+
+    @pytest.mark.parametrize(
+        ("message", "orig"),
+        [
+            ("Could not bind SENTINEL-456", None),
+            # SQLAlchemy builds the message from a type error, which can quote the value
+            ("can't adapt SENTINEL-456", ValueError("can't adapt SENTINEL-456")),
+        ],
+    )
+    def test_bare_statement_error_is_described_by_class_only(
+        self, caplog: pytest.LogCaptureFixture, message, orig
+    ) -> None:
+        """A StatementError with no driver error inside is logged without str()."""
+        import sqlalchemy.exc
+
+        sa_error = sqlalchemy.exc.StatementError(
+            message,
+            "INSERT INTO docs (secret) VALUES (:val)",
+            {"val": "SENTINEL-456"},
+            orig,
+        )
+        caplog.set_level(logging.WARNING)
+        policy = RetryPolicy(max_attempts=2, jitter=0, retry_on=lambda _: True)
+
+        def attempt():
+            raise sa_error
+
+        with pytest.raises(sqlalchemy.exc.StatementError):
+            policy.run(attempt, label="test", sleep=lambda _: None)
+
+        assert caplog.records
+        for record in caplog.records:
+            assert "SENTINEL-456" not in record.getMessage()
+            assert "INSERT INTO docs" not in record.getMessage()
+            assert "StatementError" in record.getMessage()
 
     def test_statement_error_parameters_not_in_transient_match(self) -> None:
         """StatementError parameters must not affect transient-phrase matching."""

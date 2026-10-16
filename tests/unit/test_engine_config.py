@@ -245,11 +245,19 @@ def test_invalid_retry_max_attempts_fails_at_construction() -> None:
         CockroachDBEngine.from_connection_string(URL, retry_max_attempts=0)
 
 
-def test_invalid_retry_jitter_fails_at_construction() -> None:
-    with pytest.raises(
-        TypeError, match="jitter must be True, False, or None; for a ratio, use RetryPolicy"
-    ):
-        CockroachDBEngine.from_connection_string(URL, retry_jitter=0.3)  # type: ignore[arg-type]
+@pytest.mark.parametrize("value", [0.3, 1.0, 0.0, 2, -1, "yes"])
+def test_invalid_retry_jitter_fails_at_construction(value) -> None:
+    with pytest.raises(TypeError, match=r"^retry_jitter must be .*RetryPolicy\(jitter=\.\.\.\)"):
+        CockroachDBEngine.from_connection_string(URL, retry_jitter=value)
+
+
+@pytest.mark.parametrize(("value", "ratio"), [(0, 0.0), (1, 0.5), (False, 0.0), (True, 0.5)])
+def test_retry_jitter_accepts_zero_and_one_as_off_and_on(value, ratio) -> None:
+    engine = CockroachDBEngine.from_connection_string(URL, retry_jitter=value)
+    try:
+        assert engine.retry_policy.jitter == ratio
+    finally:
+        engine.close()
 
 
 def test_invalid_retry_initial_backoff_fails_at_construction() -> None:
@@ -759,7 +767,8 @@ def test_loop_engine_does_not_hold_up_a_call_while_its_loop_starts(how, monkeypa
     try:
         began = time.monotonic()
         assert _run(engine, asyncio.sleep(0, result="ok"), how) == "ok"
-        assert time.monotonic() - began < 1.0
+        # Well below the 3 s interval, with room for a slow runner
+        assert time.monotonic() - began < 2.0
     finally:
         _close_loop(loop, thread)
 
