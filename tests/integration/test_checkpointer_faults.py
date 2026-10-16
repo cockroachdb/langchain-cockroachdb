@@ -957,6 +957,13 @@ CALLER_ROW_SQL = (
 )
 
 
+def delete_caller_row(libpq_url: str, caller: str) -> None:
+    """Remove the caller's stand-in row, which is not a real checkpoint and would
+    break anything that lists every checkpoint in the table afterwards."""
+    with psycopg.connect(libpq_url, autocommit=True) as conn:
+        conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (caller,))
+
+
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("outcome", ["commit", "rollback"])
 @pytest.mark.parametrize("mode", ["connection", "pipeline"])
@@ -999,14 +1006,20 @@ def test_sync_saver_leaves_the_callers_open_transaction_alone(libpq_url) -> None
         saver.setup()
         caller, thread = str(uuid.uuid4()), str(uuid.uuid4())
         checkpoint, versions = checkpoint_with_blobs()
-        saver.conn.execute("BEGIN")
-        saver.conn.execute(CALLER_ROW_SQL, (caller,))
-        assert saver.get_tuple(config(thread)) is None
-        saver.put(config(thread), checkpoint, {}, versions)
-        assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
-        saver.conn.execute("COMMIT")
-        assert rows(libpq_url, caller) == (1, 0, 0)
-        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+        try:
+            saver.conn.execute("BEGIN")
+            saver.conn.execute(CALLER_ROW_SQL, (caller,))
+            assert saver.get_tuple(config(thread)) is None
+            saver.put(config(thread), checkpoint, {}, versions)
+            assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+            saver.conn.execute("COMMIT")
+            assert rows(libpq_url, caller) == (1, 0, 0)
+            assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+        finally:
+            # Release the caller's locks first if an assertion stopped the test early
+            with contextlib.suppress(psycopg.Error):
+                saver.conn.rollback()
+            delete_caller_row(libpq_url, caller)
 
 
 @pytest.mark.timeout(60)
@@ -1015,14 +1028,19 @@ async def test_async_saver_leaves_the_callers_open_transaction_alone(libpq_url) 
         await saver.setup()
         caller, thread = str(uuid.uuid4()), str(uuid.uuid4())
         checkpoint, versions = checkpoint_with_blobs()
-        await saver.conn.execute("BEGIN")
-        await saver.conn.execute(CALLER_ROW_SQL, (caller,))
-        assert await saver.aget_tuple(config(thread)) is None
-        await saver.aput(config(thread), checkpoint, {}, versions)
-        assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
-        await saver.conn.execute("COMMIT")
-        assert rows(libpq_url, caller) == (1, 0, 0)
-        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+        try:
+            await saver.conn.execute("BEGIN")
+            await saver.conn.execute(CALLER_ROW_SQL, (caller,))
+            assert await saver.aget_tuple(config(thread)) is None
+            await saver.aput(config(thread), checkpoint, {}, versions)
+            assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+            await saver.conn.execute("COMMIT")
+            assert rows(libpq_url, caller) == (1, 0, 0)
+            assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+        finally:
+            with contextlib.suppress(psycopg.Error):
+                await saver.conn.rollback()
+            delete_caller_row(libpq_url, caller)
 
 
 def force_40001(faults: PsycopgFaults, error: str) -> None:
