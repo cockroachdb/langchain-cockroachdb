@@ -75,7 +75,10 @@ class FakeConnection:
 
     BEGIN, COMMIT, a failing statement and rollback() move
     ``info.transaction_status`` the way they move libpq's. The server answers
-    COMMIT with ``commit_answer``.
+    COMMIT with ``commit_answer``. With ``in_pipeline_mode`` set, rollback()
+    syncs the way psycopg's does. The first ``rollback_interruptions``
+    rollbacks are interrupted before they start, the way a second cancellation
+    or Ctrl-C would stop them.
     """
 
     autocommit = True
@@ -89,6 +92,7 @@ class FakeConnection:
         stuck: bool = False,
         on_statement: Callable[[str], Any] | None = None,
         commit_answer: str = "COMMIT",
+        rollback_interruptions: int = 0,
     ) -> None:
         self.error = error
         self.fail_at = fail_at
@@ -96,6 +100,8 @@ class FakeConnection:
         self.stuck = stuck
         self.on_statement = on_statement
         self.commit_answer = commit_answer
+        self.rollback_interruptions = rollback_interruptions
+        self.in_pipeline_mode = False
         self.statements: list[str] = []
         self.events: list[tuple[str, ...]] = []
         self._info = FakeInfo()
@@ -146,12 +152,22 @@ class FakeConnection:
         assert self.error is not None
         raise self.error
 
-    def _roll_back(self) -> None:
+    def _roll_back(self, interruption: type[BaseException]) -> None:
+        """What psycopg's rollback() sends: a pipeline is synced before and after."""
+        if self.rollback_interruptions:
+            self.rollback_interruptions -= 1
+            raise interruption()
+        if self.in_pipeline_mode:
+            self.events.append(("sync",))
+        if self._info.transaction_status == TransactionStatus.IDLE:
+            return
         self.events.append(("rollback",))
         self._info.transaction_status = TransactionStatus.IDLE
+        if self.in_pipeline_mode:
+            self.events.append(("sync",))
 
     def rollback(self) -> None:
-        self._roll_back()
+        self._roll_back(KeyboardInterrupt)
 
     def run(self, query: Any) -> None:
         fails = self._record(query)
@@ -175,7 +191,7 @@ class FakeAsyncConnection(FakeConnection):
         return FakeAsyncCursor(self)
 
     async def rollback(self) -> None:
-        self._roll_back()
+        self._roll_back(asyncio.CancelledError)
 
     async def arun(self, query: Any) -> None:
         fails = self._record(query)

@@ -30,6 +30,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from psycopg import Capabilities, Connection, Cursor, Pipeline
+from psycopg.pq import TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -103,6 +104,10 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         self.lock = threading.Lock()
         self.supports_pipeline = Capabilities().has_pipeline()
         self.retry_policy = retry_policy or RetryPolicy()
+        # Set while a write batch of ours is between BEGIN and COMMIT, and left
+        # set if its rollback did not finish. Only a single connection sets it,
+        # under the lock: a pool rolls back the connections it gets back.
+        self._batch_open = False
 
     @classmethod
     @contextmanager
@@ -499,21 +504,93 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         """``conn.transaction()`` if the statements must commit together, else nothing."""
         return conn.transaction() if transaction else contextlib.nullcontext()
 
-    def _discard_open_transaction(self, conn: Connection[DictRow]) -> None:
-        """Roll back a transaction that a stopped write batch left open.
+    def _roll_back_batch(self, conn: Connection[DictRow]) -> None:
+        """Roll back a write batch of ours that stopped between BEGIN and COMMIT.
 
-        On an autocommit connection only a write batch opens a transaction, so
-        one that is still open, or failed, was stopped between BEGIN and
-        COMMIT. Errors are ignored: a connection that broke cannot roll back,
-        and the pool replaces it.
+        psycopg's rollback() syncs a pipeline before and after the ROLLBACK.
+        Errors are ignored: a connection that broke cannot roll back, and a
+        pool replaces it. If the rollback itself is interrupted, the next
+        operation on a single connection tries again.
         """
-        if not conn.autocommit or conn.info.transaction_status not in _internal.OPEN_TRANSACTION:
-            return
         with contextlib.suppress(Exception):
-            conn.rollback()
-            if self.pipe:
-                # In pipeline mode the ROLLBACK waits in the queue until a sync
-                self.pipe.sync()
+            if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+                conn.rollback()
+        if conn.info.transaction_status not in _internal.OPEN_TRANSACTION:
+            self._batch_open = False
+
+    def _prepare_batch(
+        self, conn: Connection[DictRow], *, pipeline: bool, transaction: bool
+    ) -> bool:
+        """Finish an interrupted rollback, then say whether to batch this write.
+
+        A write is batched when its statements must commit together, it is
+        pipelined, the connection is in autocommit mode, and no transaction is
+        open on it: BEGIN inside a caller's transaction would fail and abort it.
+        """
+        if self._batch_open:
+            self._roll_back_batch(conn)
+        return (
+            transaction
+            and pipeline
+            and conn.autocommit
+            and conn.info.transaction_status == TransactionStatus.IDLE
+            and (bool(self.pipe) or self.supports_pipeline)
+        )
+
+    @contextmanager
+    def _on_saver_pipeline(
+        self,
+        conn: Connection[DictRow],
+        pipe: Pipeline,
+        *,
+        pipeline: bool,
+        transaction: bool,
+        batched: bool,
+    ) -> Iterator[Cursor[DictRow]]:
+        """Run the block on the saver-wide pipeline, resyncing it after an error."""
+        try:
+            with conn.cursor() as tx, conn.cursor(binary=True, row_factory=dict_row) as cur:
+                if batched:
+                    self._batch_open = True
+                    tx.execute("BEGIN", prepare=False)
+                with self._transaction(conn, transaction and not batched):
+                    yield cur
+                if batched:
+                    tx.execute("COMMIT", prepare=False)
+                # psycopg's transaction syncs the pipeline itself as it ends
+                if batched or (pipeline and not transaction):
+                    pipe.sync()
+                if batched:
+                    self._batch_open = False
+                    _internal.check_committed(tx)
+        except BaseException:
+            # A pipeline only exists on a single connection, so the lock is held
+            # here. Resync before releasing it, so other threads' queued statements
+            # are untouched, and roll back what a stopped batch left open
+            with contextlib.suppress(Exception):
+                pipe.sync()
+            if batched:
+                self._roll_back_batch(conn)
+            raise
+
+    @contextmanager
+    def _in_one_batch(self, conn: Connection[DictRow]) -> Iterator[Cursor[DictRow]]:
+        """Send BEGIN, the block's statements and COMMIT with one pipeline sync."""
+        own_connection = not isinstance(self.conn, ConnectionPool)
+        with conn.cursor() as tx, conn.cursor(binary=True, row_factory=dict_row) as cur:
+            try:
+                with conn.pipeline():
+                    if own_connection:
+                        self._batch_open = True
+                    tx.execute("BEGIN", prepare=False)
+                    yield cur
+                    tx.execute("COMMIT", prepare=False)
+            except BaseException:
+                self._roll_back_batch(conn)
+                raise
+            if own_connection:
+                self._batch_open = False
+            _internal.check_committed(tx)
 
     @contextmanager
     def _cursor(
@@ -529,68 +606,31 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         ``pipeline`` sends the statements together, in pipeline mode when libpq
         has it. ``transaction`` makes them commit together: without it, the sync
         that ends a pipeline commits whatever was sent, even when the block
-        stopped partway through. On an autocommit connection in pipeline mode,
-        BEGIN, the statements and COMMIT go to the server as one batch. That
-        takes one round trip, and CockroachDB can retry the whole batch itself.
-        If the block stops between BEGIN and COMMIT, the transaction is rolled
-        back before the connection is used again. Other connections use
-        psycopg's ``conn.transaction()``. A single statement commits on its own
-        and needs no transaction.
+        stopped partway through. On an idle autocommit connection in pipeline
+        mode, BEGIN, the statements and COMMIT go to the server as one batch.
+        That takes one round trip, and CockroachDB can retry the whole batch
+        itself. If the block stops between BEGIN and COMMIT, the transaction is
+        rolled back before the connection is used again. Inside a transaction
+        the caller opened, and on other connections, psycopg's
+        ``conn.transaction()`` runs the statements; in an open transaction it
+        nests a savepoint. A single statement commits on its own and needs no
+        transaction.
         """
         with self._operation_lock(), _internal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             with abandon_after(fileno, timeout, label=label):
-                # Covers a rollback that was itself interrupted
-                self._discard_open_transaction(conn)
-                batched = (
-                    transaction
-                    and conn.autocommit
-                    and (bool(self.pipe) or (pipeline and self.supports_pipeline))
-                )
+                batched = self._prepare_batch(conn, pipeline=pipeline, transaction=transaction)
                 if self.pipe:
-                    try:
-                        with (
-                            conn.cursor() as tx,
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            if batched:
-                                tx.execute("BEGIN", prepare=False)
-                            with self._transaction(conn, transaction and not batched):
-                                yield cur
-                            if batched:
-                                tx.execute("COMMIT", prepare=False)
-                            # psycopg's transaction syncs the pipeline itself as it ends
-                            if pipeline and (batched or not transaction):
-                                self.pipe.sync()
-                            if batched:
-                                _internal.check_committed(tx)
-                    except BaseException:
-                        # A pipeline only exists on a single connection, so the lock is
-                        # held here. Resync before releasing it, so other threads' queued
-                        # statements are untouched, and roll back what a stopped batch
-                        # left open
-                        with contextlib.suppress(Exception):
-                            self.pipe.sync()
-                        self._discard_open_transaction(conn)
-                        raise
+                    with self._on_saver_pipeline(
+                        conn, self.pipe, pipeline=pipeline, transaction=transaction, batched=batched
+                    ) as cur:
+                        yield cur
                 elif batched:
-                    with (
-                        conn.cursor() as tx,
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        try:
-                            # The pipeline's sync sends the whole batch at once
-                            with conn.pipeline():
-                                tx.execute("BEGIN", prepare=False)
-                                yield cur
-                                tx.execute("COMMIT", prepare=False)
-                        except BaseException:
-                            self._discard_open_transaction(conn)
-                            raise
-                        _internal.check_committed(tx)
+                    with self._in_one_batch(conn) as cur:
+                        yield cur
                 elif pipeline and self.supports_pipeline:
-                    # psycopg's transaction, for a connection not in autocommit mode,
-                    # goes around the pipeline, which saves a round trip
+                    # psycopg's transaction goes around the pipeline, which saves a
+                    # round trip
                     with (
                         self._transaction(conn, transaction),
                         conn.pipeline(),

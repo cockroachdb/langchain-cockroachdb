@@ -2,13 +2,14 @@
 
 A write with several statements (``put`` with channel blobs, ``put_writes``
 with several writes, ``delete_thread``) commits all of them or none. On an
-autocommit connection in pipeline mode, BEGIN, the statements and COMMIT go
-out as one batch: one round trip, which CockroachDB can retry by itself. If
+idle autocommit connection in pipeline mode, BEGIN, the statements and COMMIT
+go out as one batch: one round trip, which CockroachDB can retry by itself. If
 the batch stops between BEGIN and COMMIT, an error, a client-side failure and
 a cancellation included, the saver rolls the transaction back before the
-connection is used again. Connections not in autocommit mode, and libpq
-without pipeline mode, use psycopg's ``conn.transaction()``. A write with one
-statement needs no explicit transaction.
+connection is used again. Inside a transaction the caller opened, on
+connections not in autocommit mode, and with libpq without pipeline mode,
+psycopg's ``conn.transaction()`` runs the write; in an open transaction it
+nests a savepoint. A write with one statement needs no explicit transaction.
 
 The fakes record statements, rollbacks and when pipeline and transaction
 blocks open and close; the integration tests check the same against
@@ -97,6 +98,7 @@ def saver_for(kind: str, mode: str, *scripted: Any) -> tuple[Any, list[Any]]:
     pipe: Any = None
     if mode in ("pipeline", "pipeline_not_autocommit"):
         pipe = FakePipe(conn.events) if kind == "sync" else FakeAsyncPipe(conn.events)
+        conn.in_pipeline_mode = True
     return saver_class(conn, pipe, retry_policy=POLICY), [conn]
 
 
@@ -144,8 +146,8 @@ def batch(mode: str, statements: list[str], error: str | None = None) -> list[tu
         # One sync sends the batch; after an error it is the resync instead
         events = [*body, ("sync",)]
         if error is not None:
-            # In pipeline mode the ROLLBACK waits in the queue until a sync
-            events += [("rollback",), ("sync",)]
+            # psycopg's rollback() syncs the pipeline before and after ROLLBACK
+            events += [("sync",), ("rollback",), ("sync",)]
         return events
     events = [("pipeline", "open"), *body, ("pipeline", "close", error)]
     if error is not None:
@@ -301,27 +303,79 @@ async def test_a_commit_answered_with_rollback_raises(kind: str, mode: str) -> N
 
 
 @KINDS
-@pytest.mark.parametrize("mode", ["connection", "pipeline"])
-@pytest.mark.parametrize("autocommit", [True, False])
-async def test_a_transaction_left_open_is_rolled_back_before_the_next_operation(
-    kind: str, mode: str, autocommit: bool
+@pytest.mark.parametrize("mode", ["pool", "connection", "pipeline"])
+async def test_a_transaction_that_is_not_pipelined_uses_psycopgs_transaction(
+    kind: str, mode: str
 ) -> None:
-    # A rollback that was itself interrupted, for example by a second
-    # cancellation, leaves the single connection inside the transaction
+    # No write asks for this today, but on a saver-wide pipeline a batch without
+    # its sync would report a write as not saved while the resync committed it
+    saver, used = saver_for(kind, mode)
+    statements = ["DELETE FROM checkpoints WHERE thread_id = %s", WRITES]
+    if kind == "sync":
+        with saver._cursor(transaction=True) as cur:
+            for statement in statements:
+                cur.execute(statement)
+    else:
+        async with saver._cursor(transaction=True) as cur:
+            for statement in statements:
+                await cur.execute(statement)
+    body = [("statement", statement) for statement in statements]
+    assert used[0].events == [("transaction", "open"), *body, ("transaction", "close", None)]
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+@OPERATIONS
+async def test_a_write_inside_the_callers_transaction_nests_in_it(
+    kind: str, mode: str, operation: str
+) -> None:
+    # BEGIN inside the caller's transaction would fail and abort it. psycopg's
+    # transaction nests a savepoint instead, and the caller's transaction stays open.
     conn = fake(kind, mode)
-    conn.autocommit = autocommit
+    conn.info.transaction_status = TransactionStatus.INTRANS
+    saver, _ = saver_for(kind, mode, conn)
+    await write(kind, saver, operation)
+    assert conn.events == psycopg_transaction(
+        "not_autocommit" if mode == "connection" else "pipeline_not_autocommit",
+        SEVERAL[operation],
+    )
+    assert conn.info.transaction_status == TransactionStatus.INTRANS
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_the_saver_leaves_a_transaction_the_caller_opened_alone(kind: str, mode: str) -> None:
+    conn = fake(kind, mode)
     conn.info.transaction_status = TransactionStatus.INTRANS
     saver, _ = saver_for(kind, mode, conn)
     await read(kind, saver)
-    rollback = [("rollback",), ("sync",)] if mode == "pipeline" else [("rollback",)]
-    first_statement = 2 if mode == "pipeline" else 1
-    if autocommit:
-        assert conn.events[: len(rollback)] == rollback
-    else:
-        # Without autocommit an open transaction is psycopg's own, so it stays
-        assert conn.events[0][0] == "statement"
-        first_statement = 0
-    assert conn.events[first_statement][1].strip().startswith("select")
+    await write(kind, saver, "put")
+    assert ("rollback",) not in conn.events
+    assert conn.info.transaction_status == TransactionStatus.INTRANS
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_an_interrupted_rollback_is_finished_by_the_next_operation(
+    kind: str, mode: str
+) -> None:
+    # A statement fails after BEGIN, and a second interruption, Ctrl-C or
+    # another cancellation, stops the rollback that follows
+    interruption = KeyboardInterrupt if kind == "sync" else asyncio.CancelledError
+    error = server_error("42P01", "relation does not exist")
+    conn = fake(kind, mode, error, fail_at=2, rollback_interruptions=1)
+    saver, _ = saver_for(kind, mode, conn)
+    with pytest.raises(interruption):
+        await write(kind, saver, "put")
+    assert conn.info.transaction_status == TransactionStatus.INERROR
+    assert saver._batch_open
+    conn.events.clear()
+    await read(kind, saver)
+    rollback = [("sync",), ("rollback",), ("sync",)] if mode == "pipeline" else [("rollback",)]
+    assert conn.events[: len(rollback)] == rollback
+    assert conn.events[len(rollback)][1].strip().startswith("select")
+    assert conn.info.transaction_status == TransactionStatus.IDLE
+    assert not saver._batch_open
 
 
 @KINDS
@@ -341,13 +395,29 @@ async def test_a_saver_wide_pipeline_resyncs_and_rolls_back_under_the_lock(
     pipe: Any = FakePipe if kind == "sync" else FakeAsyncPipe
     saver_class: Any = CockroachDBSaver if kind == "sync" else AsyncCockroachDBSaver
     saver = saver_class(conn, pipe(conn.events, note_the_lock), retry_policy=POLICY)
+    conn.in_pipeline_mode = True
+    rollback = conn.rollback
+    if kind == "sync":
+
+        def noting_rollback() -> None:
+            note_the_lock()
+            rollback()
+
+        conn.rollback = noting_rollback
+    else:
+
+        async def anoting_rollback() -> None:
+            note_the_lock()
+            await rollback()
+
+        conn.rollback = anoting_rollback
     with pytest.raises(pg_errors.UndefinedTable):
         if operation == "put":
             await write(kind, saver, "put")
         else:
             await read(kind, saver)
-    # The resync, and in a write the sync that sends the ROLLBACK, both under the lock
-    assert held and all(held)
+    # The resync, and in a write the rollback, both under the lock
+    assert held == ([True, True] if operation == "put" else [True])
     if operation == "put":
         assert conn.events == batch("pipeline", [BLOBS], error="UndefinedTable")
     else:

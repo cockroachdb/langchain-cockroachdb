@@ -916,7 +916,8 @@ def test_sync_pipeline_saver_retries_a_write_that_follows_a_read(
         thread = str(uuid.uuid4())
         checkpoint, versions = checkpoint_with_blobs()
         assert saver.get_tuple(config(thread)) is None
-        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        # The transaction started at the read, so a pause after it must not outlast this
+        faults.server_retry_next("insert into checkpoints (", interval="5s")
         with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
             saver.put(config(thread), checkpoint, {}, versions)
         retries = [
@@ -936,7 +937,7 @@ async def test_async_pipeline_saver_retries_a_write_that_follows_a_read(
         thread = str(uuid.uuid4())
         checkpoint, versions = checkpoint_with_blobs()
         assert await saver.aget_tuple(config(thread)) is None
-        faults.server_retry_next("insert into checkpoints (", interval="500ms")
+        faults.server_retry_next("insert into checkpoints (", interval="5s")
         with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
             await saver.aput(config(thread), checkpoint, {}, versions)
         retries = [
@@ -944,6 +945,83 @@ async def test_async_pipeline_saver_retries_a_write_that_follows_a_read(
         ]
         assert len(retries) == 1
         assert "SQLSTATE 40001" in retries[0]
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+# A caller that shares the saver's single connection. Rows are counted only
+# after the caller's transaction ends: another connection reading them earlier
+# would wait for its intents.
+CALLER_ROW_SQL = (
+    "INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, checkpoint) "
+    "VALUES (%s, '', 'caller', '{}')"
+)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+def test_sync_saver_write_joins_the_callers_transaction(libpq_url, mode: str, outcome: str) -> None:
+    # The write nests a savepoint in the caller's transaction instead of a BEGIN,
+    # which would fail and abort it, so the caller's commit or rollback decides
+    with sync_saver_for(mode, libpq_url, None, psycopg.Cursor) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        with saver.conn.transaction():
+            saver.put(config(thread), checkpoint, {}, versions)
+            if outcome == "rollback":
+                raise psycopg.Rollback()
+        assert rows(libpq_url, thread) == (ROWS_AFTER["put"] if outcome == "commit" else (0, 0, 0))
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_async_saver_write_joins_the_callers_transaction(
+    libpq_url, mode: str, outcome: str
+) -> None:
+    async with async_saver_for(mode, libpq_url, None, psycopg.AsyncCursor) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        async with saver.conn.transaction():
+            await saver.aput(config(thread), checkpoint, {}, versions)
+            if outcome == "rollback":
+                raise psycopg.Rollback()
+        assert rows(libpq_url, thread) == (ROWS_AFTER["put"] if outcome == "commit" else (0, 0, 0))
+
+
+@pytest.mark.timeout(60)
+def test_sync_saver_leaves_the_callers_open_transaction_alone(libpq_url) -> None:
+    # The caller opened a transaction with a plain BEGIN and wrote in it. Neither
+    # a read nor a write of the saver may roll that back.
+    with sync_saver_for("connection", libpq_url, None, psycopg.Cursor) as saver:
+        saver.setup()
+        caller, thread = str(uuid.uuid4()), str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        saver.conn.execute("BEGIN")
+        saver.conn.execute(CALLER_ROW_SQL, (caller,))
+        assert saver.get_tuple(config(thread)) is None
+        saver.put(config(thread), checkpoint, {}, versions)
+        assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        saver.conn.execute("COMMIT")
+        assert rows(libpq_url, caller) == (1, 0, 0)
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+@pytest.mark.timeout(60)
+async def test_async_saver_leaves_the_callers_open_transaction_alone(libpq_url) -> None:
+    async with async_saver_for("connection", libpq_url, None, psycopg.AsyncCursor) as saver:
+        await saver.setup()
+        caller, thread = str(uuid.uuid4()), str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        await saver.conn.execute("BEGIN")
+        await saver.conn.execute(CALLER_ROW_SQL, (caller,))
+        assert await saver.aget_tuple(config(thread)) is None
+        await saver.aput(config(thread), checkpoint, {}, versions)
+        assert saver.conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        await saver.conn.execute("COMMIT")
+        assert rows(libpq_url, caller) == (1, 0, 0)
         assert rows(libpq_url, thread) == ROWS_AFTER["put"]
 
 
