@@ -16,6 +16,24 @@ Conn: TypeAlias = Connection[DictRow] | ConnectionPool[Connection[DictRow]]
 
 # What libpq reports while a transaction is open, or failed and not yet rolled back
 OPEN_TRANSACTION = frozenset({TransactionStatus.INTRANS, TransactionStatus.INERROR})
+# What libpq reports when no transaction can be open: idle, or the connection is gone
+NO_TRANSACTION = frozenset({TransactionStatus.IDLE, TransactionStatus.UNKNOWN})
+
+
+def mark_in_caller_transaction(error: BaseException) -> None:
+    """Mark ``error`` as raised inside a transaction the caller opened.
+
+    The saver raises such an error at once. The transaction is the caller's: a
+    retry inside it would keep it open through the backoff, hide the error
+    from the caller's own retry logic, and cannot help after an error that
+    aborted the transaction. The caller can retry the whole transaction.
+    """
+    error.in_caller_transaction = True  # type: ignore[attr-defined]
+
+
+def in_caller_transaction(error: BaseException) -> bool:
+    """True if ``error`` was raised inside a transaction the caller opened."""
+    return bool(getattr(error, "in_caller_transaction", False))
 
 
 def check_committed(cursor: Cursor[Any] | AsyncCursor[Any]) -> None:

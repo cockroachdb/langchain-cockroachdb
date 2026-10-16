@@ -1025,6 +1025,79 @@ async def test_async_saver_leaves_the_callers_open_transaction_alone(libpq_url) 
         assert rows(libpq_url, thread) == ROWS_AFTER["put"]
 
 
+def force_40001(faults: PsycopgFaults, error: str) -> None:
+    """Make the next checkpoint row fail with 40001.
+
+    "forced_error" is a plain statement error carrying the code.
+    "retry_error" is CockroachDB's own retry error, from force_retry.
+    """
+    if error == "forced_error":
+        faults.fail_next("40001", match="insert into checkpoints (")
+    else:
+        faults.server_retry_next("insert into checkpoints (", interval="10s")
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("error", ["forced_error", "retry_error"])
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+def test_sync_saver_raises_an_error_inside_the_callers_transaction_at_once(
+    libpq_url, unsafe_internals, caplog, mode: str, error: str
+) -> None:
+    # The caller owns the transaction. A retry inside it would keep it open
+    # through the backoff and hide the 40001 from the caller's retry logic, so
+    # the saver raises it at once, and the caller retries the whole transaction.
+    faults = PsycopgFaults(unsafe_internals)
+    with sync_saver_for(mode, libpq_url, None, faults.cursor_class()) as saver:
+        saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        with (
+            caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+            pytest.raises(psycopg.Error) as info,
+            saver.conn.transaction(),
+        ):
+            # The caller's own read reaches it, so CockroachDB cannot retry the
+            # transaction by itself
+            assert saver.conn.execute("SELECT 1").fetchone() is not None
+            force_40001(faults, error)
+            saver.put(config(thread), checkpoint, {}, versions)
+        assert get_sqlstate(info.value) == "40001"
+        # One attempt, so no backoff either
+        assert faults.count("insert into checkpoints (") == 1
+        assert not any("Retrying" in record.getMessage() for record in caplog.records)
+        with saver.conn.transaction():
+            saver.put(config(thread), checkpoint, {}, versions)
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("error", ["forced_error", "retry_error"])
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_async_saver_raises_an_error_inside_the_callers_transaction_at_once(
+    libpq_url, unsafe_internals, caplog, mode: str, error: str
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    async with async_saver_for(mode, libpq_url, None, faults.async_cursor_class()) as saver:
+        await saver.setup()
+        thread = str(uuid.uuid4())
+        checkpoint, versions = checkpoint_with_blobs()
+        with (
+            caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"),
+            pytest.raises(psycopg.Error) as info,
+        ):
+            async with saver.conn.transaction():
+                cur = await saver.conn.execute("SELECT 1")
+                assert await cur.fetchone() is not None
+                force_40001(faults, error)
+                await saver.aput(config(thread), checkpoint, {}, versions)
+        assert get_sqlstate(info.value) == "40001"
+        assert faults.count("insert into checkpoints (") == 1
+        assert not any("Retrying" in record.getMessage() for record in caplog.records)
+        async with saver.conn.transaction():
+            await saver.aput(config(thread), checkpoint, {}, versions)
+        assert rows(libpq_url, thread) == ROWS_AFTER["put"]
+
+
 def assert_retried_on_a_clean_connection(caplog: pytest.LogCaptureFixture, saver) -> None:
     """The failed transaction was rolled back before its connection was used again.
 

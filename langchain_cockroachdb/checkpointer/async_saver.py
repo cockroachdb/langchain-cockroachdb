@@ -109,7 +109,10 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     On a pool, operations run concurrently, each on its own pooled
     connection. On a single connection they run one at a time. A write with
     several statements runs them in one transaction, so it is saved completely
-    or not at all, even when the caller is cancelled partway through.
+    or not at all, even when the caller is cancelled partway through. On a
+    single connection the caller also uses, an operation inside a transaction
+    the caller opened joins that transaction, and its errors are raised at
+    once, not retried, so the caller can retry the whole transaction.
 
     The sync methods (``get_tuple``, ``put`` and the others) run the async
     ones on the event loop the saver was created on, so call them from other
@@ -212,6 +215,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             await self.pipe.sync()
 
     def _can_retry(self, error: BaseException) -> bool:
+        if _internal.in_caller_transaction(error):
+            # The caller owns the transaction, so it decides whether to retry all of it
+            return False
         if isinstance(self.conn, AsyncConnection) and self.conn.closed:
             logger.warning(
                 "Not retrying: the checkpointer's only connection is closed and cannot be "
@@ -627,29 +633,45 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     async def _roll_back_batch(self, conn: AsyncConnection[DictRow]) -> None:
         """Roll back a write batch of ours that stopped between BEGIN and COMMIT.
 
-        psycopg's rollback() syncs a pipeline before and after the ROLLBACK.
-        Errors are ignored: a connection that broke cannot roll back, and a
-        pool replaces it. If the rollback itself is interrupted, for example by
-        a second cancellation, the next operation on a single connection tries
-        again.
+        On a saver-wide pipeline, results still on their way are synced first,
+        so the status is fresh. psycopg's rollback() syncs a pipeline before and
+        after the ROLLBACK. Errors are ignored: a connection that broke cannot
+        roll back, and a pool replaces it.
         """
         with contextlib.suppress(Exception):
+            if self.pipe and conn.info.transaction_status == TransactionStatus.ACTIVE:
+                await self.pipe.sync()
             if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
                 await conn.rollback()
-        if conn.info.transaction_status not in _internal.OPEN_TRANSACTION:
+
+    def _settle_batch_flag(self, conn: AsyncConnection[DictRow]) -> None:
+        """Clear the batch flag once no transaction of ours can be open on ``conn``.
+
+        Called in a finally, so a cancellation cannot skip it. IDLE means the
+        batch committed or rolled back, and UNKNOWN that the connection is gone.
+        On ACTIVE, INTRANS or INERROR the flag stays set, and the next operation
+        looks again on a fresh status.
+        """
+        if conn.info.transaction_status in _internal.NO_TRANSACTION:
             self._batch_open = False
 
     async def _prepare_batch(
         self, conn: AsyncConnection[DictRow], *, pipeline: bool, transaction: bool
     ) -> bool:
-        """Finish an interrupted rollback, then say whether to batch this write.
+        """Finish rolling back a stopped batch of ours, then say whether to batch.
 
         A write is batched when its statements must commit together, it is
-        pipelined, the connection is in autocommit mode, and no transaction is
-        open on it: BEGIN inside a caller's transaction would fail and abort it.
+        pipelined, the connection is in autocommit mode, and libpq reports it
+        idle, so no transaction the caller opened is open on it: BEGIN there
+        would fail and abort the caller's transaction. On a saver-wide pipeline
+        the saver's own last read can still hold an implicit transaction while
+        the status reads idle; the batch's BEGIN then joins it.
         """
         if self._batch_open:
-            await self._roll_back_batch(conn)
+            try:
+                await self._roll_back_batch(conn)
+            finally:
+                self._settle_batch_flag(conn)
         return (
             transaction
             and pipeline
@@ -685,7 +707,6 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                 if batched or (pipeline and not transaction):
                     await pipe.sync()
                 if batched:
-                    self._batch_open = False
                     _internal.check_committed(tx)
         except BaseException:
             # A pipeline only exists on a single connection, so the lock is held
@@ -696,6 +717,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             if batched:
                 await self._roll_back_batch(conn)
             raise
+        finally:
+            if batched:
+                self._settle_batch_flag(conn)
 
     @asynccontextmanager
     async def _in_one_batch(
@@ -717,8 +741,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             except BaseException:
                 await self._roll_back_batch(conn)
                 raise
-            if own_connection:
-                self._batch_open = False
+            finally:
+                if own_connection:
+                    self._settle_batch_flag(conn)
             _internal.check_committed(tx)
 
     @asynccontextmanager
@@ -743,7 +768,9 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         again. Inside a transaction the caller opened, and on other
         connections, psycopg's ``conn.transaction()`` runs the statements; in
         an open transaction it nests a savepoint. A single statement commits on
-        its own and needs no transaction.
+        its own and needs no transaction. An error inside a transaction the
+        caller opened is marked, so the saver raises it at once instead of
+        retrying.
         """
         async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
@@ -751,29 +778,43 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                 batched = await self._prepare_batch(
                     conn, pipeline=pipeline, transaction=transaction
                 )
-                if self.pipe:
-                    async with self._on_saver_pipeline(
-                        conn, self.pipe, pipeline=pipeline, transaction=transaction, batched=batched
-                    ) as cur:
-                        yield cur
-                elif batched:
-                    async with self._in_one_batch(conn) as cur:
-                        yield cur
-                elif pipeline and self.supports_pipeline:
-                    # psycopg's transaction goes around the pipeline, which saves a
-                    # round trip
-                    async with (
-                        self._transaction(conn, transaction),
-                        conn.pipeline(),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
-                else:
-                    async with (
-                        self._transaction(conn, transaction),
-                        conn.cursor(binary=True, row_factory=dict_row) as cur,
-                    ):
-                        yield cur
+                # Open now and not a stopped batch of ours: the caller's transaction
+                in_callers_transaction = (
+                    not self._batch_open
+                    and conn.info.transaction_status in _internal.OPEN_TRANSACTION
+                )
+                try:
+                    if self.pipe:
+                        async with self._on_saver_pipeline(
+                            conn,
+                            self.pipe,
+                            pipeline=pipeline,
+                            transaction=transaction,
+                            batched=batched,
+                        ) as cur:
+                            yield cur
+                    elif batched:
+                        async with self._in_one_batch(conn) as cur:
+                            yield cur
+                    elif pipeline and self.supports_pipeline:
+                        # psycopg's transaction goes around the pipeline, which saves a
+                        # round trip
+                        async with (
+                            self._transaction(conn, transaction),
+                            conn.pipeline(),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                    else:
+                        async with (
+                            self._transaction(conn, transaction),
+                            conn.cursor(binary=True, row_factory=dict_row) as cur,
+                        ):
+                            yield cur
+                except Exception as error:
+                    if in_callers_transaction:
+                        _internal.mark_in_caller_transaction(error)
+                    raise
 
     async def _load_checkpoint_tuple_with_cursor(
         self, cur: AsyncCursor[DictRow], value: DictRow

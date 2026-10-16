@@ -19,6 +19,7 @@ CockroachDB.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -376,6 +377,74 @@ async def test_an_interrupted_rollback_is_finished_by_the_next_operation(
     assert conn.events[len(rollback)][1].strip().startswith("select")
     assert conn.info.transaction_status == TransactionStatus.IDLE
     assert not saver._batch_open
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_a_rollback_interrupted_after_it_finished_leaves_the_callers_work_alone(
+    kind: str, mode: str
+) -> None:
+    # Ctrl-C or a cancellation lands during the rollback of a failed batch.
+    # psycopg lets the rollback finish, then raises. The connection is idle, so
+    # nothing of ours is open: a transaction the caller opens next is theirs.
+    interruption = KeyboardInterrupt if kind == "sync" else asyncio.CancelledError
+    error = server_error("42P01", "relation does not exist")
+    conn = fake(kind, mode, error, fail_at=2, interrupted_after_rollback=1)
+    saver, _ = saver_for(kind, mode, conn)
+    with pytest.raises(interruption):
+        await write(kind, saver, "put")
+    assert conn.info.transaction_status == TransactionStatus.IDLE
+    assert not saver._batch_open
+    # The caller sends BEGIN on the shared connection, then the saver reads
+    conn.info.transaction_status = TransactionStatus.INTRANS
+    conn.events.clear()
+    await read(kind, saver)
+    assert ("rollback",) not in conn.events
+    assert conn.info.transaction_status == TransactionStatus.INTRANS
+
+
+@KINDS
+async def test_a_batch_left_with_results_outstanding_is_synced_then_rolled_back(
+    kind: str,
+) -> None:
+    # A second interruption stopped the resync, so libpq still reports ACTIVE.
+    # The flag stays set, and the next operation syncs the saver-wide pipeline
+    # to see the real status before it rolls back.
+    conn = fake(kind, "pipeline")
+    conn.in_pipeline_mode = True
+
+    def fresh_status() -> None:
+        if conn.info.transaction_status == TransactionStatus.ACTIVE:
+            conn.info.transaction_status = TransactionStatus.INTRANS
+
+    pipe: Any = FakePipe if kind == "sync" else FakeAsyncPipe
+    saver_class: Any = CockroachDBSaver if kind == "sync" else AsyncCockroachDBSaver
+    saver = saver_class(conn, pipe(conn.events, fresh_status), retry_policy=POLICY)
+    saver._batch_open = True
+    conn.info.transaction_status = TransactionStatus.ACTIVE
+    await read(kind, saver)
+    assert conn.events[:4] == [("sync",), ("sync",), ("rollback",), ("sync",)]
+    assert conn.events[4][1].strip().startswith("select")
+    assert not saver._batch_open
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+@pytest.mark.parametrize("operation", ["put", "get_tuple"])
+async def test_an_error_inside_the_callers_transaction_is_raised_at_once(
+    kind: str, mode: str, operation: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The caller owns the transaction, so the saver leaves the retry to it
+    conn = fake(kind, mode, server_error("40001", "restart transaction"))
+    conn.info.transaction_status = TransactionStatus.INTRANS
+    saver, _ = saver_for(kind, mode, conn)
+    with caplog.at_level(logging.WARNING), pytest.raises(pg_errors.SerializationFailure):
+        if operation == "put":
+            await write(kind, saver, "put")
+        else:
+            await read(kind, saver)
+    assert len(conn.statements) == 1
+    assert not any("Retrying" in record.getMessage() for record in caplog.records)
 
 
 @KINDS
