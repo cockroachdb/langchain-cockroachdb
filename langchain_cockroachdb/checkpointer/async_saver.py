@@ -164,7 +164,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         # set if its rollback did not finish. Only a single connection sets it,
         # under the lock: a pool rolls back the connections it gets back. It
         # cannot tell our stopped batch from a transaction the caller opens on
-        # the shared connection after ending ours, before the next saver call.
+        # the shared connection after ours ended, before the next saver call.
         # Sharing a saver's single connection that way is outside the
         # documented use: use a pool, or keep the connection to the saver.
         self._batch_open = False
@@ -672,12 +672,13 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """Finish rolling back a stopped batch of ours, then say whether to batch.
 
         If that batch is still open and cannot be rolled back, this raises
-        instead of letting the operation nest in it. A write is batched when its statements must commit together, it is
-        pipelined, the connection is in autocommit mode, and libpq reports it
-        idle, so no transaction the caller opened is open on it: BEGIN there
-        would fail and abort the caller's transaction. On a saver-wide pipeline
-        the saver's own last read can still hold an implicit transaction while
-        the status reads idle; the batch's BEGIN then joins it.
+        instead of letting the operation nest in it. A write is batched when
+        its statements must commit together, it is pipelined, the connection
+        is in autocommit mode, and libpq reports it idle, so no transaction
+        the caller opened is open on it: BEGIN there would fail and abort the
+        caller's transaction. On a saver-wide pipeline the saver's own last
+        read can still hold an implicit transaction while the status reads
+        idle; the batch's BEGIN then joins it.
         """
         if self._batch_open:
             # Outside pipeline mode libpq's status is current

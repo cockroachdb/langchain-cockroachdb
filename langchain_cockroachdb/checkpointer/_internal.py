@@ -25,8 +25,11 @@ def stuck_batch_error() -> psycopg.Error:
     never commits.
     """
     return psycopg.errors.ActiveSqlTransaction(
-        "a write batch of the checkpointer that stopped partway is still open "
-        "on its connection and could not be rolled back"
+        "a write batch of the checkpointer that stopped partway may still be open "
+        "on its connection and could not be rolled back. This happens when the "
+        "saver's single connection is shared and a transaction the caller opened "
+        "is open on it (psycopg forbids rollback() inside conn.transaction()). "
+        "End that transaction, or give the saver a pool."
     )
 
 
