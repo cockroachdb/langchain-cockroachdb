@@ -48,4 +48,4 @@ __all__ = [
     "NON_TRANSIENT_MESSAGES",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
