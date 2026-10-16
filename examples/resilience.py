@@ -11,6 +11,7 @@ connections. Each WARNING line is a retry the application never sees.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import uuid
@@ -56,8 +57,9 @@ def unsafe_internals_setting_exists() -> bool:
 NEEDS_SETTING = unsafe_internals_setting_exists()
 
 
-def fail_next_statement(engine: CockroachDBEngine, sqlstate: str, match: str) -> None:
-    """Make the next statement containing ``match`` fail on the server with ``sqlstate``."""
+@contextlib.contextmanager
+def fail_next_statement(engine: CockroachDBEngine, sqlstate: str, match: str):  # type: ignore[no-untyped-def]
+    """Inject a fault scoped to the block; the first matching statement fails with sqlstate."""
     sync_engine = engine.engine.sync_engine
     injected = [False]
 
@@ -74,6 +76,10 @@ def fail_next_statement(engine: CockroachDBEngine, sqlstate: str, match: str) ->
         )
 
     event.listen(sync_engine, "before_cursor_execute", before, retval=True)
+    try:
+        yield
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", before)
 
 
 def kill_demo_connections() -> None:
@@ -107,13 +113,13 @@ async def main() -> None:
     store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=8), table)
 
     print("1. Vector store insert hits a serialization failure (40001)")
-    fail_next_statement(engine, "40001", "insert into")
-    ids = await store.aadd_texts(["CockroachDB retries for you", "Retries are idempotent here"])
+    with fail_next_statement(engine, "40001", "insert into"):
+        ids = await store.aadd_texts(["CockroachDB retries for you", "Retries are idempotent here"])
     print(f"   stored {len(ids)} documents\n")
 
     print("2. Vector search gets an ambiguous result (40003)")
-    fail_next_statement(engine, "40003", "as distance")
-    results = await store.asimilarity_search("retries", k=2)
+    with fail_next_statement(engine, "40003", "as distance"):
+        results = await store.asimilarity_search("retries", k=2)
     print(f"   found {len(results)} documents\n")
 
     print("3. Chat history write lands on a draining node (57P01)")
@@ -121,10 +127,10 @@ async def main() -> None:
         str(uuid.uuid4()), engine=engine, table_name=f"{table}_chat"
     )
     await history.acreate_table_if_not_exists()
-    fail_next_statement(engine, "57P01", "insert into")
-    await history.aadd_messages(
-        [HumanMessage("Is anything lost?"), AIMessage("No, and nothing is doubled.")]
-    )
+    with fail_next_statement(engine, "57P01", "insert into"):
+        await history.aadd_messages(
+            [HumanMessage("Is anything lost?"), AIMessage("No, and nothing is doubled.")]
+        )
     print(f"   history holds {len(await history.aget_messages())} messages\n")
 
     print("4. Every pooled connection is killed")

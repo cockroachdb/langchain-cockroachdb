@@ -235,6 +235,32 @@ class TestAsyncCockroachDBSaver:
             assert result is None
 
     @pytest.mark.parametrize("saver_name", ["base", "pool"])
+    async def test_sync_methods_from_another_thread(
+        self, connection_string: str, saver_name: str
+    ) -> None:
+        # The sync methods run the async ones on this test's loop while it waits
+        async with _saver(saver_name, connection_string) as saver:
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "thread-sync", "checkpoint_ns": ""}
+            }
+            chkpnt = empty_checkpoint()
+            saved = await asyncio.to_thread(saver.put, config, chkpnt, {"step": 1}, {})
+            await asyncio.to_thread(saver.put_writes, saved, [("channel", "value")], "task-1")
+
+            result = await asyncio.to_thread(saver.get_tuple, saved)
+            assert result is not None
+            assert result.checkpoint["id"] == chkpnt["id"]
+            assert len(result.pending_writes) == 1
+            assert result.pending_writes[0][1] == "channel"
+            assert result.pending_writes[0][2] == "value"
+
+            listed = await asyncio.to_thread(lambda: list(saver.list(config)))
+            assert [item.checkpoint["id"] for item in listed] == [chkpnt["id"]]
+
+            await asyncio.to_thread(saver.delete_thread, "thread-sync")
+            assert await asyncio.to_thread(saver.get_tuple, config) is None
+
+    @pytest.mark.parametrize("saver_name", ["base", "pool"])
     async def test_get_nonexistent(self, connection_string: str, saver_name: str) -> None:
         async with _saver(saver_name, connection_string) as saver:
             config: RunnableConfig = {

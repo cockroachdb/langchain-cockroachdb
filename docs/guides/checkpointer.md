@@ -86,7 +86,7 @@ saver.setup()
 
 ### Connection Pool
 
-Best for web applications and high-concurrency workloads:
+Best for web applications and high-concurrency workloads. A saver on a pool runs operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. A saver on a single connection runs operations one at a time, so long-running services should use a pool. A shared pooled saver runs as many operations at once as the pool has connections, so set `max_size` for the number of agents you expect to run at the same time. psycopg_pool's default `max_size` equals `min_size`, which defaults to 4. When every connection is busy, an operation waits up to the pool's `timeout` and then raises `PoolTimeout`, which is not retried. For example:
 
 ```python
 from psycopg_pool import ConnectionPool
@@ -220,6 +220,12 @@ saver.delete_thread("my-thread")
 ```python
 saver.put_writes(config, [("channel_name", value)], task_id="task-1")
 ```
+
+### Atomic Writes
+
+`put` with channel blobs, `put_writes` with several writes, and `delete_thread` send BEGIN, their statements and COMMIT as one batch, so each write is saved completely or not at all, even when the caller is cancelled or fails partway. A write still takes one round trip, and CockroachDB can still retry it on the server. Single-statement writes are unchanged.
+
+On a single connection that the caller also uses, a write made inside a transaction the caller opened joins it as a savepoint, so the caller's commit or rollback decides. The saver never rolls back a transaction it did not open, and an error inside the caller's transaction is raised at once, without retries, so the caller's own retry loop can restart the whole transaction.
 
 ## LangGraph Integration
 

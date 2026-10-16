@@ -247,3 +247,151 @@ async def test_index_ddl_commits_with_autocommit_before_ddl_off(engine_factory) 
         ).scalar()
     assert exists is None
     await engine.adrop_table(table)
+
+
+async def test_index_warns_on_prefix_column_difference(engine_factory, caplog) -> None:
+    """Applying an index with prefix columns when one without them exists warns."""
+    engine = engine_factory()
+    table = f"prefix_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    await store.aadd_texts(["a"])
+    await store.aapply_vector_index(CSPANNIndex())
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(), prefix_columns=["id"])
+    assert any(
+        "prefix columns = id (index has none)" in record.message for record in caplog.records
+    )
+    assert any("adrop_vector_index" in record.message for record in caplog.records)
+    await engine.adrop_table(table)
+
+
+async def test_index_warns_on_partition_size_difference(engine_factory, caplog) -> None:
+    """Applying an index with different partition sizes when one exists warns."""
+    engine = engine_factory()
+    table = f"partition_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    await store.aadd_texts(["a"])
+    await store.aapply_vector_index(CSPANNIndex(min_partition_size=100))
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(min_partition_size=200))
+    assert any("min_partition_size = 200" in record.message for record in caplog.records)
+    assert any("adrop_vector_index" in record.message for record in caplog.records)
+    await engine.adrop_table(table)
+
+
+async def _prefixed_store(engine_factory, prefix: str) -> AsyncCockroachDBVectorStore:
+    """A store whose table has two extra columns, tenant and ns, for prefix tests."""
+    engine = engine_factory()
+    table = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM, namespace_column="tenant")
+    async with engine.engine.begin() as conn:
+        await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS ns STRING"))
+    return AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+
+
+def _index_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "langchain_cockroachdb.async_vectorstore"
+        and record.levelno >= logging.WARNING
+    ]
+
+
+async def test_identical_index_with_partition_sizes_reapplies_silently(
+    engine_factory, caplog
+) -> None:
+    engine = engine_factory()
+    table = f"samepart_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    index = CSPANNIndex(min_partition_size=10, max_partition_size=50)
+    await store.aapply_vector_index(index)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(min_partition_size=10, max_partition_size=50))
+        # A size the caller leaves unset accepts whatever the index has
+        await store.aapply_vector_index(CSPANNIndex(min_partition_size=10))
+        await store.aapply_vector_index(CSPANNIndex())
+    assert _index_warnings(caplog) == []
+    await engine.adrop_table(table)
+
+
+async def test_identical_index_with_two_prefix_columns_reapplies_silently(
+    engine_factory, caplog
+) -> None:
+    store = await _prefixed_store(engine_factory, "sameprefix")
+    index = CSPANNIndex(min_partition_size=10, max_partition_size=50)
+    await store.aapply_vector_index(index, prefix_columns=["tenant", "ns"])
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(index, prefix_columns=["tenant", "ns"])
+    assert _index_warnings(caplog) == []
+    await store.engine.adrop_table(store.collection_name)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (["ns", "tenant"], "prefix columns = ns, tenant (index has tenant, ns)"),
+        (["tenant"], "prefix columns = tenant (index has tenant, ns)"),
+        (["tenant", "ns", "id"], "prefix columns = tenant, ns, id (index has tenant, ns)"),
+        (None, "prefix columns = none (index has tenant, ns)"),
+    ],
+)
+async def test_index_warns_on_prefix_column_order_and_count(
+    engine_factory, caplog, requested, expected
+) -> None:
+    store = await _prefixed_store(engine_factory, "diffprefix")
+    await store.aapply_vector_index(CSPANNIndex(), prefix_columns=["tenant", "ns"])
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(), prefix_columns=requested)
+    warnings = _index_warnings(caplog)
+    assert len(warnings) == 1 and expected in warnings[0], warnings
+    assert "adrop_vector_index" in warnings[0]
+    await store.engine.adrop_table(store.collection_name)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (
+            CSPANNIndex(min_partition_size=20, max_partition_size=100),
+            "min_partition_size = 20 (index has 10)",
+        ),
+        (
+            CSPANNIndex(min_partition_size=10, max_partition_size=200),
+            "max_partition_size = 200 (index has 100)",
+        ),
+        # A substring check would let 10 match an existing 100
+        (CSPANNIndex(max_partition_size=10), "max_partition_size = 10 (index has 100)"),
+    ],
+)
+async def test_index_warns_on_each_partition_size_difference(
+    engine_factory, caplog, requested, expected
+) -> None:
+    engine = engine_factory()
+    table = f"diffpart_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    await store.aapply_vector_index(CSPANNIndex(min_partition_size=10, max_partition_size=100))
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(requested)
+    warnings = _index_warnings(caplog)
+    assert len(warnings) == 1 and expected in warnings[0], warnings
+    await engine.adrop_table(table)
+
+
+async def test_index_warns_when_a_requested_size_is_unset_on_the_index(
+    engine_factory, caplog
+) -> None:
+    engine = engine_factory()
+    table = f"unsetpart_{uuid.uuid4().hex[:8]}"
+    await engine.ainit_vectorstore_table(table, DIM)
+    store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
+    await store.aapply_vector_index(CSPANNIndex())
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
+        await store.aapply_vector_index(CSPANNIndex(min_partition_size=10))
+    warnings = _index_warnings(caplog)
+    assert len(warnings) == 1 and "min_partition_size = 10 (index has the default)" in warnings[0]
+    await engine.adrop_table(table)

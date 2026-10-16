@@ -49,19 +49,24 @@ def test_abandon_after_is_cancelled_when_the_block_finishes(socket_pair) -> None
 
 
 def test_guards_are_disabled_by_none(socket_pair) -> None:
-    a, _ = socket_pair
+    a, b = socket_pair
     with abandon_after(None, 0.01, label="x"):
         time.sleep(0.05)
     with abandon_after(a.fileno(), None, label="x"):
         time.sleep(0.05)
+    b.sendall(b"x")
+    assert a.recv(1) == b"x"
 
 
-async def test_aabandon_after_fires(socket_pair) -> None:
+async def test_aabandon_after_fires(socket_pair, caplog) -> None:
     a, _ = socket_pair
     a.setblocking(False)
-    async with aabandon_after(a.fileno(), 0.1, label="slow async query"):
-        data = await asyncio.get_running_loop().sock_recv(a, 1)
+    with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+        async with aabandon_after(a.fileno(), 0.1, label="slow async query"):
+            data = await asyncio.get_running_loop().sock_recv(a, 1)
     assert data == b""
+    assert "slow async query" in caplog.text
+    assert "0.1s attempt timeout" in caplog.text
 
 
 async def test_aabandon_after_is_cancelled_on_exit(socket_pair) -> None:

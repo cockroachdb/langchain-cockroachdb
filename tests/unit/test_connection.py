@@ -92,3 +92,40 @@ def test_gssencmode_added_for_key_value_dsn() -> None:
     options = with_libpq_defaults("host=localhost port=26257", None, 10.0)
     assert options["gssencmode"] == "disable"
     assert options["connect_timeout"] == 10
+
+
+def test_engine_asyncpg_url_gets_no_gssencmode(monkeypatch) -> None:
+    """CockroachDBEngine with asyncpg URL must not pass gssencmode to driver."""
+    import contextlib
+
+    import langchain_cockroachdb.engine as engine_module
+    from langchain_cockroachdb import CockroachDBEngine
+
+    captured = {}
+    real = engine_module.create_async_engine
+
+    def spy(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        try:
+            return real(url, **kwargs)
+        except ImportError:
+            pass
+
+    monkeypatch.setattr(engine_module, "create_async_engine", spy)
+    with contextlib.suppress(ImportError):
+        CockroachDBEngine.from_connection_string("cockroachdb+asyncpg://root@localhost:1/db")
+    assert "connect_args" not in captured["kwargs"], "asyncpg must not get libpq options"
+    url_query = captured["url"].split("?", 1)[1] if "?" in captured["url"] else ""
+    assert "gssencmode" not in url_query, "asyncpg URL must not have gssencmode in query"
+
+
+def test_key_value_dsn_with_gssencmode_keeps_it() -> None:
+    """A key/value DSN that already sets gssencmode should not override it."""
+    from langchain_cockroachdb._connection import with_libpq_defaults
+
+    dsn = "host=localhost port=26257 dbname=defaultdb gssencmode=require"
+    options = with_libpq_defaults(dsn, None, 10.0)
+    # Should not add gssencmode to options when DSN already has it
+    assert "gssencmode" not in options
+    # But connect_timeout should still be added
+    assert options["connect_timeout"] == 10

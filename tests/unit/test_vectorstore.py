@@ -38,16 +38,24 @@ class TestIdNormalization:
     def test_duplicate_uuid_spellings_rejected(self) -> None:
         """Test that different spellings of the same UUID are rejected as duplicates."""
         import uuid
-        from unittest.mock import MagicMock
 
         from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 
         # Create a UUID and two spellings (lowercase and uppercase)
         u = str(uuid.uuid4())
 
-        # Create a minimal mock instance just to call _prepare_rows
-        mock_store = MagicMock(spec=AsyncCockroachDBVectorStore)
-        mock_store.batch_size = 100
+        # Create a minimal instance with required methods
+        class MinimalStore:
+            batch_size = 100
+
+            @staticmethod
+            def _normalize_id(id_str):
+                return AsyncCockroachDBVectorStore._normalize_id(id_str)
+
+            def _validate_inputs(self, *args):
+                return AsyncCockroachDBVectorStore._validate_inputs(self, *args)
+
+        mock_store = MinimalStore()
 
         # This should raise ValueError before writing anything
         with pytest.raises(ValueError, match=r"[Dd]uplicate.*id"):

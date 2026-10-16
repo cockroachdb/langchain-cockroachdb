@@ -23,7 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 from langchain_cockroachdb._connection import to_sqlalchemy_url, with_libpq_defaults
 from langchain_cockroachdb._guard import aabandon_after
-from langchain_cockroachdb._loop import get_background_loop, run_coroutine_sync
+from langchain_cockroachdb._loop import (
+    arun_on_external_loop,
+    get_background_loop,
+    is_background_loop,
+    note_forked_loop,
+    refuse_forked_loop,
+    run_coroutine_sync,
+    run_on_external_loop,
+)
 from langchain_cockroachdb._sql import validate_identifier
 from langchain_cockroachdb.hybrid_search_config import validate_fts_language
 from langchain_cockroachdb.retry import RetryPolicy, resolve_retry_policy
@@ -76,17 +84,28 @@ class CockroachDBEngine:
             engine: SQLAlchemy AsyncEngine connected to CockroachDB
             loop: Event loop that owns ``engine`` when it runs in another
                 thread. Sync calls, and async calls from other loops, are sent
-                there. Default: async calls run on the caller's loop and sync
-                calls on a shared background loop.
+                there. Keep it running while the engine is in use: a call
+                raises RuntimeError instead of waiting forever if the loop is
+                closed or stops, or in a forked child process. Default: async
+                calls run on the caller's loop and sync calls on a shared
+                background loop.
             retry_policy: How operations retry (default: RetryPolicy())
             retry_max_attempts: Shorthand for RetryPolicy.max_attempts
             retry_initial_backoff: Shorthand for RetryPolicy.initial_backoff
             retry_max_backoff: Shorthand for RetryPolicy.max_backoff
             retry_backoff_multiplier: Shorthand for RetryPolicy.backoff_multiplier
             retry_jitter: Shorthand for RetryPolicy.jitter (True means 0.5)
+
+        Raises:
+            RuntimeError: If ``loop`` was running in the parent process when
+                this process was forked. Its copy here can never run.
         """
+        if loop is not None:
+            refuse_forked_loop(loop)
         self._engine = engine
         self._loop = loop
+        # A loop passed as loop= runs only in this process, so a fork child must not use it
+        self._pid = os.getpid()
         self.retry_policy = resolve_retry_policy(
             retry_policy,
             base=RetryPolicy(),
@@ -212,7 +231,10 @@ class CockroachDBEngine:
 
         If you also use ``engine`` directly from your own event loop while
         calling sync methods here, pass that loop as ``loop`` so all work stays
-        on it.
+        on it. Keep that loop running in its thread while the engine is in use.
+        A call raises RuntimeError instead of waiting forever if the loop is
+        closed or stops, or in a forked child process. In a child, build the
+        engine with a loop started in the child, or without ``loop``.
 
         Args:
             engine: SQLAlchemy AsyncEngine
@@ -226,6 +248,10 @@ class CockroachDBEngine:
 
         Returns:
             CockroachDBEngine instance
+
+        Raises:
+            RuntimeError: If ``loop`` was running in the parent process when
+                this process was forked. Its copy here can never run.
         """
         return cls(
             engine,
@@ -269,15 +295,17 @@ class CockroachDBEngine:
         if self._loop is not None:
             if asyncio.get_running_loop() is self._loop:
                 return await coro
-            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-            return await asyncio.wrap_future(future)
+            return await arun_on_external_loop(coro, self._loop, owner_pid=self._pid)
+        current_loop = asyncio.get_running_loop()
+        if is_background_loop(current_loop):
+            return await coro
         with self._usage("async"):
             return await coro
 
     def _run_as_sync(self, coro: Coroutine[Any, Any, T]) -> T:
         """Run database work for the sync API and wait for the result."""
         if self._loop is not None:
-            return run_coroutine_sync(coro, self._loop)
+            return run_on_external_loop(coro, self._loop, owner_pid=self._pid)
         with self._usage("sync"):
             return run_coroutine_sync(coro, get_background_loop())
 
@@ -486,11 +514,18 @@ def _after_fork_in_child() -> None:
     ``dispose(close=False)`` drops the inherited connections without closing
     them, and psycopg only finishes a connection in the process that opened
     it, so the parent's sessions keep working.
+
+    It also records each loop passed as loop= that was running in the parent.
+    Its copy can never run here, so a new engine built on it is refused.
     """
-    for engine in list(_ENGINES):
+    engines = list(_ENGINES)
+    for engine in engines:
         engine._usage_lock = threading.Lock()
         engine._active = {"sync": 0, "async": 0}
         engine.engine.sync_engine.dispose(close=False)
+    for engine in engines:
+        if engine._loop is not None:
+            note_forked_loop(engine._loop)
 
 
 if hasattr(os, "register_at_fork"):

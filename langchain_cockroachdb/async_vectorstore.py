@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -85,6 +86,16 @@ class _Match:
 
 
 @dataclass
+class _Inputs:
+    """An add call's validated input, everything except the embeddings."""
+
+    metadata_json: list[str]
+    ids: list[str]
+    caller_supplied_ids: list[str]
+    batch_size: int
+
+
+@dataclass
 class _Rows:
     """Validated input for an insert, one entry per document."""
 
@@ -94,6 +105,45 @@ class _Rows:
     ids: list[str]
     batch_size: int
     caller_supplied_ids: list[str]
+
+
+@dataclass
+class _ExistingVectorIndex:
+    """A vector index as SHOW CREATE TABLE renders it."""
+
+    definition: str
+    columns: list[str]
+    options: dict[str, str]
+
+
+def _find_vector_index(create_statement: str, name: str) -> _ExistingVectorIndex | None:
+    """Find the vector index ``name`` in a SHOW CREATE TABLE statement.
+
+    SHOW CREATE TABLE renders a line such as
+    ``VECTOR INDEX idx ("tenant", ns, embedding vector_cosine_ops) WITH
+    (min_partition_size=10, max_partition_size=50)`` on every supported
+    version. Column names that are keywords come back quoted. Returns None
+    when no such line exists.
+    """
+    match = re.search(
+        rf'^\s*VECTOR INDEX "?{re.escape(name)}"? \((?P<columns>[^)]*)\)'
+        r"(?: WITH \((?P<options>[^)]*)\))?",
+        create_statement,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    columns = [
+        part.split()[0].strip('"').lower()
+        for part in match.group("columns").split(",")
+        if part.strip()
+    ]
+    options = {}
+    for option in (match.group("options") or "").split(","):
+        key, sep, value = option.partition("=")
+        if sep:
+            options[key.strip().lower()] = value.strip()
+    return _ExistingVectorIndex(match.group(0), columns, options)
 
 
 def _check_batch_size(batch_size: Any) -> int:
@@ -106,6 +156,19 @@ def _check_batch_size(batch_size: Any) -> int:
             f"inserted row uses 4 parameters."
         )
     return batch_size
+
+
+def _metadata_json(metadatas: Sequence[dict | None]) -> list[str]:
+    """Serialize each metadata dict, naming the first one that is not valid JSON."""
+    serialized = []
+    for position, metadata in enumerate(metadatas):
+        try:
+            serialized.append(json.dumps(metadata if metadata is not None else {}, allow_nan=False))
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                f"Metadata for text {position} is not JSON serializable: {error}"
+            ) from error
+    return serialized
 
 
 class AsyncCockroachDBVectorStore(VectorStore):
@@ -274,25 +337,30 @@ class AsyncCockroachDBVectorStore(VectorStore):
             clauses.append(builder.build(filter))
         return "WHERE " + " AND ".join(clauses) if clauses else ""
 
-    def _prepare_rows(  # noqa: PLR0912
+    def _validate_inputs(
         self,
-        texts: list[str],
-        embeddings: Sequence[Sequence[float]],
+        count: int,
         metadatas: list[dict] | None,
         ids: Sequence[str | None] | None,
-        kwargs: dict[str, Any],
-    ) -> _Rows:
-        """Validate and serialize everything up front, so bad input writes nothing."""
-        count = len(texts)
-        if len(embeddings) != count:
-            raise ValueError(f"Got {len(embeddings)} embeddings for {count} texts")
+        kwargs: dict[str, Any] | None = None,
+    ) -> _Inputs:
+        """Check everything about an add call that does not need the embeddings.
+
+        The add methods call this before they embed anything, so bad input
+        costs no embedding calls and writes nothing. The namespace conflict
+        check is a database query and runs later, after embedding.
+        """
+        validated_metadatas: list[dict | None]
         if metadatas is None:
-            metadatas = [{} for _ in texts]
+            validated_metadatas = [{} for _ in range(count)]
         elif len(metadatas) != count:
             raise ValueError(f"Got {len(metadatas)} metadatas for {count} texts")
+        else:
+            validated_metadatas = list(metadatas)
+
         caller_supplied: list[str] = []
         if ids is None:
-            resolved_ids = [str(uuid.uuid4()) for _ in texts]
+            resolved_ids = [str(uuid.uuid4()) for _ in range(count)]
         elif len(ids) != count:
             raise ValueError(f"Got {len(ids)} ids for {count} texts")
         else:
@@ -303,30 +371,39 @@ class AsyncCockroachDBVectorStore(VectorStore):
                     caller_supplied.append(str(i))
                 else:
                     resolved_ids.append(str(uuid.uuid4()))
+
         seen = set()
         for doc_id in resolved_ids:
             normalized = self._normalize_id(doc_id)
             if normalized in seen:
                 raise ValueError(f"Duplicate id in one add call: {doc_id}")
             seen.add(normalized)
-        metadata_json = []
-        for position, metadata in enumerate(metadatas):
-            try:
-                metadata_json.append(
-                    json.dumps(metadata if metadata is not None else {}, allow_nan=False)
-                )
-            except (TypeError, ValueError) as error:
-                raise TypeError(
-                    f"Metadata for text {position} is not JSON serializable: {error}"
-                ) from error
-        batch_size = _check_batch_size(kwargs.get("batch_size", self.batch_size))
+
+        batch_size = _check_batch_size((kwargs or {}).get("batch_size", self.batch_size))
+        return _Inputs(
+            _metadata_json(validated_metadatas), resolved_ids, caller_supplied, batch_size
+        )
+
+    def _prepare_rows(
+        self,
+        texts: list[str],
+        embeddings: Sequence[Sequence[float]],
+        metadatas: list[dict] | None,
+        ids: Sequence[str | None] | None,
+        kwargs: dict[str, Any],
+    ) -> _Rows:
+        """Validate and serialize everything up front, so bad input writes nothing."""
+        count = len(texts)
+        inputs = self._validate_inputs(count, metadatas, ids, kwargs)
+        if len(embeddings) != count:
+            raise ValueError(f"Got {len(embeddings)} embeddings for {count} texts")
         return _Rows(
             texts,
             [list(map(float, e)) for e in embeddings],
-            metadata_json,
-            resolved_ids,
-            batch_size,
-            caller_supplied,
+            inputs.metadata_json,
+            inputs.ids,
+            inputs.batch_size,
+            inputs.caller_supplied_ids,
         )
 
     @staticmethod
@@ -588,30 +665,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
         for column in prefix_columns or []:
             validate_identifier(column, what="prefix column")
         name = index.get_index_name(self.collection_name, self.embedding_column)
-        existing = await self._execute(
-            text(
-                "SELECT indexdef FROM pg_indexes "
-                "WHERE schemaname = :schema AND tablename = :table AND indexname = :name"
-            ),
-            {
-                "schema": self.schema.lower(),
-                "table": self.collection_name.lower(),
-                "name": name.lower(),
-            },
+        # pg_indexes.indexdef leaves out the partition sizes on v25.4, so read
+        # SHOW CREATE TABLE, which renders them on every supported version.
+        # It takes no bound parameters; the identifiers are validated.
+        rows = await self._execute(
+            text(f"SELECT create_statement FROM [SHOW CREATE TABLE {self._fqn}]"),
             label=f"look up vector index {name}",
             fetch=True,
         )
-        opclass = index.distance_strategy.get_opclass()
-        if existing:
-            if opclass not in existing[0][0]:
-                logger.warning(
-                    "Vector index %s already exists without %s, so %s searches will not use it. "
-                    "Drop it with adrop_vector_index() and apply it again. Indexes created before "
-                    "langchain-cockroachdb 0.4.0 always used vector_l2_ops.",
-                    name,
-                    opclass,
-                    index.distance_strategy.name,
-                )
+        existing = _find_vector_index(rows[0][0], name) if rows else None
+        if existing is not None:
+            self._warn_on_index_differences(index, name, existing, prefix_columns)
             return
         sql = index.get_create_index_sql(
             self.collection_name,
@@ -620,6 +684,61 @@ class AsyncCockroachDBVectorStore(VectorStore):
             prefix_columns=prefix_columns,
         )
         await self._execute(text(sql), label=f"create vector index {name}", ddl=True)
+
+    def _warn_on_index_differences(
+        self,
+        index: CSPANNIndex,
+        name: str,
+        existing: _ExistingVectorIndex,
+        prefix_columns: list[str] | None,
+    ) -> None:
+        """Log a WARNING when an existing index differs from the requested one.
+
+        The existing index is left alone. Prefix columns must match in order
+        and count, with the vector column last. A partition size the caller
+        did not set accepts whatever the index has.
+        """
+        opclass = index.distance_strategy.get_opclass()
+        if opclass not in existing.definition:
+            logger.warning(
+                "Vector index %s already exists without %s, so %s searches will not use it. "
+                "Drop it with adrop_vector_index() and apply it again. Indexes created before "
+                "langchain-cockroachdb 0.4.0 always used vector_l2_ops.",
+                name,
+                opclass,
+                index.distance_strategy.name,
+            )
+        differences = []
+        wanted = [column.lower() for column in prefix_columns or []]
+        found = existing.columns[:-1]
+        if wanted != found:
+            differences.append(
+                f"prefix columns = {', '.join(wanted) or 'none'} "
+                f"(index has {', '.join(found) or 'none'})"
+            )
+        vector_column = existing.columns[-1] if existing.columns else ""
+        if vector_column != self.embedding_column.lower():
+            differences.append(
+                f"vector column = {self.embedding_column} (index has {vector_column or 'none'})"
+            )
+        for option, size in (
+            ("min_partition_size", index.min_partition_size),
+            ("max_partition_size", index.max_partition_size),
+        ):
+            if size is None:
+                continue
+            current = existing.options.get(option)
+            if current is None:
+                differences.append(f"{option} = {size} (index has the default)")
+            elif current != str(size):
+                differences.append(f"{option} = {size} (index has {current})")
+        if differences:
+            logger.warning(
+                "Vector index %s already exists but differs in: %s. "
+                "Drop it with adrop_vector_index() and apply it again.",
+                name,
+                "; ".join(differences),
+            )
 
     async def _drop_vector_index(self, index: CSPANNIndex) -> None:
         sql = index.get_drop_index_sql(
@@ -694,6 +813,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         texts_list = list(texts)
         if not texts_list:
             return []
+        self._validate_inputs(len(texts_list), metadatas, ids, kwargs)
         embeddings = await self._embeddings.aembed_documents(texts_list)
         return await self.aadd_embeddings(
             texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs
@@ -879,8 +999,10 @@ class AsyncCockroachDBVectorStore(VectorStore):
     ) -> None:
         """Apply a C-SPANN vector index.
 
-        Warns instead of rebuilding when an index with the same name exists
-        with a different operator class.
+        When an index with the same name exists, it is left alone. A WARNING
+        names each difference from the requested index: the operator class,
+        the prefix columns (order and count) and any partition size you set.
+        Applying the same index again logs nothing.
 
         Args:
             index: Index configuration
@@ -932,15 +1054,17 @@ class AsyncCockroachDBVectorStore(VectorStore):
         """
         resolved = cls._engine_for(engine, connection_string)
         texts = list(texts)
+        table_args, store_args = split_from_texts_args(kwargs)
+        store = cls(
+            engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args
+        )
+        if texts:
+            store._validate_inputs(len(texts), metadatas, ids)
         vectors = await embedding.aembed_documents(texts) if texts else []
         dimension = (
             len(vectors[0]) if vectors else len(await embedding.aembed_query("dimension probe"))
         )
-        table_args, store_args = split_from_texts_args(kwargs)
         await resolved.ainit_vectorstore_table(collection_name, dimension, **table_args)
-        store = cls(
-            engine=resolved, embeddings=embedding, collection_name=collection_name, **store_args
-        )
         if texts:
             await store.aadd_embeddings(texts, vectors, metadatas=metadatas, ids=ids)
         return store
