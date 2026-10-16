@@ -1,7 +1,7 @@
 # <img src="https://raw.githubusercontent.com/cockroachdb/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
 
 [![Tests](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml)
-[![PyPI version](https://badge.fury.io/py/langchain-cockroachdb.svg)](https://badge.fury.io/py/langchain-cockroachdb)
+[![PyPI version](https://img.shields.io/pypi/v/langchain-cockroachdb)](https://pypi.org/project/langchain-cockroachdb/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Downloads](https://static.pepy.tech/badge/langchain-cockroachdb)](https://pepy.tech/projects/langchain-cockroachdb?timeRange=threeMonths&category=version&includeCIDownloads=true&granularity=weekly&viewType=line&versions=Total%2C0.*)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
