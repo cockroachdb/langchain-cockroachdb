@@ -1576,15 +1576,15 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#041-unreleased" class="md-nav__link">
+  <a href="#041-2026-10-16" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [0.4.1] - Unreleased
+        [0.4.1] - 2026-10-16
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[0.4.1] - Unreleased">
+    <nav class="md-nav" aria-label="[0.4.1] - 2026-10-16">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1913,15 +1913,15 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#041-unreleased" class="md-nav__link">
+  <a href="#041-2026-10-16" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [0.4.1] - Unreleased
+        [0.4.1] - 2026-10-16
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[0.4.1] - Unreleased">
+    <nav class="md-nav" aria-label="[0.4.1] - 2026-10-16">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -2193,7 +2193,7 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased"><a href="https://github.com/cockroachdb/langchain-cockroachdb/compare/v0.2.1...HEAD">Unreleased</a><a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
-<h2 id="041-unreleased">[0.4.1] - Unreleased<a class="headerlink" href="#041-unreleased" title="Permanent link">&para;</a></h2>
+<h2 id="041-2026-10-16">[0.4.1] - 2026-10-16<a class="headerlink" href="#041-2026-10-16" title="Permanent link">&para;</a></h2>
 <h3 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Checkpointers on a psycopg_pool pool now run operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. Before, every operation in the process waited on one lock, which on a multi-region cluster capped a saver at a few operations per second. A saver on a single connection (including <code>pipeline=True</code>) still runs one operation at a time. Concurrency is bounded by the pool's <code>max_size</code>; when every connection is busy, operations wait for the pool (30 s by default) and a <code>PoolTimeout</code> is not retried. On a 9-node, 3-region CockroachDB cluster (Docker, with simulated cross-region latency and a stubbed model) with 16 LangGraph agents sharing one pooled saver, throughput went from 0.27 turns per second (median turn 55 s) in 0.4.0 to about 7.5 turns per second (median turn about 1.2 s) in 0.4.1.</li>
