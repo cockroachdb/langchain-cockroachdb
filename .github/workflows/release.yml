@@ -18,6 +18,31 @@ jobs:
    steps:
      - uses: actions/checkout@v7
 
+     # The release PR carries the version bump and the dated changelog entry,
+     # and that entry becomes the GitHub release notes
+     - name: Check the version and extract the release notes
+       env:
+         VERSION: ${{ inputs.version }}
+       run: |
+         grep -qx "version = \"$VERSION\"" pyproject.toml \
+           || { echo "pyproject.toml is not at version $VERSION"; exit 1; }
+         grep -qx "__version__ = \"$VERSION\"" langchain_cockroachdb/__init__.py \
+           || { echo "langchain_cockroachdb/__init__.py is not at version $VERSION"; exit 1; }
+         heading=$(grep -m1 -F "## [$VERSION]" CHANGELOG.md || true)
+         [ -n "$heading" ] || { echo "CHANGELOG.md has no entry for $VERSION"; exit 1; }
+         case "$heading" in
+           *Unreleased*) echo "Date the $VERSION entry in CHANGELOG.md before releasing"; exit 1 ;;
+         esac
+         extract() {
+           awk -v v="$VERSION" 'index($0, "## [" v "]") == 1 {found=1; next}
+             found && /^## \[/ {exit} found {print}' "$1" | sed -e '/./,$!d'
+         }
+         extract CHANGELOG.md > release-notes.md
+         grep -q '[^[:space:]]' release-notes.md \
+           || { echo "The $VERSION entry in CHANGELOG.md is empty"; exit 1; }
+         extract docs/about/changelog.md | cmp -s - release-notes.md \
+           || { echo "The $VERSION entry differs between CHANGELOG.md and docs/about/changelog.md"; exit 1; }
+
      - name: Setup UV
        uses: ./.github/actions/uv_setup
        with:
@@ -68,6 +93,8 @@ jobs:
          # Tag the commit this run tested and built, not whatever main points to now
          target_commitish: ${{ github.sha }}
          name: Release v${{ inputs.version }}
+         # The changelog entry first, then GitHub's list of merged PRs
+         body_path: release-notes.md
          draft: false
          prerelease: false
          generate_release_notes: true
