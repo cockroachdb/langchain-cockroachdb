@@ -16,8 +16,18 @@ Conn: TypeAlias = Connection[DictRow] | ConnectionPool[Connection[DictRow]]
 
 # What libpq reports while a transaction is open, or failed and not yet rolled back
 OPEN_TRANSACTION = frozenset({TransactionStatus.INTRANS, TransactionStatus.INERROR})
-# What libpq reports when no transaction can be open: idle, or the connection is gone
-NO_TRANSACTION = frozenset({TransactionStatus.IDLE, TransactionStatus.UNKNOWN})
+
+
+def stuck_batch_error() -> psycopg.Error:
+    """The error raised when a stopped write batch of ours could not be rolled back.
+
+    Running the operation anyway would nest it in that transaction, which
+    never commits.
+    """
+    return psycopg.errors.ActiveSqlTransaction(
+        "a write batch of the checkpointer that stopped partway is still open "
+        "on its connection and could not be rolled back"
+    )
 
 
 def mark_in_caller_transaction(error: BaseException) -> None:

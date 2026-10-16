@@ -80,7 +80,8 @@ class FakeConnection:
     rollbacks are interrupted before they start, the way a second cancellation
     or Ctrl-C would stop them. The first ``interrupted_after_rollback``
     rollbacks finish and then raise the interruption, the way psycopg's wait()
-    lets an interrupted rollback finish before it re-raises.
+    lets an interrupted rollback finish before it re-raises. Every rollback
+    fails with ``rollback_error`` when one is given.
     """
 
     autocommit = True
@@ -96,6 +97,7 @@ class FakeConnection:
         commit_answer: str = "COMMIT",
         rollback_interruptions: int = 0,
         interrupted_after_rollback: int = 0,
+        rollback_error: BaseException | None = None,
     ) -> None:
         self.error = error
         self.fail_at = fail_at
@@ -105,6 +107,7 @@ class FakeConnection:
         self.commit_answer = commit_answer
         self.rollback_interruptions = rollback_interruptions
         self.interrupted_after_rollback = interrupted_after_rollback
+        self.rollback_error = rollback_error
         self.in_pipeline_mode = False
         self.statements: list[str] = []
         self.events: list[tuple[str, ...]] = []
@@ -161,6 +164,8 @@ class FakeConnection:
         if self.rollback_interruptions:
             self.rollback_interruptions -= 1
             raise interruption()
+        if self.rollback_error is not None:
+            raise self.rollback_error
         if self.in_pipeline_mode:
             self.events.append(("sync",))
         if self._info.transaction_status == TransactionStatus.IDLE:

@@ -162,7 +162,11 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         self.retry_policy = retry_policy or RetryPolicy()
         # Set while a write batch of ours is between BEGIN and COMMIT, and left
         # set if its rollback did not finish. Only a single connection sets it,
-        # under the lock: a pool rolls back the connections it gets back.
+        # under the lock: a pool rolls back the connections it gets back. It
+        # cannot tell our stopped batch from a transaction the caller opens on
+        # the shared connection after ending ours, before the next saver call.
+        # Sharing a saver's single connection that way is outside the
+        # documented use: use a pool, or keep the connection to the saver.
         self._batch_open = False
 
     @classmethod
@@ -215,9 +219,6 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             await self.pipe.sync()
 
     def _can_retry(self, error: BaseException) -> bool:
-        if _internal.in_caller_transaction(error):
-            # The caller owns the transaction, so it decides whether to retry all of it
-            return False
         if isinstance(self.conn, AsyncConnection) and self.conn.closed:
             logger.warning(
                 "Not retrying: the checkpointer's only connection is closed and cannot be "
@@ -225,7 +226,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                 "are replaced."
             )
             return False
-        return True
+        # The caller owns its transaction, so it decides whether to retry all of it
+        return not _internal.in_caller_transaction(error)
 
     async def setup(self) -> None:
         """Set up the checkpoint database asynchronously.
@@ -630,29 +632,38 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         """``conn.transaction()`` if the statements must commit together, else nothing."""
         return conn.transaction() if transaction else contextlib.nullcontext()
 
-    async def _roll_back_batch(self, conn: AsyncConnection[DictRow]) -> None:
+    async def _roll_back_batch(self, conn: AsyncConnection[DictRow], *, synced: bool) -> bool:
         """Roll back a write batch of ours that stopped between BEGIN and COMMIT.
 
-        On a saver-wide pipeline, results still on their way are synced first,
-        so the status is fresh. psycopg's rollback() syncs a pipeline before and
-        after the ROLLBACK. Errors are ignored: a connection that broke cannot
-        roll back, and a pool replaces it.
+        ``synced`` says whether libpq's status is current. On a saver-wide
+        pipeline it is only current once a sync has completed: until then it
+        can read IDLE while the batch is open. So this syncs first if needed,
+        then rolls back an open transaction; psycopg's rollback() syncs a
+        pipeline before and after the ROLLBACK. Errors are ignored, each step
+        on its own: results still on their way often carry the batch's error,
+        and a connection that broke cannot roll back. Returns whether the
+        status is now current.
         """
-        with contextlib.suppress(Exception):
-            if self.pipe and conn.info.transaction_status == TransactionStatus.ACTIVE:
+        if self.pipe and not synced:
+            with contextlib.suppress(Exception):
                 await self.pipe.sync()
-            if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+                synced = True
+        if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+            with contextlib.suppress(Exception):
                 await conn.rollback()
+                synced = True
+        return synced
 
-    def _settle_batch_flag(self, conn: AsyncConnection[DictRow]) -> None:
+    def _settle_batch_flag(self, conn: AsyncConnection[DictRow], *, synced: bool) -> None:
         """Clear the batch flag once no transaction of ours can be open on ``conn``.
 
-        Called in a finally, so a cancellation cannot skip it. IDLE means the
-        batch committed or rolled back, and UNKNOWN that the connection is gone.
-        On ACTIVE, INTRANS or INERROR the flag stays set, and the next operation
-        looks again on a fresh status.
+        Called in a finally, so a cancellation cannot skip it. UNKNOWN means
+        the connection is gone. IDLE counts only when the status is current
+        (``synced``): then the batch committed or rolled back. Otherwise the
+        flag stays set, and the next operation looks again after a sync.
         """
-        if conn.info.transaction_status in _internal.NO_TRANSACTION:
+        status = conn.info.transaction_status
+        if status == TransactionStatus.UNKNOWN or (synced and status == TransactionStatus.IDLE):
             self._batch_open = False
 
     async def _prepare_batch(
@@ -660,7 +671,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
     ) -> bool:
         """Finish rolling back a stopped batch of ours, then say whether to batch.
 
-        A write is batched when its statements must commit together, it is
+        If that batch is still open and cannot be rolled back, this raises
+        instead of letting the operation nest in it. A write is batched when its statements must commit together, it is
         pipelined, the connection is in autocommit mode, and libpq reports it
         idle, so no transaction the caller opened is open on it: BEGIN there
         would fail and abort the caller's transaction. On a saver-wide pipeline
@@ -668,10 +680,14 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         the status reads idle; the batch's BEGIN then joins it.
         """
         if self._batch_open:
+            # Outside pipeline mode libpq's status is current
+            synced = not self.pipe
             try:
-                await self._roll_back_batch(conn)
+                synced = await self._roll_back_batch(conn, synced=synced)
             finally:
-                self._settle_batch_flag(conn)
+                self._settle_batch_flag(conn, synced=synced)
+            if self._batch_open and conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+                raise _internal.stuck_batch_error()
         return (
             transaction
             and pipeline
@@ -691,6 +707,8 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
         batched: bool,
     ) -> AsyncIterator[AsyncCursor[DictRow]]:
         """Run the block on the saver-wide pipeline, resyncing it after an error."""
+        # Whether a sync completed, so that libpq's status is current
+        synced = False
         try:
             async with (
                 conn.cursor() as tx,
@@ -706,6 +724,7 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                 # psycopg's transaction syncs the pipeline itself as it ends
                 if batched or (pipeline and not transaction):
                     await pipe.sync()
+                    synced = True
                 if batched:
                     _internal.check_committed(tx)
         except BaseException:
@@ -714,12 +733,13 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
             # are untouched, and roll back what a stopped batch left open
             with contextlib.suppress(Exception):
                 await pipe.sync()
+                synced = True
             if batched:
-                await self._roll_back_batch(conn)
+                synced = await self._roll_back_batch(conn, synced=synced)
             raise
         finally:
             if batched:
-                self._settle_batch_flag(conn)
+                self._settle_batch_flag(conn, synced=synced)
 
     @asynccontextmanager
     async def _in_one_batch(
@@ -739,11 +759,12 @@ class AsyncCockroachDBSaver(BaseCockroachDBSaver):
                     yield cur
                     await tx.execute("COMMIT", prepare=False)
             except BaseException:
-                await self._roll_back_batch(conn)
+                # The pipeline's exit has synced, so the status is current
+                await self._roll_back_batch(conn, synced=True)
                 raise
             finally:
                 if own_connection:
-                    self._settle_batch_flag(conn)
+                    self._settle_batch_flag(conn, synced=True)
             _internal.check_committed(tx)
 
     @asynccontextmanager

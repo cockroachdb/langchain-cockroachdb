@@ -372,7 +372,11 @@ async def test_an_interrupted_rollback_is_finished_by_the_next_operation(
     assert saver._batch_open
     conn.events.clear()
     await read(kind, saver)
-    rollback = [("sync",), ("rollback",), ("sync",)] if mode == "pipeline" else [("rollback",)]
+    # On a saver-wide pipeline the status is current only after a sync, so the
+    # saver syncs before it looks, then psycopg's rollback syncs around ROLLBACK
+    rollback = (
+        [("sync",), ("sync",), ("rollback",), ("sync",)] if mode == "pipeline" else [("rollback",)]
+    )
     assert conn.events[: len(rollback)] == rollback
     assert conn.events[len(rollback)][1].strip().startswith("select")
     assert conn.info.transaction_status == TransactionStatus.IDLE
@@ -445,6 +449,117 @@ async def test_an_error_inside_the_callers_transaction_is_raised_at_once(
             await read(kind, saver)
     assert len(conn.statements) == 1
     assert not any("Retrying" in record.getMessage() for record in caplog.records)
+
+
+@KINDS
+async def test_a_closed_connection_in_the_callers_transaction_still_gets_the_pool_advice(
+    kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The only connection breaks while the caller's transaction is open, for
+    # example when the hang guard shuts it. Neither reason allows a retry, and
+    # the advice to use a pool is still logged.
+    lost = psycopg.OperationalError(
+        "consuming input failed: server closed the connection unexpectedly"
+    )
+    conn = fake(kind, "connection", lost, breaks=True)
+    conn.info.transaction_status = TransactionStatus.INTRANS
+    saver, _ = saver_for(kind, "connection", conn)
+    with caplog.at_level(logging.WARNING), pytest.raises(psycopg.OperationalError):
+        await write(kind, saver, "put")
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("only connection is closed" in m for m in messages) == 1
+    assert not any("Retrying" in m for m in messages)
+
+
+def pipelined_saver(kind: str, conn: Any, on_sync: Any) -> Any:
+    """A saver on ``conn`` with a saver-wide pipeline whose syncs call ``on_sync``."""
+    conn.in_pipeline_mode = True
+    pipe: Any = FakePipe if kind == "sync" else FakeAsyncPipe
+    saver_class: Any = CockroachDBSaver if kind == "sync" else AsyncCockroachDBSaver
+    return saver_class(conn, pipe(conn.events, on_sync), retry_policy=POLICY)
+
+
+@KINDS
+async def test_the_rollback_still_runs_when_the_sync_before_it_raises(kind: str) -> None:
+    # The results still on their way carry the stopped batch's error, so the
+    # sync that makes the status current raises. The ROLLBACK must still go out.
+    conn = fake(kind, "pipeline")
+    syncs = 0
+
+    def deliver_the_batch_error() -> None:
+        nonlocal syncs
+        syncs += 1
+        if syncs == 1:
+            conn.info.transaction_status = TransactionStatus.INERROR
+            raise server_error("42P01", "relation does not exist")
+
+    saver = pipelined_saver(kind, conn, deliver_the_batch_error)
+    saver._batch_open = True
+    conn.info.transaction_status = TransactionStatus.ACTIVE
+    await read(kind, saver)
+    assert conn.events[:4] == [("sync",), ("sync",), ("rollback",), ("sync",)]
+    assert conn.events[4][1].strip().startswith("select")
+    assert not saver._batch_open
+
+
+@KINDS
+async def test_a_double_interruption_keeps_the_flag_until_a_sync_shows_the_batch_ended(
+    kind: str,
+) -> None:
+    # A first interruption stops the batch before COMMIT. A second one stops
+    # the resync before its Sync goes out, after BEGIN's results were read, so
+    # libpq reads IDLE while the batch is still open on the server.
+    interruption = KeyboardInterrupt if kind == "sync" else asyncio.CancelledError
+
+    def stop_on_the_checkpoint(query: str) -> None:
+        if query == CHECKPOINT:
+            raise interruption()
+
+    async def astop_on_the_checkpoint(query: str) -> None:
+        stop_on_the_checkpoint(query)
+
+    hook = stop_on_the_checkpoint if kind == "sync" else astop_on_the_checkpoint
+    conn = fake(kind, "pipeline", on_statement=hook)
+    syncs = 0
+
+    def stale_then_current() -> None:
+        nonlocal syncs
+        syncs += 1
+        if syncs == 1:
+            conn.info.transaction_status = TransactionStatus.IDLE
+            raise interruption()
+        if syncs == 2:
+            conn.info.transaction_status = TransactionStatus.INTRANS
+
+    saver = pipelined_saver(kind, conn, stale_then_current)
+    with pytest.raises(interruption):
+        await write(kind, saver, "put")
+    # No sync completed, so the IDLE status does not clear the flag
+    assert saver._batch_open
+    conn.on_statement = None
+    conn.events.clear()
+    await read(kind, saver)
+    # The next operation syncs, finds its own batch open, and rolls it back
+    assert conn.events[:4] == [("sync",), ("sync",), ("rollback",), ("sync",)]
+    assert conn.events[4][1].strip().startswith("select")
+    assert not saver._batch_open
+
+
+@KINDS
+@pytest.mark.parametrize("mode", ["connection", "pipeline"])
+async def test_a_batch_that_cannot_be_rolled_back_stops_the_next_operation(
+    kind: str, mode: str
+) -> None:
+    # Running on would nest the operation in the saver's own leftover
+    # transaction, which never commits
+    conn = fake(kind, mode, rollback_error=psycopg.OperationalError("rollback failed"))
+    saver, _ = saver_for(kind, mode, conn)
+    saver._batch_open = True
+    conn.info.transaction_status = TransactionStatus.INTRANS
+    with pytest.raises(pg_errors.ActiveSqlTransaction, match="could not be rolled back"):
+        await read(kind, saver)
+    assert not [event for event in conn.events if event[0] == "statement"]
+    assert saver._batch_open
 
 
 @KINDS
