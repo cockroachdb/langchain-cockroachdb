@@ -101,9 +101,8 @@ Commits use conventional prefixes (`fix:`, `feat:`, `test:`, `docs:`, `ci:`,
 
 - Pull requests are squash merged. Include tests for behavior changes, and a CHANGELOG entry for anything a user would notice. Keep `CHANGELOG.md` and `docs/about/changelog.md` the same.
 - To release:
-  1. Bump `version` in `pyproject.toml` and `__version__` in `langchain_cockroachdb/__init__.py`.
-  2. Date the CHANGELOG entry in both files.
-  3. Run the **Release** workflow by hand with the version. It runs the tests, builds, publishes to PyPI through trusted publishing, and creates the tag and the GitHub release.
-  4. Keep `release.yml` inlined. Trusted publishing broke when it was split into a reusable workflow.
+  1. In the release PR itself, bump `version` in `pyproject.toml` and `__version__` in `langchain_cockroachdb/__init__.py`, and date the CHANGELOG entry in both files. The merge commit is then ready to release.
+  2. Run the **Release** workflow by hand with the version. It checks that the version and a dated CHANGELOG entry are in place, runs the tests, builds, publishes to PyPI through trusted publishing, and creates the tag and a GitHub release whose notes start with the CHANGELOG entry.
+  3. Keep `release.yml` inlined. Trusted publishing broke when it was split into a reusable workflow.
 - The documentation site deploys from `main` on its own.
 - When user-facing behavior changes, also update the CockroachDB pages in the LangChain docs (the langchain-ai/docs repository). Links in those pages stay within docs.langchain.com.
