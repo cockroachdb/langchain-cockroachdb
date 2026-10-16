@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - Unreleased
+
+### Performance
+
+- Checkpointers on a psycopg_pool pool now run operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. Before, every operation in the process waited on one lock, which on a multi-region cluster capped a saver at a few operations per second. A saver on a single connection (including `pipeline=True`) still runs one operation at a time. Concurrency is bounded by the pool's `max_size`; when every connection is busy, operations wait for the pool (30 s by default) and a `PoolTimeout` is not retried. On a 9-node, 3-region CockroachDB cluster with 16 agents sharing one pooled saver, throughput went from 0.27 turns per second (median turn 55 s) in 0.4.0 to about 7.5 turns per second (median turn about 1.2 s) in 0.4.1.
+
+### Fixed
+
+- `put` with channel blobs, `put_writes` with several writes, and `delete_thread` now send BEGIN, their statements and COMMIT as one batch, so each write is saved completely or not at all, even when the caller is cancelled or fails partway. Before, an interrupted write could leave blob rows without their checkpoint, part of a task's pending writes (which LangGraph treats as a finished task), or a half-deleted thread. A write still takes one round trip, and CockroachDB can still retry it on the server. Single-statement writes are unchanged. Connections not in autocommit mode use psycopg's `conn.transaction()` (the docs already require `autocommit=True`).
+- On a single connection that the caller also uses, a write made inside a transaction the caller opened joins it as a savepoint, so the caller's commit or rollback decides. The saver never rolls back a transaction it did not open, and an error inside the caller's transaction is raised at once, without retries, so the caller's own retry loop can restart the whole transaction.
+- Pooled checkpointers retry when psycopg reports the connection broken, even when the error text is unfamiliar. This fixed checkpointer retries over TLS: on CockroachDB Cloud a dropped connection reads "SSL error: unexpected eof while reading" (OpenSSL 3), which was not recognized, so a pooled saver gave up instead of retrying. That wording is now also in `TRANSIENT_MESSAGES`. A definite SQLSTATE still decides first, as on the SQLAlchemy path.
+- `AsyncCockroachDBSaver`'s sync methods raise a clear `RuntimeError` instead of hanging when the saver's loop is closed, stopped, or the process forked, and they cancel the abandoned work. `put` and `put_writes` called from the saver's own loop thread now raise `InvalidStateError` instead of deadlocking (the other sync methods already did).
+- Engines built with `loop=` (`CockroachDBEngine(engine, loop=...)` or `CockroachDBEngine.from_engine(engine, loop=...)`) fail fast with a clear `RuntimeError` instead of hanging when that loop is closed, never started, stops or closes during a call, or the process forked (including an engine rebuilt in a child around the parent's loop). A loop that has not started yet gets a short grace period (`LOOP_START_TIMEOUT`, 1 s).
+- `RetryPolicy` rejects NaN and infinity in its numeric fields, and `delay()` can no longer overflow for large attempt numbers or multipliers.
+- A non-bool flat `jitter` / `retry_jitter` argument now raises `TypeError` (it used to become 0.5 silently). Use `RetryPolicy(jitter=...)` for a ratio.
+- Retry warnings name the underlying driver error when an application wraps it, and never include SQL text or parameter values.
+- `aadd_texts` / `add_texts` validate input (lengths, ids, duplicates, namespaces) before calling the embedding model, so invalid input no longer pays for embedding calls.
+- Applying a vector index whose name already exists with different prefix columns or partition sizes now logs a WARNING naming each difference, like the existing opclass warning, instead of doing nothing silently.
+- Checkpointer setup logs its bootstrap step as "checkpointer setup" instead of a second "checkpointer migration 0".
+
 ## [0.4.0] - 2026-10-14
 
 ### Added

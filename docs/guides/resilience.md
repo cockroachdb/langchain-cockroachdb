@@ -107,7 +107,7 @@ It is off by default. Good starting points are 10 to 30 seconds for interactive 
 
 ## Checkpointers: use a connection pool
 
-A single connection cannot recover once it drops, so the savers do not retry a dead single connection. Give them a pool, which replaces broken connections:
+A single connection cannot recover once it drops, so the savers do not retry a dead single connection. Give them a pool, which replaces broken connections and enables concurrent operations:
 
 ```python
 from psycopg.rows import dict_row
@@ -124,7 +124,11 @@ with ConnectionPool(
     checkpointer.setup()  # safe to run from several processes at once
 ```
 
-A pipelined saver (`from_conn_string(..., pipeline=True)`) uses one connection, so it also cannot recover once that connection drops. Use a pool for long-running services.
+A saver on a pool runs operations concurrently, each on its own pooled connection, so one saver can serve many agents, threads or tasks. A saver on a single connection (including `pipeline=True`) runs operations one at a time, so long-running services should use a pool.
+
+Pooled savers retry when psycopg reports the connection broken, even when the error text is unfamiliar. This includes retries over TLS: on CockroachDB Cloud a dropped connection reads "SSL error: unexpected eof while reading" (OpenSSL 3), which is now recognized and retried.
+
+`put` with channel blobs, `put_writes` with several writes, and `delete_thread` send BEGIN, their statements and COMMIT as one batch, so each write is saved completely or not at all, even when the caller is cancelled or fails partway. A write still takes one round trip, and CockroachDB can still retry it on the server. On a single connection that the caller also uses, a write made inside a transaction the caller opened joins it as a savepoint, so the caller's commit or rollback decides.
 
 `from_conn_string` accepts `retry_policy`, `connect_timeout`, `prepare_threshold` and `connect_kwargs` (for example `{"application_name": "my-service"}`).
 
