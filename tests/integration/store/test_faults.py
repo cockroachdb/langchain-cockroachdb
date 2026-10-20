@@ -267,20 +267,24 @@ def test_stuck_write_is_abandoned_and_retried(store_factory, libpq_url, caplog) 
         except BaseException as error:  # noqa: BLE001
             errors.append(error)
 
-    writer = threading.Thread(target=put)
-    with (
-        caplog.at_level(logging.WARNING, logger=RETRY_LOGGER),
-        hold_row_lock(libpq_url, lock_sql, ("docs", "k1")),
-    ):
-        writer.start()
-        # The first attempt reaches the upsert and waits on the lock
-        wait_for_statement(libpq_url, app, f"insert into {store.sql.items}")
-        # Release the lock only once the store gave up on that attempt
-        deadline = time.monotonic() + 10
-        while not retries(caplog, "store put"):
-            assert time.monotonic() < deadline, "the stuck attempt was not abandoned"
-            time.sleep(0.05)
-    writer.join(30)
+    writer = threading.Thread(target=put, daemon=True)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger=RETRY_LOGGER),
+            hold_row_lock(libpq_url, lock_sql, ("docs", "k1")),
+        ):
+            writer.start()
+            # The first attempt reaches the upsert and waits on the lock
+            wait_for_statement(libpq_url, app, f"insert into {store.sql.items}")
+            # Release the lock only once the store gave up on that attempt
+            deadline = time.monotonic() + 10
+            while not retries(caplog, "store put"):
+                assert time.monotonic() < deadline, "the stuck attempt was not abandoned"
+                time.sleep(0.05)
+    finally:
+        # The lock is released by now, so a started writer can finish
+        if writer.ident is not None:
+            writer.join(30)
     assert not writer.is_alive()
     assert errors == []
     assert "attempt timeout" in caplog.text
@@ -296,9 +300,12 @@ def test_concurrent_puts_to_one_key_both_succeed(store_factory, admin) -> None:
     stores = [store_factory("pool", index=index_config()) for _ in range(2)]
     puts = 50
     errors: list[BaseException] = []
+    # Both writers start together, so their puts overlap
+    start = threading.Barrier(2)
 
     def write(writer: int) -> None:
         try:
+            start.wait(30)
             for n in range(puts):
                 stores[writer].put(("docs",), "shared", {"text": f"writer {writer} put {n}"})
         except BaseException as error:  # noqa: BLE001
@@ -342,7 +349,8 @@ def test_error_inside_callers_transaction_is_raised_at_once(
         pytest.raises(psycopg.errors.SerializationFailure) as info,
         store.conn.transaction(),
     ):
-        # The caller's own read reached it, so CockroachDB cannot retry it alone
+        # The caller's own statement runs first, so the transaction is the
+        # caller's and already in use when the store's put joins it
         assert store.conn.execute("SELECT 1").fetchone() is not None
         faults.fail_next("40001", match=items_match(store))
         store.put(("docs",), "k1", {"text": "hello"})
@@ -415,11 +423,14 @@ def assert_set_up_once(libpq_url: str, store: Any) -> None:
             statements[table] = found[0]
     assert statements[store.sql.vectors].count("VECTOR INDEX") == 1
     for statement in statements.values():
-        assert statement.count(TTL_SETTING) == 1
+        assert statement.count(TTL_SETTING) == 1, statement
+        assert statement.count(f"ttl_job_cron = '{store.ttl.cron}'") == 1, statement
 
 
 @pytest.mark.timeout(240)
 def test_parallel_setup_converges(libpq_url, table_name) -> None:
+    # Six stores with the default retry policy, as six processes starting
+    # together would. On v25.4 their TTL steps fail each other until retried
     errors: list[BaseException] = []
     stores: list[CockroachDBStore] = []
 
@@ -429,7 +440,6 @@ def test_parallel_setup_converges(libpq_url, table_name) -> None:
                 libpq_url,
                 index=index_config(),
                 ttl={"default_ttl": 5},
-                retry_policy=RetryPolicy(initial_backoff=0.05, max_attempts=10),
                 table_name=table_name,
             ) as store:
                 store.setup()
@@ -455,7 +465,6 @@ async def test_async_parallel_setup_converges(libpq_url, table_name) -> None:
             libpq_url,
             index=index_config(),
             ttl={"default_ttl": 5},
-            retry_policy=RetryPolicy(initial_backoff=0.05, max_attempts=10),
             table_name=table_name,
         ) as store:
             await store.setup()
