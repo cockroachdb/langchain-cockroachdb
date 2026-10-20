@@ -10,7 +10,6 @@ from langchain_cockroachdb.store.config import ResolvedIndex
 from langchain_cockroachdb.store.filters import translate_filter
 from langchain_cockroachdb.store.namespaces import (
     prefix_condition,
-    to_text,
     truncate_expression,
 )
 
@@ -22,6 +21,18 @@ ItemRow = tuple[str, str, str, float | None]  # prefix, key, value_json, ttl_min
 VectorRow = tuple[
     str, str, str, list[float], float | None
 ]  # prefix, key, field_name, embedding, ttl_minutes
+
+
+def _validate_paging(limit: int, offset: int) -> None:
+    """Validate paging parameters.
+
+    Raises:
+        ValueError: If limit or offset is negative.
+    """
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
 
 
 class StoreSQL:
@@ -56,8 +67,8 @@ class StoreSQL:
         self.vectors = f"{self._schema}.{self._table_name}_vectors"
         self.migrations_table = f"{self._schema}.{self._table_name}_migrations"
 
-        # Vector index name
-        self._vector_index_name = f"{self._table_name}_vectors_embedding_idx"
+        # Vector index name (public)
+        self.vector_index_name = f"{self._table_name}_vectors_embedding_idx"
 
     def migrations(self) -> list[str]:
         """Return numbered migration statements for items table.
@@ -111,7 +122,7 @@ class StoreSQL:
         if not self._index.flat:
             opclass = self._index.distance.get_opclass()
             index_sql = (
-                f"CREATE VECTOR INDEX IF NOT EXISTS {self._vector_index_name} "
+                f"CREATE VECTOR INDEX IF NOT EXISTS {self.vector_index_name} "
                 f"ON {self.vectors} (prefix, embedding {opclass})"
             )
 
@@ -133,7 +144,13 @@ class StoreSQL:
 
         Returns:
             List of ALTER TABLE SET statements.
+
+        Raises:
+            ValueError: If cron contains single quote.
         """
+        if "'" in cron:
+            raise ValueError("cron expression cannot contain single quote")
+
         stmts = [
             f"ALTER TABLE {self.items} SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
         ]
@@ -159,12 +176,12 @@ class StoreSQL:
         return stmts
 
     def get(
-        self, namespace: Sequence[str], keys: Sequence[str], *, omit_expired: bool
+        self, namespace_text: str, keys: Sequence[str], *, omit_expired: bool
     ) -> tuple[str, list]:
         """Build SELECT for items by namespace and keys.
 
         Args:
-            namespace: Namespace labels.
+            namespace_text: Namespace as dot-separated text.
             keys: Item keys to fetch.
             omit_expired: Whether to exclude expired items.
 
@@ -175,18 +192,18 @@ class StoreSQL:
 FROM {self.items}
 WHERE prefix = %s AND key = ANY(%s)"""
 
-        params: list[Any] = [to_text(namespace), list(keys)]
+        params: list[Any] = [namespace_text, list(keys)]
 
         if omit_expired:
             sql += "\nAND (expires_at IS NULL OR expires_at > now())"
 
         return (sql, params)
 
-    def refresh(self, namespace: Sequence[str], keys: Sequence[str]) -> tuple[str, list]:
+    def refresh(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build UPDATE to refresh TTL for items.
 
         Args:
-            namespace: Namespace labels.
+            namespace_text: Namespace as dot-separated text.
             keys: Item keys to refresh.
 
         Returns:
@@ -196,14 +213,14 @@ WHERE prefix = %s AND key = ANY(%s)"""
 SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'
 WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
 
-        params: list[Any] = [to_text(namespace), list(keys)]
+        params: list[Any] = [namespace_text, list(keys)]
         return (sql, params)
 
-    def refresh_vectors(self, namespace: Sequence[str], keys: Sequence[str]) -> tuple[str, list]:
+    def refresh_vectors(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build UPDATE to refresh TTL for vectors.
 
         Args:
-            namespace: Namespace labels.
+            namespace_text: Namespace as dot-separated text.
             keys: Item keys to refresh.
 
         Returns:
@@ -213,7 +230,7 @@ WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
 SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'
 WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
 
-        params: list[Any] = [to_text(namespace), list(keys)]
+        params: list[Any] = [namespace_text, list(keys)]
         return (sql, params)
 
     def upsert_items(self, rows: Sequence[ItemRow]) -> tuple[str, list]:
@@ -221,24 +238,35 @@ WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
 
         Args:
             rows: Sequence of (prefix, key, value_json, ttl_minutes) tuples.
+                Callers must dedupe (prefix, key) rows (ON CONFLICT cannot touch a row twice).
 
         Returns:
             Tuple of (SQL, parameters).
+
+        Raises:
+            ValueError: If rows is empty.
         """
-        # Use UNION ALL to reference ttl_minutes only once per row
+        if not rows:
+            raise ValueError("rows cannot be empty")
+
+        # Use UNION ALL to reference ttl_minutes only once per row, with typed placeholders
         selects = []
         for i in range(len(rows)):
             if i == 0:
                 selects.append(
-                    "SELECT %s AS prefix, %s AS key, CAST(%s AS JSONB) AS value, %s AS ttl_minutes"
+                    "SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
+                    "CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes"
                 )
             else:
-                selects.append("UNION ALL SELECT %s, %s, CAST(%s AS JSONB), %s")
+                selects.append(
+                    "UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), "
+                    "CAST(%s AS JSONB), CAST(%s AS DECIMAL)"
+                )
 
         union_sql = "\n    ".join(selects)
 
         sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes)
-SELECT prefix, key, value, now() + ttl_minutes * INTERVAL '1 minute', ttl_minutes
+SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key) DO UPDATE SET
     value = EXCLUDED.value,
@@ -253,11 +281,11 @@ ON CONFLICT (prefix, key) DO UPDATE SET
 
         return (sql, params)
 
-    def delete_items(self, namespace: Sequence[str], keys: Sequence[str]) -> tuple[str, list]:
+    def delete_items(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build DELETE for items by namespace and keys.
 
         Args:
-            namespace: Namespace labels.
+            namespace_text: Namespace as dot-separated text.
             keys: Item keys to delete.
 
         Returns:
@@ -266,14 +294,14 @@ ON CONFLICT (prefix, key) DO UPDATE SET
         sql = f"""DELETE FROM {self.items}
 WHERE prefix = %s AND key = ANY(%s)"""
 
-        params: list[Any] = [to_text(namespace), list(keys)]
+        params: list[Any] = [namespace_text, list(keys)]
         return (sql, params)
 
-    def delete_vectors(self, namespace: Sequence[str], keys: Sequence[str]) -> tuple[str, list]:
+    def delete_vectors(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build DELETE for vectors by namespace and keys.
 
         Args:
-            namespace: Namespace labels.
+            namespace_text: Namespace as dot-separated text.
             keys: Item keys to delete.
 
         Returns:
@@ -282,7 +310,7 @@ WHERE prefix = %s AND key = ANY(%s)"""
         sql = f"""DELETE FROM {self.vectors}
 WHERE prefix = %s AND key = ANY(%s)"""
 
-        params: list[Any] = [to_text(namespace), list(keys)]
+        params: list[Any] = [namespace_text, list(keys)]
         return (sql, params)
 
     def upsert_vectors(self, rows: Sequence[VectorRow]) -> tuple[str, list]:
@@ -290,24 +318,36 @@ WHERE prefix = %s AND key = ANY(%s)"""
 
         Args:
             rows: Sequence of (prefix, key, field_name, embedding, ttl_minutes) tuples.
+                Callers must dedupe (prefix, key, field_name) rows (ON CONFLICT cannot touch a row twice).
 
         Returns:
             Tuple of (SQL, parameters).
+
+        Raises:
+            ValueError: If rows is empty.
         """
-        # Use UNION ALL to reference ttl_minutes only once per row
+        if not rows:
+            raise ValueError("rows cannot be empty")
+
+        # Use UNION ALL to reference ttl_minutes only once per row, with typed placeholders
         selects = []
         for i in range(len(rows)):
             if i == 0:
                 selects.append(
-                    "SELECT %s AS prefix, %s AS key, %s AS field_name, CAST(%s AS VECTOR) AS embedding, %s AS ttl_minutes"
+                    "SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
+                    "CAST(%s AS STRING) AS field_name, CAST(%s AS VECTOR) AS embedding, "
+                    "CAST(%s AS DECIMAL) AS ttl_minutes"
                 )
             else:
-                selects.append("UNION ALL SELECT %s, %s, %s, CAST(%s AS VECTOR), %s")
+                selects.append(
+                    "UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), "
+                    "CAST(%s AS STRING), CAST(%s AS VECTOR), CAST(%s AS DECIMAL)"
+                )
 
         union_sql = "\n    ".join(selects)
 
         sql = f"""INSERT INTO {self.vectors} (prefix, key, field_name, embedding, expires_at, ttl_minutes)
-SELECT prefix, key, field_name, embedding, now() + ttl_minutes * INTERVAL '1 minute', ttl_minutes
+SELECT prefix, key, field_name, embedding, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     embedding = EXCLUDED.embedding,
@@ -346,10 +386,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         Raises:
             ValueError: If limit or offset is negative.
         """
-        if limit < 0:
-            raise ValueError("limit must be non-negative")
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        _validate_paging(limit, offset)
 
         sql = f"SELECT prefix, key, value, created_at, updated_at\nFROM {self.items}\nWHERE "
         params: list[Any] = []
@@ -401,56 +438,63 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         Raises:
             ValueError: If limit or offset is negative.
         """
-        if limit < 0:
-            raise ValueError("limit must be non-negative")
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        _validate_paging(limit, offset)
 
         if self._index is None:
             raise ValueError("semantic_search requires an index configuration")
 
+        from langchain_cockroachdb.indexes import DistanceStrategy
+
         operator = self._index.distance.get_operator()
 
-        # Build the ranked CTE - references query vector twice
+        # Build SQL text
         sql = f"""WITH ranked AS (
     SELECT prefix, key, field_name, embedding {operator} CAST(%s AS VECTOR) AS distance
     FROM {self.vectors}
     WHERE """
 
-        # Parameters: both query vectors first, then namespace, filter, over_fetch, limit, offset
-        params: list[Any] = [QUERY_VECTOR, QUERY_VECTOR]
+        # Build params in order of placeholders in SQL text
+        params: list[Any] = [QUERY_VECTOR]  # First placeholder
 
         # Namespace condition on vectors table
         ns_condition, ns_params = prefix_condition("prefix", namespace_prefix)
         sql += ns_condition
 
+        # Filter expired vectors in CTE
+        if omit_expired:
+            sql += " AND (expires_at IS NULL OR expires_at > now())"
+
         sql += f"""
     ORDER BY embedding {operator} CAST(%s AS VECTOR)
     LIMIT %s
-)
-SELECT DISTINCT ON (i.prefix, i.key)
-    i.prefix, i.key, i.value, i.created_at, i.updated_at,"""
+),
+best AS (
+    SELECT DISTINCT ON (i.prefix, i.key)
+        i.prefix, i.key, i.value, i.created_at, i.updated_at,"""
 
         # Score calculation
-        if self._index.distance.value == "cosine":
-            sql += "\n    1 - r.distance AS score"
+        if self._index.distance == DistanceStrategy.COSINE:
+            sql += "\n        1 - r.distance AS score"
         else:
-            sql += "\n    -r.distance AS score"
+            sql += "\n        -r.distance AS score"
 
         sql += f"""
-FROM ranked r
-JOIN {self.items} i ON r.prefix = i.prefix AND r.key = i.key
-WHERE """
+    FROM ranked r
+    JOIN {self.items} i ON r.prefix = i.prefix AND r.key = i.key
+    WHERE """
 
-        # Add namespace params
+        # Add namespace params after first QUERY_VECTOR
         params.extend(ns_params)
 
-        # Filter conditions
-        filter_conditions, filter_params = translate_filter(filter)
+        # Add second QUERY_VECTOR and over_fetch
+        params.append(QUERY_VECTOR)
+        params.append(over_fetch)
+
+        # Filter conditions on items
+        filter_conditions, filter_params = translate_filter(filter, value_column="i.value")
         if filter_conditions:
             sql += " AND ".join(filter_conditions)
             sql += " AND "
-            params.extend(filter_params)
 
         # Expiry clause on items table
         if omit_expired:
@@ -458,19 +502,24 @@ WHERE """
         else:
             sql += "TRUE"
 
-        # Final ordering and paging
-        sql += "\nORDER BY i.prefix, i.key, r.distance\n"
-        sql += "ORDER BY score DESC, prefix, key\nLIMIT %s OFFSET %s"
+        sql += """
+    ORDER BY i.prefix, i.key, r.distance
+)
+SELECT prefix, key, value, created_at, updated_at, score
+FROM best
+ORDER BY score DESC, prefix, key
+LIMIT %s OFFSET %s"""
 
-        # Add over_fetch, limit, offset
-        params.extend([over_fetch, limit, offset])
+        # Add filter params, then limit and offset
+        params.extend(filter_params)
+        params.extend([limit, offset])
 
         return (sql, params)
 
     def list_namespaces(
         self,
         *,
-        match_conditions: Sequence[tuple[str, list]],
+        match_conditions: Sequence[str],
         max_depth: int | None,
         limit: int,
         offset: int,
@@ -479,7 +528,7 @@ WHERE """
         """Build query to list distinct namespaces.
 
         Args:
-            match_conditions: List of (regex pattern, params) tuples.
+            match_conditions: Regex pattern strings (from match_pattern).
             max_depth: Maximum namespace depth for truncation, or None.
             limit: Maximum results.
             offset: Results to skip.
@@ -491,10 +540,7 @@ WHERE """
         Raises:
             ValueError: If limit or offset is negative.
         """
-        if limit < 0:
-            raise ValueError("limit must be non-negative")
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        _validate_paging(limit, offset)
 
         # Build truncation expression or use prefix directly
         ns_expr = truncate_expression("prefix", max_depth) if max_depth is not None else "prefix"
@@ -509,10 +555,9 @@ WHERE """
             sql += "TRUE"
 
         # Match conditions (regex patterns)
-        for pattern, pattern_params in match_conditions:
+        for pattern in match_conditions:
             sql += " AND prefix ~ %s"
             params.append(pattern)
-            params.extend(pattern_params)
 
         sql += "\nORDER BY ns\nLIMIT %s OFFSET %s"
         params.extend([limit, offset])

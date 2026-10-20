@@ -60,15 +60,15 @@ def test_match_pattern_escapes_regex_metacharacters():
     """Test that regex metacharacters are escaped."""
     # Plus sign (regex metacharacter)
     pattern = match_pattern(("a+b",), "prefix")
-    assert pattern == r"^a\+b(\.|\Z)"
+    assert pattern == r"^a\+b(\.|\z)"
 
     # Wildcard in the middle
     pattern = match_pattern(("uid", "*", "alice"), "prefix")
-    assert pattern == r"^uid\.[^.]+\.alice(\.|\Z)"
+    assert pattern == r"^uid\.[^.]+\.alice(\.|\z)"
 
     # Suffix pattern
     pattern = match_pattern(("v1",), "suffix")
-    assert pattern == r"(^|\.)v1\Z"
+    assert pattern == r"(^|\.)v1\z"
 
 
 def test_truncate_expression():

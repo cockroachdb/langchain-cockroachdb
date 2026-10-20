@@ -120,9 +120,9 @@ def match_pattern(path: Sequence[str], match_type: Literal["prefix", "suffix"]) 
     pattern = r"\.".join(parts)
 
     if match_type == "prefix":
-        return rf"^{pattern}(\.|\Z)"
+        return rf"^{pattern}(\.|\z)"
     else:  # suffix
-        return rf"(^|\.){pattern}\Z"
+        return rf"(^|\.){pattern}\z"
 
 
 def truncate_expression(column: str, max_depth: int) -> str:

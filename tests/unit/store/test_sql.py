@@ -109,7 +109,7 @@ def test_search_sql_rejects_negative_paging():
 
 
 def test_semantic_search_param_order():
-    """semantic_search parameters appear in correct order: query vector twice, namespace, filter, over_fetch, limit, offset."""
+    """semantic_search parameters match placeholder order in SQL text."""
     sql = StoreSQL("public", "store", index=_make_index())
     query_sql, params = sql.semantic_search(
         namespace_prefix=["a", "b"],
@@ -120,20 +120,25 @@ def test_semantic_search_param_order():
         over_fetch=100,
     )
 
-    # QUERY_VECTOR appears twice (CTE and score calculation)
+    # Order: QUERY_VECTOR, namespace params, QUERY_VECTOR, over_fetch, filter params, limit, offset
+    # First QUERY_VECTOR (in ranked CTE)
     assert params[0] is QUERY_VECTOR
-    assert params[1] is QUERY_VECTOR
 
-    # Then namespace params (exact match "a.b", then pattern "a.b.%")
-    assert params[2] == "a.b"
-    assert params[3] == "a.b.%"
+    # Namespace params (exact match "a.b", then pattern "a.b.%")
+    assert params[1] == "a.b"
+    assert params[2] == "a.b.%"
 
-    # Then filter params (key "x", value "1")
-    assert params[4] == "x"
-    assert params[5] == "1"
+    # Second QUERY_VECTOR (ORDER BY in ranked CTE)
+    assert params[3] is QUERY_VECTOR
 
-    # Then over_fetch, limit, offset
-    assert params[6] == 100
+    # over_fetch
+    assert params[4] == 100
+
+    # Filter params (key "x", value "1")
+    assert params[5] == "x"
+    assert params[6] == "1"
+
+    # limit, offset
     assert params[7] == 5
     assert params[8] == 10
 
@@ -176,7 +181,7 @@ def test_no_cast_shorthand():
 def test_get():
     """get() builds SELECT with prefix and key list."""
     sql = StoreSQL("public", "store", index=None)
-    query_sql, params = sql.get(["a", "b"], ["k1", "k2"], omit_expired=True)
+    query_sql, params = sql.get("a.b", ["k1", "k2"], omit_expired=True)
 
     assert "SELECT" in query_sql
     assert "FROM public.store" in query_sql
@@ -190,7 +195,7 @@ def test_get():
 def test_refresh():
     """refresh() builds UPDATE to extend TTL."""
     sql = StoreSQL("public", "store", index=None)
-    query_sql, params = sql.refresh(["a"], ["k1"])
+    query_sql, params = sql.refresh("a", ["k1"])
 
     assert "UPDATE public.store" in query_sql
     assert "expires_at = now() + ttl_minutes * INTERVAL '1 minute'" in query_sql
@@ -202,7 +207,7 @@ def test_refresh():
 def test_refresh_vectors():
     """refresh_vectors() mirrors refresh for vectors table."""
     sql = StoreSQL("public", "store", index=_make_index())
-    query_sql, params = sql.refresh_vectors(["a"], ["k1"])
+    query_sql, params = sql.refresh_vectors("a", ["k1"])
 
     assert "UPDATE public.store_vectors" in query_sql
     assert "expires_at = now() + ttl_minutes * INTERVAL '1 minute'" in query_sql
@@ -233,7 +238,7 @@ def test_upsert_items():
 def test_delete_items():
     """delete_items() builds DELETE with prefix and key list."""
     sql = StoreSQL("public", "store", index=None)
-    query_sql, params = sql.delete_items(["a"], ["k1", "k2"])
+    query_sql, params = sql.delete_items("a", ["k1", "k2"])
 
     assert "DELETE FROM public.store" in query_sql
     assert "prefix = %s" in query_sql
@@ -245,7 +250,7 @@ def test_delete_items():
 def test_delete_vectors():
     """delete_vectors() mirrors delete_items for vectors table."""
     sql = StoreSQL("public", "store", index=_make_index())
-    query_sql, params = sql.delete_vectors(["a"], ["k1"])
+    query_sql, params = sql.delete_vectors("a", ["k1"])
 
     assert "DELETE FROM public.store_vectors" in query_sql
 
@@ -399,3 +404,107 @@ def test_disable_ttl_statements():
     for stmt in stmts:
         assert "ALTER TABLE" in stmt
         assert "RESET (ttl)" in stmt
+
+
+def test_upsert_empty_rows_raises():
+    """Empty rows should raise ValueError."""
+    sql = StoreSQL("public", "store", index=None)
+
+    with pytest.raises(ValueError, match="rows cannot be empty"):
+        sql.upsert_items([])
+
+    sql_with_index = StoreSQL("public", "store", index=_make_index())
+    with pytest.raises(ValueError, match="rows cannot be empty"):
+        sql_with_index.upsert_vectors([])
+
+
+def test_ttl_cron_validation():
+    """ttl_statements should reject cron with single quote."""
+    sql = StoreSQL("public", "store", index=None)
+
+    with pytest.raises(ValueError, match="single quote"):
+        sql.ttl_statements("0 0 * * *'; DROP TABLE")
+
+
+def test_every_builder_has_one_param_per_placeholder():
+    """Every %s in SQL must have exactly one parameter."""
+    # Use a mixed case: namespace with 3 labels, filter with two keys, index configured
+    sql = StoreSQL("public", "store", index=_make_index())
+
+    # get
+    query_sql, params = sql.get("a.b.c", ["k1"], omit_expired=True)
+    assert query_sql.count("%s") == len(params)
+
+    # refresh
+    query_sql, params = sql.refresh("a.b.c", ["k1", "k2"])
+    assert query_sql.count("%s") == len(params)
+
+    # refresh_vectors
+    query_sql, params = sql.refresh_vectors("a.b.c", ["k1"])
+    assert query_sql.count("%s") == len(params)
+
+    # upsert_items
+    rows = [("a.b.c", "k1", '{"x": 1}', 60.0), ("a.b.c", "k2", '{"y": 2}', None)]
+    query_sql, params = sql.upsert_items(rows)
+    assert query_sql.count("%s") == len(params)
+
+    # delete_items
+    query_sql, params = sql.delete_items("a.b.c", ["k1", "k2"])
+    assert query_sql.count("%s") == len(params)
+
+    # delete_vectors
+    query_sql, params = sql.delete_vectors("a.b.c", ["k1"])
+    assert query_sql.count("%s") == len(params)
+
+    # upsert_vectors
+    vec_rows = [("a.b.c", "k1", "f1", [0.1, 0.2], 60.0)]
+    query_sql, params = sql.upsert_vectors(vec_rows)
+    assert query_sql.count("%s") == len(params)
+
+    # search
+    query_sql, params = sql.search(
+        namespace_prefix=["a", "b", "c"],
+        filter={"x": 1, "y": 2},
+        limit=10,
+        offset=5,
+        omit_expired=True,
+    )
+    assert query_sql.count("%s") == len(params)
+
+    # semantic_search
+    query_sql, params = sql.semantic_search(
+        namespace_prefix=["a", "b", "c"],
+        filter={"x": 1, "y": 2},
+        limit=10,
+        offset=5,
+        omit_expired=True,
+        over_fetch=100,
+    )
+    # Subtract 2 because QUERY_VECTOR appears twice but is the same object
+    assert query_sql.count("%s") == len(params)
+
+    # list_namespaces
+    query_sql, params = sql.list_namespaces(
+        match_conditions=["^a", "^b"],
+        max_depth=2,
+        limit=10,
+        offset=0,
+        omit_expired=True,
+    )
+    assert query_sql.count("%s") == len(params)
+
+    # delete_namespace
+    deletes = sql.delete_namespace(["a", "b", "c"])
+    for query_sql, params in deletes:
+        assert query_sql.count("%s") == len(params)
+
+    # sweep
+    sweeps = sql.sweep()
+    for query_sql, params in sweeps:
+        assert query_sql.count("%s") == len(params)
+
+
+def test_vector_index_name_is_public():
+    """vector_index_name is exposed as a public attribute."""
+    sql = StoreSQL("public", "my_store", index=_make_index())
+    assert sql.vector_index_name == "my_store_vectors_embedding_idx"

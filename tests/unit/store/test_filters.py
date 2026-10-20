@@ -119,3 +119,40 @@ def test_custom_value_column():
     conditions, params = translate_filter({"x": 1}, value_column="data")
     assert conditions == ["data -> %s = CAST(%s AS JSONB)"]
     assert params == ["x", "1"]
+
+
+def test_nested_path_with_numeric_operator():
+    """Numeric operator at nested path uses #> and #>>."""
+    conditions, params = translate_filter({"profile": {"n": {"$gt": 1}}})
+    assert len(conditions) == 1
+    assert "jsonb_typeof" in conditions[0]
+    assert "#>" in conditions[0]
+    assert "#>>" in conditions[0]
+    assert "AS DECIMAL" in conditions[0]
+    assert params == [["profile", "n"], ["profile", "n"], 1]
+
+
+def test_nested_path_with_ne_operator():
+    """$ne at nested path uses #> with IS DISTINCT FROM."""
+    conditions, params = translate_filter({"profile": {"lang": {"$ne": "en"}}})
+    assert len(conditions) == 1
+    assert "#>" in conditions[0]
+    assert "IS DISTINCT FROM" in conditions[0]
+    assert params == [["profile", "lang"], '"en"']
+
+
+def test_value_column_validation():
+    """value_column must be a valid identifier or alias.identifier."""
+    # Valid single identifier
+    translate_filter({"x": 1}, value_column="data")
+
+    # Valid qualified identifier
+    translate_filter({"x": 1}, value_column="i.value")
+
+    # Invalid: too many dots
+    with pytest.raises(ValueError, match="value_column"):
+        translate_filter({"x": 1}, value_column="a.b.c")
+
+    # Invalid: not an identifier
+    with pytest.raises(ValueError, match="value_column"):
+        translate_filter({"x": 1}, value_column="foo; DROP")
