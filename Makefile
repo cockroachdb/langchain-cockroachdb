@@ -95,7 +95,7 @@ format-check: ensure-venv ## Check code formatting without making changes
 
 type-check: ensure-venv ## Run type checker (mypy)
 	@echo "$(BLUE)Running type checker...$(NC)"
-	@.venv/bin/mypy langchain_cockroachdb --ignore-missing-imports --no-site-packages 2>&1 | grep -v "_pytest" || true
+	@.venv/bin/mypy langchain_cockroachdb
 
 check: lint format-check type-check ## Run all code quality checks
 
