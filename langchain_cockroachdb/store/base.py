@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -335,7 +336,8 @@ class BaseCockroachDBStore:
 
         Raises:
             ValueError: If the model returned the wrong number of embeddings,
-                or an embedding whose size is not the index's dims.
+                an embedding whose size is not the index's dims, or one with
+                NaN or infinite values.
         """
         if self.index is None or not plan.embed_requests:
             return []
@@ -346,13 +348,18 @@ class BaseCockroachDBStore:
             )
         ttls = {(prefix, key): ttl for prefix, key, _, ttl in plan.items}
         rows: list[VectorRow] = []
-        for (prefix, key, field_name, _), embedding in zip(
-            plan.embed_requests, embeddings, strict=True
-        ):
+        # The length check above keeps the two lists in step
+        for i, (prefix, key, field_name, _) in enumerate(plan.embed_requests):
+            embedding = embeddings[i]
             if len(embedding) != self.index.dims:
                 raise ValueError(
                     f"The embedding model returned a vector of {len(embedding)} dimensions, "
                     f"but the index has {self.index.dims}"
+                )
+            if not all(math.isfinite(value) for value in embedding):
+                raise ValueError(
+                    f"The embedding model returned a vector with NaN or infinite values "
+                    f"for {prefix}/{key}, field {field_name}"
                 )
             rows.append((prefix, key, field_name, list(embedding), ttls[(prefix, key)]))
         return rows

@@ -426,6 +426,35 @@ def test_vector_rows_check_the_embedding_model_output() -> None:
         store._vector_rows(plan, [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
     with pytest.raises(ValueError, match="2 dimensions, but the index has 3"):
         store._vector_rows(plan, [[1.0, 0.0]])
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match=r"NaN or infinite values for a/k1, field text"):
+            store._vector_rows(plan, [[1.0, bad, 0.0]])
+
+
+class NaNEmbeddings(CountingEmbeddings):
+    """A broken model whose vectors hold NaN."""
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        return [[float("nan"), 0.0, 0.0] for _ in texts]
+
+
+def test_nan_embedding_fails_before_any_statement() -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": NaNEmbeddings(), "fields": ["text"]},
+    )
+    opened: list[object] = []
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+        opened.append(kwargs)
+        yield StatementLog([])
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match=r"NaN or infinite values for a/k, field text"):
+        store.put(("a",), "k", {"text": "x"})
+    assert opened == []
 
 
 def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
@@ -445,6 +474,33 @@ def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
     store._cursor = fake_cursor  # type: ignore[method-assign]
     store.batch([PutOp(("a",), "k", {"text": "x"}, index=False), PutOp(("a",), "j", None)])
     assert embeddings.calls == 0
+    vectors, items = store.sql.vectors, store.sql.items
+    assert statement_kinds(batches[0]) == [
+        f"DELETE {vectors}",
+        f"INSERT {items}",
+        f"DELETE {items}",
+        f"DELETE {vectors}",
+    ]
+
+
+async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    batches: list[list[tuple[str, list]]] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+        batches.append([])
+        yield AsyncStatementLog(batches[-1])
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    await store.abatch([PutOp(("a",), "k", {"text": "x"}, index=False), PutOp(("a",), "j", None)])
+    assert embeddings.calls == 0
+    assert embeddings.async_calls == 0
     vectors, items = store.sql.vectors, store.sql.items
     assert statement_kinds(batches[0]) == [
         f"DELETE {vectors}",

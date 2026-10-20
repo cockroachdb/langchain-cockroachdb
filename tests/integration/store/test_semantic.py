@@ -60,6 +60,20 @@ def assert_index(statement: str, *, options: str | None) -> None:
         assert options in statement
 
 
+def assert_embeddings_match(rows: list[dict[str, Any]]) -> None:
+    """Each row of TWO_MESSAGES holds the embedding of its own text, within float32 precision."""
+    model = DeterministicFakeEmbedding(size=DIMS)
+    texts = {"text": "hello", "messages[*].content.0": "first", "messages[*].content.1": "second"}
+    assert sorted(row["field_name"] for row in rows) == sorted(texts)
+    for row in rows:
+        expected = model.embed_documents([texts[row["field_name"]]])[0]
+        stored = parse_vector(row["embedding"])
+        assert all(
+            math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+            for a, b in zip(stored, expected, strict=True)
+        )
+
+
 CSPANN_OPTIONS = "WITH (min_partition_size=16, max_partition_size=64)"
 
 
@@ -102,15 +116,7 @@ def test_put_writes_one_vector_per_field_text(store_factory, admin, mode) -> Non
     ]
     # Each row holds the embedding of its own text
     rows = admin.execute(f"SELECT field_name, embedding FROM {store.sql.vectors}").fetchall()
-    model = DeterministicFakeEmbedding(size=DIMS)
-    texts = {"text": "hello", "messages[*].content.0": "first", "messages[*].content.1": "second"}
-    for row in rows:
-        expected = model.embed_documents([texts[row["field_name"]]])[0]
-        stored = parse_vector(row["embedding"])
-        assert all(
-            math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
-            for a, b in zip(stored, expected, strict=True)
-        )
+    assert_embeddings_match(rows)
     # A put that names its own fields embeds those instead
     store.put(("docs", "a"), "k2", {"title": "t", "text": "x"}, index=["title"])
     assert ("docs.a", "k2", "title") in vector_fields(admin, store)
@@ -218,7 +224,9 @@ def test_put_batch_with_vectors_is_atomic_when_interrupted(
         store.setup()
         store.put(("docs",), "k1", TWO_MESSAGES)
         store.put(("docs",), "gone", {"text": "bye"})
-        # Stop at the vector upsert, after the old vectors and the items were sent
+        # Stop at the vector upsert. The earlier statements of the batch ran
+        # or, in pipeline mode, may still sit in the client buffer. Either way
+        # nothing of the batch may commit
         interruption.match = f"insert into {store.sql.vectors} ".lower()
         interruption.armed = True
         with pytest.raises(RuntimeError, match="interrupted"):
@@ -272,6 +280,8 @@ async def test_async_put_writes_one_vector_per_field_text(astore_factory, aadmin
         ("docs.a", "k1", "messages[*].content.1"),
         ("docs.a", "k1", "text"),
     ]
+    cur = await aadmin.execute(f"SELECT field_name, embedding FROM {store.sql.vectors}")
+    assert_embeddings_match(await cur.fetchall())
 
 
 async def test_async_reput_with_fewer_fields_removes_stale_vectors(
