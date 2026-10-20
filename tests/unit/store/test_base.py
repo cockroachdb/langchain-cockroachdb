@@ -525,6 +525,15 @@ def test_batch_plan_keeps_search_queries_to_embed() -> None:
     assert make_base()._plan_batch([SearchOp(("a",), query="q")]).search_to_embed == []
 
 
+def test_only_a_store_with_a_ttl_configuration_refreshes_expiry() -> None:
+    # BaseStore resolves refresh_ttl to true without a TTL configuration
+    ops = [GetOp(("a",), "k", refresh_ttl=True), SearchOp(("a",), refresh_ttl=True)]
+    for store, refreshes in ((make_base(), False), (make_base(ttl={"default_ttl": 1}), True)):
+        plan = store._plan_batch(ops)
+        statements = [*plan.get_statements, *plan.search_statements]
+        assert ["UPDATE" in sql for sql, _ in statements] == [refreshes, refreshes]
+
+
 class SearchConnection:
     """A fake connection for read groups. Every statement and its params is logged.
 

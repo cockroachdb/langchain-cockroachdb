@@ -152,7 +152,6 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         self._configure(index=resolved_index, ttl=ttl, table_name=table_name, schema=schema)
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
-        self._ttl_given = ttl is not None
         self.conn = conn
         self.pipe = pipe
         self.lock = asyncio.Lock()

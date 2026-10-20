@@ -281,6 +281,9 @@ class BaseCockroachDBStore:
     sql: StoreSQL
     index: ResolvedIndex | None
     ttl: ResolvedTTL
+    # Whether a TTL configuration was given. Without one the store never
+    # refreshes an expiry and setup() leaves the table TTL settings alone.
+    _ttl_given: bool
     _warned_query_without_index: bool
     # Pooled batches run concurrently; the lock makes the warning appear once
     _warning_lock: threading.Lock
@@ -296,9 +299,19 @@ class BaseCockroachDBStore:
         """Set the shared state from validated settings."""
         self.index = index
         self.ttl = resolve_ttl_config(ttl)
+        self._ttl_given = ttl is not None
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
         self._warning_lock = threading.Lock()
+
+    def _refresh(self, refresh_ttl: bool) -> bool:
+        """Whether a read pushes back the expiry of the rows it returns.
+
+        BaseStore resolves refresh_ttl to true when the store has no TTL
+        configuration. Such a store still leaves expiry alone, so it never
+        extends rows that another store wrote with a TTL.
+        """
+        return bool(refresh_ttl) and self._ttl_given
 
     def _plan_batch(self, ops: Iterable[Op]) -> BatchPlan:
         """Validate a batch and build all its statements.
@@ -312,7 +325,7 @@ class BaseCockroachDBStore:
         groups: dict[tuple[tuple[str, ...], bool], list[tuple[int, GetOp]]] = defaultdict(list)
         for i, op in grouped.get(GetOp, []):
             if isinstance(op, GetOp):
-                groups[(tuple(op.namespace), bool(op.refresh_ttl))].append((i, op))
+                groups[(tuple(op.namespace), self._refresh(op.refresh_ttl))].append((i, op))
         for i, op in grouped.get(SearchOp, []):
             if not isinstance(op, SearchOp):
                 continue
@@ -500,7 +513,7 @@ class BaseCockroachDBStore:
                     offset=op.offset,
                     omit_expired=omit_expired,
                     over_fetch=over_fetch,
-                    refresh=op.refresh_ttl,
+                    refresh=self._refresh(op.refresh_ttl),
                 )
                 if op.namespace_prefix:
                     statements.append(
@@ -510,7 +523,7 @@ class BaseCockroachDBStore:
                             offset=op.offset,
                             omit_expired=omit_expired,
                             over_fetch=over_fetch,
-                            refresh=op.refresh_ttl,
+                            refresh=self._refresh(op.refresh_ttl),
                         )
                     )
                     lookups.append(
@@ -535,7 +548,7 @@ class BaseCockroachDBStore:
                     limit=op.limit,
                     offset=op.offset,
                     omit_expired=omit_expired,
-                    refresh=op.refresh_ttl,
+                    refresh=self._refresh(op.refresh_ttl),
                 )
             )
         return statements, to_embed, lookups
