@@ -47,14 +47,21 @@ def store_factory(libpq_url: str, table_name: str) -> Iterator[Callable[..., Coc
 
     Every store of a test shares the test's table name unless ``table_name``
     is passed. ``setup()`` runs unless ``setup=False``. Connections close
-    after the test.
+    after the test. ``connect_kwargs`` adds psycopg connection options, such
+    as an application_name or a cursor_factory for fault injection.
     """
     resources: list[Any] = []
 
-    def make(mode: str, *, setup: bool = True, **kwargs: Any) -> CockroachDBStore:
+    def make(
+        mode: str,
+        *,
+        setup: bool = True,
+        connect_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> CockroachDBStore:
         kwargs.setdefault("table_name", table_name)
         kwargs.setdefault("retry_policy", FAST)
-        options = connection_options(libpq_url, None, 10.0, 5, component="store")
+        options = connection_options(libpq_url, connect_kwargs, 10.0, 5, component="store")
         if mode == "pool":
             pool: ConnectionPool[Connection[Any]] = ConnectionPool(
                 libpq_url, min_size=1, max_size=4, kwargs=options, open=True
@@ -111,14 +118,21 @@ async def astore_factory(libpq_url: str, table_name: str) -> AsyncIterator[Facto
     """Make async stores on a pool, a connection or a pipelined connection.
 
     Same conventions as store_factory: the test's table name, FAST retries,
-    and setup() unless ``setup=False``. Connections close after the test.
+    setup() unless ``setup=False``, and ``connect_kwargs``. Connections close
+    after the test.
     """
     resources: list[Any] = []
 
-    async def make(mode: str, *, setup: bool = True, **kwargs: Any) -> AsyncCockroachDBStore:
+    async def make(
+        mode: str,
+        *,
+        setup: bool = True,
+        connect_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncCockroachDBStore:
         kwargs.setdefault("table_name", table_name)
         kwargs.setdefault("retry_policy", FAST)
-        options = connection_options(libpq_url, None, 10.0, 5, component="store")
+        options = connection_options(libpq_url, connect_kwargs, 10.0, 5, component="store")
         if mode == "pool":
             pool: AsyncConnectionPool[AsyncConnection[Any]] = AsyncConnectionPool(
                 libpq_url, min_size=1, max_size=4, kwargs=options, open=False
