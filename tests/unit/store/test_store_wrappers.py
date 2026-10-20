@@ -7,6 +7,7 @@ import contextlib
 from collections.abc import AsyncIterator
 
 import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.store.base import GetOp, SearchOp
 from psycopg_pool import AsyncConnectionPool
 
@@ -29,12 +30,16 @@ async def test_construction_inside_a_loop_with_a_pool() -> None:
     assert store.pipe is None
 
 
-async def test_pool_with_pipeline_and_index_are_rejected() -> None:
+async def test_pool_with_pipeline_is_rejected_and_index_is_validated() -> None:
     pool = AsyncConnectionPool("", open=False)
     with pytest.raises(ValueError, match="Pipeline"):
         AsyncCockroachDBStore(pool, pipe=object())  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="embed"):
         AsyncCockroachDBStore(pool, index={"dims": 3, "embed": None})  # type: ignore[typeddict-item]
+    store = AsyncCockroachDBStore(
+        pool, index={"dims": 3, "embed": DeterministicFakeEmbedding(size=3)}
+    )
+    assert store.index is not None and store.index.dims == 3
 
 
 async def test_sync_batch_from_the_stores_own_loop_raises() -> None:

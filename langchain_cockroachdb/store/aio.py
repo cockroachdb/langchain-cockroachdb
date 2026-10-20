@@ -33,6 +33,7 @@ from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
     PoolConfig,
+    resolve_index_config,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.store import DEFAULT_SWEEP_INTERVAL_MINUTES
@@ -119,7 +120,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             conn: A psycopg AsyncConnection, or an AsyncConnectionPool
                 (recommended). It must be in autocommit mode and use dict_row.
             pipe: A pipeline on ``conn``, only with a single connection
-            index: Semantic search settings. Not supported yet.
+            index: Semantic search settings. When given, setup() also creates
+                the vectors table and its C-SPANN index, and puts embed the
+                configured fields of each item.
             ttl: TTL settings. When given, setup() also turns on CockroachDB
                 row-level TTL for expired rows.
             retry_policy: How operations retry (default: RetryPolicy())
@@ -129,11 +132,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             RuntimeError: If no event loop is running
             ValueError: If a pipeline is given with a pool, or a name or the
-                TTL settings are invalid
-            NotImplementedError: If ``index`` is given
+                TTL or index settings are invalid
         """
-        if index is not None:
-            raise NotImplementedError("semantic search arrives in a later task")
+        # Validated first, so a bad index fails before anything starts
+        resolved_index = resolve_index_config(index)
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
             raise ValueError(
                 "Pipeline should be used only with a single AsyncConnection, "
@@ -147,7 +149,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 "for example in an async function. In sync code, use CockroachDBStore."
             ) from error
         super().__init__()
-        self._configure(index=None, ttl=ttl, table_name=table_name, schema=schema)
+        self._configure(index=resolved_index, ttl=ttl, table_name=table_name, schema=schema)
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
         self._ttl_given = ttl is not None
@@ -188,7 +190,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             pipeline: Whether to use pipeline mode on the single connection.
                 Ignored with pool_config.
             pool_config: Open an AsyncConnectionPool with these settings instead of one connection
-            index: Semantic search settings. Not supported yet.
+            index: Semantic search settings
             ttl: TTL settings
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
@@ -252,8 +254,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         MUST be called the first time the store is used. Safe to run from
         several processes at once: every migration is idempotent and versions
-        are recorded with ON CONFLICT DO NOTHING. With a TTL configuration,
-        it then turns on CockroachDB row-level TTL on ``expires_at``.
+        are recorded with ON CONFLICT DO NOTHING. With an index, it creates
+        the vectors table and its C-SPANN index (unless ``flat``) on every
+        call. With a TTL configuration, it then turns on CockroachDB
+        row-level TTL on ``expires_at``.
         """
         migrations = self.sql.migrations()
         version_sql = f"SELECT v FROM {self.sql.migrations_table} ORDER BY v DESC LIMIT 1"
@@ -343,7 +347,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         return await self._retry(read, label=label)
 
     async def _run_puts(self, plan: PutPlan) -> None:
-        statements = self._write_statements(plan)
+        # Embed once, before the first attempt: a retry reuses the vectors
+        embeddings: list[list[float]] = []
+        if self.index is not None and plan.embed_requests:
+            embeddings = await self.index.embeddings.aembed_documents(
+                [text for _, _, _, text in plan.embed_requests]
+            )
+        statements = self._write_statements(plan, self._vector_rows(plan, embeddings))
         if not statements:
             return
 

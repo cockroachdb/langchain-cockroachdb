@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import uuid
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 
 import psycopg
 import pytest
 from langgraph.store.memory import InMemoryStore
-from psycopg import Connection
+from psycopg import AsyncConnection, Connection
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
-from langchain_cockroachdb import CockroachDBStore, RetryPolicy
+from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore, RetryPolicy
 from langchain_cockroachdb._connection import connection_options
 
 MODES = ("pool", "connection", "pipeline")
 FAST = RetryPolicy(initial_backoff=0.01, max_backoff=0.05)
+
+Factory = Callable[..., Awaitable[AsyncCockroachDBStore]]
 
 
 def drop_store_tables(libpq_url: str, table_name: str, schema: str = "public") -> None:
@@ -101,4 +103,59 @@ def reference() -> Callable[[], InMemoryStore]:
 def admin(libpq_url: str) -> Iterator[Connection[Any]]:
     """A plain autocommit connection for checking rows directly."""
     with Connection.connect(libpq_url, autocommit=True, row_factory=dict_row) as conn:
+        yield conn
+
+
+@pytest.fixture
+async def astore_factory(libpq_url: str, table_name: str) -> AsyncIterator[Factory]:
+    """Make async stores on a pool, a connection or a pipelined connection.
+
+    Same conventions as store_factory: the test's table name, FAST retries,
+    and setup() unless ``setup=False``. Connections close after the test.
+    """
+    resources: list[Any] = []
+
+    async def make(mode: str, *, setup: bool = True, **kwargs: Any) -> AsyncCockroachDBStore:
+        kwargs.setdefault("table_name", table_name)
+        kwargs.setdefault("retry_policy", FAST)
+        options = connection_options(libpq_url, None, 10.0, 5, component="store")
+        if mode == "pool":
+            pool: AsyncConnectionPool[AsyncConnection[Any]] = AsyncConnectionPool(
+                libpq_url, min_size=1, max_size=4, kwargs=options, open=False
+            )
+            await pool.open()
+            resources.append(pool)
+            store = AsyncCockroachDBStore(pool, **kwargs)
+        elif mode in ("connection", "pipeline"):
+            conn = await AsyncConnection.connect(libpq_url, **options)
+            resources.append(conn)
+            pipe = None
+            if mode == "pipeline":
+                pipe_cm = conn.pipeline()
+                pipe = await pipe_cm.__aenter__()
+                resources.append(pipe_cm)
+            store = AsyncCockroachDBStore(conn, pipe=pipe, **kwargs)
+        else:
+            raise ValueError(f"unknown mode {mode!r}")
+        if setup:
+            await store.setup()
+        return store
+
+    yield make
+    for resource in reversed(resources):
+        try:
+            if isinstance(resource, (AsyncConnectionPool, AsyncConnection)):
+                await resource.close()
+            else:
+                await resource.__aexit__(None, None, None)
+        except Exception as error:  # noqa: BLE001
+            warnings.warn(f"store cleanup failed: {error!r}", UserWarning, stacklevel=1)
+
+
+@pytest.fixture
+async def aadmin(libpq_url: str) -> AsyncIterator[AsyncConnection[Any]]:
+    """A plain autocommit async connection for checking rows without blocking the loop."""
+    async with await AsyncConnection.connect(
+        libpq_url, autocommit=True, row_factory=dict_row
+    ) as conn:
         yield conn

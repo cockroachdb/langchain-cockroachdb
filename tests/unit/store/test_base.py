@@ -2,9 +2,10 @@
 
 import contextlib
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 
+import psycopg
 import pytest
 from langchain_core.embeddings import Embeddings
 from langgraph.store.base import (
@@ -15,24 +16,45 @@ from langgraph.store.base import (
     PutOp,
     SearchOp,
 )
+from psycopg_pool import AsyncConnectionPool
 
+from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.base import BaseCockroachDBStore, PutPlan, _group_ops
 from langchain_cockroachdb.store.config import resolve_index_config
 from langchain_cockroachdb.store.store import CockroachDBStore
 
+FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
+
 
 class CountingEmbeddings(Embeddings):
-    """Embeddings that count their calls and return fixed vectors."""
+    """Embeddings that count their calls and return one vector per text.
+
+    ``calls`` counts sync calls and ``async_calls`` awaited ones. The
+    vector of a text is its length, then zeros, so tests can tell texts apart.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+        self.async_calls = 0
+        self.texts: list[str] = []
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         self.calls += 1
-        return [[1.0, 0.0, 0.0] for _ in texts]
+        self.texts.extend(texts)
+        return [[float(len(text)), 0.0, 0.0] for text in texts]
 
     def embed_query(self, text: str) -> list[float]:
         self.calls += 1
+        return [1.0, 0.0, 0.0]
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.async_calls += 1
+        self.texts.extend(texts)
+        return [[float(len(text)), 0.0, 0.0] for text in texts]
+
+    async def aembed_query(self, text: str) -> list[float]:
+        self.async_calls += 1
         return [1.0, 0.0, 0.0]
 
 
@@ -170,12 +192,14 @@ def test_paging_zero_limit_short_circuits() -> None:
         store.batch([ListNamespacesOp(limit=-1)])
 
 
-def test_index_is_not_supported_yet() -> None:
-    with pytest.raises(NotImplementedError, match="semantic search arrives in a later task"):
-        CockroachDBStore(
-            object(),  # type: ignore[arg-type]
-            index={"dims": 3, "embed": CountingEmbeddings()},
-        )
+def test_index_is_accepted() -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+    )
+    assert store.index is not None
+    assert store.index.dims == 3
+    assert len(store.sql.vector_statements()) == 2
 
 
 class RecordingCursor:
@@ -217,3 +241,223 @@ def test_read_group_queues_every_statement_before_fetching() -> None:
     log.clear()
     store.batch([SearchOp(("a",)), SearchOp(("b",), refresh_ttl=False)])
     assert log == ["cursor"] + ["execute"] * 2 + ["fetch"] * 2
+
+
+class FlakyCursor:
+    """A write cursor whose first attempt fails with a retryable 40001.
+
+    Every attempt records its statements in ``attempts``.
+    """
+
+    def __init__(self) -> None:
+        self.attempts: list[list[tuple[str, list]]] = []
+
+    def enter(self) -> list[tuple[str, list]]:
+        self.attempts.append([])
+        if len(self.attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+        return self.attempts[-1]
+
+
+class StatementLog:
+    def __init__(self, statements: list[tuple[str, list]]) -> None:
+        self.statements = statements
+        self.connection = self
+
+    def execute(self, query: str, params: list) -> None:
+        self.statements.append((query, params))
+
+
+class AsyncStatementLog(StatementLog):
+    async def execute(self, query: str, params: list) -> None:  # type: ignore[override]
+        self.statements.append((query, params))
+
+
+INDEX = {"dims": 3, "fields": ["text", "messages[*].content"]}
+INDEXED_OPS = [
+    PutOp(("a",), "k1", {"text": "one", "messages": [{"content": "hi"}, {"content": "there"}]}),
+    PutOp(("a",), "k2", {"text": "two"}, ttl=5.0),
+    PutOp(("a",), "k3", {"text": "skip me"}, index=False),
+    PutOp(("a",), "k4", None),
+]
+
+
+def statement_kinds(statements: list[tuple[str, list]]) -> list[str]:
+    """Each statement as its verb and table, e.g. "DELETE public.store_vectors"."""
+    return [f"{sql.split()[0]} {sql.split()[2]}" for sql, _ in statements]
+
+
+def vector_upserts(statements: list[tuple[str, list]], store: BaseCockroachDBStore) -> list:
+    """The (prefix, key, field_name, vector literal, ttl) rows of the vector upserts."""
+    rows = []
+    for sql, params in statements:
+        if sql.startswith(f"INSERT INTO {store.sql.vectors} "):
+            rows.extend(tuple(params[i : i + 5]) for i in range(0, len(params), 5))
+    return rows
+
+
+def assert_write_batch(statements: list[tuple[str, list]], store: BaseCockroachDBStore) -> None:
+    vectors, items = store.sql.vectors, store.sql.items
+    # Old vectors go first, then items, new vectors, and the deletes
+    assert statement_kinds(statements) == [
+        f"DELETE {vectors}",
+        f"INSERT {items}",
+        f"INSERT {vectors}",
+        f"DELETE {items}",
+        f"DELETE {vectors}",
+    ]
+    assert statements[0][1] == ["a", ["k1", "k2", "k3"]]
+    assert vector_upserts(statements, store) == [
+        ("a", "k1", "text", "[3.0,0.0,0.0]", None),
+        ("a", "k1", "messages[*].content.0", "[2.0,0.0,0.0]", None),
+        ("a", "k1", "messages[*].content.1", "[5.0,0.0,0.0]", None),
+        ("a", "k2", "text", "[3.0,0.0,0.0]", 5.0),
+    ]
+    assert statements[-1][1] == ["a", ["k4"]]
+
+
+def test_put_plan_embeds_once_outside_retry() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    flaky = FlakyCursor()
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+        assert kwargs["pipeline"] is True and kwargs["transaction"] is True
+        yield StatementLog(flaky.enter())
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    store.batch(INDEXED_OPS)
+    assert embeddings.calls == 1
+    assert embeddings.async_calls == 0
+    assert embeddings.texts == ["one", "hi", "there", "two"]
+    # The retry reran the same statements with the same vectors
+    assert len(flaky.attempts) == 2
+    assert_write_batch(flaky.attempts[1], store)
+
+
+async def test_async_put_plan_embeds_once_outside_retry() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    flaky = FlakyCursor()
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+        assert kwargs["pipeline"] is True and kwargs["transaction"] is True
+        yield AsyncStatementLog(flaky.enter())
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    await store.abatch(INDEXED_OPS)
+    assert embeddings.async_calls == 1
+    assert embeddings.calls == 0
+    assert embeddings.texts == ["one", "hi", "there", "two"]
+    assert len(flaky.attempts) == 2
+    assert_write_batch(flaky.attempts[1], store)
+
+
+BAD_BATCHES = [
+    [PutOp(("a",), "good", {"text": "fine"}), PutOp(("a",), "bad", {"text": float("nan")})],
+    [PutOp(("a",), "good", {"text": "fine"}), PutOp(("a.b",), "k", {"text": "x"})],
+    [PutOp(("a",), "good", {"text": "fine"}), SearchOp(("a",), limit=-1)],
+]
+
+
+def test_validation_fails_before_embedding() -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+    )
+    for ops in BAD_BATCHES:
+        with pytest.raises((ValueError, InvalidNamespaceError)):
+            store.batch(ops)
+    assert embeddings.calls == 0
+    assert embeddings.async_calls == 0
+
+
+async def test_async_validation_fails_before_embedding() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+    )
+    for ops in BAD_BATCHES:
+        with pytest.raises((ValueError, InvalidNamespaceError)):
+            await store.abatch(ops)
+    assert embeddings.calls == 0
+    assert embeddings.async_calls == 0
+
+
+def test_vector_rows_dedup_and_mirror_ttl() -> None:
+    store = make_base(fields=["text"])
+    plan = store._plan_puts(
+        [
+            PutOp(("a",), "k1", {"text": "one"}, ttl=7.0),
+            PutOp(("a",), "k2", {"text": "two", "title": "t"}, index=["text", "title", "text"]),
+        ]
+    )
+    # A field listed twice is embedded once
+    assert plan.embed_requests == [
+        ("a", "k1", "text", "one"),
+        ("a", "k2", "text", "two"),
+        ("a", "k2", "title", "t"),
+    ]
+    rows = store._vector_rows(plan, [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    assert rows == [
+        ("a", "k1", "text", [1.0, 0.0, 0.0], 7.0),
+        ("a", "k2", "text", [2.0, 0.0, 0.0], None),
+        ("a", "k2", "title", [3.0, 0.0, 0.0], None),
+    ]
+
+
+def test_vector_rows_check_the_embedding_model_output() -> None:
+    store = make_base(fields=["text"])
+    plan = store._plan_puts([PutOp(("a",), "k1", {"text": "one"})])
+    with pytest.raises(ValueError, match="returned 2 embeddings for 1 texts"):
+        store._vector_rows(plan, [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="2 dimensions, but the index has 3"):
+        store._vector_rows(plan, [[1.0, 0.0]])
+
+
+def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    batches: list[list[tuple[str, list]]] = []
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+        batches.append([])
+        yield StatementLog(batches[-1])
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    store.batch([PutOp(("a",), "k", {"text": "x"}, index=False), PutOp(("a",), "j", None)])
+    assert embeddings.calls == 0
+    vectors, items = store.sql.vectors, store.sql.items
+    assert statement_kinds(batches[0]) == [
+        f"DELETE {vectors}",
+        f"INSERT {items}",
+        f"DELETE {items}",
+        f"DELETE {vectors}",
+    ]
+
+
+def test_batch_plan_keeps_search_queries_to_embed() -> None:
+    store = make_base(fields=["text"])
+    plan = store._plan_batch(
+        [SearchOp(("a",), query="hello", limit=3), SearchOp(("b",)), SearchOp(("c",), query="x")]
+    )
+    assert plan.search_to_embed == [(0, "hello"), (2, "x")]
+    assert make_base()._plan_batch([SearchOp(("a",), query="q")]).search_to_embed == []

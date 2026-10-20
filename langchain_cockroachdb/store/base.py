@@ -38,13 +38,17 @@ from langchain_cockroachdb.store.namespaces import (
     to_text,
     validate_labels,
 )
-from langchain_cockroachdb.store.sql import ItemRow, StoreSQL
+from langchain_cockroachdb.store.sql import ItemRow, StoreSQL, VectorRow
 
 logger = logging.getLogger(__name__)
 
 # Rows in one multi-row item upsert. Each row takes 4 bound parameters, so a
 # statement stays far below the limit of 65,535 parameters.
 ITEMS_PER_STATEMENT = 500
+
+# Rows in one multi-row vector upsert. VECTOR rows are large, so batches stay
+# small, like the vector store's default batch_size.
+VECTORS_PER_STATEMENT = 100
 
 
 def _check_paging(limit: int, offset: int) -> None:
@@ -95,7 +99,8 @@ class PutPlan:
     Attributes:
         deletes: Namespace text to the keys deleted there.
         items: Item rows to upsert, one per (namespace, key).
-        embed_requests: (prefix, key, field_name, text) for every text to embed.
+        embed_requests: (prefix, key, field_name, text) for every text to
+            embed, one per (prefix, key, field_name).
         reindexed: Namespace text to the put keys whose vectors are deleted
             before new ones are written. Every put item when the store has an index.
     """
@@ -118,6 +123,8 @@ class BatchPlan:
         get_statements: One read statement per get group.
         searches: The searches that need a statement, as (position, op).
         search_statements: One statement per search, in the order of ``searches``.
+        search_to_embed: (statement position, query text) for every search
+            statement that needs the embedding of its query.
         listings: The list_namespaces ops, as (position, op).
         listing_statements: One statement per listing.
         puts: What the batch's puts and deletes write, or None without puts.
@@ -130,6 +137,7 @@ class BatchPlan:
     get_statements: list[tuple[str, list]] = field(default_factory=list)
     searches: list[tuple[int, SearchOp]] = field(default_factory=list)
     search_statements: list[tuple[str, list]] = field(default_factory=list)
+    search_to_embed: list[tuple[int, str]] = field(default_factory=list)
     listings: list[tuple[int, ListNamespacesOp]] = field(default_factory=list)
     listing_statements: list[tuple[str, list]] = field(default_factory=list)
     puts: PutPlan | None = None
@@ -247,7 +255,7 @@ class BaseCockroachDBStore:
         if puts:
             plan.puts = self._plan_puts(puts)
         if plan.searches:
-            plan.search_statements = self._search_plan(plan.searches)[0]
+            plan.search_statements, plan.search_to_embed = self._search_plan(plan.searches)
         plan.listing_statements = [self._listing_statement(op) for _, op in plan.listings]
         # One statement per namespace and refresh choice. With refresh, the
         # statement also pushes back the expiry of the rows it reads.
@@ -280,6 +288,8 @@ class BaseCockroachDBStore:
             latest[(tuple(op.namespace), op.key)] = op
 
         plan = PutPlan()
+        # One text per vector row: a path listed twice is embedded once
+        requests: dict[tuple[str, str, str], str] = {}
         for (namespace, key), op in latest.items():
             prefix = to_text(namespace)
             if op.value is None:
@@ -305,12 +315,47 @@ class BaseCockroachDBStore:
             for path, tokens in paths:
                 texts = get_text_at_path(op.value, tokens)
                 if len(texts) > 1:
-                    plan.embed_requests.extend(
-                        (prefix, key, f"{path}.{i}", text) for i, text in enumerate(texts)
-                    )
+                    for i, text in enumerate(texts):
+                        requests[(prefix, key, f"{path}.{i}")] = text
                 elif texts:
-                    plan.embed_requests.append((prefix, key, path, texts[0]))
+                    requests[(prefix, key, path)] = texts[0]
+        plan.embed_requests = [
+            (prefix, key, field_name, text) for (prefix, key, field_name), text in requests.items()
+        ]
         return plan
+
+    def _vector_rows(self, plan: PutPlan, embeddings: Sequence[Sequence[float]]) -> list[VectorRow]:
+        """Pair the embeddings of ``plan.embed_requests`` with their rows.
+
+        Each vector row gets the TTL of its item, so vectors expire with it.
+
+        Args:
+            plan: The put plan whose texts were embedded.
+            embeddings: One embedding per embed request, in the same order.
+
+        Raises:
+            ValueError: If the model returned the wrong number of embeddings,
+                or an embedding whose size is not the index's dims.
+        """
+        if self.index is None or not plan.embed_requests:
+            return []
+        if len(embeddings) != len(plan.embed_requests):
+            raise ValueError(
+                f"The embedding model returned {len(embeddings)} embeddings for "
+                f"{len(plan.embed_requests)} texts"
+            )
+        ttls = {(prefix, key): ttl for prefix, key, _, ttl in plan.items}
+        rows: list[VectorRow] = []
+        for (prefix, key, field_name, _), embedding in zip(
+            plan.embed_requests, embeddings, strict=True
+        ):
+            if len(embedding) != self.index.dims:
+                raise ValueError(
+                    f"The embedding model returned a vector of {len(embedding)} dimensions, "
+                    f"but the index has {self.index.dims}"
+                )
+            rows.append((prefix, key, field_name, list(embedding), ttls[(prefix, key)]))
+        return rows
 
     def _search_plan(
         self, search_ops: Sequence[tuple[int, SearchOp]]
@@ -367,12 +412,13 @@ class BaseCockroachDBStore:
         return first
 
     def _write_statements(
-        self, plan: PutPlan, vector_rows: Sequence[Any] = ()
+        self, plan: PutPlan, vector_rows: Sequence[VectorRow] = ()
     ) -> list[tuple[str, list]]:
         """The statements of a put batch, in the order they must run.
 
         Old vectors of re-indexed items go first, then the item upserts, the
-        vector upserts, and the deletes with their vectors.
+        vector upserts, and the deletes with their vectors. ``vector_rows``
+        come from ``_vector_rows``, computed once before the first attempt.
         """
         statements: list[tuple[str, list]] = []
         for prefix, keys in plan.reindexed.items():
@@ -381,9 +427,9 @@ class BaseCockroachDBStore:
             statements.append(
                 self.sql.upsert_items(plan.items[start : start + ITEMS_PER_STATEMENT])
             )
-        for start in range(0, len(vector_rows), ITEMS_PER_STATEMENT):
+        for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT):
             statements.append(
-                self.sql.upsert_vectors(vector_rows[start : start + ITEMS_PER_STATEMENT])
+                self.sql.upsert_vectors(vector_rows[start : start + VECTORS_PER_STATEMENT])
             )
         for prefix, keys in plan.deletes.items():
             statements.append(self.sql.delete_items(prefix, keys))
