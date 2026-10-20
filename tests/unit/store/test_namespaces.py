@@ -44,16 +44,40 @@ def test_prefix_condition_empty_matches_all():
     assert params == []
 
 
-def test_prefix_condition_escapes_like_metacharacters():
-    """Test that LIKE metacharacters are escaped."""
-    # Underscore
-    sql, params = prefix_condition("namespace", ("user_1",))
-    assert "namespace = %s OR namespace LIKE %s ESCAPE '\\'" in sql
-    assert params == ["user_1", "user\\_1.%"]
+def test_prefix_condition_is_a_plain_range():
+    """Labels with LIKE metacharacters give plain range bounds, with no escaping.
 
-    # Percent
-    sql, params = prefix_condition("namespace", ("50%off",))
-    assert params == ["50%off", "50\\%off.%"]
+    The integration test test_search_scope_with_metacharacter_labels runs
+    these against the database.
+    """
+    sql, params = prefix_condition("namespace", ("user_1",))
+    assert sql == "(namespace = %s OR (namespace >= %s AND namespace < %s))"
+    assert params == ["user_1", "user_1.", "user_1/"]
+    assert "LIKE" not in sql
+
+    _, params = prefix_condition("namespace", ("50%off", "x"))
+    assert params == ["50%off.x", "50%off.x.", "50%off.x/"]
+
+    _, params = prefix_condition("namespace", ("back\\slash",))
+    assert params == ["back\\slash", "back\\slash.", "back\\slash/"]
+
+
+def matches(namespace: str, prefix: tuple[str, ...]) -> bool:
+    """The condition evaluated in Python, comparing bytes like CockroachDB."""
+    _, (exact, low, high) = prefix_condition("namespace", prefix)
+    value = namespace.encode()
+    return value == exact.encode() or low.encode() <= value < high.encode()
+
+
+def test_prefix_condition_matches_descendants_only():
+    assert matches("a", ("a",))
+    assert matches("a.b", ("a",))
+    assert matches("a.b.c", ("a",))
+    # Siblings that share the text prefix, and labels starting with bytes
+    # just before and after "."
+    for other in ("ab", "a-b", "a/b", "a0", "b", "", "a\u00e9"):
+        assert not matches(other, ("a",)), other
+    assert matches("a.\u00e9", ("a",))
 
 
 def test_match_pattern_escapes_regex_metacharacters():

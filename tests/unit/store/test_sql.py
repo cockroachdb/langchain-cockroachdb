@@ -124,23 +124,22 @@ def test_semantic_search_param_order():
     # First QUERY_VECTOR (in ranked CTE)
     assert params[0] is QUERY_VECTOR
 
-    # Namespace params (exact match "a.b", then pattern "a.b.%")
-    assert params[1] == "a.b"
-    assert params[2] == "a.b.%"
+    # Namespace params (exact match "a.b", then the range "a.b." to "a.b/")
+    assert params[1:4] == ["a.b", "a.b.", "a.b/"]
 
     # Second QUERY_VECTOR (ORDER BY in ranked CTE)
-    assert params[3] is QUERY_VECTOR
+    assert params[4] is QUERY_VECTOR
 
     # over_fetch
-    assert params[4] == 100
+    assert params[5] == 100
 
     # Filter params (key "x", value "1")
-    assert params[5] == "x"
-    assert params[6] == "1"
+    assert params[6] == "x"
+    assert params[7] == "1"
 
     # limit, offset
-    assert params[7] == 5
-    assert params[8] == 10
+    assert params[8] == 5
+    assert params[9] == 10
 
 
 def test_no_cast_shorthand():
@@ -373,16 +372,16 @@ def test_delete_namespace():
     assert query_sql.startswith("WITH deleted_vectors AS (")
     assert "DELETE FROM public.store_vectors" in query_sql
     assert "DELETE FROM public.store\n" in query_sql
-    assert "(prefix = %s OR prefix LIKE %s ESCAPE '\\')" in query_sql
+    assert "(prefix = %s OR (prefix >= %s AND prefix < %s))" in query_sql
     assert query_sql.endswith("RETURNING key")
-    assert params == ["a.b", "a.b.%", "a.b", "a.b.%"]
+    assert params == ["a.b", "a.b.", "a.b/"] * 2
 
     # Without index: only items delete
     sql_no_index = StoreSQL("public", "store", index=None)
     query_sql, params = sql_no_index.delete_namespace(["a"])
     assert query_sql.startswith("DELETE FROM public.store\n")
     assert "store_vectors" not in query_sql
-    assert params == ["a", "a.%"]
+    assert params == ["a", "a.", "a/"]
 
 
 def test_sweep():

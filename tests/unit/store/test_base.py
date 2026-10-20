@@ -20,7 +20,12 @@ from psycopg_pool import AsyncConnectionPool
 
 from langchain_cockroachdb.retry import RetryPolicy
 from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
-from langchain_cockroachdb.store.base import BaseCockroachDBStore, PutPlan, _group_ops
+from langchain_cockroachdb.store.base import (
+    MAX_SEARCH_NAMESPACES,
+    BaseCockroachDBStore,
+    PutPlan,
+    _group_ops,
+)
 from langchain_cockroachdb.store.config import resolve_index_config
 from langchain_cockroachdb.store.store import CockroachDBStore
 
@@ -700,6 +705,41 @@ def test_beam_size_runs_set_local_in_the_search_transaction() -> None:
     conn.attempts.clear()
     store.batch([SearchOp(("a",))])
     assert conn.session == []
+
+
+def searches_with_namespaces(count: int) -> list[tuple[str, list]]:
+    """The search statements sent when the lookup finds ``count`` namespaces."""
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    conn = SearchConnection([f"a.n{i}" for i in range(count)])
+    conn.attempts["store search"] = 1  # no injected failure
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[SearchConnection]:
+        yield conn.enter(kwargs)
+        conn.exit()
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    store.batch([SearchOp(("a",), query="q", filter={"x": 1})])
+    return [(sql, params) for label, sql, params in conn.executed if label == "store search"]
+
+
+def test_too_many_namespaces_fall_back_to_one_statement() -> None:
+    assert MAX_SEARCH_NAMESPACES == 1000
+    [capped] = searches_with_namespaces(MAX_SEARCH_NAMESPACES)
+    assert "prefix = ANY(CAST(%s AS STRING[]))" in capped[0]
+    assert len(capped[1][1]) == MAX_SEARCH_NAMESPACES
+
+    [fallback] = searches_with_namespaces(MAX_SEARCH_NAMESPACES + 1)
+    # The scan form: the namespace range in the vectors CTE, no array
+    assert "ANY(" not in fallback[0]
+    assert "(prefix = %s OR (prefix >= %s AND prefix < %s))" in fallback[0]
+    vector = "[1.0,0.0,0.0]"
+    # over_fetch for the default limit of 10: 10 * 1 * 2 + 1
+    assert fallback[1] == [vector, "a", "a.", "a/", vector, 21, "x", "1", 10, 0]
 
 
 def test_query_vector_is_checked_before_any_statement() -> None:

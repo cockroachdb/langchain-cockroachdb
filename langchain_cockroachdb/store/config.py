@@ -36,7 +36,10 @@ class CockroachDBIndexConfig(IndexConfig, total=False):  # type: ignore[call-arg
         distance_type: Distance metric (cosine, l2, or inner_product). Default cosine.
         cspann: C-SPANN index parameters (both or neither).
         flat: Whether to use a flat (brute-force) index. Default False.
-        beam_size: Beam width for C-SPANN search.
+        beam_size: Beam width for C-SPANN search. Searches with a query set
+            it with SET LOCAL in their own transaction. Inside a transaction
+            the caller opened on a single connection shared with the store,
+            it lasts until that transaction ends.
     """
 
     distance_type: Literal["cosine", "l2", "inner_product"]

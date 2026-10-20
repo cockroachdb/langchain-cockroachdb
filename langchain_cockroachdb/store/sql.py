@@ -44,22 +44,6 @@ def bind(statement: tuple[str, list], placeholder: object, value: Any) -> tuple[
     return (sql, [value if param is placeholder else param for param in params])
 
 
-def _prefix_range(column: str, namespace_prefix: Sequence[str]) -> tuple[str, list[str]]:
-    """Match a namespace and its descendants with a range the primary key can scan.
-
-    The strings that start with "a.b." are exactly those from "a.b." up to,
-    not including, "a.b/", because "/" is the byte after "." and STRING
-    compares bytes. The range constrains the primary key scan on every
-    supported version, while v25.4 scans the whole table for
-    ``LIKE ... ESCAPE``. Labels need no escaping.
-    """
-    text = ".".join(namespace_prefix)
-    return (
-        f"({column} = %s OR ({column} >= %s AND {column} < %s))",
-        [text, f"{text}.", f"{text}/"],
-    )
-
-
 class StoreSQL:
     """SQL statement builder for the CockroachDB store.
 
@@ -180,6 +164,11 @@ class StoreSQL:
 
         psycopg cannot bind a parameter in SET, so the value is formatted
         into the text. It is a positive int checked here, never user text.
+
+        SET LOCAL lasts until the transaction ends. The store runs it in the
+        search group's own transaction. But if a caller searches inside a
+        transaction it opened on a single connection it shares with the
+        store, the setting lasts until that caller's transaction ends.
 
         Raises:
             ValueError: If beam_size is not a positive int.
@@ -495,20 +484,29 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     #   and the vectors CTE has no other filter. An expiry check in that CTE
     #   turns every search into a scan of the primary key, and FORCE_INDEX
     #   reports that the index cannot be used.
-    # - A namespace and its descendants, (prefix = x OR prefix LIKE 'x.%'
-    #   ESCAPE ...), is never served by the index on any of the three. On
-    #   v25.4 the LIKE with ESCAPE is not even turned into a key span, so it
-    #   scans the whole table; v26.2 and v26.3 scan the prefix's key span. A
-    #   subquery, prefix IN (SELECT DISTINCT ...), does not help either.
+    # - A namespace and its descendants, the range from prefix_condition (or
+    #   the earlier LIKE 'x.%' ESCAPE form), is never served by the index on
+    #   any of the three. The range gets the prefix's key span; v25.4 scanned
+    #   the whole table for the LIKE form.
+    # - Nor are the namespaces computed in the same statement: with
+    #   prefix = ANY(ARRAY(SELECT DISTINCT prefix FROM <items or vectors>
+    #   WHERE <range>)) the subquery runs first, then the vectors table is
+    #   scanned in full; with prefix IN (SELECT DISTINCT ...) the planner uses
+    #   a lookup join into the primary key. FORCE_INDEX reports that the
+    #   vector index cannot be used for either.
     #
-    # So a search under a namespace takes two steps. namespace_lookup finds
-    # the namespaces that have vectors, seeking once per namespace, and
-    # semantic_search_in ranks with prefix = ANY(those namespaces), which the
-    # index serves. A search of the whole store has no prefix to constrain
-    # and uses semantic_search, a scan with exact ranking. Results are the
-    # same either way: expiry and filters are checked on the joined items,
-    # and vectors expire with their item. An expired vector that was not yet
-    # deleted can take one of the over_fetch slots, like a filtered-out item.
+    # So a search under a namespace takes two steps, two round trips.
+    # namespace_lookup finds the namespaces that have vectors, seeking once
+    # per namespace, and semantic_search_in ranks with prefix = ANY(those
+    # namespaces), which the index serves. When the lookup finds more than
+    # MAX_SEARCH_NAMESPACES (store/base.py), the search uses semantic_search
+    # instead, so the array stays bounded. A search of the whole store has no
+    # prefix to constrain and uses semantic_search too, a scan with exact
+    # ranking. Results are the same either way: expiry and filters are
+    # checked on the joined items, and vectors expire with their item. The
+    # vectors CTE has no expiry check, so that the index can serve it. As a
+    # result, expired vectors not yet deleted can occupy over_fetch slots,
+    # like filtered-out items: lower recall, never wrong results.
 
     def semantic_search(
         self,
@@ -605,8 +603,8 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             raise ValueError("namespace_lookup needs a non-empty namespace prefix")
         if self._index is None:
             raise ValueError("namespace_lookup requires an index configuration")
-        condition, params = _prefix_range("prefix", namespace_prefix)
-        inner, inner_params = _prefix_range("v.prefix", namespace_prefix)
+        condition, params = prefix_condition("prefix", namespace_prefix)
+        inner, inner_params = prefix_condition("v.prefix", namespace_prefix)
         sql = f"""WITH RECURSIVE found (prefix) AS (
     (SELECT prefix FROM {self.vectors} WHERE {condition} ORDER BY prefix LIMIT 1)
     UNION ALL
@@ -634,6 +632,11 @@ SELECT prefix FROM found WHERE prefix IS NOT NULL"""
         refresh: bool,
     ) -> tuple[str, list]:
         """Build a semantic search whose vectors CTE matches ``condition``.
+
+        The vectors CTE has no expiry check, so that the C-SPANN index can
+        serve it. Expired vectors not yet deleted can therefore occupy
+        over_fetch slots: lower recall, never wrong results, since the
+        items join checks expiry.
 
         The CTE ranks vectors by distance and keeps ``over_fetch`` of them.
         The items join applies the filter and expiry, then DISTINCT ON keeps

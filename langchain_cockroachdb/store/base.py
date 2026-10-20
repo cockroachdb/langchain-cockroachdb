@@ -53,6 +53,11 @@ ITEMS_PER_STATEMENT = 500
 # small, like the vector store's default batch_size.
 VECTORS_PER_STATEMENT = 100
 
+# Most namespaces a semantic search sends to the vector index in one array.
+# A search whose namespace lookup finds more uses the one-statement scan
+# form instead, so the array, and the index probes, stay bounded.
+MAX_SEARCH_NAMESPACES = 1000
+
 
 def _check_paging(limit: int, offset: int) -> None:
     """Raise ValueError for negative paging, before any database work."""
@@ -115,6 +120,23 @@ class PutPlan:
 
 
 @dataclass
+class NamespaceLookup:
+    """The namespace lookup of a semantic search under a namespace.
+
+    Attributes:
+        position: The position of the search statement in the batch's
+            search statements.
+        statement: The lookup, StoreSQL.namespace_lookup.
+        fallback: The one-statement form of the search, used when the
+            lookup finds more than MAX_SEARCH_NAMESPACES namespaces.
+    """
+
+    position: int
+    statement: tuple[str, list]
+    fallback: tuple[str, list]
+
+
+@dataclass
 class BatchPlan:
     """The statements of a batch, built before any of them runs.
 
@@ -128,9 +150,9 @@ class BatchPlan:
         search_statements: One statement per search, in the order of ``searches``.
         search_to_embed: (statement position, query text) for every search
             statement that needs the embedding of its query.
-        search_lookups: (statement position, namespace lookup) for every
-            semantic search under a namespace. The lookup finds the
-            namespaces bound in place of NAMESPACES.
+        search_lookups: The namespace lookup of every semantic search under
+            a namespace. The lookup finds the namespaces bound in place of
+            NAMESPACES.
         search_session: Statements that run first in the search group, in
             its transaction: the beam size, when set and a query is present.
         listings: The list_namespaces ops, as (position, op).
@@ -146,7 +168,7 @@ class BatchPlan:
     searches: list[tuple[int, SearchOp]] = field(default_factory=list)
     search_statements: list[tuple[str, list]] = field(default_factory=list)
     search_to_embed: list[tuple[int, str]] = field(default_factory=list)
-    search_lookups: list[tuple[int, tuple[str, list]]] = field(default_factory=list)
+    search_lookups: list[NamespaceLookup] = field(default_factory=list)
     search_session: list[str] = field(default_factory=list)
     listings: list[tuple[int, ListNamespacesOp]] = field(default_factory=list)
     listing_statements: list[tuple[str, list]] = field(default_factory=list)
@@ -177,20 +199,34 @@ class BatchPlan:
 
     def bind_query_vectors(self, vectors: Mapping[str, Sequence[float]]) -> None:
         """Put the embedding of each query text into its search statements."""
+        texts = dict(self.search_to_embed)
         for position, text in self.search_to_embed:
             self.search_statements[position] = StoreSQL.bind_query_vector(
                 self.search_statements[position], vectors[text]
             )
+        for lookup in self.search_lookups:
+            lookup.fallback = StoreSQL.bind_query_vector(
+                lookup.fallback, vectors[texts[lookup.position]]
+            )
 
     def lookup_statements(self) -> list[tuple[str, list]]:
         """The namespace lookups, to run as one read group before the searches."""
-        return [statement for _, statement in self.search_lookups]
+        return [lookup.statement for lookup in self.search_lookups]
 
     def bind_namespaces(self, found: list[Any]) -> None:
-        """Put the namespaces each lookup found into its search statement."""
-        for (position, _), rows in zip(self.search_lookups, found, strict=True):
-            self.search_statements[position] = bind(
-                self.search_statements[position], NAMESPACES, [row["prefix"] for row in rows]
+        """Put the namespaces each lookup found into its search statement.
+
+        A search whose lookup found more than MAX_SEARCH_NAMESPACES
+        namespaces runs its one-statement form instead.
+        """
+        for lookup, rows in zip(self.search_lookups, found, strict=True):
+            if len(rows) > MAX_SEARCH_NAMESPACES:
+                self.search_statements[lookup.position] = lookup.fallback
+                continue
+            self.search_statements[lookup.position] = bind(
+                self.search_statements[lookup.position],
+                NAMESPACES,
+                [row["prefix"] for row in rows],
             )
 
     def _fill_gets(self, found: list[Any]) -> None:
@@ -433,27 +469,35 @@ class BaseCockroachDBStore:
 
     def _search_plan(
         self, search_ops: Sequence[tuple[int, SearchOp]]
-    ) -> tuple[list[tuple[str, list]], list[tuple[int, str]], list[tuple[int, tuple[str, list]]]]:
+    ) -> tuple[list[tuple[str, list]], list[tuple[int, str]], list[NamespaceLookup]]:
         """Build one statement per search op.
 
-        A semantic search under a namespace gets a namespace lookup too: see
-        the notes above StoreSQL.semantic_search.
+        A semantic search under a namespace gets a namespace lookup too, and
+        a one-statement fallback: see the notes above StoreSQL.semantic_search.
 
         Returns:
             The statements, in the order of ``search_ops``; the
             (statement position, query text) pairs whose QUERY_VECTOR
-            placeholders need the query's embedding; and the
-            (statement position, lookup) pairs whose NAMESPACES placeholder
-            needs the namespaces the lookup finds.
+            placeholders need the query's embedding; and the lookups whose
+            namespaces fill the NAMESPACES placeholders.
         """
         statements: list[tuple[str, list]] = []
         to_embed: list[tuple[int, str]] = []
-        lookups: list[tuple[int, tuple[str, list]]] = []
+        lookups: list[NamespaceLookup] = []
         omit_expired = self.ttl.omit_expired
         for position, (_, op) in enumerate(search_ops):
             if op.query and self.index is not None:
                 # PostgresStore's rule: room for every vector of each result, twice
                 over_fetch = op.limit * self.index.estimated_vectors * 2 + 1
+                one_statement = self.sql.semantic_search(
+                    namespace_prefix=op.namespace_prefix,
+                    filter=op.filter,
+                    limit=op.limit,
+                    offset=op.offset,
+                    omit_expired=omit_expired,
+                    over_fetch=over_fetch,
+                    refresh=op.refresh_ttl,
+                )
                 if op.namespace_prefix:
                     statements.append(
                         self.sql.semantic_search_in(
@@ -465,19 +509,13 @@ class BaseCockroachDBStore:
                             refresh=op.refresh_ttl,
                         )
                     )
-                    lookups.append((position, self.sql.namespace_lookup(op.namespace_prefix)))
-                else:
-                    statements.append(
-                        self.sql.semantic_search(
-                            namespace_prefix=op.namespace_prefix,
-                            filter=op.filter,
-                            limit=op.limit,
-                            offset=op.offset,
-                            omit_expired=omit_expired,
-                            over_fetch=over_fetch,
-                            refresh=op.refresh_ttl,
+                    lookups.append(
+                        NamespaceLookup(
+                            position, self.sql.namespace_lookup(op.namespace_prefix), one_statement
                         )
                     )
+                else:
+                    statements.append(one_statement)
                 to_embed.append((position, op.query))
                 continue
             if op.query and self._first_query_without_index():

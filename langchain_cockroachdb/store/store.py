@@ -313,6 +313,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         transaction: SET LOCAL only takes effect inside a transaction block.
         On v25.4, v26.2 and v26.3 it is ignored in the implicit transaction
         of a pipeline, and works between BEGIN and COMMIT sent in one batch.
+        Inside a transaction the caller opened on a single connection shared
+        with the store, the group nests in a savepoint, and the setting
+        lasts until the caller's transaction ends.
         """
 
         def read() -> list[list[DictRow]]:

@@ -63,21 +63,15 @@ def from_text(prefix: str) -> tuple[str, ...]:
     return tuple(prefix.split("."))
 
 
-def escape_like(text: str) -> str:
-    """Escape LIKE pattern metacharacters.
-
-    Args:
-        text: Text to escape.
-
-    Returns:
-        Text with backslash, percent, and underscore escaped.
-    """
-    # Escape backslash first, then percent and underscore
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def prefix_condition(column: str, namespace_prefix: Sequence[str]) -> tuple[str, list[str]]:
-    """Build a SQL condition for namespace prefix matching.
+    """Build a SQL condition for a namespace and its descendants.
+
+    The descendants of "a.b" are the strings that start with "a.b.", which
+    are exactly those from "a.b." up to, not including, "a.b/": CockroachDB
+    compares STRING bytewise, and "/" is the byte after ".". So the
+    condition is a range, which needs no escaping and constrains the
+    primary key scan on every supported version. ``LIKE 'a.b.%' ESCAPE``
+    does not: v25.4 scans the whole table for it.
 
     Args:
         column: Column name (validated identifier, already formatted).
@@ -86,15 +80,16 @@ def prefix_condition(column: str, namespace_prefix: Sequence[str]) -> tuple[str,
     Returns:
         Tuple of (SQL condition, parameter values).
         Empty prefix returns ("TRUE", []).
-        Non-empty returns a condition with exact match OR prefix match.
+        Non-empty returns an exact match OR the descendants' range.
     """
     if not namespace_prefix:
         return ("TRUE", [])
 
     text = to_text(namespace_prefix)
-    escaped = escape_like(text)
-
-    return (f"({column} = %s OR {column} LIKE %s ESCAPE '\\')", [text, f"{escaped}.%"])
+    return (
+        f"({column} = %s OR ({column} >= %s AND {column} < %s))",
+        [text, f"{text}.", f"{text}/"],
+    )
 
 
 def match_pattern(path: Sequence[str], match_type: Literal["prefix", "suffix"]) -> str:
