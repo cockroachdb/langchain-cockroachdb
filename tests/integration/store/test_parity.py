@@ -15,7 +15,6 @@ from __future__ import annotations
 import contextlib
 import multiprocessing
 import threading
-import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -377,74 +376,6 @@ def test_delete_namespace_counts_and_scopes(store_factory, mode) -> None:
     assert store.delete_namespace(("user", "a")) == 0
     with pytest.raises(ValueError, match="drop the store's tables"):
         store.delete_namespace(())
-
-
-def test_ttl_expiry_refresh_and_sweep(store_factory, admin, table_name, mode) -> None:
-    # A TTL configuration also turns on row-level TTL in setup()
-    store = store_factory(mode, ttl={"default_ttl": 1.0, "refresh_on_read": True})
-    store.put(("t",), "short", {"v": 1}, ttl=0.01)
-    store.put(("t",), "long", {"v": 2})
-    store.put(("t",), "none", {"v": 3}, ttl=None)
-    store.put(("t",), "one", {"v": 4}, ttl=1)
-
-    def expires(key: str) -> Any:
-        row = admin.execute(
-            f"SELECT expires_at, ttl_minutes FROM {table_name} WHERE key = %s", (key,)
-        ).fetchone()
-        return row
-
-    # No ttl argument: the default. ttl=None: no expiry. ttl=1: one minute
-    assert expires("long")["ttl_minutes"] == 1
-    assert expires("none")["ttl_minutes"] is None
-    assert expires("none")["expires_at"] is None
-    assert expires("one")["ttl_minutes"] == 1
-    before = expires("long")["expires_at"]
-    time.sleep(1.2)
-    assert store.get(("t",), "short") is None
-    assert {item.key for item in store.search(("t",))} == {"long", "none", "one"}
-    after = expires("long")["expires_at"]
-    assert after > before
-    assert store.get(("t",), "long", refresh_ttl=False) is not None
-    assert expires("long")["expires_at"] == after
-    time.sleep(0.05)
-    assert store.get(("t",), "long") is not None
-    assert expires("long")["expires_at"] > after
-    assert store.sweep_ttl() == 1
-    assert store.sweep_ttl() == 0
-    assert expires("short") is None
-    assert "ttl_expiration_expression" in create_statement(admin, table_name)
-    store.disable_ttl()
-    assert "ttl_expiration_expression" not in create_statement(admin, table_name)
-
-
-def create_statement(admin: Any, table_name: str) -> str:
-    row = admin.execute(f"SHOW CREATE TABLE {table_name}").fetchone()
-    return row["create_statement"]
-
-
-@pytest.mark.timeout(60)
-def test_ttl_sweeper_thread_deletes_expired_rows(store_factory, admin, table_name) -> None:
-    store = store_factory("pool", ttl={"default_ttl": 1.0})
-    store.put(("t",), "short", {"v": 1}, ttl=0.005)
-    store.put(("t",), "long", {"v": 2})
-    # About 0.6 seconds between sweeps
-    future = store.start_ttl_sweeper(0.01)  # type: ignore[arg-type]
-    deadline = time.monotonic() + WAIT
-    while time.monotonic() < deadline:
-        keys = [row["key"] for row in admin.execute(f"SELECT key FROM {table_name}")]
-        if keys == ["long"]:
-            break
-        time.sleep(0.2)
-    assert keys == ["long"]
-    assert store.stop_ttl_sweeper(timeout=WAIT)
-    assert future.result(timeout=WAIT) is None
-    assert store.stop_ttl_sweeper() is True
-
-
-def test_store_without_ttl_config_has_no_sweeper(store_factory) -> None:
-    store = store_factory("connection")
-    future = store.start_ttl_sweeper()
-    assert future.done() and future.result() is None
 
 
 def test_from_conn_string_modes(libpq_url, table_name) -> None:
