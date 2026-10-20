@@ -31,7 +31,12 @@ from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
 from langchain_cockroachdb.checkpointer import _internal
 from langchain_cockroachdb.retry import RetryPolicy
-from langchain_cockroachdb.store.base import BaseCockroachDBStore, BatchPlan, PutPlan
+from langchain_cockroachdb.store.base import (
+    BaseCockroachDBStore,
+    BatchPlan,
+    PutPlan,
+    ttl_setup_policy,
+)
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
@@ -265,8 +270,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         if self.index is not None:
             self._check_index()
         if self._ttl_given:
+            policy = ttl_setup_policy(self.retry_policy)
             for statement in self.sql.ttl_statements(self.ttl.cron):
-                self._run_ddl(statement, "store TTL setup")
+                self._run_ddl(statement, "store TTL setup", policy=policy)
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         """Run a batch of operations.

@@ -28,7 +28,12 @@ from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
 from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.retry import RetryPolicy
-from langchain_cockroachdb.store.base import BaseCockroachDBStore, BatchPlan, PutPlan
+from langchain_cockroachdb.store.base import (
+    BaseCockroachDBStore,
+    BatchPlan,
+    PutPlan,
+    ttl_setup_policy,
+)
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
@@ -302,8 +307,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         if self.index is not None:
             await self._check_index()
         if self._ttl_given:
+            policy = ttl_setup_policy(self.retry_policy)
             for statement in self.sql.ttl_statements(self.ttl.cron):
-                await self._run_ddl(statement, "store TTL setup")
+                await self._run_ddl(statement, "store TTL setup", policy=policy)
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         """Run a batch of operations.

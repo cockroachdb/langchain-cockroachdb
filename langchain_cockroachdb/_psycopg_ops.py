@@ -77,9 +77,9 @@ class PsycopgOps:
         super().__init_subclass__(**kwargs)
         _check_component(cls)
 
-    def _retry(self, fn: Callable[[], T], *, label: str) -> T:
-        """Run ``fn`` under the retry policy."""
-        return self.retry_policy.run(fn, label=label, can_retry=self._can_retry)
+    def _retry(self, fn: Callable[[], T], *, label: str, policy: RetryPolicy | None = None) -> T:
+        """Run ``fn`` under ``policy``, by default the host's retry policy."""
+        return (policy or self.retry_policy).run(fn, label=label, can_retry=self._can_retry)
 
     def _sync_pipeline(self) -> None:
         """Sync pipeline if one is in use. Each statement runs in its own transaction."""
@@ -97,15 +97,18 @@ class PsycopgOps:
         # The caller owns its transaction, so it decides whether to retry all of it
         return not _internal.in_caller_transaction(error)
 
-    def _run_ddl(self, statement: str, label: str) -> None:
-        """Run a single DDL statement with retry and timeout."""
+    def _run_ddl(self, statement: str, label: str, *, policy: RetryPolicy | None = None) -> None:
+        """Run a single DDL statement with retry and timeout.
+
+        ``policy`` replaces the host's retry policy for this statement.
+        """
 
         def execute() -> None:
             with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
                 cur.execute(statement)
                 self._sync_pipeline()
 
-        self._retry(execute, label=label)
+        self._retry(execute, label=label, policy=policy)
 
     def _operation_lock(self) -> contextlib.AbstractContextManager[object]:
         """The lock an operation holds while it uses the connection.
@@ -361,9 +364,11 @@ class AsyncPsycopgOps:
         super().__init_subclass__(**kwargs)
         _check_component(cls)
 
-    async def _retry(self, fn: Callable[[], Awaitable[T]], *, label: str) -> T:
-        """Run ``fn`` under the retry policy."""
-        return await self.retry_policy.arun(fn, label=label, can_retry=self._can_retry)
+    async def _retry(
+        self, fn: Callable[[], Awaitable[T]], *, label: str, policy: RetryPolicy | None = None
+    ) -> T:
+        """Run ``fn`` under ``policy``, by default the host's retry policy."""
+        return await (policy or self.retry_policy).arun(fn, label=label, can_retry=self._can_retry)
 
     async def _sync_pipeline(self) -> None:
         """Sync pipeline if one is in use. Each statement runs in its own transaction."""
@@ -631,8 +636,13 @@ class AsyncPsycopgOps:
                         _internal.mark_in_caller_transaction(error)
                     raise
 
-    async def _run_ddl(self, statement: str, label: str) -> None:
-        """Run a single DDL statement with retry and timeout."""
+    async def _run_ddl(
+        self, statement: str, label: str, *, policy: RetryPolicy | None = None
+    ) -> None:
+        """Run a single DDL statement with retry and timeout.
+
+        ``policy`` replaces the host's retry policy for this statement.
+        """
 
         async def execute() -> None:
             async with self._cursor(
@@ -641,4 +651,4 @@ class AsyncPsycopgOps:
                 await cur.execute(statement)
                 await self._sync_pipeline()
 
-        await self._retry(execute, label=label)
+        await self._retry(execute, label=label, policy=policy)

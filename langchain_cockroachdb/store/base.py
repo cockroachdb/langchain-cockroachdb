@@ -14,7 +14,7 @@ import re
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 from langgraph.store.base import (
@@ -30,6 +30,7 @@ from langgraph.store.base import (
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
 from langchain_cockroachdb.async_vectorstore import _find_vector_index
+from langchain_cockroachdb.retry import RetryPolicy, get_sqlstate
 from langchain_cockroachdb.store.config import (
     ResolvedIndex,
     ResolvedTTL,
@@ -59,6 +60,36 @@ ITEMS_PER_STATEMENT = 500
 # Rows in one multi-row vector upsert. VECTOR rows are large, so batches stay
 # small, like the vector store's default batch_size.
 VECTORS_PER_STATEMENT = 100
+
+# CockroachDB v25.4 refuses to change a table's TTL settings while another
+# schema change on that table runs. Several setup() calls at once then fail
+# each other's TTL step. The other change finishes soon, so the TTL step
+# retries an error with this SQLSTATE and one of these phrases.
+SCHEMA_CHANGE_BUSY_SQLSTATE = "0A000"
+SCHEMA_CHANGE_BUSY_MESSAGES: tuple[str, ...] = (
+    "another schema change on the table is being processed",
+)
+
+
+def is_schema_change_busy(error: BaseException) -> bool:
+    """True if ``error`` says another schema change on the table is still running."""
+    if get_sqlstate(error) != SCHEMA_CHANGE_BUSY_SQLSTATE:
+        return False
+    message = str(error).lower()
+    return any(phrase in message for phrase in SCHEMA_CHANGE_BUSY_MESSAGES)
+
+
+def ttl_setup_policy(policy: RetryPolicy) -> RetryPolicy:
+    """``policy``, also retrying a TTL change that met another running schema change.
+
+    Every other error is decided by ``policy`` as it is, including its own
+    ``retry_on``. The TTL statements are idempotent, so a retry is safe.
+    """
+
+    def retry_on(error: BaseException) -> bool:
+        return is_schema_change_busy(error) or policy.is_retryable(error)
+
+    return replace(policy, retry_on=retry_on)
 
 
 def _check_paging(limit: int, offset: int) -> None:
