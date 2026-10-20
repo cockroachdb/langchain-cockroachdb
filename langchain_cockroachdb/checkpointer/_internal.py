@@ -18,18 +18,20 @@ Conn: TypeAlias = Connection[DictRow] | ConnectionPool[Connection[DictRow]]
 OPEN_TRANSACTION = frozenset({TransactionStatus.INTRANS, TransactionStatus.INERROR})
 
 
-def stuck_batch_error() -> psycopg.Error:
+def stuck_batch_error(component: str = "checkpointer") -> psycopg.Error:
     """The error raised when a stopped write batch of ours could not be rolled back.
 
     Running the operation anyway would nest it in that transaction, which
-    never commits.
+    never commits. ``component`` names the owner of the batch. The
+    checkpointer's message calls its owner the saver, as it always has.
     """
+    owner = "saver" if component == "checkpointer" else component
     return psycopg.errors.ActiveSqlTransaction(
-        "a write batch of the checkpointer that stopped partway may still be open "
+        f"a write batch of the {component} that stopped partway may still be open "
         "on its connection and could not be rolled back. This happens when the "
-        "saver's single connection is shared and a transaction the caller opened "
+        f"{owner}'s single connection is shared and a transaction the caller opened "
         "is open on it (psycopg forbids rollback() inside conn.transaction()). "
-        "End that transaction, or give the saver a pool."
+        f"End that transaction, or give the {owner} a pool."
     )
 
 

@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from psycopg.conninfo import conninfo_to_dict
+from psycopg.rows import dict_row
 
 SQLALCHEMY_SCHEME = "cockroachdb+psycopg"
 
@@ -116,3 +117,33 @@ def with_libpq_defaults(
     if "gssencmode" not in merged and not _url_sets_gssencmode(url):
         merged["gssencmode"] = DEFAULT_GSSENCMODE
     return merged
+
+
+# The psycopg components (checkpointers, store) depend on these connection settings
+_MANAGED_OPTIONS = frozenset({"autocommit", "row_factory", "prepare_threshold"})
+
+
+def connection_options(
+    conn_string: str,
+    connect_kwargs: Mapping[str, Any] | None,
+    connect_timeout: float | None,
+    prepare_threshold: int | None,
+    *,
+    component: str = "checkpointer",
+) -> dict[str, Any]:
+    """Keyword arguments for psycopg's connect(), shared by the psycopg components.
+
+    ``component`` names the caller in the error message.
+
+    Raises:
+        ValueError: If connect_kwargs sets an option the component manages
+    """
+    managed = _MANAGED_OPTIONS & set(connect_kwargs or {})
+    if managed:
+        raise ValueError(
+            f"{', '.join(sorted(managed))} cannot go in connect_kwargs: the {component} sets "
+            "autocommit and row_factory itself, and prepare_threshold has its own argument"
+        )
+    options = with_libpq_defaults(conn_string, connect_kwargs, connect_timeout)
+    options.update(autocommit=True, row_factory=dict_row, prepare_threshold=prepare_threshold)
+    return options
