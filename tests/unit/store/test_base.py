@@ -1,5 +1,6 @@
 """Unit tests for the store's shared planning code. No database."""
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Iterator
@@ -598,7 +599,7 @@ class AsyncSearchConnection(SearchConnection):
 
 
 QUERY_OPS = [
-    SearchOp(("a",), query="first", limit=2),
+    SearchOp(("a",), query="first", limit=2, offset=3),
     SearchOp(("b",), query="first"),
     SearchOp((), query="second"),
     SearchOp(("c",)),
@@ -608,7 +609,10 @@ QUERY_OPS = [
 def assert_query_statements(conn: SearchConnection) -> None:
     lookups = [params for label, _, params in conn.executed if label == "store search namespaces"]
     # One lookup per semantic search under a namespace, sent once: lookups are not retried here
-    assert lookups == [["a", "a.", "a/"] * 2, ["b", "b.", "b/"] * 2]
+    assert lookups == [
+        ["a", "a.", "a/"] * 2 + [MAX_SEARCH_NAMESPACES],
+        ["b", "b.", "b/"] * 2 + [MAX_SEARCH_NAMESPACES],
+    ]
     searches = [(sql, params) for label, sql, params in conn.executed if label == "store search"]
     # Two attempts of four statements each; the retry reuses the same vectors
     assert len(searches) == 8
@@ -616,8 +620,8 @@ def assert_query_statements(conn: SearchConnection) -> None:
     first, second, root, plain = searches[4:]
     assert "prefix = ANY(CAST(%s AS STRING[]))" in first[0]
     assert first[1][:3] == ["[1.0,0.0,0.0]", ["a", "a.x"], "[1.0,0.0,0.0]"]
-    # over_fetch = limit * estimated_vectors * 2 + 1
-    assert first[1][3] == 2 * 1 * 2 + 1
+    # over_fetch = (limit + offset) * estimated_vectors * 2 + 1
+    assert first[1][3] == (2 + 3) * 1 * 2 + 1
     assert second[1][1] == ["a", "a.x"]
     # A search of the whole store has no namespace condition and no lookup
     assert "ANY(" not in root[0] and root[1][0] == "[1.0,0.0,0.0]"
@@ -675,6 +679,40 @@ async def test_async_query_is_embedded_once_per_distinct_text_outside_retry() ->
     assert conn.attempts == {"store search namespaces": 1, "store search": 2}
     assert_query_statements(conn)
     assert conn.session == []
+
+
+class FailingEmbeddings(CountingEmbeddings):
+    """aembed_query fails for "bad" and waits forever for any other text."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = 0
+
+    async def aembed_query(self, text: str) -> list[float]:
+        if text == "bad":
+            await asyncio.sleep(0)
+            raise RuntimeError("embedding service down")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return [1.0, 0.0, 0.0]
+
+
+async def test_async_failed_query_embedding_cancels_the_others() -> None:
+    embeddings = FailingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+    )
+    with pytest.raises(RuntimeError, match="embedding service down"):
+        await store.abatch(
+            [SearchOp(("a",), query="slow"), SearchOp(("a",), query="bad"), SearchOp((), query="x")]
+        )
+    # Let the cancellations run
+    await asyncio.sleep(0)
+    assert embeddings.cancelled == 2
 
 
 def test_beam_size_runs_set_local_in_the_search_transaction() -> None:

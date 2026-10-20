@@ -454,6 +454,17 @@ def test_semantic_paging_applies_after_dedup(store_factory, mode) -> None:
     assert store.search(("docs",), query="k2 a", limit=2, offset=3) == full[3:]
 
 
+def test_deep_semantic_page_has_candidates(store_factory, mode) -> None:
+    # One vector per item, so over_fetch without the offset would be 2 * 1 * 2 + 1 = 5
+    store = store_factory(mode, index=index_config(fields=["text"]))
+    for i in range(12):
+        store.put(("docs",), f"k{i:02}", {"text": f"item number {i}"})
+    full = store.search(("docs",), query="item number 3", limit=12)
+    assert len(full) == 12
+    deep = store.search(("docs",), query="item number 3", limit=2, offset=10)
+    assert plain_order(deep) == plain_order(full[10:])
+
+
 def dot(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b, strict=True))
 
@@ -630,6 +641,16 @@ async def test_async_semantic_paging_applies_after_dedup(astore_factory, mode) -
     assert [page[0].key for page in pages] == plain_order(full)
 
 
+async def test_async_deep_semantic_page_has_candidates(astore_factory, mode) -> None:
+    store = await astore_factory(mode, index=index_config(fields=["text"]))
+    for i in range(12):
+        await store.aput(("docs",), f"k{i:02}", {"text": f"item number {i}"})
+    full = await store.asearch(("docs",), query="item number 3", limit=12)
+    assert len(full) == 12
+    deep = await store.asearch(("docs",), query="item number 3", limit=2, offset=10)
+    assert plain_order(deep) == plain_order(full[10:])
+
+
 async def test_async_l2_and_inner_product_scores(astore_factory, mode) -> None:
     store = await astore_factory(mode, index=index_config(distance_type="l2"))
     await aput_docs(store)
@@ -696,3 +717,8 @@ async def test_async_beam_size_is_applied(astore_factory, mode, monkeypatch) -> 
     monkeypatch.setattr(store.sql, "semantic_search_in", beam_probe)
     probe = await store.asearch(("docs",), query="anything")
     assert [(item.key, item.score) for item in probe] == [("probe", 5.0)]
+    if mode != "pool":
+        # SET LOCAL ends with the transaction; the session keeps the default
+        cur = await store.conn.execute("SHOW vector_search_beam_size")
+        row = await cur.fetchone()
+        assert row is not None and row["vector_search_beam_size"] != "5"

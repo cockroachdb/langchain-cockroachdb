@@ -4,7 +4,13 @@ import pytest
 
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
-from langchain_cockroachdb.store.sql import NAMESPACES, QUERY_VECTOR, StoreSQL, bind
+from langchain_cockroachdb.store.sql import (
+    MAX_SEARCH_NAMESPACES,
+    NAMESPACES,
+    QUERY_VECTOR,
+    StoreSQL,
+    bind,
+)
 
 
 def _make_index(
@@ -581,11 +587,15 @@ def test_namespace_lookup_seeks_each_distinct_namespace():
     """
     sql = StoreSQL("public", "store", index=_make_index())
     query_sql, params = sql.namespace_lookup(["a", "b"])
-    assert query_sql.startswith("WITH RECURSIVE found (prefix) AS (")
+    assert query_sql.startswith("WITH RECURSIVE found (prefix, n) AS (")
     assert "FROM public.store_vectors" in query_sql
     assert "LIKE" not in query_sql
     assert "ORDER BY prefix LIMIT 1" in query_sql
-    assert params == ["a.b", "a.b.", "a.b/"] * 2
+    # The lookup stops after MAX_SEARCH_NAMESPACES + 1 namespaces
+    assert "found.n + 1" in query_sql
+    assert "WHERE found.prefix IS NOT NULL AND found.n <= %s" in query_sql
+    assert params == ["a.b", "a.b.", "a.b/"] * 2 + [MAX_SEARCH_NAMESPACES]
+    assert MAX_SEARCH_NAMESPACES == 1000
     assert query_sql.count("%s") == len(params)
     assert query_sql.rstrip().endswith("SELECT prefix FROM found WHERE prefix IS NOT NULL")
     # Labels may hold LIKE wildcards; the range form needs no escaping

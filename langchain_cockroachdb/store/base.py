@@ -41,7 +41,14 @@ from langchain_cockroachdb.store.namespaces import (
     to_text,
     validate_labels,
 )
-from langchain_cockroachdb.store.sql import NAMESPACES, ItemRow, StoreSQL, VectorRow, bind
+from langchain_cockroachdb.store.sql import (
+    MAX_SEARCH_NAMESPACES,
+    NAMESPACES,
+    ItemRow,
+    StoreSQL,
+    VectorRow,
+    bind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +59,6 @@ ITEMS_PER_STATEMENT = 500
 # Rows in one multi-row vector upsert. VECTOR rows are large, so batches stay
 # small, like the vector store's default batch_size.
 VECTORS_PER_STATEMENT = 100
-
-# Most namespaces a semantic search sends to the vector index in one array.
-# A search whose namespace lookup finds more uses the one-statement scan
-# form instead, so the array, and the index probes, stay bounded.
-MAX_SEARCH_NAMESPACES = 1000
 
 
 def _check_paging(limit: int, offset: int) -> None:
@@ -487,8 +489,10 @@ class BaseCockroachDBStore:
         omit_expired = self.ttl.omit_expired
         for position, (_, op) in enumerate(search_ops):
             if op.query and self.index is not None:
-                # PostgresStore's rule: room for every vector of each result, twice
-                over_fetch = op.limit * self.index.estimated_vectors * 2 + 1
+                # Room for every vector of each result up to the end of the
+                # page, twice. PostgresStore leaves out the offset and runs
+                # out of candidates on deep pages
+                over_fetch = (op.limit + op.offset) * self.index.estimated_vectors * 2 + 1
                 one_statement = self.sql.semantic_search(
                     namespace_prefix=op.namespace_prefix,
                     filter=op.filter,

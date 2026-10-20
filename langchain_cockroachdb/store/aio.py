@@ -382,9 +382,14 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         """
         assert self.index is not None
         texts = plan.query_texts()
-        vectors = await asyncio.gather(
-            *(self.index.embeddings.aembed_query(text) for text in texts)
-        )
+        tasks = [asyncio.ensure_future(self.index.embeddings.aembed_query(text)) for text in texts]
+        try:
+            vectors = await asyncio.gather(*tasks)
+        except BaseException:
+            # gather leaves the other calls running when one fails
+            for task in tasks:
+                task.cancel()
+            raise
         self._bind_query_vectors(plan, texts, vectors)
 
     async def adrop_vector_index(self) -> None:

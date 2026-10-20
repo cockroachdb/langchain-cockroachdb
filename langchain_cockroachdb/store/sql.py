@@ -19,6 +19,12 @@ QUERY_VECTOR = object()
 # Stands in the params for the namespaces found by namespace_lookup
 NAMESPACES = object()
 
+# Most namespaces a semantic search sends to the vector index in one array.
+# namespace_lookup stops after one more, and a search whose lookup finds
+# more uses the one-statement scan form instead, so the lookup, the array
+# and the index probes stay bounded.
+MAX_SEARCH_NAMESPACES = 1000
+
 # Type aliases
 ItemRow = tuple[str, str, str, float | None]  # prefix, key, value_json, ttl_minutes
 VectorRow = tuple[
@@ -484,22 +490,27 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     #   and the vectors CTE has no other filter. An expiry check in that CTE
     #   turns every search into a scan of the primary key, and FORCE_INDEX
     #   reports that the index cannot be used.
-    # - A namespace and its descendants, the range from prefix_condition (or
-    #   the earlier LIKE 'x.%' ESCAPE form), is never served by the index on
-    #   any of the three. The range gets the prefix's key span; v25.4 scanned
-    #   the whole table for the LIKE form.
-    # - Nor are the namespaces computed in the same statement: with
-    #   prefix = ANY(ARRAY(SELECT DISTINCT prefix FROM <items or vectors>
-    #   WHERE <range>)) the subquery runs first, then the vectors table is
-    #   scanned in full; with prefix IN (SELECT DISTINCT ...) the planner uses
-    #   a lookup join into the primary key. FORCE_INDEX reports that the
-    #   vector index cannot be used for either.
+    # - A namespace and its descendants, as the range from prefix_condition:
+    #   semantic_search with it (the full statement) scans the vectors
+    #   primary key over the prefix's key span on v25.4.14, and FORCE_INDEX
+    #   on the vector index fails with "cannot be used for this query". The
+    #   earlier LIKE 'x.%' ESCAPE form was not served by the index on any of
+    #   the three either, and v25.4 scanned the whole table for it.
+    # - Nor are the namespaces computed in the same statement. Measured on
+    #   the vectors CTE alone, on v25.4.14 and v26.3.2: with prefix =
+    #   ANY(ARRAY(SELECT DISTINCT prefix FROM <items or vectors> WHERE
+    #   <range>)) the subquery runs first, then the vectors table is scanned
+    #   in full; with prefix IN (SELECT DISTINCT prefix FROM <items> WHERE
+    #   <range>) the plan is a lookup join into the vectors primary key. For
+    #   the ANY(ARRAY(...)) form FORCE_INDEX fails with the same error.
     #
-    # So a search under a namespace takes two steps, two round trips.
+    # So a search under a namespace takes two steps, two round trips. A
+    # namespace created between the lookup and the search is not searched,
+    # which is the same as the search having run a moment earlier.
     # namespace_lookup finds the namespaces that have vectors, seeking once
     # per namespace, and semantic_search_in ranks with prefix = ANY(those
     # namespaces), which the index serves. When the lookup finds more than
-    # MAX_SEARCH_NAMESPACES (store/base.py), the search uses semantic_search
+    # MAX_SEARCH_NAMESPACES, the search uses semantic_search
     # instead, so the array stays bounded. A search of the whole store has no
     # prefix to constrain and uses semantic_search too, a scan with exact
     # ranking. Results are the same either way: expiry and filters are
@@ -590,7 +601,9 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
 
         A recursive CTE seeks to the next namespace in the primary key until
         none is left, so it reads one row per namespace, not every vector.
-        Expired vectors count; the search itself checks expiry.
+        It counts them and stops after MAX_SEARCH_NAMESPACES + 1, enough for
+        the store to know it must fall back to the scan form. Expired
+        vectors count; the search itself checks expiry.
 
         Returns:
             Tuple of (SQL, parameters). Each row has a ``prefix``.
@@ -605,19 +618,19 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             raise ValueError("namespace_lookup requires an index configuration")
         condition, params = prefix_condition("prefix", namespace_prefix)
         inner, inner_params = prefix_condition("v.prefix", namespace_prefix)
-        sql = f"""WITH RECURSIVE found (prefix) AS (
-    (SELECT prefix FROM {self.vectors} WHERE {condition} ORDER BY prefix LIMIT 1)
+        sql = f"""WITH RECURSIVE found (prefix, n) AS (
+    (SELECT prefix, 1 FROM {self.vectors} WHERE {condition} ORDER BY prefix LIMIT 1)
     UNION ALL
     SELECT (
         SELECT v.prefix FROM {self.vectors} AS v
         WHERE v.prefix > found.prefix AND {inner}
         ORDER BY v.prefix LIMIT 1
-    )
+    ), found.n + 1
     FROM found
-    WHERE found.prefix IS NOT NULL
+    WHERE found.prefix IS NOT NULL AND found.n <= %s
 )
 SELECT prefix FROM found WHERE prefix IS NOT NULL"""
-        return (sql, params + inner_params)
+        return (sql, [*params, *inner_params, MAX_SEARCH_NAMESPACES])
 
     def _semantic(
         self,
