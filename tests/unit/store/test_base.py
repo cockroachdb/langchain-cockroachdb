@@ -1,6 +1,8 @@
 """Unit tests for the store's shared planning code. No database."""
 
+import contextlib
 import logging
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pytest
@@ -15,8 +17,7 @@ from langgraph.store.base import (
 )
 
 from langchain_cockroachdb.store.base import BaseCockroachDBStore, PutPlan, _group_ops
-from langchain_cockroachdb.store.config import resolve_index_config, resolve_ttl_config
-from langchain_cockroachdb.store.sql import StoreSQL
+from langchain_cockroachdb.store.config import resolve_index_config
 from langchain_cockroachdb.store.store import CockroachDBStore
 
 
@@ -38,14 +39,10 @@ class CountingEmbeddings(Embeddings):
 def make_base(*, fields: list[str] | None = None, ttl=None) -> BaseCockroachDBStore:
     """BaseCockroachDBStore state built directly, without a connection."""
     store = BaseCockroachDBStore()
-    store.index = None
+    index = None
     if fields is not None:
-        store.index = resolve_index_config(
-            {"dims": 3, "embed": CountingEmbeddings(), "fields": fields}
-        )
-    store.ttl = resolve_ttl_config(ttl)
-    store.sql = StoreSQL("public", "store", index=store.index)
-    store._warned_query_without_index = False
+        index = resolve_index_config({"dims": 3, "embed": CountingEmbeddings(), "fields": fields})
+    store._configure(index=index, ttl=ttl, table_name="store", schema="public")
     return store
 
 
@@ -179,3 +176,44 @@ def test_index_is_not_supported_yet() -> None:
             object(),  # type: ignore[arg-type]
             index={"dims": 3, "embed": CountingEmbeddings()},
         )
+
+
+class RecordingCursor:
+    """A cursor that records executes and fetches in a shared log."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+        self.connection = self
+
+    def cursor(self, **kwargs: object) -> "RecordingCursor":
+        return RecordingCursor(self.log)
+
+    def execute(self, query: str, params: list) -> None:
+        self.log.append("execute")
+
+    def fetchall(self) -> list:
+        self.log.append("fetch")
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def test_read_group_queues_every_statement_before_fetching() -> None:
+    store = CockroachDBStore(object())  # type: ignore[arg-type]
+    log: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[RecordingCursor]:
+        log.append("cursor")
+        yield RecordingCursor(log)
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    results = store.batch([GetOp(("a",), "k"), GetOp(("b",), "k"), GetOp(("c",), "k")])
+    assert results == [None, None, None]
+    # One cursor context, three statements, every fetch after every execute
+    assert log == ["cursor"] + ["execute"] * 3 + ["fetch"] * 3
+
+    log.clear()
+    store.batch([SearchOp(("a",)), SearchOp(("b",), refresh_ttl=False)])
+    assert log == ["cursor"] + ["execute"] * 2 + ["fetch"] * 2

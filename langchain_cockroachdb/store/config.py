@@ -25,7 +25,9 @@ class CSPANNConfig(TypedDict, total=False):
     max_partition_size: int
 
 
-class CockroachDBIndexConfig(IndexConfig):
+# total=False keeps every added key optional. The ignore is for type checks
+# run without langgraph installed, where the base class is untyped
+class CockroachDBIndexConfig(IndexConfig, total=False):  # type: ignore[call-arg,unused-ignore]
     """CockroachDB-specific index configuration.
 
     Extends LangGraph IndexConfig with CockroachDB vector index options.
@@ -43,7 +45,7 @@ class CockroachDBIndexConfig(IndexConfig):
     beam_size: int
 
 
-class CockroachDBTTLConfig(TTLConfig):
+class CockroachDBTTLConfig(TTLConfig, total=False):  # type: ignore[call-arg,unused-ignore]
     """CockroachDB-specific TTL configuration.
 
     Extends LangGraph TTLConfig with CockroachDB TTL options.
@@ -214,7 +216,7 @@ def resolve_index_config(index: CockroachDBIndexConfig | None) -> ResolvedIndex 
         raise ValueError("beam_size must be a positive integer")
 
     # Process fields
-    raw_fields = index.get("fields", ["$"])
+    raw_fields = index.get("fields") or ["$"]
     fields_list: list[tuple[str, Literal["$"] | list[str]]] = []
     estimated = 0
 
@@ -293,6 +295,8 @@ def resolve_ttl_config(ttl: TTLConfig | CockroachDBTTLConfig | None) -> Resolved
 
     # Check for explicit ttl_job_cron
     ttl_job_cron = ttl.get("ttl_job_cron") if isinstance(ttl, dict) else None
+    if ttl_job_cron is not None and not isinstance(ttl_job_cron, str):
+        raise ValueError(f"ttl_job_cron must be a string, got {type(ttl_job_cron).__name__}")
 
     if ttl_job_cron is not None:
         # Validate cron expression to prevent SQL injection

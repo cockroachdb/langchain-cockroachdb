@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -139,6 +140,8 @@ class BaseCockroachDBStore:
     index: ResolvedIndex | None
     ttl: ResolvedTTL
     _warned_query_without_index: bool
+    # Pooled batches run concurrently; the lock makes the warning appear once
+    _warning_lock: threading.Lock
 
     def _configure(
         self,
@@ -153,6 +156,7 @@ class BaseCockroachDBStore:
         self.ttl = resolve_ttl_config(ttl)
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
+        self._warning_lock = threading.Lock()
 
     def _plan_puts(self, put_ops: Iterable[PutOp]) -> PutPlan:
         """Plan the rows a batch of puts writes.
@@ -227,12 +231,12 @@ class BaseCockroachDBStore:
                         offset=op.offset,
                         omit_expired=omit_expired,
                         over_fetch=over_fetch,
+                        refresh=op.refresh_ttl,
                     )
                 )
                 to_embed.append((position, op.query))
                 continue
-            if op.query and not self._warned_query_without_index:
-                self._warned_query_without_index = True
+            if op.query and self._first_query_without_index():
                 self._log.warning(
                     "A search query was given, but the store has no index configured. "
                     "Results are filtered and ordered by updated_at, not ranked by "
@@ -245,9 +249,17 @@ class BaseCockroachDBStore:
                     limit=op.limit,
                     offset=op.offset,
                     omit_expired=omit_expired,
+                    refresh=op.refresh_ttl,
                 )
             )
         return statements, to_embed
+
+    def _first_query_without_index(self) -> bool:
+        """True the first time a search query meets a store without an index."""
+        with self._warning_lock:
+            first = not self._warned_query_without_index
+            self._warned_query_without_index = True
+        return first
 
     def _write_statements(
         self, plan: PutPlan, vector_rows: Sequence[Any] = ()

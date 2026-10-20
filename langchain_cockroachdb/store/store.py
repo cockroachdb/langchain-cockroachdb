@@ -29,7 +29,7 @@ from langgraph.store.base import (
     TTLConfig,
 )
 from psycopg import Capabilities, Connection, Pipeline
-from psycopg.rows import DictRow
+from psycopg.rows import DictRow, dict_row
 from psycopg_pool import ConnectionPool
 
 from langchain_cockroachdb._connection import connection_options, to_libpq_url
@@ -319,43 +319,53 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """Run ``batch`` in a worker thread, as PostgresStore does."""
         return await asyncio.get_running_loop().run_in_executor(None, self.batch, list(ops))
 
-    def _run_gets(self, gets: list[tuple[int, GetOp]], results: list[Result]) -> None:
-        by_namespace: dict[tuple[str, ...], list[tuple[int, GetOp]]] = defaultdict(list)
-        for i, op in gets:
-            by_namespace[tuple(op.namespace)].append((i, op))
-        omit_expired = self.ttl.omit_expired
+    def _read_all(self, statements: list[tuple[str, list]], label: str) -> list[list[DictRow]]:
+        """Run read statements as one round trip and return the rows of each.
 
-        def read() -> dict[tuple[str, ...], dict[str, DictRow]]:
-            found: dict[tuple[str, ...], dict[str, DictRow]] = {}
+        Every statement goes on its own cursor and all are sent before any
+        result is fetched, so in pipeline mode the group costs one round
+        trip. Without pipeline support they run one after another.
+        """
+
+        def read() -> list[list[DictRow]]:
             with self._cursor(
-                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="store get"
+                pipeline=True, timeout=self.retry_policy.attempt_timeout, label=label
             ) as cur:
-                for namespace, items in by_namespace.items():
-                    prefix = to_text(namespace)
-                    keys = list(dict.fromkeys(op.key for _, op in items))
-                    cur.execute(*self.sql.get(prefix, keys, omit_expired=omit_expired))
-                    rows = {row["key"]: row for row in cur.fetchall()}
-                    found[namespace] = rows
-                    refresh = list(
-                        dict.fromkeys(
-                            op.key for _, op in items if op.refresh_ttl and op.key in rows
-                        )
-                    )
-                    if refresh:
-                        self._refresh(cur, prefix, refresh)
-            return found
+                conn = cur.connection
+                cursors = [cur] + [
+                    conn.cursor(binary=True, row_factory=dict_row) for _ in statements[1:]
+                ]
+                try:
+                    for statement_cursor, statement in zip(cursors, statements, strict=True):
+                        statement_cursor.execute(*statement)
+                    return [statement_cursor.fetchall() for statement_cursor in cursors]
+                finally:
+                    for extra in cursors[1:]:
+                        extra.close()
 
-        found = self._retry(read, label="store get")
-        for namespace, items in by_namespace.items():
+        return self._retry(read, label=label)
+
+    def _run_gets(self, gets: list[tuple[int, GetOp]], results: list[Result]) -> None:
+        # One statement per namespace and refresh choice. With refresh, the
+        # statement also pushes back the expiry of the rows it reads.
+        groups: dict[tuple[tuple[str, ...], bool], list[tuple[int, GetOp]]] = defaultdict(list)
+        for i, op in gets:
+            groups[(tuple(op.namespace), bool(op.refresh_ttl))].append((i, op))
+        statements = [
+            self.sql.get(
+                to_text(namespace),
+                list(dict.fromkeys(op.key for _, op in items)),
+                omit_expired=self.ttl.omit_expired,
+                refresh=refresh,
+            )
+            for (namespace, refresh), items in groups.items()
+        ]
+        found = self._read_all(statements, "store get")
+        for ((namespace, _), items), rows in zip(groups.items(), found, strict=True):
+            by_key = {row["key"]: row for row in rows}
             for i, op in items:
-                row = found[namespace].get(op.key)
+                row = by_key.get(op.key)
                 results[i] = None if row is None else _row_to_item(namespace, row)
-
-    def _refresh(self, cur: Any, prefix: str, keys: list[str]) -> None:
-        """Push back the expiry of rows that have a TTL."""
-        cur.execute(*self.sql.refresh(prefix, keys))
-        if self.index is not None:
-            cur.execute(*self.sql.refresh_vectors(prefix, keys))
 
     def _run_searches(
         self,
@@ -363,24 +373,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         statements: list[tuple[str, list]],
         results: list[Result],
     ) -> None:
-        def read() -> list[list[DictRow]]:
-            found: list[list[DictRow]] = []
-            with self._cursor(
-                pipeline=True, timeout=self.retry_policy.attempt_timeout, label="store search"
-            ) as cur:
-                for (_, op), statement in zip(searches, statements, strict=True):
-                    cur.execute(*statement)
-                    rows = cur.fetchall()
-                    found.append(rows)
-                    if op.refresh_ttl and rows:
-                        by_prefix: dict[str, list[str]] = defaultdict(list)
-                        for row in rows:
-                            by_prefix[row["prefix"]].append(row["key"])
-                        for prefix, keys in by_prefix.items():
-                            self._refresh(cur, prefix, keys)
-            return found
-
-        found = self._retry(read, label="store search")
+        found = self._read_all(statements, "store search")
         for (i, _), rows in zip(searches, found, strict=True):
             results[i] = [_row_to_search_item(row) for row in rows]
 
@@ -390,19 +383,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         statements: list[tuple[str, list]],
         results: list[Result],
     ) -> None:
-        def read() -> list[list[DictRow]]:
-            found: list[list[DictRow]] = []
-            with self._cursor(
-                pipeline=True,
-                timeout=self.retry_policy.attempt_timeout,
-                label="store list namespaces",
-            ) as cur:
-                for statement in statements:
-                    cur.execute(*statement)
-                    found.append(cur.fetchall())
-            return found
-
-        found = self._retry(read, label="store list namespaces")
+        found = self._read_all(statements, "store list namespaces")
         for (i, _), rows in zip(listings, found, strict=True):
             results[i] = [from_text(row["ns"]) for row in rows]
 
@@ -427,7 +408,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """Delete every item in a namespace and its descendants.
 
         ``("user", "a")`` deletes ``("user", "a")`` and ``("user", "a", "b")``,
-        not ``("user", "ab")``. The deletes commit together.
+        not ``("user", "ab")``. One statement deletes the items and their vectors.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
@@ -446,18 +427,17 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 "store on purpose, delete each top-level namespace from list_namespaces("
                 "max_depth=1), or drop the store's tables."
             )
-        statements = self.sql.delete_namespace(prefix)
+        statement = self.sql.delete_namespace(prefix)
 
         def write() -> int:
+            # One statement, so items and vectors commit together. pipeline=True
+            # makes a component-wide pipeline sync, which commits it
             with self._cursor(
                 pipeline=True,
-                transaction=True,
                 timeout=self.retry_policy.attempt_timeout,
                 label="store delete namespace",
             ) as cur:
-                for statement in statements[:-1]:
-                    cur.execute(*statement)
-                cur.execute(*statements[-1])
+                cur.execute(*statement)
                 return len(cur.fetchall())
 
         return self._retry(write, label="store delete namespace")

@@ -192,27 +192,63 @@ def test_get():
     assert params == ["a.b", ["k1", "k2"]]
 
 
-def test_refresh():
-    """refresh() builds UPDATE to extend TTL."""
+def test_get_with_refresh_is_one_statement():
+    """get(refresh=True) updates expiry in CTEs and reads in the same statement."""
     sql = StoreSQL("public", "store", index=None)
-    query_sql, params = sql.refresh("a", ["k1"])
+    query_sql, params = sql.get("a", ["k1"], omit_expired=True, refresh=True)
 
+    assert query_sql.startswith("WITH refreshed AS (")
     assert "UPDATE public.store" in query_sql
     assert "expires_at = now() + ttl_minutes * INTERVAL '1 minute'" in query_sql
     assert "ttl_minutes IS NOT NULL" in query_sql
+    assert "refreshed_vectors" not in query_sql
+    assert query_sql.rstrip().endswith("AND (expires_at IS NULL OR expires_at > now())")
+    assert query_sql.count("%s") == len(params)
+    assert params == ["a", ["k1"], "a", ["k1"]]
 
-    assert params == ["a", ["k1"]]
-
-
-def test_refresh_vectors():
-    """refresh_vectors() mirrors refresh for vectors table."""
-    sql = StoreSQL("public", "store", index=_make_index())
-    query_sql, params = sql.refresh_vectors("a", ["k1"])
-
+    # With an index the vectors get a CTE of their own
+    indexed = StoreSQL("public", "store", index=_make_index())
+    query_sql, params = indexed.get("a", ["k1"], omit_expired=False, refresh=True)
+    assert "refreshed_vectors AS (" in query_sql
     assert "UPDATE public.store_vectors" in query_sql
-    assert "expires_at = now() + ttl_minutes * INTERVAL '1 minute'" in query_sql
+    assert "expires_at > now()" not in query_sql
+    assert params == ["a", ["k1"]] * 3
 
-    assert params == ["a", ["k1"]]
+
+def test_search_with_refresh_wraps_results():
+    """search(refresh=True) keeps its params and updates the rows it returns."""
+    sql = StoreSQL("public", "store", index=_make_index())
+    plain_sql, plain_params = sql.search(
+        namespace_prefix=["a"], filter={"x": 1}, limit=10, offset=5, omit_expired=True
+    )
+    query_sql, params = sql.search(
+        namespace_prefix=["a"],
+        filter={"x": 1},
+        limit=10,
+        offset=5,
+        omit_expired=True,
+        refresh=True,
+    )
+    assert params == plain_params
+    assert query_sql.startswith("WITH search_results AS (\n" + plain_sql + "\n)")
+    assert "updated AS (" in query_sql
+    assert "updated_vectors AS (" in query_sql
+    assert "(prefix, key) IN (SELECT prefix, key FROM search_results)" in query_sql
+    assert query_sql.endswith("FROM search_results\nORDER BY updated_at DESC, prefix, key")
+
+    semantic_sql, semantic_params = sql.semantic_search(
+        namespace_prefix=["a"],
+        filter=None,
+        limit=3,
+        offset=0,
+        omit_expired=True,
+        over_fetch=7,
+        refresh=True,
+    )
+    assert semantic_params[0] is QUERY_VECTOR
+    assert semantic_params[-2:] == [3, 0]
+    assert semantic_sql.count("%s") == len(semantic_params)
+    assert semantic_sql.endswith("score\nFROM search_results\nORDER BY score DESC, prefix, key")
 
 
 def test_upsert_items():
@@ -330,31 +366,23 @@ def test_list_namespaces():
 
 
 def test_delete_namespace():
-    """delete_namespace() returns list of (sql, params) tuples."""
-    # With index: vectors delete, then items delete
+    """delete_namespace() is one statement; vectors go in a CTE with an index."""
     sql = StoreSQL("public", "store", index=_make_index())
-    deletes = sql.delete_namespace(["a", "b"])
+    query_sql, params = sql.delete_namespace(["a", "b"])
 
-    assert len(deletes) == 2
-
-    # Vectors delete
-    vectors_sql, vectors_params = deletes[0]
-    assert "DELETE FROM public.store_vectors" in vectors_sql
-    assert "(prefix = %s OR prefix LIKE %s ESCAPE '\\')" in vectors_sql
-    assert vectors_params == ["a.b", "a.b.%"]
-
-    # Items delete with RETURNING
-    items_sql, items_params = deletes[1]
-    assert "DELETE FROM public.store" in items_sql
-    assert "RETURNING key" in items_sql
-    assert items_params == ["a.b", "a.b.%"]
+    assert query_sql.startswith("WITH deleted_vectors AS (")
+    assert "DELETE FROM public.store_vectors" in query_sql
+    assert "DELETE FROM public.store\n" in query_sql
+    assert "(prefix = %s OR prefix LIKE %s ESCAPE '\\')" in query_sql
+    assert query_sql.endswith("RETURNING key")
+    assert params == ["a.b", "a.b.%", "a.b", "a.b.%"]
 
     # Without index: only items delete
     sql_no_index = StoreSQL("public", "store", index=None)
-    deletes = sql_no_index.delete_namespace(["a"])
-
-    assert len(deletes) == 1
-    assert "RETURNING key" in deletes[0][0]
+    query_sql, params = sql_no_index.delete_namespace(["a"])
+    assert query_sql.startswith("DELETE FROM public.store\n")
+    assert "store_vectors" not in query_sql
+    assert params == ["a", "a.%"]
 
 
 def test_sweep():
@@ -435,12 +463,8 @@ def test_every_builder_has_one_param_per_placeholder():
     query_sql, params = sql.get("a.b.c", ["k1"], omit_expired=True)
     assert query_sql.count("%s") == len(params)
 
-    # refresh
-    query_sql, params = sql.refresh("a.b.c", ["k1", "k2"])
-    assert query_sql.count("%s") == len(params)
-
-    # refresh_vectors
-    query_sql, params = sql.refresh_vectors("a.b.c", ["k1"])
+    # get with refresh
+    query_sql, params = sql.get("a.b.c", ["k1", "k2"], omit_expired=True, refresh=True)
     assert query_sql.count("%s") == len(params)
 
     # upsert_items
@@ -493,9 +517,8 @@ def test_every_builder_has_one_param_per_placeholder():
     assert query_sql.count("%s") == len(params)
 
     # delete_namespace
-    deletes = sql.delete_namespace(["a", "b", "c"])
-    for query_sql, params in deletes:
-        assert query_sql.count("%s") == len(params)
+    query_sql, params = sql.delete_namespace(["a", "b", "c"])
+    assert query_sql.count("%s") == len(params)
 
     # sweep
     sweeps = sql.sweep()

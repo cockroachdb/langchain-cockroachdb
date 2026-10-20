@@ -176,8 +176,26 @@ class StoreSQL:
 
         return stmts
 
+    def _refresh_cte(self, name: str, table: str, where: str) -> str:
+        """A CTE that pushes back the expiry of the rows of ``table`` matching ``where``.
+
+        Only rows with a TTL change. Data-modifying CTEs run even when the
+        statement does not read them, and the statement's SELECT reads the
+        rows as they were before the update.
+        """
+        return (
+            f"{name} AS (\n    UPDATE {table}\n"
+            "    SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'\n"
+            f"    WHERE ttl_minutes IS NOT NULL AND {where}\n    RETURNING key\n)"
+        )
+
     def get(
-        self, namespace_text: str, keys: Sequence[str], *, omit_expired: bool
+        self,
+        namespace_text: str,
+        keys: Sequence[str],
+        *,
+        omit_expired: bool,
+        refresh: bool = False,
     ) -> tuple[str, list]:
         """Build SELECT for items by namespace and keys.
 
@@ -185,54 +203,46 @@ class StoreSQL:
             namespace_text: Namespace as dot-separated text.
             keys: Item keys to fetch.
             omit_expired: Whether to exclude expired items.
+            refresh: Whether to also push back the expiry of the rows read,
+                in the same statement (vectors too, with an index).
 
         Returns:
             Tuple of (SQL, parameters).
         """
+        expiry = " AND (expires_at IS NULL OR expires_at > now())" if omit_expired else ""
+        where = f"prefix = %s AND key = ANY(%s){expiry}"
         sql = f"""SELECT key, value, created_at, updated_at
 FROM {self.items}
-WHERE prefix = %s AND key = ANY(%s)"""
-
+WHERE {where}"""
         params: list[Any] = [namespace_text, list(keys)]
+        if not refresh:
+            return (sql, params)
 
-        if omit_expired:
-            sql += "\nAND (expires_at IS NULL OR expires_at > now())"
+        ctes = [self._refresh_cte("refreshed", self.items, where)]
+        cte_params: list[Any] = [namespace_text, list(keys)]
+        if self._index is not None:
+            ctes.append(self._refresh_cte("refreshed_vectors", self.vectors, where))
+            cte_params.extend([namespace_text, list(keys)])
+        return ("WITH " + ",\n".join(ctes) + "\n" + sql, cte_params + params)
 
-        return (sql, params)
+    def _with_refresh(self, query: str, columns: str, order_by: str) -> str:
+        """Wrap a search query so the rows it returns get their expiry pushed back.
 
-    def refresh(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
-        """Build UPDATE to refresh TTL for items.
-
-        Args:
-            namespace_text: Namespace as dot-separated text.
-            keys: Item keys to refresh.
-
-        Returns:
-            Tuple of (SQL, parameters).
+        The query becomes the CTE ``search_results``. Its parameters stay
+        first and in order, since the added CTEs take none.
         """
-        sql = f"""UPDATE {self.items}
-SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'
-WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
-
-        params: list[Any] = [namespace_text, list(keys)]
-        return (sql, params)
-
-    def refresh_vectors(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
-        """Build UPDATE to refresh TTL for vectors.
-
-        Args:
-            namespace_text: Namespace as dot-separated text.
-            keys: Item keys to refresh.
-
-        Returns:
-            Tuple of (SQL, parameters).
-        """
-        sql = f"""UPDATE {self.vectors}
-SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'
-WHERE prefix = %s AND key = ANY(%s) AND ttl_minutes IS NOT NULL"""
-
-        params: list[Any] = [namespace_text, list(keys)]
-        return (sql, params)
+        where = "(prefix, key) IN (SELECT prefix, key FROM search_results)"
+        ctes = [
+            f"search_results AS (\n{query}\n)",
+            self._refresh_cte("updated", self.items, where),
+        ]
+        if self._index is not None:
+            ctes.append(self._refresh_cte("updated_vectors", self.vectors, where))
+        return (
+            "WITH "
+            + ",\n".join(ctes)
+            + f"\nSELECT {columns}\nFROM search_results\nORDER BY {order_by}"
+        )
 
     def upsert_items(self, rows: Sequence[ItemRow]) -> tuple[str, list]:
         """Build multi-row INSERT for items with ON CONFLICT.
@@ -371,6 +381,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         limit: int,
         offset: int,
         omit_expired: bool,
+        refresh: bool = False,
     ) -> tuple[str, list]:
         """Build plain search query ordered by updated_at.
 
@@ -380,6 +391,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             limit: Maximum results.
             offset: Results to skip.
             omit_expired: Whether to exclude expired items.
+            refresh: Whether to also push back the expiry of the rows returned.
 
         Returns:
             Tuple of (SQL, parameters).
@@ -408,8 +420,11 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             sql += " AND (expires_at IS NULL OR expires_at > now())"
 
         # Order and paging
-        sql += "\nORDER BY updated_at DESC, prefix, key\nLIMIT %s OFFSET %s"
+        order_by = "updated_at DESC, prefix, key"
+        sql += f"\nORDER BY {order_by}\nLIMIT %s OFFSET %s"
         params.extend([limit, offset])
+        if refresh:
+            sql = self._with_refresh(sql, "prefix, key, value, created_at, updated_at", order_by)
 
         return (sql, params)
 
@@ -422,6 +437,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         offset: int,
         omit_expired: bool,
         over_fetch: int,
+        refresh: bool = False,
     ) -> tuple[str, list]:
         """Build semantic search query with vector similarity.
 
@@ -432,6 +448,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             offset: Results to skip.
             omit_expired: Whether to exclude expired items.
             over_fetch: Limit for the vector CTE (top-k from index).
+            refresh: Whether to also push back the expiry of the rows returned.
 
         Returns:
             Tuple of (SQL, parameters). Query vector appears as QUERY_VECTOR sentinel twice.
@@ -512,6 +529,10 @@ LIMIT %s OFFSET %s"""
         # Add filter params, then limit and offset
         params.extend(filter_params)
         params.extend([limit, offset])
+        if refresh:
+            sql = self._with_refresh(
+                sql, "prefix, key, value, created_at, updated_at, score", "score DESC, prefix, key"
+            )
 
         return (sql, params)
 
@@ -563,31 +584,28 @@ LIMIT %s OFFSET %s"""
 
         return (sql, params)
 
-    def delete_namespace(self, namespace_prefix: Sequence[str]) -> list[tuple[str, list]]:
-        """Build DELETE statements for a namespace and its descendants.
+    def delete_namespace(self, namespace_prefix: Sequence[str]) -> tuple[str, list]:
+        """Build one DELETE for a namespace and its descendants.
+
+        With an index, the vectors go in a data-modifying CTE of the same
+        statement.
 
         Args:
             namespace_prefix: Namespace prefix to delete.
 
         Returns:
-            List of (SQL, parameters) tuples. Vectors delete (if index configured),
-            then items delete with RETURNING key.
+            Tuple of (SQL, parameters). The statement returns the key of
+            every item deleted.
         """
-        deletes: list[tuple[str, list]] = []
-
-        # Build prefix condition
         ns_condition, ns_params = prefix_condition("prefix", namespace_prefix)
-
-        # Vectors delete (if index configured)
-        if self._index is not None:
-            vectors_sql = f"DELETE FROM {self.vectors}\nWHERE {ns_condition}"
-            deletes.append((vectors_sql, ns_params.copy()))
-
-        # Items delete with RETURNING
-        items_sql = f"DELETE FROM {self.items}\nWHERE {ns_condition}\nRETURNING key"
-        deletes.append((items_sql, ns_params.copy()))
-
-        return deletes
+        sql = f"DELETE FROM {self.items}\nWHERE {ns_condition}\nRETURNING key"
+        if self._index is None:
+            return (sql, list(ns_params))
+        cte = (
+            f"WITH deleted_vectors AS (\n    DELETE FROM {self.vectors}\n"
+            f"    WHERE {ns_condition}\n    RETURNING key\n)\n"
+        )
+        return (cte + sql, list(ns_params) + list(ns_params))
 
     def sweep(self) -> list[tuple[str, list]]:
         """Build DELETE statements for expired rows.

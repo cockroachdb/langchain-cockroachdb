@@ -398,6 +398,9 @@ def test_ttl_expiry_refresh_and_sweep(store_factory, admin, table_name, mode) ->
     assert after > before
     assert store.get(("t",), "long", refresh_ttl=False) is not None
     assert expires("long")["expires_at"] == after
+    time.sleep(0.05)
+    assert store.get(("t",), "long") is not None
+    assert expires("long")["expires_at"] > after
     assert store.sweep_ttl() == 1
     assert store.sweep_ttl() == 0
     assert expires("short") is None
