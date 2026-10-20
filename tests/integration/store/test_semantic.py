@@ -1,8 +1,12 @@
-"""Semantic search on the store: the write path.
+"""Semantic search on the store.
 
-Indexed items get one vector row per text, written in the same transaction
-as the item. Re-puts replace the vectors, ``index=False`` and deletes remove
-them, and vectors carry the item's TTL.
+The write path: indexed items get one vector row per text, written in the
+same transaction as the item. Re-puts replace the vectors, ``index=False``
+and deletes remove them, and vectors carry the item's TTL.
+
+The query path: ``search(query=...)`` ranks items by vector similarity
+through the C-SPANN index and returns scores, and ``setup()`` checks an
+existing index against the store's configuration.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from typing import Any
 
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
-from langgraph.store.base import PutOp
+from langgraph.store.base import PutOp, SearchItem
 from psycopg import AsyncConnection, Connection
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
@@ -350,3 +354,345 @@ async def test_put_batch_with_vectors_is_atomic_under_cancellation(
         assert not any("rolling back returned connection" in r.getMessage() for r in caplog.records)
         await store.abatch(batch_ops("new"))
         assert await avector_fields(aadmin, store) == AFTER
+
+
+# The query path
+
+DOCS = {
+    "apple": "apples are red and sweet",
+    "sky": "the sky is blue at noon",
+    "cat": "cats purr when they are happy",
+}
+
+
+def put_docs(store: CockroachDBStore, namespace: tuple[str, ...] = ("docs",)) -> None:
+    for key, text in DOCS.items():
+        store.put(namespace, key, {"text": text})
+
+
+async def aput_docs(store: AsyncCockroachDBStore, namespace: tuple[str, ...] = ("docs",)) -> None:
+    for key, text in DOCS.items():
+        await store.aput(namespace, key, {"text": text})
+
+
+def assert_ranked_by_cosine(results: list[SearchItem]) -> None:
+    """The item whose text is the query comes first with similarity 1, the others lower."""
+    assert [item.key for item in results][0] == "sky"
+    assert sorted(item.key for item in results) == sorted(DOCS)
+    scores = [item.score for item in results]
+    assert all(score is not None for score in scores)
+    # Vectors are stored as float32
+    assert math.isclose(scores[0], 1.0, abs_tol=1e-6)  # type: ignore[arg-type]
+    assert all(score < scores[0] - 1e-3 for score in scores[1:])  # type: ignore[operator]
+    assert scores == sorted(scores, reverse=True)  # type: ignore[type-var]
+
+
+def plain_order(results: list[SearchItem]) -> list[str]:
+    return [item.key for item in results]
+
+
+def test_query_ranks_by_similarity_and_returns_scores(store_factory, mode) -> None:
+    store = store_factory(mode, index=index_config())
+    put_docs(store)
+    results = store.search(("docs",), query=DOCS["sky"])
+    assert_ranked_by_cosine(results)
+    assert results[0].value == {"text": DOCS["sky"]}
+    assert results[0].namespace == ("docs",)
+    # The same query twice in one batch, and a search of the whole store
+    root = store.search((), query=DOCS["sky"], limit=2)
+    assert [item.key for item in root] == [item.key for item in results[:2]]
+
+
+def test_query_includes_descendant_namespaces_and_applies_filters(store_factory, mode) -> None:
+    store = store_factory(mode, index=index_config())
+    store.put(("users", "a"), "top", {"text": "dark theme", "kind": "pref"})
+    store.put(("users", "a", "notes"), "deep", {"text": "dark theme", "kind": "note"})
+    store.put(("users", "a", "notes", "x"), "deeper", {"text": "light theme", "kind": "note"})
+    # Siblings that share the text prefix but not the namespace
+    store.put(("users", "ab"), "sibling", {"text": "dark theme", "kind": "pref"})
+    store.put(("users",), "parent", {"text": "dark theme", "kind": "pref"})
+
+    results = store.search(("users", "a"), query="dark theme")
+    assert {(item.namespace, item.key) for item in results} == {
+        (("users", "a"), "top"),
+        (("users", "a", "notes"), "deep"),
+        (("users", "a", "notes", "x"), "deeper"),
+    }
+    assert {item.key for item in results[:2]} == {"top", "deep"}
+    notes = store.search(("users", "a"), query="dark theme", filter={"kind": "note"})
+    assert [item.key for item in notes] == ["deep", "deeper"]
+    assert store.search(("users", "zzz"), query="dark theme") == []
+    everything = store.search((), query="dark theme", limit=10)
+    assert len(everything) == 5
+
+
+def test_multi_vector_items_are_deduplicated_keeping_best_score(store_factory, mode) -> None:
+    store = store_factory(mode, index=index_config())
+    store.put(
+        ("docs",),
+        "many",
+        {"text": "alpha", "messages": [{"content": "beta"}, {"content": "gamma"}]},
+    )
+    store.put(("docs",), "one", {"text": "delta"})
+    results = store.search(("docs",), query="gamma")
+    assert [item.key for item in results] == ["many", "one"]
+    assert math.isclose(results[0].score, 1.0, abs_tol=1e-6)  # type: ignore[arg-type]
+
+
+def test_semantic_paging_applies_after_dedup(store_factory, mode) -> None:
+    store = store_factory(mode, index=index_config())
+    for key in ("k1", "k2", "k3", "k4"):
+        store.put(
+            ("docs",),
+            key,
+            {"text": f"{key} text", "messages": [{"content": f"{key} a"}, {"content": f"{key} b"}]},
+        )
+    full = store.search(("docs",), query="k2 a", limit=10)
+    assert len(full) == 4 and full[0].key == "k2"
+    pages = [store.search(("docs",), query="k2 a", limit=1, offset=i) for i in range(4)]
+    assert [page[0].key for page in pages] == [item.key for item in full]
+    assert store.search(("docs",), query="k2 a", limit=2, offset=3) == full[3:]
+
+
+def dot(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b, strict=True))
+
+
+@pytest.mark.parametrize("distance", ["l2", "inner_product"])
+def test_l2_and_inner_product_scores(store_factory, table_name, admin, mode, distance) -> None:
+    store = store_factory(
+        mode, table_name=f"{table_name}_{distance}", index=index_config(distance_type=distance)
+    )
+    try:
+        put_docs(store)
+        results = store.search(("docs",), query=DOCS["sky"])
+        model = DeterministicFakeEmbedding(size=DIMS)
+        query = model.embed_query(DOCS["sky"])
+        expected = {}
+        for key, text in DOCS.items():
+            vector = model.embed_query(text)
+            if distance == "l2":
+                # The score is the negated L2 distance
+                expected[key] = -math.sqrt(
+                    sum((a - b) ** 2 for a, b in zip(vector, query, strict=True))
+                )
+            else:
+                # CockroachDB's <#> is the negated inner product; the score negates it again
+                expected[key] = dot(vector, query)
+        assert [item.key for item in results] == sorted(expected, key=expected.get, reverse=True)
+        for item in results:
+            assert math.isclose(item.score, expected[item.key], rel_tol=1e-4, abs_tol=1e-4)  # type: ignore[arg-type]
+        if distance == "l2":
+            assert results[0].key == "sky" and abs(results[0].score) < 1e-3  # type: ignore[arg-type]
+    finally:
+        drop_store_tables(admin.info.dsn, f"{table_name}_{distance}")
+
+
+def test_query_without_index_warns_once_and_searches_plainly(store_factory, mode, caplog) -> None:
+    store = store_factory(mode)
+    store.put(("docs",), "old", {"text": "the sky is blue"})
+    store.put(("docs",), "new", {"text": "cats"})
+    with caplog.at_level(logging.WARNING):
+        first = store.search(("docs",), query="the sky is blue")
+        second = store.search(("docs",), query="cats")
+    warnings = [r for r in caplog.records if "no index configured" in r.getMessage()]
+    assert len(warnings) == 1
+    # Ordered by updated_at, newest first, with no score
+    assert plain_order(first) == plain_order(second) == ["new", "old"]
+    assert all(item.score is None for item in first)
+
+
+def test_setup_rejects_distance_change_and_dims_change(store_factory, mode) -> None:
+    store_factory(mode, index=index_config())
+    l2 = store_factory(mode, setup=False, index=index_config(distance_type="l2"))
+    with pytest.raises(ValueError) as raised:
+        l2.setup()
+    name = l2.sql.vector_index_name
+    assert str(raised.value) == (
+        f"the vector index {name} uses vector_cosine_ops; drop it with drop_vector_index() "
+        "and run setup() again to use vector_l2_ops"
+    )
+    wider = store_factory(mode, setup=False, index={**index_config(), "dims": 8})
+    with pytest.raises(ValueError, match=rf"VECTOR\({DIMS}\).*dims=8"):
+        wider.setup()
+
+
+def test_setup_warns_on_partition_size_change(store_factory, mode, caplog) -> None:
+    store_factory(
+        mode, index=index_config(cspann={"min_partition_size": 16, "max_partition_size": 64})
+    )
+    with caplog.at_level(logging.WARNING):
+        store_factory(
+            mode, index=index_config(cspann={"min_partition_size": 32, "max_partition_size": 128})
+        )
+    messages = [r.getMessage() for r in caplog.records if "partition_size" in r.getMessage()]
+    assert len(messages) == 1
+    assert "min_partition_size = 32 (index has 16)" in messages[0]
+    assert "max_partition_size = 128 (index has 64)" in messages[0]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        store_factory(mode, index=index_config(flat=True))
+    assert any("flat" in r.getMessage() for r in caplog.records)
+
+
+def test_drop_vector_index_then_setup_rebuilds(store_factory, admin, mode) -> None:
+    store = store_factory(mode, index=index_config())
+    put_docs(store)
+    l2 = store_factory(mode, setup=False, index=index_config(distance_type="l2"))
+    l2.drop_vector_index()
+    assert "VECTOR INDEX" not in create_statement(admin, l2.sql.vectors)
+    # Dropping twice is fine
+    l2.drop_vector_index()
+    l2.setup()
+    assert "embedding vector_l2_ops)" in create_statement(admin, l2.sql.vectors)
+    results = l2.search(("docs",), query=DOCS["sky"])
+    assert results[0].key == "sky"
+    assert abs(results[0].score) < 1e-3  # type: ignore[arg-type]
+
+
+def beam_probe(**_: Any) -> tuple[str, list]:
+    """A search statement that returns the session's beam size as the score."""
+    return (
+        "SELECT 'docs' AS prefix, 'probe' AS key, CAST('{}' AS JSONB) AS value, "
+        "now() AS created_at, now() AS updated_at, "
+        "CAST(current_setting('vector_search_beam_size') AS FLOAT8) AS score",
+        [],
+    )
+
+
+def test_beam_size_is_applied(store_factory, mode, monkeypatch) -> None:
+    store = store_factory(mode, index=index_config(beam_size=7))
+    put_docs(store)
+    # The real search works with the beam size set
+    assert store.search(("docs",), query=DOCS["sky"])[0].key == "sky"
+    # The setting holds inside the search group, which runs in one transaction
+    monkeypatch.setattr(store.sql, "semantic_search_in", beam_probe)
+    probe = store.search(("docs",), query="anything")
+    assert [(item.key, item.score) for item in probe] == [("probe", 7.0)]
+    if mode != "pool":
+        # SET LOCAL ends with the transaction; the session keeps the default
+        row = store.conn.execute("SHOW vector_search_beam_size").fetchone()
+        assert row is not None and row["vector_search_beam_size"] != "7"
+
+
+# The query path, async
+
+
+async def test_async_query_ranks_by_similarity_and_returns_scores(astore_factory, mode) -> None:
+    store = await astore_factory(mode, index=index_config())
+    await aput_docs(store)
+    results = await store.asearch(("docs",), query=DOCS["sky"])
+    assert_ranked_by_cosine(results)
+    # Two searches in one tick run as one batch, with one embedding per text
+    same, root = await asyncio.gather(
+        store.asearch(("docs",), query=DOCS["sky"]), store.asearch((), query=DOCS["sky"])
+    )
+    assert plain_order(same) == plain_order(root) == plain_order(results)
+
+
+async def test_async_query_includes_descendant_namespaces_and_applies_filters(
+    astore_factory, mode
+) -> None:
+    store = await astore_factory(mode, index=index_config())
+    await store.aput(("users", "a"), "top", {"text": "dark theme", "kind": "pref"})
+    await store.aput(("users", "a", "notes"), "deep", {"text": "dark theme", "kind": "note"})
+    await store.aput(("users", "ab"), "sibling", {"text": "dark theme", "kind": "pref"})
+    results = await store.asearch(("users", "a"), query="dark theme")
+    assert sorted(item.key for item in results) == ["deep", "top"]
+    notes = await store.asearch(("users", "a"), query="dark theme", filter={"kind": "note"})
+    assert [item.key for item in notes] == ["deep"]
+
+
+async def test_async_multi_vector_items_are_deduplicated_keeping_best_score(
+    astore_factory, mode
+) -> None:
+    store = await astore_factory(mode, index=index_config())
+    await store.aput(
+        ("docs",),
+        "many",
+        {"text": "alpha", "messages": [{"content": "beta"}, {"content": "gamma"}]},
+    )
+    await store.aput(("docs",), "one", {"text": "delta"})
+    results = await store.asearch(("docs",), query="gamma")
+    assert [item.key for item in results] == ["many", "one"]
+    assert math.isclose(results[0].score, 1.0, abs_tol=1e-6)  # type: ignore[arg-type]
+
+
+async def test_async_semantic_paging_applies_after_dedup(astore_factory, mode) -> None:
+    store = await astore_factory(mode, index=index_config())
+    for key in ("k1", "k2", "k3"):
+        await store.aput(
+            ("docs",), key, {"text": f"{key} text", "messages": [{"content": f"{key} a"}]}
+        )
+    full = await store.asearch(("docs",), query="k3 a", limit=10)
+    assert len(full) == 3 and full[0].key == "k3"
+    pages = [await store.asearch(("docs",), query="k3 a", limit=1, offset=i) for i in range(3)]
+    assert [page[0].key for page in pages] == plain_order(full)
+
+
+async def test_async_l2_and_inner_product_scores(astore_factory, mode) -> None:
+    store = await astore_factory(mode, index=index_config(distance_type="l2"))
+    await aput_docs(store)
+    results = await store.asearch(("docs",), query=DOCS["sky"])
+    assert results[0].key == "sky" and abs(results[0].score) < 1e-3  # type: ignore[arg-type]
+    scores = [item.score for item in results]
+    assert all(score <= 0 for score in scores)  # type: ignore[operator]
+    assert scores == sorted(scores, reverse=True)  # type: ignore[type-var]
+
+
+async def test_async_query_without_index_warns_once_and_searches_plainly(
+    astore_factory, mode, caplog
+) -> None:
+    store = await astore_factory(mode)
+    await store.aput(("docs",), "old", {"text": "the sky is blue"})
+    await store.aput(("docs",), "new", {"text": "cats"})
+    with caplog.at_level(logging.WARNING):
+        first = await store.asearch(("docs",), query="the sky is blue")
+        second = await store.asearch(("docs",), query="cats")
+    assert len([r for r in caplog.records if "no index configured" in r.getMessage()]) == 1
+    assert plain_order(first) == plain_order(second) == ["new", "old"]
+
+
+async def test_async_setup_rejects_distance_change_and_dims_change(astore_factory, mode) -> None:
+    await astore_factory(mode, index=index_config())
+    ip = await astore_factory(mode, setup=False, index=index_config(distance_type="inner_product"))
+    with pytest.raises(ValueError, match="uses vector_cosine_ops; drop it with drop_vector_index"):
+        await ip.setup()
+    wider = await astore_factory(mode, setup=False, index={**index_config(), "dims": 8})
+    with pytest.raises(ValueError, match=r"dims=8"):
+        await wider.setup()
+
+
+async def test_async_setup_warns_on_partition_size_change(astore_factory, mode, caplog) -> None:
+    await astore_factory(
+        mode, index=index_config(cspann={"min_partition_size": 16, "max_partition_size": 64})
+    )
+    with caplog.at_level(logging.WARNING):
+        await astore_factory(
+            mode, index=index_config(cspann={"min_partition_size": 16, "max_partition_size": 96})
+        )
+    messages = [r.getMessage() for r in caplog.records if "partition_size" in r.getMessage()]
+    assert len(messages) == 1 and "max_partition_size = 96 (index has 64)" in messages[0]
+    assert "min_partition_size" not in messages[0]
+
+
+async def test_async_drop_vector_index_then_setup_rebuilds(astore_factory, aadmin, mode) -> None:
+    store = await astore_factory(mode, index=index_config())
+    await aput_docs(store)
+    l2 = await astore_factory(mode, setup=False, index=index_config(distance_type="l2"))
+    await l2.adrop_vector_index()
+    await l2.adrop_vector_index()
+    await l2.setup()
+    cur = await aadmin.execute(f"SHOW CREATE TABLE {l2.sql.vectors}")
+    row = await cur.fetchone()
+    assert row is not None and "embedding vector_l2_ops)" in row["create_statement"]
+    assert (await l2.asearch(("docs",), query=DOCS["sky"]))[0].key == "sky"
+
+
+async def test_async_beam_size_is_applied(astore_factory, mode, monkeypatch) -> None:
+    store = await astore_factory(mode, index=index_config(beam_size=5))
+    await aput_docs(store)
+    assert (await store.asearch(("docs",), query=DOCS["sky"]))[0].key == "sky"
+    monkeypatch.setattr(store.sql, "semantic_search_in", beam_probe)
+    probe = await store.asearch(("docs",), query="anything")
+    assert [(item.key, item.score) for item in probe] == [("probe", 5.0)]

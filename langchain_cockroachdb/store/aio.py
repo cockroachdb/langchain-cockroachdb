@@ -19,7 +19,7 @@ from typing import Any
 
 from langgraph.store.base import InvalidNamespaceError, Op, Result, TTLConfig
 from langgraph.store.base.batch import AsyncBatchedBaseStore
-from psycopg import AsyncConnection, AsyncPipeline, Capabilities
+from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -28,7 +28,7 @@ from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
 from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.retry import RetryPolicy
-from langchain_cockroachdb.store.base import BaseCockroachDBStore, PutPlan
+from langchain_cockroachdb.store.base import BaseCockroachDBStore, BatchPlan, PutPlan
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
@@ -256,8 +256,14 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         several processes at once: every migration is idempotent and versions
         are recorded with ON CONFLICT DO NOTHING. With an index, it creates
         the vectors table and its C-SPANN index (unless ``flat``) on every
-        call. With a TTL configuration, it then turns on CockroachDB
-        row-level TTL on ``expires_at``.
+        call, then checks an existing index against the configuration. With
+        a TTL configuration, it then turns on CockroachDB row-level TTL on
+        ``expires_at``.
+
+        Raises:
+            ValueError: If the vectors table exists with other dims, or its
+                index uses another distance. A different partition size, or
+                an index while ``flat`` is set, logs a WARNING instead.
         """
         migrations = self.sql.migrations()
         version_sql = f"SELECT v FROM {self.sql.migrations_table} ORDER BY v DESC LIMIT 1"
@@ -294,6 +300,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         for statement in self.sql.vector_statements():
             await self._run_ddl(statement, "store vector setup")
+        if self.index is not None:
+            await self._check_index()
         if self._ttl_given:
             for statement in self.sql.ttl_statements(self.ttl.cron):
                 await self._run_ddl(statement, "store TTL setup")
@@ -312,39 +320,92 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             One result per op, in the order of ``ops``.
         """
         plan = self._plan_batch(ops)
-        for label, statements, fill in plan.reads():
-            fill(await self._read_all(statements, label))
+        if plan.search_to_embed:
+            await self._embed_queries(plan)
+        if plan.search_lookups:
+            plan.bind_namespaces(
+                await self._read_all(plan.lookup_statements(), "store search namespaces")
+            )
+        for label, statements, fill, session in plan.reads():
+            fill(await self._read_all(statements, label, session))
         if plan.puts is not None:
             await self._run_puts(plan.puts)
         return plan.results
 
     async def _read_all(
-        self, statements: list[tuple[str, list]], label: str
+        self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
     ) -> list[list[DictRow]]:
         """Run read statements as one round trip and return the rows of each.
 
         Every statement goes on its own cursor and all are sent before any
         result is fetched, so in pipeline mode the group costs one round
-        trip. Without pipeline support they run one after another.
+        trip. Without pipeline support they run one after another. The rows
+        are fetched once the block has synced the pipeline.
+
+        ``session`` statements run first, and then the group runs in one
+        transaction: SET LOCAL only takes effect inside a transaction block.
+        On v25.4, v26.2 and v26.3 it is ignored in the implicit transaction
+        of a pipeline, and works between BEGIN and COMMIT sent in one batch.
         """
 
         async def read() -> list[list[DictRow]]:
-            async with self._cursor(
-                pipeline=True, timeout=self.retry_policy.attempt_timeout, label=label
-            ) as cur:
-                conn = cur.connection
-                cursors = [cur] + [
-                    conn.cursor(binary=True, row_factory=dict_row) for _ in statements[1:]
-                ]
-                try:
-                    for statement_cursor, statement in zip(cursors, statements, strict=True):
-                        await statement_cursor.execute(*statement)
-                    return [await statement_cursor.fetchall() for statement_cursor in cursors]
-                finally:
-                    for extra in cursors[1:]:
-                        await extra.close()
+            cursors: list[AsyncCursor[DictRow]] = []
+            try:
+                async with self._cursor(
+                    pipeline=True,
+                    transaction=bool(session),
+                    timeout=self.retry_policy.attempt_timeout,
+                    label=label,
+                ) as cur:
+                    for setting in session or ():
+                        await cur.execute(setting, prepare=False)
+                    conn = cur.connection
+                    for statement in statements:
+                        cursors.append(conn.cursor(binary=True, row_factory=dict_row))
+                        await cursors[-1].execute(*statement)
+                return [await statement_cursor.fetchall() for statement_cursor in cursors]
+            finally:
+                for statement_cursor in cursors:
+                    await statement_cursor.close()
 
         return await self._retry(read, label=label)
+
+    async def _embed_queries(self, plan: BatchPlan) -> None:
+        """Embed each distinct query text of the batch once and bind the vectors.
+
+        Runs before the first attempt of any read, so a retry reuses the
+        vectors. aembed_query, not aembed_documents: models that embed
+        queries and documents differently get the query form.
+        """
+        assert self.index is not None
+        texts = plan.query_texts()
+        vectors = await asyncio.gather(
+            *(self.index.embeddings.aembed_query(text) for text in texts)
+        )
+        self._bind_query_vectors(plan, texts, vectors)
+
+    async def adrop_vector_index(self) -> None:
+        """Drop the store's vector index, if it exists.
+
+        Run setup() afterwards to build it again with the store's current
+        configuration, for example to change the distance. Searches scan
+        the vectors until the new index is built.
+        """
+        await self._run_ddl(self.sql.drop_vector_index(), "store drop vector index")
+
+    async def _check_index(self) -> None:
+        """Read the vectors table's definition and check it against the configuration."""
+
+        async def read() -> str:
+            async with self._cursor(
+                timeout=self.retry_policy.attempt_timeout, label="store index check"
+            ) as cur:
+                await cur.execute(self.sql.show_create_vectors())
+                await self._sync_pipeline()
+                row = await cur.fetchone()
+                return "" if row is None else row["create_statement"]
+
+        self._check_vector_index(await self._retry(read, label="store index check"))
 
     async def _run_puts(self, plan: PutPlan) -> None:
         # Embed once, before the first attempt: a retry reuses the vectors

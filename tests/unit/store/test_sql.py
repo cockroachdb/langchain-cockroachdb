@@ -4,7 +4,7 @@ import pytest
 
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
-from langchain_cockroachdb.store.sql import QUERY_VECTOR, StoreSQL
+from langchain_cockroachdb.store.sql import NAMESPACES, QUERY_VECTOR, StoreSQL, bind
 
 
 def _make_index(
@@ -530,3 +530,97 @@ def test_vector_index_name_is_public():
     """vector_index_name is exposed as a public attribute."""
     sql = StoreSQL("public", "my_store", index=_make_index())
     assert sql.vector_index_name == "my_store_vectors_embedding_idx"
+
+
+def test_ranked_vectors_carry_no_expiry_condition():
+    """The vector CTE ranks without the expiry check, so C-SPANN can serve it.
+
+    The items join checks expiry, and vectors expire with their item.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    query_sql, _ = sql.semantic_search(
+        namespace_prefix=["a"], filter=None, limit=3, offset=0, omit_expired=True, over_fetch=7
+    )
+    ranked, rest = query_sql.split("\n),\nbest AS (", 1)
+    assert "expires_at" not in ranked
+    assert "(i.expires_at IS NULL OR i.expires_at > now())" in rest
+
+
+def test_semantic_search_in_ranks_within_found_namespaces():
+    """semantic_search_in matches the namespaces from namespace_lookup with ANY."""
+    sql = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    query_sql, params = sql.semantic_search_in(
+        filter={"x": 1}, limit=5, offset=2, omit_expired=False, over_fetch=11
+    )
+    assert "WHERE prefix = ANY(CAST(%s AS STRING[]))" in query_sql
+    assert "LIKE" not in query_sql
+    assert "-r.distance AS score" in query_sql
+    assert "embedding <-> CAST(%s AS VECTOR)" in query_sql
+    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, "x", "1", 5, 2]
+    assert query_sql.count("%s") == len(params)
+    assert "::" not in query_sql
+
+    refreshed_sql, refreshed_params = sql.semantic_search_in(
+        filter=None, limit=5, offset=0, omit_expired=True, over_fetch=11, refresh=True
+    )
+    assert refreshed_params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, 5, 0]
+    assert refreshed_sql.startswith("WITH search_results AS (")
+    assert refreshed_sql.count("%s") == len(refreshed_params)
+
+    with pytest.raises(ValueError, match="index"):
+        StoreSQL("public", "store").semantic_search_in(
+            filter=None, limit=1, offset=0, omit_expired=True, over_fetch=3
+        )
+
+
+def test_namespace_lookup_seeks_each_distinct_namespace():
+    """namespace_lookup finds the namespaces under a prefix, one index seek each.
+
+    The range ">= 'a.b.' AND < 'a.b/'" holds exactly the strings that start
+    with "a.b.", because "/" is the byte after ".". It constrains the primary
+    key scan on every supported version; LIKE with ESCAPE does not on v25.4.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    query_sql, params = sql.namespace_lookup(["a", "b"])
+    assert query_sql.startswith("WITH RECURSIVE found (prefix) AS (")
+    assert "FROM public.store_vectors" in query_sql
+    assert "LIKE" not in query_sql
+    assert "ORDER BY prefix LIMIT 1" in query_sql
+    assert params == ["a.b", "a.b.", "a.b/"] * 2
+    assert query_sql.count("%s") == len(params)
+    assert query_sql.rstrip().endswith("SELECT prefix FROM found WHERE prefix IS NOT NULL")
+    # Labels may hold LIKE wildcards; the range form needs no escaping
+    _, params = sql.namespace_lookup(["50%_off"])
+    assert params[:3] == ["50%_off", "50%_off.", "50%_off/"]
+
+    with pytest.raises(ValueError, match="namespace"):
+        sql.namespace_lookup([])
+
+
+def test_bind_replaces_placeholders_only():
+    statement = ("SELECT %s, %s, %s", [QUERY_VECTOR, 1, QUERY_VECTOR])
+    assert bind(statement, QUERY_VECTOR, "[1.0]") == ("SELECT %s, %s, %s", ["[1.0]", 1, "[1.0]"])
+    # The original statement is left as it was
+    assert statement[1][0] is QUERY_VECTOR
+    assert StoreSQL.bind_query_vector(statement, [1.0, 2.5]) == (
+        "SELECT %s, %s, %s",
+        ["[1.0,2.5]", 1, "[1.0,2.5]"],
+    )
+
+
+def test_beam_size_statement_formats_a_validated_int():
+    sql = StoreSQL("public", "store", index=_make_index())
+    assert sql.beam_size_statement(16) == "SET LOCAL vector_search_beam_size = 16"
+    for bad in (0, -1, True, 1.5, "8; DROP TABLE x"):
+        with pytest.raises(ValueError, match="beam_size"):
+            sql.beam_size_statement(bad)  # type: ignore[arg-type]
+
+
+def test_vector_index_statements():
+    sql = StoreSQL("app", "mem", index=_make_index())
+    assert (
+        sql.drop_vector_index() == "DROP INDEX IF EXISTS app.mem_vectors@mem_vectors_embedding_idx"
+    )
+    assert sql.show_create_vectors() == (
+        "SELECT create_statement FROM [SHOW CREATE TABLE app.mem_vectors]"
+    )

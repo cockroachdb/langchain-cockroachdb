@@ -14,8 +14,10 @@ from langchain_cockroachdb.store.namespaces import (
     truncate_expression,
 )
 
-# Module-level sentinel for the query vector parameter
+# Stands in the params for the query vector until the query is embedded
 QUERY_VECTOR = object()
+# Stands in the params for the namespaces found by namespace_lookup
+NAMESPACES = object()
 
 # Type aliases
 ItemRow = tuple[str, str, str, float | None]  # prefix, key, value_json, ttl_minutes
@@ -34,6 +36,28 @@ def _validate_paging(limit: int, offset: int) -> None:
         raise ValueError("limit must be non-negative")
     if offset < 0:
         raise ValueError("offset must be non-negative")
+
+
+def bind(statement: tuple[str, list], placeholder: object, value: Any) -> tuple[str, list]:
+    """A copy of ``statement`` with ``value`` wherever ``placeholder`` is in its params."""
+    sql, params = statement
+    return (sql, [value if param is placeholder else param for param in params])
+
+
+def _prefix_range(column: str, namespace_prefix: Sequence[str]) -> tuple[str, list[str]]:
+    """Match a namespace and its descendants with a range the primary key can scan.
+
+    The strings that start with "a.b." are exactly those from "a.b." up to,
+    not including, "a.b/", because "/" is the byte after "." and STRING
+    compares bytes. The range constrains the primary key scan on every
+    supported version, while v25.4 scans the whole table for
+    ``LIKE ... ESCAPE``. Labels need no escaping.
+    """
+    text = ".".join(namespace_prefix)
+    return (
+        f"({column} = %s OR ({column} >= %s AND {column} < %s))",
+        [text, f"{text}.", f"{text}/"],
+    )
 
 
 class StoreSQL:
@@ -136,6 +160,40 @@ class StoreSQL:
             stmts.append(index_sql + ";")
 
         return stmts
+
+    def show_create_vectors(self) -> str:
+        """The statement that reads the vectors table's definition.
+
+        setup() checks the existing vector index and VECTOR column in it.
+        SHOW CREATE TABLE renders the operator class and partition sizes on
+        every supported version.
+        """
+        return f"SELECT create_statement FROM [SHOW CREATE TABLE {self.vectors}]"
+
+    def drop_vector_index(self) -> str:
+        """The statement that drops the vector index, if it exists."""
+        return f"DROP INDEX IF EXISTS {self.vectors}@{self.vector_index_name}"
+
+    @staticmethod
+    def beam_size_statement(beam_size: int) -> str:
+        """The statement that sets the C-SPANN beam size for one transaction.
+
+        psycopg cannot bind a parameter in SET, so the value is formatted
+        into the text. It is a positive int checked here, never user text.
+
+        Raises:
+            ValueError: If beam_size is not a positive int.
+        """
+        if isinstance(beam_size, bool) or not isinstance(beam_size, int) or beam_size < 1:
+            raise ValueError(f"beam_size must be a positive integer, got {beam_size!r}")
+        return f"SET LOCAL vector_search_beam_size = {beam_size}"
+
+    @staticmethod
+    def bind_query_vector(
+        statement: tuple[str, list], embedding: Sequence[float]
+    ) -> tuple[str, list]:
+        """A copy of a semantic search statement with its query vector bound."""
+        return bind(statement, QUERY_VECTOR, vector_literal(embedding))
 
     def ttl_statements(self, cron: str) -> list[str]:
         """Return ALTER TABLE statements to enable TTL.
@@ -428,6 +486,30 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
 
         return (sql, params)
 
+    # How semantic searches find their vectors. Measured with EXPLAIN on
+    # v25.4.14, v26.2.7 and v26.3.2, on a vectors table of a few thousand rows
+    # after ANALYZE, with the index on (prefix, embedding):
+    #
+    # - The C-SPANN index serves a search only when the prefix column is
+    #   constrained to a set of values (prefix = x, or prefix = ANY(array))
+    #   and the vectors CTE has no other filter. An expiry check in that CTE
+    #   turns every search into a scan of the primary key, and FORCE_INDEX
+    #   reports that the index cannot be used.
+    # - A namespace and its descendants, (prefix = x OR prefix LIKE 'x.%'
+    #   ESCAPE ...), is never served by the index on any of the three. On
+    #   v25.4 the LIKE with ESCAPE is not even turned into a key span, so it
+    #   scans the whole table; v26.2 and v26.3 scan the prefix's key span. A
+    #   subquery, prefix IN (SELECT DISTINCT ...), does not help either.
+    #
+    # So a search under a namespace takes two steps. namespace_lookup finds
+    # the namespaces that have vectors, seeking once per namespace, and
+    # semantic_search_in ranks with prefix = ANY(those namespaces), which the
+    # index serves. A search of the whole store has no prefix to constrain
+    # and uses semantic_search, a scan with exact ranking. Results are the
+    # same either way: expiry and filters are checked on the joined items,
+    # and vectors expire with their item. An expired vector that was not yet
+    # deleted can take one of the over_fetch slots, like a filtered-out item.
+
     def semantic_search(
         self,
         *,
@@ -439,7 +521,10 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         over_fetch: int,
         refresh: bool = False,
     ) -> tuple[str, list]:
-        """Build semantic search query with vector similarity.
+        """Build a semantic search in one statement, ranked by vector distance.
+
+        The store uses it for searches of the whole store, and
+        semantic_search_in for searches under a namespace.
 
         Args:
             namespace_prefix: Namespace prefix to match.
@@ -451,72 +536,142 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             refresh: Whether to also push back the expiry of the rows returned.
 
         Returns:
-            Tuple of (SQL, parameters). Query vector appears as QUERY_VECTOR sentinel twice.
+            Tuple of (SQL, parameters). The query vector appears as the
+            QUERY_VECTOR placeholder twice.
 
         Raises:
-            ValueError: If limit or offset is negative.
+            ValueError: If limit or offset is negative, or there is no index.
+        """
+        condition, condition_params = prefix_condition("prefix", namespace_prefix)
+        return self._semantic(
+            condition,
+            condition_params,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            omit_expired=omit_expired,
+            over_fetch=over_fetch,
+            refresh=refresh,
+        )
+
+    def semantic_search_in(
+        self,
+        *,
+        filter: Mapping | None,
+        limit: int,
+        offset: int,
+        omit_expired: bool,
+        over_fetch: int,
+        refresh: bool = False,
+    ) -> tuple[str, list]:
+        """Build a semantic search within the namespaces namespace_lookup found.
+
+        The vectors CTE matches ``prefix = ANY(...)``, which the C-SPANN
+        index serves. Bind the namespaces in place of NAMESPACES and the
+        query vector in place of QUERY_VECTOR.
+
+        Returns:
+            Tuple of (SQL, parameters).
+
+        Raises:
+            ValueError: If limit or offset is negative, or there is no index.
+        """
+        return self._semantic(
+            "prefix = ANY(CAST(%s AS STRING[]))",
+            [NAMESPACES],
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            omit_expired=omit_expired,
+            over_fetch=over_fetch,
+            refresh=refresh,
+        )
+
+    def namespace_lookup(self, namespace_prefix: Sequence[str]) -> tuple[str, list]:
+        """Build the query for the namespaces under a prefix that have vectors.
+
+        A recursive CTE seeks to the next namespace in the primary key until
+        none is left, so it reads one row per namespace, not every vector.
+        Expired vectors count; the search itself checks expiry.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has a ``prefix``.
+
+        Raises:
+            ValueError: If the prefix is empty. A search of the whole store
+                needs no lookup.
+        """
+        if not namespace_prefix:
+            raise ValueError("namespace_lookup needs a non-empty namespace prefix")
+        if self._index is None:
+            raise ValueError("namespace_lookup requires an index configuration")
+        condition, params = _prefix_range("prefix", namespace_prefix)
+        inner, inner_params = _prefix_range("v.prefix", namespace_prefix)
+        sql = f"""WITH RECURSIVE found (prefix) AS (
+    (SELECT prefix FROM {self.vectors} WHERE {condition} ORDER BY prefix LIMIT 1)
+    UNION ALL
+    SELECT (
+        SELECT v.prefix FROM {self.vectors} AS v
+        WHERE v.prefix > found.prefix AND {inner}
+        ORDER BY v.prefix LIMIT 1
+    )
+    FROM found
+    WHERE found.prefix IS NOT NULL
+)
+SELECT prefix FROM found WHERE prefix IS NOT NULL"""
+        return (sql, params + inner_params)
+
+    def _semantic(
+        self,
+        condition: str,
+        condition_params: Sequence[Any],
+        *,
+        filter: Mapping | None,
+        limit: int,
+        offset: int,
+        omit_expired: bool,
+        over_fetch: int,
+        refresh: bool,
+    ) -> tuple[str, list]:
+        """Build a semantic search whose vectors CTE matches ``condition``.
+
+        The CTE ranks vectors by distance and keeps ``over_fetch`` of them.
+        The items join applies the filter and expiry, then DISTINCT ON keeps
+        the best distance of each item. Score is 1 - distance for cosine and
+        the negated distance for L2 and inner product, so higher is better.
         """
         _validate_paging(limit, offset)
-
         if self._index is None:
             raise ValueError("semantic_search requires an index configuration")
 
         operator = self._index.distance.get_operator()
+        if self._index.distance == DistanceStrategy.COSINE:
+            score = "1 - r.distance AS score"
+        else:
+            score = "-r.distance AS score"
 
-        # Build SQL text
+        # No expiry check here: see the notes above semantic_search
         sql = f"""WITH ranked AS (
     SELECT prefix, key, field_name, embedding {operator} CAST(%s AS VECTOR) AS distance
     FROM {self.vectors}
-    WHERE """
-
-        # Build params in order of placeholders in SQL text
-        params: list[Any] = [QUERY_VECTOR]  # First placeholder
-
-        # Namespace condition on vectors table
-        ns_condition, ns_params = prefix_condition("prefix", namespace_prefix)
-        sql += ns_condition
-
-        # Filter expired vectors in CTE
-        if omit_expired:
-            sql += " AND (expires_at IS NULL OR expires_at > now())"
-
-        sql += f"""
+    WHERE {condition}
     ORDER BY embedding {operator} CAST(%s AS VECTOR)
     LIMIT %s
 ),
 best AS (
     SELECT DISTINCT ON (i.prefix, i.key)
-        i.prefix, i.key, i.value, i.created_at, i.updated_at,"""
-
-        # Score calculation
-        if self._index.distance == DistanceStrategy.COSINE:
-            sql += "\n        1 - r.distance AS score"
-        else:
-            sql += "\n        -r.distance AS score"
-
-        sql += f"""
+        i.prefix, i.key, i.value, i.created_at, i.updated_at,
+        {score}
     FROM ranked r
     JOIN {self.items} i ON r.prefix = i.prefix AND r.key = i.key
     WHERE """
+        params: list[Any] = [QUERY_VECTOR, *condition_params, QUERY_VECTOR, over_fetch]
 
-        # Add namespace params after first QUERY_VECTOR
-        params.extend(ns_params)
-
-        # Add second QUERY_VECTOR and over_fetch
-        params.append(QUERY_VECTOR)
-        params.append(over_fetch)
-
-        # Filter conditions on items
-        filter_conditions, filter_params = translate_filter(filter, value_column="i.value")
-        if filter_conditions:
-            sql += " AND ".join(filter_conditions)
-            sql += " AND "
-
-        # Expiry clause on items table
+        conditions, filter_params = translate_filter(filter, value_column="i.value")
         if omit_expired:
-            sql += "(i.expires_at IS NULL OR i.expires_at > now())"
-        else:
-            sql += "TRUE"
+            conditions = [*conditions, "(i.expires_at IS NULL OR i.expires_at > now())"]
+        sql += " AND ".join(conditions) if conditions else "TRUE"
+        params.extend(filter_params)
 
         sql += """
     ORDER BY i.prefix, i.key, r.distance
@@ -525,15 +680,11 @@ SELECT prefix, key, value, created_at, updated_at, score
 FROM best
 ORDER BY score DESC, prefix, key
 LIMIT %s OFFSET %s"""
-
-        # Add filter params, then limit and offset
-        params.extend(filter_params)
         params.extend([limit, offset])
         if refresh:
             sql = self._with_refresh(
                 sql, "prefix, key, value, created_at, updated_at, score", "score DESC, prefix, key"
             )
-
         return (sql, params)
 
     def list_namespaces(

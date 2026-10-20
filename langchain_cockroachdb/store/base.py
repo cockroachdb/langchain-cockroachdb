@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -28,6 +29,7 @@ from langgraph.store.base import (
 )
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
+from langchain_cockroachdb.async_vectorstore import _find_vector_index
 from langchain_cockroachdb.store.config import (
     ResolvedIndex,
     ResolvedTTL,
@@ -39,7 +41,7 @@ from langchain_cockroachdb.store.namespaces import (
     to_text,
     validate_labels,
 )
-from langchain_cockroachdb.store.sql import ItemRow, StoreSQL, VectorRow
+from langchain_cockroachdb.store.sql import NAMESPACES, ItemRow, StoreSQL, VectorRow, bind
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,11 @@ class BatchPlan:
         search_statements: One statement per search, in the order of ``searches``.
         search_to_embed: (statement position, query text) for every search
             statement that needs the embedding of its query.
+        search_lookups: (statement position, namespace lookup) for every
+            semantic search under a namespace. The lookup finds the
+            namespaces bound in place of NAMESPACES.
+        search_session: Statements that run first in the search group, in
+            its transaction: the beam size, when set and a query is present.
         listings: The list_namespaces ops, as (position, op).
         listing_statements: One statement per listing.
         puts: What the batch's puts and deletes write, or None without puts.
@@ -139,23 +146,52 @@ class BatchPlan:
     searches: list[tuple[int, SearchOp]] = field(default_factory=list)
     search_statements: list[tuple[str, list]] = field(default_factory=list)
     search_to_embed: list[tuple[int, str]] = field(default_factory=list)
+    search_lookups: list[tuple[int, tuple[str, list]]] = field(default_factory=list)
+    search_session: list[str] = field(default_factory=list)
     listings: list[tuple[int, ListNamespacesOp]] = field(default_factory=list)
     listing_statements: list[tuple[str, list]] = field(default_factory=list)
     puts: PutPlan | None = None
 
-    def reads(self) -> list[tuple[str, list[tuple[str, list]], Callable[[list[Any]], None]]]:
+    def reads(
+        self,
+    ) -> list[tuple[str, list[tuple[str, list]], Callable[[list[Any]], None], list[str]]]:
         """The read groups to run, in order: gets, searches, then listings.
 
-        Each group is (label, statements, fill). Run the statements as one
-        round trip and pass ``fill`` the rows of each statement, in order;
-        it puts them into ``results``. Empty groups are left out.
+        Each group is (label, statements, fill, session). Run the session
+        statements, then the statements, as one round trip, in one
+        transaction when there are session statements, and pass ``fill``
+        the rows of each statement, in order; it puts them into
+        ``results``. Empty groups are left out. Bind the query vectors and
+        namespaces first.
         """
         groups = [
-            ("store get", self.get_statements, self._fill_gets),
-            ("store search", self.search_statements, self._fill_searches),
-            ("store list namespaces", self.listing_statements, self._fill_listings),
+            ("store get", self.get_statements, self._fill_gets, []),
+            ("store search", self.search_statements, self._fill_searches, self.search_session),
+            ("store list namespaces", self.listing_statements, self._fill_listings, []),
         ]
         return [group for group in groups if group[1]]
+
+    def query_texts(self) -> list[str]:
+        """The distinct query texts to embed, in order of first use."""
+        return list(dict.fromkeys(text for _, text in self.search_to_embed))
+
+    def bind_query_vectors(self, vectors: Mapping[str, Sequence[float]]) -> None:
+        """Put the embedding of each query text into its search statements."""
+        for position, text in self.search_to_embed:
+            self.search_statements[position] = StoreSQL.bind_query_vector(
+                self.search_statements[position], vectors[text]
+            )
+
+    def lookup_statements(self) -> list[tuple[str, list]]:
+        """The namespace lookups, to run as one read group before the searches."""
+        return [statement for _, statement in self.search_lookups]
+
+    def bind_namespaces(self, found: list[Any]) -> None:
+        """Put the namespaces each lookup found into its search statement."""
+        for (position, _), rows in zip(self.search_lookups, found, strict=True):
+            self.search_statements[position] = bind(
+                self.search_statements[position], NAMESPACES, [row["prefix"] for row in rows]
+            )
 
     def _fill_gets(self, found: list[Any]) -> None:
         for ((namespace, _), items), rows in zip(self.get_groups, found, strict=True):
@@ -256,7 +292,11 @@ class BaseCockroachDBStore:
         if puts:
             plan.puts = self._plan_puts(puts)
         if plan.searches:
-            plan.search_statements, plan.search_to_embed = self._search_plan(plan.searches)
+            plan.search_statements, plan.search_to_embed, plan.search_lookups = self._search_plan(
+                plan.searches
+            )
+            if plan.search_to_embed and self.index is not None and self.index.beam_size:
+                plan.search_session = [self.sql.beam_size_statement(self.index.beam_size)]
         plan.listing_statements = [self._listing_statement(op) for _, op in plan.listings]
         # One statement per namespace and refresh choice. With refresh, the
         # statement also pushes back the expiry of the rows it reads.
@@ -351,46 +391,93 @@ class BaseCockroachDBStore:
         # The length check above keeps the two lists in step
         for i, (prefix, key, field_name, _) in enumerate(plan.embed_requests):
             embedding = embeddings[i]
-            if len(embedding) != self.index.dims:
-                raise ValueError(
-                    f"The embedding model returned a vector of {len(embedding)} dimensions, "
-                    f"but the index has {self.index.dims}"
-                )
-            if not all(math.isfinite(value) for value in embedding):
-                raise ValueError(
-                    f"The embedding model returned a vector with NaN or infinite values "
-                    f"for {prefix}/{key}, field {field_name}"
-                )
+            self._check_embedding(embedding, f"{prefix}/{key}, field {field_name}")
             rows.append((prefix, key, field_name, list(embedding), ttls[(prefix, key)]))
         return rows
 
+    def _check_embedding(self, embedding: Sequence[float], what: str) -> None:
+        """Raise ValueError if an embedding does not fit the index.
+
+        Raises:
+            ValueError: If its size is not the index's dims, or it holds NaN
+                or infinite values.
+        """
+        if self.index is None:
+            return
+        if len(embedding) != self.index.dims:
+            raise ValueError(
+                f"The embedding model returned a vector of {len(embedding)} dimensions, "
+                f"but the index has {self.index.dims}"
+            )
+        if not all(math.isfinite(value) for value in embedding):
+            raise ValueError(
+                f"The embedding model returned a vector with NaN or infinite values for {what}"
+            )
+
+    def _bind_query_vectors(
+        self, plan: BatchPlan, texts: Sequence[str], vectors: Sequence[Sequence[float]]
+    ) -> None:
+        """Check the embeddings of ``plan.query_texts()`` and bind them.
+
+        Raises:
+            ValueError: If the model returned the wrong number of embeddings,
+                or one that does not fit the index.
+        """
+        if len(vectors) != len(texts):
+            raise ValueError(
+                f"The embedding model returned {len(vectors)} embeddings for {len(texts)} queries"
+            )
+        for text, vector in zip(texts, vectors, strict=True):
+            self._check_embedding(vector, f"the query {text!r}")
+        plan.bind_query_vectors(dict(zip(texts, vectors, strict=True)))
+
     def _search_plan(
         self, search_ops: Sequence[tuple[int, SearchOp]]
-    ) -> tuple[list[tuple[str, list]], list[tuple[int, str]]]:
+    ) -> tuple[list[tuple[str, list]], list[tuple[int, str]], list[tuple[int, tuple[str, list]]]]:
         """Build one statement per search op.
 
+        A semantic search under a namespace gets a namespace lookup too: see
+        the notes above StoreSQL.semantic_search.
+
         Returns:
-            The statements, in the order of ``search_ops``, and the
+            The statements, in the order of ``search_ops``; the
             (statement position, query text) pairs whose QUERY_VECTOR
-            placeholders need the query's embedding.
+            placeholders need the query's embedding; and the
+            (statement position, lookup) pairs whose NAMESPACES placeholder
+            needs the namespaces the lookup finds.
         """
         statements: list[tuple[str, list]] = []
         to_embed: list[tuple[int, str]] = []
+        lookups: list[tuple[int, tuple[str, list]]] = []
         omit_expired = self.ttl.omit_expired
         for position, (_, op) in enumerate(search_ops):
             if op.query and self.index is not None:
+                # PostgresStore's rule: room for every vector of each result, twice
                 over_fetch = op.limit * self.index.estimated_vectors * 2 + 1
-                statements.append(
-                    self.sql.semantic_search(
-                        namespace_prefix=op.namespace_prefix,
-                        filter=op.filter,
-                        limit=op.limit,
-                        offset=op.offset,
-                        omit_expired=omit_expired,
-                        over_fetch=over_fetch,
-                        refresh=op.refresh_ttl,
+                if op.namespace_prefix:
+                    statements.append(
+                        self.sql.semantic_search_in(
+                            filter=op.filter,
+                            limit=op.limit,
+                            offset=op.offset,
+                            omit_expired=omit_expired,
+                            over_fetch=over_fetch,
+                            refresh=op.refresh_ttl,
+                        )
                     )
-                )
+                    lookups.append((position, self.sql.namespace_lookup(op.namespace_prefix)))
+                else:
+                    statements.append(
+                        self.sql.semantic_search(
+                            namespace_prefix=op.namespace_prefix,
+                            filter=op.filter,
+                            limit=op.limit,
+                            offset=op.offset,
+                            omit_expired=omit_expired,
+                            over_fetch=over_fetch,
+                            refresh=op.refresh_ttl,
+                        )
+                    )
                 to_embed.append((position, op.query))
                 continue
             if op.query and self._first_query_without_index():
@@ -409,7 +496,65 @@ class BaseCockroachDBStore:
                     refresh=op.refresh_ttl,
                 )
             )
-        return statements, to_embed
+        return statements, to_embed, lookups
+
+    def _check_vector_index(self, create_statement: str) -> None:
+        """Compare the vectors table and its index with the store's configuration.
+
+        ``create_statement`` is the SHOW CREATE TABLE output of the vectors
+        table, read after setup() ran the vector statements. Those use IF NOT
+        EXISTS, so they leave an existing table and index as they are.
+
+        Raises:
+            ValueError: If the VECTOR column has other dims, or the index uses
+                another operator class (distance).
+        """
+        if self.index is None:
+            return
+        column = re.search(r"\bembedding VECTOR\((\d+)\)", create_statement, re.IGNORECASE)
+        if column is not None and int(column.group(1)) != self.index.dims:
+            raise ValueError(
+                f"The vectors table {self.sql.vectors} has an embedding column of "
+                f"VECTOR({column.group(1)}), but the index is configured with "
+                f"dims={self.index.dims}. Use dims={column.group(1)}, or another table_name."
+            )
+        name = self.sql.vector_index_name
+        existing = _find_vector_index(create_statement, name)
+        if existing is None:
+            return
+        if self.index.flat:
+            self._log.warning(
+                "The index is configured with flat=True, but the vector index %s exists, "
+                "so searches may still use it. Drop it with drop_vector_index() to search "
+                "without it.",
+                name,
+            )
+            return
+        wanted = self.index.distance.get_opclass()
+        found = re.search(r"\bvector_\w+_ops\b", existing.definition)
+        # vector_l2_ops is the default operator class
+        current = found.group(0) if found else "vector_l2_ops"
+        if current != wanted:
+            raise ValueError(
+                f"the vector index {name} uses {current}; drop it with drop_vector_index() "
+                f"and run setup() again to use {wanted}"
+            )
+        # A partition size that is not configured accepts whatever the index has
+        differences = []
+        for option, size in self.index.cspann.items():
+            current_size = existing.options.get(option)
+            if current_size is None:
+                differences.append(f"{option} = {size} (index has the default)")
+            elif current_size != str(size):
+                differences.append(f"{option} = {size} (index has {current_size})")
+        if differences:
+            self._log.warning(
+                "The vector index %s already exists with other partition sizes than "
+                "configured: %s. It keeps its own. Drop it with drop_vector_index() and run "
+                "setup() again to use the configured ones.",
+                name,
+                "; ".join(differences),
+            )
 
     def _first_query_without_index(self) -> bool:
         """True the first time a search query meets a store without an index."""

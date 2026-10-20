@@ -167,12 +167,12 @@ def test_search_plan_warns_once_without_index(caplog: pytest.LogCaptureFixture) 
         (3, SearchOp(("b",), query="again", limit=5, offset=1)),
     ]
     with caplog.at_level(logging.WARNING):
-        statements, to_embed = store._search_plan(ops)
+        statements, to_embed, lookups = store._search_plan(ops)
         store._search_plan(ops)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "no index" in warnings[0].getMessage()
-    assert to_embed == []
+    assert to_embed == [] and lookups == []
     assert len(statements) == 2
     sql, params = statements[1]
     assert "ORDER BY updated_at DESC" in sql
@@ -517,3 +517,264 @@ def test_batch_plan_keeps_search_queries_to_embed() -> None:
     )
     assert plan.search_to_embed == [(0, "hello"), (2, "x")]
     assert make_base()._plan_batch([SearchOp(("a",), query="q")]).search_to_embed == []
+
+
+class SearchConnection:
+    """A fake connection for read groups. Every statement and its params is logged.
+
+    Namespace lookups return ``namespaces``; other statements return no rows.
+    The first attempt of the "store search" group fails with a retryable 40001
+    as its block ends, after its statements were sent.
+    """
+
+    def __init__(self, namespaces: list[str]) -> None:
+        self.namespaces = namespaces
+        self.attempts: dict[str, int] = {}
+        self.executed: list[tuple[str, str, list]] = []
+        self.session: list[str] = []
+        self.kwargs: list[dict[str, object]] = []
+        self.label = ""
+
+    def enter(self, kwargs: dict[str, object]) -> "SearchConnection":
+        self.kwargs.append(kwargs)
+        self.label = str(kwargs["label"])
+        self.attempts[self.label] = self.attempts.get(self.label, 0) + 1
+        return self
+
+    def exit(self) -> None:
+        if self.label == "store search" and self.attempts[self.label] == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    @property
+    def connection(self) -> "SearchConnection":
+        return self
+
+    def cursor(self, **kwargs: object) -> "SearchCursor":
+        return SearchCursor(self)
+
+    def execute(self, query: str, params: list | None = None, **kwargs: object) -> None:
+        self.session.append(query)
+
+
+class SearchCursor:
+    def __init__(self, conn: SearchConnection) -> None:
+        self.conn = conn
+        self.rows: list[dict[str, object]] = []
+
+    def execute(self, query: str, params: list) -> None:
+        self.conn.executed.append((self.conn.label, query, params))
+        if query.startswith("WITH RECURSIVE"):
+            self.rows = [{"prefix": ns} for ns in self.conn.namespaces]
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.rows
+
+    def close(self) -> None:
+        pass
+
+
+class AsyncSearchCursor(SearchCursor):
+    async def execute(self, query: str, params: list) -> None:  # type: ignore[override]
+        SearchCursor.execute(self, query, params)
+
+    async def fetchall(self) -> list[dict[str, object]]:  # type: ignore[override]
+        return self.rows
+
+    async def close(self) -> None:  # type: ignore[override]
+        pass
+
+
+class AsyncSearchConnection(SearchConnection):
+    def cursor(self, **kwargs: object) -> AsyncSearchCursor:  # type: ignore[override]
+        return AsyncSearchCursor(self)
+
+    async def execute(self, query: str, params: list | None = None, **kwargs: object) -> None:  # type: ignore[override]
+        self.session.append(query)
+
+
+QUERY_OPS = [
+    SearchOp(("a",), query="first", limit=2),
+    SearchOp(("b",), query="first"),
+    SearchOp((), query="second"),
+    SearchOp(("c",)),
+]
+
+
+def assert_query_statements(conn: SearchConnection) -> None:
+    lookups = [params for label, _, params in conn.executed if label == "store search namespaces"]
+    # One lookup per semantic search under a namespace, sent once: lookups are not retried here
+    assert lookups == [["a", "a.", "a/"] * 2, ["b", "b.", "b/"] * 2]
+    searches = [(sql, params) for label, sql, params in conn.executed if label == "store search"]
+    # Two attempts of four statements each; the retry reuses the same vectors
+    assert len(searches) == 8
+    assert searches[:4] == searches[4:]
+    first, second, root, plain = searches[4:]
+    assert "prefix = ANY(CAST(%s AS STRING[]))" in first[0]
+    assert first[1][:3] == ["[1.0,0.0,0.0]", ["a", "a.x"], "[1.0,0.0,0.0]"]
+    # over_fetch = limit * estimated_vectors * 2 + 1
+    assert first[1][3] == 2 * 1 * 2 + 1
+    assert second[1][1] == ["a", "a.x"]
+    # A search of the whole store has no namespace condition and no lookup
+    assert "ANY(" not in root[0] and root[1][0] == "[1.0,0.0,0.0]"
+    assert "embedding" not in plain[0]
+    for _, params in searches:
+        assert all(type(param) is not object for param in params)
+
+
+def test_query_is_embedded_once_per_distinct_text_outside_retry() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    conn = SearchConnection(["a", "a.x"])
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[SearchConnection]:
+        yield conn.enter(kwargs)
+        conn.exit()
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    results = store.batch(QUERY_OPS)
+    assert results == [[], [], [], []]
+    # Two distinct texts, each embedded once with embed_query, before any attempt
+    assert embeddings.calls == 2
+    assert embeddings.async_calls == 0
+    assert conn.attempts == {"store search namespaces": 1, "store search": 2}
+    assert_query_statements(conn)
+    # No beam size configured: no session statement and no transaction
+    assert conn.session == []
+    assert all(kwargs["transaction"] is False for kwargs in conn.kwargs)
+
+
+async def test_async_query_is_embedded_once_per_distinct_text_outside_retry() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    conn = AsyncSearchConnection(["a", "a.x"])
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncSearchConnection]:
+        yield conn.enter(kwargs)  # type: ignore[misc]
+        conn.exit()
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    results = await store.abatch(QUERY_OPS)
+    assert results == [[], [], [], []]
+    assert embeddings.async_calls == 2
+    assert embeddings.calls == 0
+    assert conn.attempts == {"store search namespaces": 1, "store search": 2}
+    assert_query_statements(conn)
+    assert conn.session == []
+
+
+def test_beam_size_runs_set_local_in_the_search_transaction() -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"], "beam_size": 24},
+        retry_policy=FAST,
+    )
+    conn = SearchConnection(["a"])
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[SearchConnection]:
+        yield conn.enter(kwargs)
+        conn.exit()
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    store.batch([SearchOp(("a",), query="q"), GetOp(("a",), "k")])
+    # Once per attempt of the search group, and only there
+    assert conn.session == ["SET LOCAL vector_search_beam_size = 24"] * 2
+    transactions = {str(kwargs["label"]): kwargs["transaction"] for kwargs in conn.kwargs}
+    assert transactions == {
+        "store search namespaces": False,
+        "store get": False,
+        "store search": True,
+    }
+    # A batch without a query needs no beam size
+    conn.session.clear()
+    conn.attempts.clear()
+    store.batch([SearchOp(("a",))])
+    assert conn.session == []
+
+
+def test_query_vector_is_checked_before_any_statement() -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 4, "embed": CountingEmbeddings(), "fields": ["text"]},
+    )
+    with pytest.raises(ValueError, match="3 dimensions, but the index has 4"):
+        store.batch([SearchOp(("a",), query="q")])
+
+
+VECTORS_TABLE = """CREATE TABLE public.store_vectors (
+\tprefix STRING NOT NULL,
+\tkey STRING NOT NULL,
+\tfield_name STRING NOT NULL,
+\tembedding VECTOR({dims}) NOT NULL,
+\tCONSTRAINT store_vectors_pkey PRIMARY KEY (prefix ASC, key ASC, field_name ASC),
+{index}
+)"""
+COSINE_INDEX = "\tVECTOR INDEX store_vectors_embedding_idx (prefix, embedding vector_cosine_ops)"
+
+
+def index_base(**extra: object) -> BaseCockroachDBStore:
+    store = BaseCockroachDBStore()
+    index = resolve_index_config(
+        {"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"], **extra}  # type: ignore[typeddict-item]
+    )
+    store._configure(index=index, ttl=None, table_name="store", schema="public")
+    return store
+
+
+def test_index_check_passes_on_a_matching_index(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        index_base()._check_vector_index(VECTORS_TABLE.format(dims=3, index=COSINE_INDEX))
+        # No index at all (setup creates it) is not an error either
+        index_base()._check_vector_index(VECTORS_TABLE.format(dims=3, index=""))
+    assert caplog.records == []
+
+
+def test_index_check_rejects_dims_and_distance_changes() -> None:
+    with pytest.raises(ValueError, match=r"VECTOR\(8\).*dims=3"):
+        index_base()._check_vector_index(VECTORS_TABLE.format(dims=8, index=COSINE_INDEX))
+    with pytest.raises(ValueError) as raised:
+        index_base(distance_type="l2")._check_vector_index(
+            VECTORS_TABLE.format(dims=3, index=COSINE_INDEX)
+        )
+    assert str(raised.value) == (
+        "the vector index store_vectors_embedding_idx uses vector_cosine_ops; drop it with "
+        "drop_vector_index() and run setup() again to use vector_l2_ops"
+    )
+
+
+def test_index_check_warns_on_partition_sizes_and_flat(caplog: pytest.LogCaptureFixture) -> None:
+    sized = COSINE_INDEX + " WITH (min_partition_size=16, max_partition_size=64)"
+    statement = VECTORS_TABLE.format(dims=3, index=sized)
+    with caplog.at_level(logging.WARNING):
+        index_base(
+            cspann={"min_partition_size": 32, "max_partition_size": 128}
+        )._check_vector_index(statement)
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "min_partition_size = 32 (index has 16)" in message
+    assert "max_partition_size = 128 (index has 64)" in message
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # No partition sizes configured: whatever the index has is accepted
+        index_base()._check_vector_index(statement)
+        index_base(cspann={"min_partition_size": 16, "max_partition_size": 64})._check_vector_index(
+            statement
+        )
+    assert caplog.records == []
+
+    with caplog.at_level(logging.WARNING):
+        index_base(flat=True)._check_vector_index(statement)
+    assert len(caplog.records) == 1
+    assert "flat" in caplog.records[0].getMessage()
+    assert "drop_vector_index()" in caplog.records[0].getMessage()
