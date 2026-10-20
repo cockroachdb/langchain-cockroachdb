@@ -11,7 +11,7 @@ import json
 import logging
 import threading
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -21,6 +21,7 @@ from langgraph.store.base import (
     ListNamespacesOp,
     Op,
     PutOp,
+    Result,
     SearchItem,
     SearchOp,
 )
@@ -105,6 +106,64 @@ class PutPlan:
     reindexed: dict[str, list[str]] = field(default_factory=dict)
 
 
+@dataclass
+class BatchPlan:
+    """The statements of a batch, built before any of them runs.
+
+    Attributes:
+        results: One slot per op, in the order of the batch. Searches with
+            ``limit == 0`` and the puts are already filled in.
+        get_groups: The gets, grouped by (namespace, refresh choice), in
+            the order of ``get_statements``.
+        get_statements: One read statement per get group.
+        searches: The searches that need a statement, as (position, op).
+        search_statements: One statement per search, in the order of ``searches``.
+        listings: The list_namespaces ops, as (position, op).
+        listing_statements: One statement per listing.
+        puts: What the batch's puts and deletes write, or None without puts.
+    """
+
+    results: list[Result]
+    get_groups: list[tuple[tuple[tuple[str, ...], bool], list[tuple[int, GetOp]]]] = field(
+        default_factory=list
+    )
+    get_statements: list[tuple[str, list]] = field(default_factory=list)
+    searches: list[tuple[int, SearchOp]] = field(default_factory=list)
+    search_statements: list[tuple[str, list]] = field(default_factory=list)
+    listings: list[tuple[int, ListNamespacesOp]] = field(default_factory=list)
+    listing_statements: list[tuple[str, list]] = field(default_factory=list)
+    puts: PutPlan | None = None
+
+    def reads(self) -> list[tuple[str, list[tuple[str, list]], Callable[[list[Any]], None]]]:
+        """The read groups to run, in order: gets, searches, then listings.
+
+        Each group is (label, statements, fill). Run the statements as one
+        round trip and pass ``fill`` the rows of each statement, in order;
+        it puts them into ``results``. Empty groups are left out.
+        """
+        groups = [
+            ("store get", self.get_statements, self._fill_gets),
+            ("store search", self.search_statements, self._fill_searches),
+            ("store list namespaces", self.listing_statements, self._fill_listings),
+        ]
+        return [group for group in groups if group[1]]
+
+    def _fill_gets(self, found: list[Any]) -> None:
+        for ((namespace, _), items), rows in zip(self.get_groups, found, strict=True):
+            by_key = {row["key"]: row for row in rows}
+            for i, op in items:
+                row = by_key.get(op.key)
+                self.results[i] = None if row is None else _row_to_item(namespace, row)
+
+    def _fill_searches(self, found: list[Any]) -> None:
+        for (i, _), rows in zip(self.searches, found, strict=True):
+            self.results[i] = [_row_to_search_item(row) for row in rows]
+
+    def _fill_listings(self, found: list[Any]) -> None:
+        for (i, _), rows in zip(self.listings, found, strict=True):
+            self.results[i] = [from_text(row["ns"]) for row in rows]
+
+
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
     """Build an Item from a get row."""
     return Item(
@@ -157,6 +216,52 @@ class BaseCockroachDBStore:
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
         self._warning_lock = threading.Lock()
+
+    def _plan_batch(self, ops: Iterable[Op]) -> BatchPlan:
+        """Validate a batch and build all its statements.
+
+        Everything that can fail without the database fails here, before
+        any statement runs: labels, paging, and values that are not JSON.
+        """
+        grouped, total = _group_ops(ops)
+        plan = BatchPlan(results=[None] * total)
+
+        groups: dict[tuple[tuple[str, ...], bool], list[tuple[int, GetOp]]] = defaultdict(list)
+        for i, op in grouped.get(GetOp, []):
+            if isinstance(op, GetOp):
+                groups[(tuple(op.namespace), bool(op.refresh_ttl))].append((i, op))
+        for i, op in grouped.get(SearchOp, []):
+            if not isinstance(op, SearchOp):
+                continue
+            if op.limit == 0:
+                plan.results[i] = []
+            else:
+                plan.searches.append((i, op))
+        plan.listings = [
+            (i, op)
+            for i, op in grouped.get(ListNamespacesOp, [])
+            if isinstance(op, ListNamespacesOp)
+        ]
+        puts = [op for _, op in grouped.get(PutOp, []) if isinstance(op, PutOp)]
+
+        if puts:
+            plan.puts = self._plan_puts(puts)
+        if plan.searches:
+            plan.search_statements = self._search_plan(plan.searches)[0]
+        plan.listing_statements = [self._listing_statement(op) for _, op in plan.listings]
+        # One statement per namespace and refresh choice. With refresh, the
+        # statement also pushes back the expiry of the rows it reads.
+        plan.get_groups = list(groups.items())
+        plan.get_statements = [
+            self.sql.get(
+                to_text(namespace),
+                list(dict.fromkeys(op.key for _, op in items)),
+                omit_expired=self.ttl.omit_expired,
+                refresh=refresh,
+            )
+            for (namespace, refresh), items in plan.get_groups
+        ]
+        return plan
 
     def _plan_puts(self, put_ops: Iterable[PutOp]) -> PutPlan:
         """Plan the rows a batch of puts writes.

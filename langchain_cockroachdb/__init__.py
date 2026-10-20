@@ -23,6 +23,7 @@ from langchain_cockroachdb.retry import (
     sync_retry_with_backoff,
 )
 from langchain_cockroachdb.store import (
+    AsyncCockroachDBStore,
     CockroachDBIndexConfig,
     CockroachDBStore,
     CockroachDBTTLConfig,
@@ -42,6 +43,7 @@ __all__ = [
     "CockroachDBSaver",
     "AsyncCockroachDBSaver",
     "CockroachDBStore",
+    "AsyncCockroachDBStore",
     "CockroachDBIndexConfig",
     "CockroachDBTTLConfig",
     "async_retry_with_backoff",

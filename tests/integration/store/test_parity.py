@@ -36,6 +36,91 @@ from langchain_cockroachdb import CockroachDBStore, RetryPolicy
 
 WAIT = 10
 
+# Op lists and data shared with the async parity tests in test_async.py
+GET_OPS = [
+    GetOp(("docs", "a"), "k1"),
+    GetOp(("docs", "a"), "k2"),
+    GetOp(("docs", "b"), "k1"),
+    GetOp(("docs",), "k1"),
+    GetOp(("docs", "a"), "k1"),
+]
+PREFIX_ITEMS: list[tuple[tuple[str, ...], str, dict[str, Any]]] = [
+    (("user", "a"), "k1", {"v": 1}),
+    (("user", "a", "b"), "k2", {"v": 2}),
+    (("user", "ab"), "k3", {"v": 3}),
+    (("other",), "k4", {"v": 4}),
+]
+PREFIX_CASES: list[tuple[tuple[str, ...], set[str]]] = [
+    (("user",), {"k1", "k2", "k3"}),
+    (("user", "a"), {"k1", "k2"}),
+    (("user", "a", "b"), {"k2"}),
+    (("user", "ab"), {"k3"}),
+    (("use",), set()),
+    ((), {"k1", "k2", "k3", "k4"}),
+]
+FRUIT: dict[str, dict[str, Any]] = {
+    "apple": {"color": "red", "size": 3, "meta": {"lang": "en"}, "tags": ["a", "b"]},
+    "banana": {"color": "yellow", "size": 10, "meta": {"lang": "fr"}, "tags": ["b"]},
+    "cherry": {"color": "red", "size": 7.5, "meta": {"lang": "en", "x": 1}},
+    "date": {"size": 5, "tags": ["a", "b", "c"]},
+}
+FILTER_CASES: list[tuple[dict, set[str]]] = [
+    ({"color": "red"}, {"apple", "cherry"}),
+    ({"color": {"$eq": "yellow"}}, {"banana"}),
+    ({"meta": {"lang": "en"}}, {"apple", "cherry"}),
+    ({"size": {"$gt": 5}}, {"banana", "cherry"}),
+    ({"size": {"$gte": 5, "$lt": 10}}, {"cherry", "date"}),
+    ({"size": {"$lte": 3}}, {"apple"}),
+    ({"color": {"$ne": "red"}}, {"banana", "date"}),
+    ({"tags": ["a", "b"]}, {"apple"}),
+    ({"color": "red", "size": {"$gt": 4}}, {"cherry"}),
+    ({"missing": "x"}, set()),
+]
+NAMESPACES = [
+    ("a", "b", "c"),
+    ("a", "b", "d", "e"),
+    ("a", "b", "d", "i"),
+    ("a", "b", "f"),
+    ("a", "c", "f"),
+    ("x", "b"),
+    ("x", "f"),
+]
+LIST_CASES: list[dict[str, Any]] = [
+    {},
+    {"prefix": ("a", "b")},
+    {"prefix": ("a", "b"), "max_depth": 3},
+    {"suffix": ("f",)},
+    {"prefix": ("a",), "suffix": ("f",)},
+    {"prefix": ("a", "*", "f")},
+    {"suffix": ("*", "f")},
+    {"prefix": ("*", "b")},
+    {"max_depth": 1},
+    {"max_depth": 2},
+    {"max_depth": 2, "limit": 2, "offset": 1},
+    {"limit": 3},
+    {"limit": 2, "offset": 4},
+    {"prefix": ("nope",)},
+]
+UNICODE_VALUE: dict[str, Any] = {
+    "text": "héllo wörld, 你好, emoji 🎉, quote ' and \" and \\ backslash",
+    "nested": {"list": [1, "two", {"three": [3.5, None, True, False]}], "empty": {}},
+    "big": 12345678901234567890,
+    "negative": -42,
+    "float": 0.125,
+    "none": None,
+    "ключ 🔑": "unicode key",
+}
+MIXED_OPS = [
+    PutOp(("m", "3"), "c", {"v": 3}),
+    GetOp(("m", "1"), "a"),
+    SearchOp(("m", "2")),
+    ListNamespacesOp(match_conditions=(MatchCondition("prefix", ("m",)),)),
+    GetOp(("m", "2"), "b"),
+    PutOp(("m", "1"), "a", None),
+    GetOp(("m", "3"), "c"),
+    SearchOp(("m",), limit=0),
+]
+
 
 def norm(result: Any) -> Any:
     """A result without timestamps, comparable across stores."""
@@ -64,14 +149,7 @@ def test_parity_put_get_delete(store_factory, reference, mode) -> None:
         s.put(("docs", "b"), "k1", {"text": "other"})
         s.put(("docs", "a"), "k1", {"text": "one again", "n": 1})
         s.delete(("docs", "a"), "k2")
-    ops = [
-        GetOp(("docs", "a"), "k1"),
-        GetOp(("docs", "a"), "k2"),
-        GetOp(("docs", "b"), "k1"),
-        GetOp(("docs",), "k1"),
-        GetOp(("docs", "a"), "k1"),
-    ]
-    mine, theirs = both([store, ref], ops)
+    mine, theirs = both([store, ref], GET_OPS)
     assert mine == theirs
     assert mine[0] == (("docs", "a"), "k1", {"text": "one again", "n": 1})
     assert mine[1] is None
@@ -83,18 +161,9 @@ def test_parity_put_get_delete(store_factory, reference, mode) -> None:
 def test_parity_search_prefix_and_descendants(store_factory, reference, mode) -> None:
     store, ref = store_factory(mode), reference()
     for s in (store, ref):
-        s.put(("user", "a"), "k1", {"v": 1})
-        s.put(("user", "a", "b"), "k2", {"v": 2})
-        s.put(("user", "ab"), "k3", {"v": 3})
-        s.put(("other",), "k4", {"v": 4})
-    for prefix, expected_keys in [
-        (("user",), {"k1", "k2", "k3"}),
-        (("user", "a"), {"k1", "k2"}),
-        (("user", "a", "b"), {"k2"}),
-        (("user", "ab"), {"k3"}),
-        (("use",), set()),
-        ((), {"k1", "k2", "k3", "k4"}),
-    ]:
+        for namespace, key, value in PREFIX_ITEMS:
+            s.put(namespace, key, value)
+    for prefix, expected_keys in PREFIX_CASES:
         mine, theirs = store.search(prefix), ref.search(prefix)
         assert as_set(mine) == as_set(theirs), prefix
         assert {item.key for item in mine} == expected_keys, prefix
@@ -103,28 +172,10 @@ def test_parity_search_prefix_and_descendants(store_factory, reference, mode) ->
 
 def test_parity_filters(store_factory, reference, mode) -> None:
     store, ref = store_factory(mode), reference()
-    values = {
-        "apple": {"color": "red", "size": 3, "meta": {"lang": "en"}, "tags": ["a", "b"]},
-        "banana": {"color": "yellow", "size": 10, "meta": {"lang": "fr"}, "tags": ["b"]},
-        "cherry": {"color": "red", "size": 7.5, "meta": {"lang": "en", "x": 1}},
-        "date": {"size": 5, "tags": ["a", "b", "c"]},
-    }
     for s in (store, ref):
-        for key, value in values.items():
+        for key, value in FRUIT.items():
             s.put(("fruit",), key, value)
-    filters: list[tuple[dict, set[str]]] = [
-        ({"color": "red"}, {"apple", "cherry"}),
-        ({"color": {"$eq": "yellow"}}, {"banana"}),
-        ({"meta": {"lang": "en"}}, {"apple", "cherry"}),
-        ({"size": {"$gt": 5}}, {"banana", "cherry"}),
-        ({"size": {"$gte": 5, "$lt": 10}}, {"cherry", "date"}),
-        ({"size": {"$lte": 3}}, {"apple"}),
-        ({"color": {"$ne": "red"}}, {"banana", "date"}),
-        ({"tags": ["a", "b"]}, {"apple"}),
-        ({"color": "red", "size": {"$gt": 4}}, {"cherry"}),
-        ({"missing": "x"}, set()),
-    ]
-    for filter, expected in filters:
+    for filter, expected in FILTER_CASES:
         mine, theirs = (
             store.search(("fruit",), filter=filter),
             ref.search(("fruit",), filter=filter),
@@ -184,35 +235,10 @@ def test_paging_edges(store_factory, reference, mode) -> None:
 
 def test_parity_list_namespaces(store_factory, reference, mode) -> None:
     store, ref = store_factory(mode), reference()
-    namespaces = [
-        ("a", "b", "c"),
-        ("a", "b", "d", "e"),
-        ("a", "b", "d", "i"),
-        ("a", "b", "f"),
-        ("a", "c", "f"),
-        ("x", "b"),
-        ("x", "f"),
-    ]
     for s in (store, ref):
-        for ns in namespaces:
+        for ns in NAMESPACES:
             s.put(ns, "k", {"v": 1})
-    cases: list[dict[str, Any]] = [
-        {},
-        {"prefix": ("a", "b")},
-        {"prefix": ("a", "b"), "max_depth": 3},
-        {"suffix": ("f",)},
-        {"prefix": ("a",), "suffix": ("f",)},
-        {"prefix": ("a", "*", "f")},
-        {"suffix": ("*", "f")},
-        {"prefix": ("*", "b")},
-        {"max_depth": 1},
-        {"max_depth": 2},
-        {"max_depth": 2, "limit": 2, "offset": 1},
-        {"limit": 3},
-        {"limit": 2, "offset": 4},
-        {"prefix": ("nope",)},
-    ]
-    for case in cases:
+    for case in LIST_CASES:
         assert store.list_namespaces(**case) == ref.list_namespaces(**case), case
     assert store.list_namespaces(prefix=("a", "b"), max_depth=3) == [
         ("a", "b", "c"),
@@ -223,15 +249,7 @@ def test_parity_list_namespaces(store_factory, reference, mode) -> None:
 
 def test_values_round_trip_unicode_and_nesting(store_factory, reference, mode) -> None:
     store, ref = store_factory(mode), reference()
-    value = {
-        "text": "héllo wörld, 你好, emoji 🎉, quote ' and \" and \\ backslash",
-        "nested": {"list": [1, "two", {"three": [3.5, None, True, False]}], "empty": {}},
-        "big": 12345678901234567890,
-        "negative": -42,
-        "float": 0.125,
-        "none": None,
-        "ключ 🔑": "unicode key",
-    }
+    value = UNICODE_VALUE
     for s in (store, ref):
         s.put(("ünï", "命名空间"), "ключ-🔑", value)
     mine = store.get(("ünï", "命名空间"), "ключ-🔑")
@@ -264,17 +282,7 @@ def test_batch_mixed_ops_keep_result_order(store_factory, reference, mode) -> No
     for s in (store, ref):
         s.put(("m", "1"), "a", {"v": 1})
         s.put(("m", "2"), "b", {"v": 2})
-    ops = [
-        PutOp(("m", "3"), "c", {"v": 3}),
-        GetOp(("m", "1"), "a"),
-        SearchOp(("m", "2")),
-        ListNamespacesOp(match_conditions=(MatchCondition("prefix", ("m",)),)),
-        GetOp(("m", "2"), "b"),
-        PutOp(("m", "1"), "a", None),
-        GetOp(("m", "3"), "c"),
-        SearchOp(("m",), limit=0),
-    ]
-    mine, theirs = both([store, ref], ops)
+    mine, theirs = both([store, ref], MIXED_OPS)
     assert mine == theirs
     assert mine[0] is None and mine[5] is None
     # Reads run before the batch's puts, in both stores

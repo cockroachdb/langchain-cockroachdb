@@ -12,20 +12,15 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
-from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
 from langgraph.store.base import (
     BaseStore,
-    GetOp,
     InvalidNamespaceError,
-    ListNamespacesOp,
     Op,
-    PutOp,
     Result,
-    SearchOp,
     TTLConfig,
 )
 from psycopg import Capabilities, Connection, Pipeline
@@ -36,19 +31,13 @@ from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
 from langchain_cockroachdb.checkpointer import _internal
 from langchain_cockroachdb.retry import RetryPolicy
-from langchain_cockroachdb.store.base import (
-    BaseCockroachDBStore,
-    PutPlan,
-    _group_ops,
-    _row_to_item,
-    _row_to_search_item,
-)
+from langchain_cockroachdb.store.base import BaseCockroachDBStore, PutPlan
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
     PoolConfig,
 )
-from langchain_cockroachdb.store.namespaces import from_text, to_text, validate_labels
+from langchain_cockroachdb.store.namespaces import validate_labels
 
 logger = logging.getLogger(__name__)
 
@@ -281,39 +270,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Returns:
             One result per op, in the order of ``ops``.
         """
-        grouped, total = _group_ops(ops)
-        results: list[Result] = [None] * total
-
-        gets = [(i, op) for i, op in grouped.get(GetOp, []) if isinstance(op, GetOp)]
-        searches: list[tuple[int, SearchOp]] = []
-        for i, op in grouped.get(SearchOp, []):
-            if not isinstance(op, SearchOp):
-                continue
-            if op.limit == 0:
-                results[i] = []
-            else:
-                searches.append((i, op))
-        listings = [
-            (i, op)
-            for i, op in grouped.get(ListNamespacesOp, [])
-            if isinstance(op, ListNamespacesOp)
-        ]
-        puts = [op for _, op in grouped.get(PutOp, []) if isinstance(op, PutOp)]
-
-        # Everything that can fail without the database fails here, first
-        plan = self._plan_puts(puts) if puts else None
-        search_statements = self._search_plan(searches)[0] if searches else []
-        listing_statements = [self._listing_statement(op) for _, op in listings]
-
-        if gets:
-            self._run_gets(gets, results)
-        if searches:
-            self._run_searches(searches, search_statements, results)
-        if listings:
-            self._run_listings(listings, listing_statements, results)
-        if plan is not None:
-            self._run_puts(plan)
-        return results
+        plan = self._plan_batch(ops)
+        for label, statements, fill in plan.reads():
+            fill(self._read_all(statements, label))
+        if plan.puts is not None:
+            self._run_puts(plan.puts)
+        return plan.results
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         """Run ``batch`` in a worker thread, as PostgresStore does."""
@@ -344,48 +306,6 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                         extra.close()
 
         return self._retry(read, label=label)
-
-    def _run_gets(self, gets: list[tuple[int, GetOp]], results: list[Result]) -> None:
-        # One statement per namespace and refresh choice. With refresh, the
-        # statement also pushes back the expiry of the rows it reads.
-        groups: dict[tuple[tuple[str, ...], bool], list[tuple[int, GetOp]]] = defaultdict(list)
-        for i, op in gets:
-            groups[(tuple(op.namespace), bool(op.refresh_ttl))].append((i, op))
-        statements = [
-            self.sql.get(
-                to_text(namespace),
-                list(dict.fromkeys(op.key for _, op in items)),
-                omit_expired=self.ttl.omit_expired,
-                refresh=refresh,
-            )
-            for (namespace, refresh), items in groups.items()
-        ]
-        found = self._read_all(statements, "store get")
-        for ((namespace, _), items), rows in zip(groups.items(), found, strict=True):
-            by_key = {row["key"]: row for row in rows}
-            for i, op in items:
-                row = by_key.get(op.key)
-                results[i] = None if row is None else _row_to_item(namespace, row)
-
-    def _run_searches(
-        self,
-        searches: list[tuple[int, SearchOp]],
-        statements: list[tuple[str, list]],
-        results: list[Result],
-    ) -> None:
-        found = self._read_all(statements, "store search")
-        for (i, _), rows in zip(searches, found, strict=True):
-            results[i] = [_row_to_search_item(row) for row in rows]
-
-    def _run_listings(
-        self,
-        listings: list[tuple[int, ListNamespacesOp]],
-        statements: list[tuple[str, list]],
-        results: list[Result],
-    ) -> None:
-        found = self._read_all(statements, "store list namespaces")
-        for (i, _), rows in zip(listings, found, strict=True):
-            results[i] = [from_text(row["ns"]) for row in rows]
 
     def _run_puts(self, plan: PutPlan) -> None:
         statements = self._write_statements(plan)
