@@ -63,8 +63,16 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     The async twin of CockroachDBStore: same tables, same SQL, same
     behavior. For production, pass a ``psycopg_pool.AsyncConnectionPool``
     or use ``from_conn_string`` with ``pool_config``: a pool replaces broken
-    connections and runs batches concurrently, while a single connection
-    runs one batch at a time.
+    connections, while a single connection cannot recover from a dropped one.
+
+    ``aget``, ``aput``, ``asearch`` and the other awaited calls, and the sync
+    wrappers, go through AsyncBatchedBaseStore's queue, which runs one
+    ``abatch`` at a time. So a pool does not run those calls in parallel, and
+    a large pool does not speed them up. What the queue gives instead is
+    coalescing: ops queued in the same tick run as one batch, with one round
+    trip per read group and one transaction for the writes. Only direct
+    ``abatch`` calls, or sync ``batch`` calls from other threads, run
+    concurrently on a pool.
 
     The constructor must run inside a running event loop, because
     AsyncBatchedBaseStore starts a task on it there. Awaited calls made in
@@ -93,9 +101,6 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     _log = logger
     _own_loop_message = _OWN_LOOP
     _loop_messages = _LOOP_MESSAGES
-
-    # Runs operations one at a time on a single connection; a pool needs no lock
-    lock: asyncio.Lock
 
     def __init__(
         self,

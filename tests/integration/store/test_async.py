@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from langgraph.store.base import BaseStore, GetOp, InvalidNamespaceError, PutOp
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from langchain_cockroachdb import AsyncCockroachDBStore
@@ -35,7 +36,6 @@ from tests.integration.store.test_parity import (
     UNICODE_VALUE,
     WAIT,
     as_set,
-    create_statement,
     norm,
 )
 
@@ -86,6 +86,22 @@ async def astore_factory(libpq_url: str, table_name: str) -> AsyncIterator[Facto
                 await resource.__aexit__(None, None, None)
         except Exception as error:  # noqa: BLE001
             warnings.warn(f"store cleanup failed: {error!r}", UserWarning, stacklevel=1)
+
+
+@pytest.fixture
+async def aadmin(libpq_url: str) -> AsyncIterator[AsyncConnection[Any]]:
+    """A plain autocommit async connection for checking rows without blocking the loop."""
+    async with await AsyncConnection.connect(
+        libpq_url, autocommit=True, row_factory=dict_row
+    ) as conn:
+        yield conn
+
+
+async def create_statement(aadmin: AsyncConnection[Any], table_name: str) -> str:
+    cur = await aadmin.execute(f"SHOW CREATE TABLE {table_name}")
+    row = await cur.fetchone()
+    assert row is not None
+    return row["create_statement"]
 
 
 async def both(stores: list[BaseStore], ops: list) -> list[list]:
@@ -165,6 +181,10 @@ async def test_async_paging_edges(astore_factory, reference, mode) -> None:
     with pytest.raises(ValueError, match="limit"):
         await store.asearch(("p",), limit=-1)
     with pytest.raises(ValueError, match="offset"):
+        await store.asearch(("p",), offset=-1)
+    with pytest.raises(ValueError, match="limit"):
+        await store.alist_namespaces(limit=-1)
+    with pytest.raises(ValueError, match="offset"):
         await store.alist_namespaces(offset=-2)
     assert await store.asearch(("p",), offset=5) == await ref.asearch(("p",), offset=5) == []
     assert await store.alist_namespaces(offset=5) == await ref.alist_namespaces(offset=5) == []
@@ -213,40 +233,46 @@ async def test_async_batch_mixed_ops_keep_result_order(astore_factory, reference
     mine, theirs = await both([store, ref], MIXED_OPS)
     assert mine == theirs
     assert mine[0] is None and mine[5] is None
+    # Reads run before the batch's puts, in both stores
     assert mine[6] is None
+    assert await both([store, ref], [GetOp(("m", "1"), "a"), GetOp(("m", "3"), "c")]) == [
+        [None, (("m", "3"), "c", {"v": 3})],
+        [None, (("m", "3"), "c", {"v": 3})],
+    ]
 
 
-async def test_async_ttl_expiry_refresh_and_sweep(astore_factory, admin, table_name, mode) -> None:
+async def test_async_ttl_expiry_refresh_and_sweep(astore_factory, aadmin, table_name, mode) -> None:
     store = await astore_factory(mode, ttl={"default_ttl": 1.0, "refresh_on_read": True})
     await store.aput(("t",), "short", {"v": 1}, ttl=0.01)
     await store.aput(("t",), "long", {"v": 2})
     await store.aput(("t",), "none", {"v": 3}, ttl=None)
 
-    def expires(key: str) -> Any:
-        return admin.execute(
+    async def expires(key: str) -> Any:
+        cur = await aadmin.execute(
             f"SELECT expires_at, ttl_minutes FROM {table_name} WHERE key = %s", (key,)
-        ).fetchone()
+        )
+        return await cur.fetchone()
 
-    assert expires("long")["ttl_minutes"] == 1
-    assert expires("none")["expires_at"] is None
-    before = expires("long")["expires_at"]
+    assert (await expires("long"))["ttl_minutes"] == 1
+    assert (await expires("none"))["expires_at"] is None
+    before = (await expires("long"))["expires_at"]
     await asyncio.sleep(1.2)
     assert await store.aget(("t",), "short") is None
     assert {item.key for item in await store.asearch(("t",))} == {"long", "none"}
-    after = expires("long")["expires_at"]
+    after = (await expires("long"))["expires_at"]
     assert after > before
     assert await store.aget(("t",), "long", refresh_ttl=False) is not None
-    assert expires("long")["expires_at"] == after
+    assert (await expires("long"))["expires_at"] == after
     assert await store.sweep_ttl() == 1
     assert await store.sweep_ttl() == 0
-    assert "ttl_expiration_expression" in create_statement(admin, table_name)
+    assert "ttl_expiration_expression" in await create_statement(aadmin, table_name)
     await store.disable_ttl()
-    assert "ttl_expiration_expression" not in create_statement(admin, table_name)
+    assert "ttl_expiration_expression" not in await create_statement(aadmin, table_name)
 
 
 @pytest.mark.timeout(60)
 async def test_async_ttl_sweeper_task_deletes_expired_rows(
-    astore_factory, admin, table_name
+    astore_factory, aadmin, table_name
 ) -> None:
     store = await astore_factory("pool", ttl={"default_ttl": 1.0})
     await store.aput(("t",), "short", {"v": 1}, ttl=0.005)
@@ -256,7 +282,8 @@ async def test_async_ttl_sweeper_task_deletes_expired_rows(
     assert await store.start_ttl_sweeper(0.01) is task  # type: ignore[arg-type]
     keys: list[str] = []
     for _ in range(WAIT * 5):
-        keys = [row["key"] for row in admin.execute(f"SELECT key FROM {table_name}")]
+        cur = await aadmin.execute(f"SELECT key FROM {table_name}")
+        keys = [row["key"] for row in await cur.fetchall()]
         if keys == ["long"]:
             break
         await asyncio.sleep(0.2)
