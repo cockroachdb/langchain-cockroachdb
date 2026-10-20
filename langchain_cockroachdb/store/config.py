@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from langchain_core.embeddings import Embeddings
 from langgraph.store.base import IndexConfig, TTLConfig
@@ -55,6 +55,23 @@ class CockroachDBTTLConfig(TTLConfig):
 
     omit_expired: bool
     ttl_job_cron: str
+
+
+class PoolConfig(TypedDict, total=False):
+    """Connection pool settings for ``CockroachDBStore.from_conn_string``.
+
+    The same meaning as PostgresStore's PoolConfig.
+
+    Attributes:
+        min_size: Connections the pool keeps open. Default 1.
+        max_size: Most connections the pool opens, or None for min_size.
+        kwargs: Extra psycopg connection options for every pooled connection.
+            autocommit, row_factory and prepare_threshold are set by the store.
+    """
+
+    min_size: int
+    max_size: int | None
+    kwargs: dict[str, Any]
 
 
 @dataclass(frozen=True)

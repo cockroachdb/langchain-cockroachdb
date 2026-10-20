@@ -3,4 +3,16 @@
 A LangGraph Store implementation backed by CockroachDB.
 """
 
-__all__: list[str] = []
+from langchain_cockroachdb.store.config import (
+    CockroachDBIndexConfig,
+    CockroachDBTTLConfig,
+    PoolConfig,
+)
+from langchain_cockroachdb.store.store import CockroachDBStore
+
+__all__ = [
+    "CockroachDBStore",
+    "CockroachDBIndexConfig",
+    "CockroachDBTTLConfig",
+    "PoolConfig",
+]

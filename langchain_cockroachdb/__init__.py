@@ -22,6 +22,12 @@ from langchain_cockroachdb.retry import (
     is_retryable_error,
     sync_retry_with_backoff,
 )
+from langchain_cockroachdb.store import (
+    CockroachDBIndexConfig,
+    CockroachDBStore,
+    CockroachDBTTLConfig,
+    PoolConfig,
+)
 from langchain_cockroachdb.vectorstores import CockroachDBVectorStore
 
 __all__ = [
@@ -36,6 +42,10 @@ __all__ = [
     "CockroachDBChatMessageHistory",
     "CockroachDBSaver",
     "AsyncCockroachDBSaver",
+    "CockroachDBStore",
+    "CockroachDBIndexConfig",
+    "CockroachDBTTLConfig",
+    "PoolConfig",
     "async_retry_with_backoff",
     "sync_retry_with_backoff",
     "is_retryable_error",
