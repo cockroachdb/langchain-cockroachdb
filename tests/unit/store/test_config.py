@@ -84,13 +84,35 @@ def test_resolve_index_tokenizes_fields():
     resolved = resolve_index_config(config)
 
     assert resolved is not None
-    # "text" tokenizes to 1 label
-    # "messages[*].content" tokenizes to 2 labels
-    assert resolved.estimated_vectors == 3
+    # "text" tokenizes to 1 token
+    # "messages[*].content" tokenizes to 3 tokens (messages, [*], content)
+    assert resolved.estimated_vectors == 4
     assert len(resolved.fields) == 2
     # Check that the fields are tuples of (path, tokens)
     assert resolved.fields[0][0] == "text"
     assert resolved.fields[1][0] == "messages[*].content"
+
+    # Test with indexed array element
+    config2: CockroachDBIndexConfig = {
+        "dims": 3,
+        "embed": FakeEmbeddings(size=3),
+        "fields": ["a.b[0].c"],
+    }
+    resolved2 = resolve_index_config(config2)
+    assert resolved2 is not None
+    # "a.b[0].c" tokenizes to 4 tokens (a, b, [0], c)
+    assert resolved2.estimated_vectors == 4
+
+    # Test with root path plus another field
+    config3: CockroachDBIndexConfig = {
+        "dims": 3,
+        "embed": FakeEmbeddings(size=3),
+        "fields": ["$", "text"],
+    }
+    resolved3 = resolve_index_config(config3)
+    assert resolved3 is not None
+    # "$" counts as 1, "text" tokenizes to 1
+    assert resolved3.estimated_vectors == 2
 
 
 def test_resolve_ttl_none_filters_but_writes_nothing():

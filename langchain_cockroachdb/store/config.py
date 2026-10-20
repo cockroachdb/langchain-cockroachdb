@@ -210,8 +210,7 @@ def resolve_index_config(index: CockroachDBIndexConfig | None) -> ResolvedIndex 
             # Other paths use tokenize_path
             tokens = tokenize_path(path)
             fields_list.append((path, tokens))
-            # Estimate excludes wildcard tokens like "[*]"
-            estimated += sum(1 for t in tokens if not t.startswith("["))
+            estimated += len(tokens)
 
     return ResolvedIndex(
         dims=dims,
