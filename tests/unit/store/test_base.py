@@ -94,9 +94,10 @@ def test_plan_puts_dedups_last_wins_and_splits_deletes() -> None:
     assert plan.embed_requests == []
     assert plan.reindexed == {}
 
-    # Without an op TTL, the configured default applies
+    # The op's TTL is used as given: BaseStore.put already applied the
+    # default, so None means no expiry even with a default configured
     plan = store._plan_puts([PutOp(("a",), "k1", {"v": 1})])
-    assert plan.items == [("a", "k1", '{"v": 1}', 5.0)]
+    assert plan.items == [("a", "k1", '{"v": 1}', None)]
     plan = make_base()._plan_puts([PutOp(("a",), "k1", {"v": 1})])
     assert plan.items == [("a", "k1", '{"v": 1}', None)]
 

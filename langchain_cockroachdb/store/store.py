@@ -159,7 +159,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Args:
             conn_string: CockroachDB connection string (cockroachdb://, postgresql:// and similar)
-            pipeline: Whether to use pipeline mode on the single connection
+            pipeline: Whether to use pipeline mode on the single connection.
+                Ignored with pool_config.
             pool_config: Open a ConnectionPool with these settings instead of one connection
             index: Semantic search settings. Not supported yet.
             ttl: TTL settings
@@ -173,13 +174,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Yields:
             CockroachDBStore instance. The connection or pool closes on exit.
 
-        Raises:
-            ValueError: If both pipeline and pool_config are given
+        With ``pool_config``, ``pipeline`` is ignored, as in PostgresStore: a
+        pipeline needs a single connection.
         """
-        if pipeline and pool_config is not None:
-            raise ValueError(
-                "pipeline cannot be used with pool_config: a pipeline needs one connection"
-            )
         policy = retry_policy or RetryPolicy()
         url = to_libpq_url(conn_string)
         options = dict(connect_kwargs or {})
@@ -444,7 +441,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """
         prefix = validate_labels(namespace_prefix)
         if not prefix:
-            raise InvalidNamespaceError("delete_namespace needs a non-empty namespace prefix")
+            raise InvalidNamespaceError(
+                "delete_namespace needs a non-empty namespace prefix. To clear the whole "
+                "store on purpose, delete each top-level namespace from list_namespaces("
+                "max_depth=1), or drop the store's tables."
+            )
         statements = self.sql.delete_namespace(prefix)
 
         def write() -> int:

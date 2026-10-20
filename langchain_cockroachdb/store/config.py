@@ -104,7 +104,7 @@ class ResolvedTTL:
     """Validated and normalized TTL configuration.
 
     Attributes:
-        default_ttl: Default expiration seconds, or None.
+        default_ttl: Default expiration in minutes, or None.
         refresh_on_read: Whether to refresh expiration on read.
         omit_expired: Whether to exclude expired items from reads.
         sweep_interval_minutes: TTL sweep interval, or None.

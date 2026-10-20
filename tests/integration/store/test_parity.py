@@ -30,6 +30,7 @@ from langgraph.store.base import (
     PutOp,
     SearchOp,
 )
+from psycopg_pool import ConnectionPool
 
 from langchain_cockroachdb import CockroachDBStore, RetryPolicy
 
@@ -366,7 +367,7 @@ def test_delete_namespace_counts_and_scopes(store_factory, mode) -> None:
         (("user_a",), "k5"),
     }
     assert store.delete_namespace(("user", "a")) == 0
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="drop the store's tables"):
         store.delete_namespace(())
 
 
@@ -376,6 +377,7 @@ def test_ttl_expiry_refresh_and_sweep(store_factory, admin, table_name, mode) ->
     store.put(("t",), "short", {"v": 1}, ttl=0.01)
     store.put(("t",), "long", {"v": 2})
     store.put(("t",), "none", {"v": 3}, ttl=None)
+    store.put(("t",), "one", {"v": 4}, ttl=1)
 
     def expires(key: str) -> Any:
         row = admin.execute(
@@ -383,12 +385,15 @@ def test_ttl_expiry_refresh_and_sweep(store_factory, admin, table_name, mode) ->
         ).fetchone()
         return row
 
-    # put(ttl=None) without an op TTL falls back to the default
+    # No ttl argument: the default. ttl=None: no expiry. ttl=1: one minute
     assert expires("long")["ttl_minutes"] == 1
+    assert expires("none")["ttl_minutes"] is None
+    assert expires("none")["expires_at"] is None
+    assert expires("one")["ttl_minutes"] == 1
     before = expires("long")["expires_at"]
     time.sleep(1.2)
     assert store.get(("t",), "short") is None
-    assert {item.key for item in store.search(("t",))} == {"long", "none"}
+    assert {item.key for item in store.search(("t",))} == {"long", "none", "one"}
     after = expires("long")["expires_at"]
     assert after > before
     assert store.get(("t",), "long", refresh_ttl=False) is not None
@@ -441,11 +446,14 @@ def test_from_conn_string_modes(libpq_url, table_name) -> None:
             store.setup()
             store.put(("f",), str(kwargs), {"v": 1})
             assert store.get(("f",), str(kwargs)) is not None
-    with (
-        pytest.raises(ValueError, match="pool_config"),
-        CockroachDBStore.from_conn_string(libpq_url, pipeline=True, pool_config={"min_size": 1}),
-    ):
-        pass
+    # pool_config overrides pipeline, as in PostgresStore
+    with CockroachDBStore.from_conn_string(
+        libpq_url, table_name=table_name, pipeline=True, pool_config={"min_size": 1}
+    ) as store:
+        assert isinstance(store.conn, ConnectionPool)
+        assert store.pipe is None
+        store.put(("f",), "both", {"v": 1})
+        assert store.get(("f",), "both") is not None
     with (
         pytest.raises(ValueError, match="autocommit"),
         CockroachDBStore.from_conn_string(libpq_url, pool_config={"kwargs": {"autocommit": False}}),

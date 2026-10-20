@@ -154,14 +154,12 @@ class BaseCockroachDBStore:
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
 
-    def _op_ttl(self, op: PutOp) -> float | None:
-        """The TTL in minutes for a put: the op's own, else the configured default."""
-        return op.ttl if op.ttl is not None else self.ttl.default_ttl
-
     def _plan_puts(self, put_ops: Iterable[PutOp]) -> PutPlan:
         """Plan the rows a batch of puts writes.
 
-        The last op for a (namespace, key) wins. Values are serialized here,
+        The last op for a (namespace, key) wins. Each item gets the op's TTL
+        as given, like PostgresStore: BaseStore.put already filled in the
+        configured default, so None means no expiry. Values are serialized here,
         so an unserializable value fails the batch before anything is
         embedded or sent.
 
@@ -184,7 +182,7 @@ class BaseCockroachDBStore:
                 raise ValueError(
                     f"value for {prefix}/{key} is not JSON serializable: {error}"
                 ) from error
-            plan.items.append((prefix, key, value_json, self._op_ttl(op)))
+            plan.items.append((prefix, key, value_json, op.ttl))
             if self.index is None:
                 continue
             plan.reindexed.setdefault(prefix, []).append(key)
