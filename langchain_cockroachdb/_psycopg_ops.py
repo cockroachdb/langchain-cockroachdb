@@ -79,7 +79,8 @@ class PsycopgOps:
 
     def _retry(self, fn: Callable[[], T], *, label: str, policy: RetryPolicy | None = None) -> T:
         """Run ``fn`` under ``policy``, by default the host's retry policy."""
-        return (policy or self.retry_policy).run(fn, label=label, can_retry=self._can_retry)
+        active = policy if policy is not None else self.retry_policy
+        return active.run(fn, label=label, can_retry=self._can_retry)
 
     def _sync_pipeline(self) -> None:
         """Sync pipeline if one is in use. Each statement runs in its own transaction."""
@@ -100,15 +101,17 @@ class PsycopgOps:
     def _run_ddl(self, statement: str, label: str, *, policy: RetryPolicy | None = None) -> None:
         """Run a single DDL statement with retry and timeout.
 
-        ``policy`` replaces the host's retry policy for this statement.
+        ``policy`` replaces the host's retry policy for this statement,
+        including its ``ddl_attempt_timeout``.
         """
+        active = policy if policy is not None else self.retry_policy
 
         def execute() -> None:
-            with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
+            with self._cursor(timeout=active.ddl_attempt_timeout, label=label) as cur:
                 cur.execute(statement)
                 self._sync_pipeline()
 
-        self._retry(execute, label=label, policy=policy)
+        self._retry(execute, label=label, policy=active)
 
     def _operation_lock(self) -> contextlib.AbstractContextManager[object]:
         """The lock an operation holds while it uses the connection.
@@ -641,14 +644,14 @@ class AsyncPsycopgOps:
     ) -> None:
         """Run a single DDL statement with retry and timeout.
 
-        ``policy`` replaces the host's retry policy for this statement.
+        ``policy`` replaces the host's retry policy for this statement,
+        including its ``ddl_attempt_timeout``.
         """
+        active = policy if policy is not None else self.retry_policy
 
         async def execute() -> None:
-            async with self._cursor(
-                timeout=self.retry_policy.ddl_attempt_timeout, label=label
-            ) as cur:
+            async with self._cursor(timeout=active.ddl_attempt_timeout, label=label) as cur:
                 await cur.execute(statement)
                 await self._sync_pipeline()
 
-        await self._retry(execute, label=label, policy=policy)
+        await self._retry(execute, label=label, policy=active)

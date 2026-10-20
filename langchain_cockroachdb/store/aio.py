@@ -27,12 +27,11 @@ from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
 from langchain_cockroachdb.checkpointer import _ainternal
-from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
     PutPlan,
-    ttl_setup_policy,
 )
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
@@ -264,6 +263,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         a TTL configuration, it then turns on CockroachDB row-level TTL on
         ``expires_at``.
 
+        On CockroachDB v25.4 a TTL change fails while another setup() changes
+        the same table. That error is retried under the store's retry policy,
+        even if its ``retry_on`` would refuse it; ``max_attempts=1`` turns this
+        off.
+
         Raises:
             ValueError: If the vectors table exists with other dims, or its
                 index uses another distance. A different partition size, or
@@ -307,7 +311,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         if self.index is not None:
             await self._check_index()
         if self._ttl_given:
-            policy = ttl_setup_policy(self.retry_policy)
+            policy = schema_change_policy(self.retry_policy)
             for statement in self.sql.ttl_statements(self.ttl.cron):
                 await self._run_ddl(statement, "store TTL setup", policy=policy)
 

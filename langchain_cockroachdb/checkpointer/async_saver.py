@@ -44,7 +44,7 @@ from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
 from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
-from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
 
@@ -602,16 +602,29 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
     async def aenable_ttl(self, ttl_interval: str = "7 days", cron: str = "@daily") -> None:
         """Enable CockroachDB row-level TTL on checkpoint tables.
 
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+
         Args:
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
         self._validate_ttl_params(ttl_interval, cron)
         statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        policy = schema_change_policy(self.retry_policy)
         for statement in statements:
-            await self._run_ddl(statement, "enable TTL")
+            await self._run_ddl(statement, "enable TTL", policy=policy)
 
     async def adisable_ttl(self) -> None:
-        """Disable CockroachDB row-level TTL on checkpoint tables."""
+        """Disable CockroachDB row-level TTL on checkpoint tables.
+
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+        """
+        policy = schema_change_policy(self.retry_policy)
         for statement in self.DISABLE_TTL_SQL:
-            await self._run_ddl(statement, "disable TTL")
+            await self._run_ddl(statement, "disable TTL", policy=policy)

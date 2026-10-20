@@ -26,7 +26,6 @@ from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     PutPlan,
     _group_ops,
-    ttl_setup_policy,
 )
 from langchain_cockroachdb.store.config import resolve_index_config
 from langchain_cockroachdb.store.store import CockroachDBStore
@@ -866,28 +865,3 @@ def test_index_check_warns_on_partition_sizes_and_flat(caplog: pytest.LogCapture
     assert len(caplog.records) == 1
     assert "flat" in caplog.records[0].getMessage()
     assert "drop_vector_index()" in caplog.records[0].getMessage()
-
-
-def _error(code: str, message: str) -> psycopg.Error:
-    """A psycopg error carrying ``code``, as the driver raises it for server errors."""
-    error = psycopg.errors.lookup(code)(message)
-    error.sqlstate = code
-    return error
-
-
-def test_ttl_setup_policy_retries_a_busy_schema_change_only() -> None:
-    # v25.4 rejects a TTL change while another schema change on the table runs
-    busy = _error(
-        "0A000",
-        "cannot modify TTL settings while another schema change on the table is being processed",
-    )
-    other = _error("0A000", "unimplemented: something else")
-    policy = ttl_setup_policy(RetryPolicy())
-    assert policy.is_retryable(busy)
-    assert not policy.is_retryable(other)
-    assert policy.is_retryable(_error("40001", "restart transaction"))
-    assert not RetryPolicy().is_retryable(busy)
-    # A policy's own retry_on still decides every other error
-    never = ttl_setup_policy(RetryPolicy(retry_on=lambda error: False))
-    assert never.is_retryable(busy)
-    assert not never.is_retryable(_error("40001", "restart transaction"))

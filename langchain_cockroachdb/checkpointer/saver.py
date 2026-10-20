@@ -37,7 +37,7 @@ from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
 from langchain_cockroachdb.checkpointer import _internal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
-from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
 
@@ -449,19 +449,32 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         Rows older than ttl_interval will be automatically deleted by a
         background CockroachDB job on the specified cron schedule.
 
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+
         Args:
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
         self._validate_ttl_params(ttl_interval, cron)
         statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        policy = schema_change_policy(self.retry_policy)
         for statement in statements:
-            self._run_ddl(statement, "enable TTL")
+            self._run_ddl(statement, "enable TTL", policy=policy)
 
     def disable_ttl(self) -> None:
-        """Disable CockroachDB row-level TTL on checkpoint tables."""
+        """Disable CockroachDB row-level TTL on checkpoint tables.
+
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+        """
+        policy = schema_change_policy(self.retry_policy)
         for statement in self.DISABLE_TTL_SQL:
-            self._run_ddl(statement, "disable TTL")
+            self._run_ddl(statement, "disable TTL", policy=policy)
 
     def _load_checkpoint_tuple_with_cursor(
         self, cur: Cursor[DictRow], value: DictRow

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `enable_ttl` and `disable_ttl` (and `aenable_ttl` and `adisable_ttl`) on the checkpointers no longer fail when several processes run them at once on CockroachDB v25.4. That version refuses to change a table's TTL settings while another schema change on it runs, with SQLSTATE 0A000, which was not retried. These TTL changes now retry that error under the saver's retry policy, even if its `retry_on` would refuse it; `max_attempts=1` turns this off. The code and phrase are exported as `SCHEMA_CHANGE_BUSY_SQLSTATE` and `SCHEMA_CHANGE_BUSY_MESSAGES`, with `is_schema_change_busy()` and `schema_change_policy()`.
+
 ## [0.4.1] - 2026-10-16
 
 ### Performance

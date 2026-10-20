@@ -13,11 +13,14 @@ from sqlalchemy.exc import TimeoutError as SAPoolTimeout
 from langchain_cockroachdb.retry import (
     DEFAULT_RETRY_POLICY,
     RETRYABLE_SQLSTATES,
+    SCHEMA_CHANGE_BUSY_SQLSTATE,
     RetryPolicy,
     async_retry_with_backoff,
     get_sqlstate,
     is_retryable_error,
+    is_schema_change_busy,
     resolve_retry_policy,
+    schema_change_policy,
     sync_retry_with_backoff,
 )
 
@@ -735,3 +738,63 @@ class TestSQLParameterSafety:
         )
 
         assert not is_retryable_error(sa_error)
+
+
+BUSY_MESSAGE = (
+    "cannot modify TTL settings while another schema change on the table is being processed"
+)
+
+
+class TestSchemaChangePolicy:
+    def test_busy_error_needs_the_code_and_the_phrase(self) -> None:
+        assert SCHEMA_CHANGE_BUSY_SQLSTATE == "0A000"
+        assert is_schema_change_busy(server_error("0A000", BUSY_MESSAGE))
+        assert is_schema_change_busy(wrapped(server_error("0A000", BUSY_MESSAGE)))
+        assert not is_schema_change_busy(server_error("0A000", "unimplemented: something else"))
+        assert not is_schema_change_busy(server_error("XX000", BUSY_MESSAGE))
+
+    def test_phrases_match_without_regard_to_case(self) -> None:
+        error = server_error("0A000", "Schema Change In Flight")
+        assert is_schema_change_busy(error, ["schema change in flight"])
+        assert is_schema_change_busy(error, ["SCHEMA CHANGE IN FLIGHT"])
+        assert schema_change_policy(RetryPolicy(), ["SCHEMA change in FLIGHT"]).is_retryable(error)
+        with pytest.raises(TypeError):
+            is_schema_change_busy(error, "schema change in flight")
+
+    def test_policy_retries_the_busy_error_and_keeps_the_rest(self) -> None:
+        busy = server_error("0A000", BUSY_MESSAGE)
+        base = RetryPolicy(max_attempts=7, initial_backoff=0.3, ddl_attempt_timeout=4.0)
+        policy = schema_change_policy(base)
+        assert not base.is_retryable(busy)
+        assert policy.is_retryable(busy)
+        assert policy.is_retryable(server_error("40001"))
+        assert not policy.is_retryable(server_error("0A000", "unimplemented: something else"))
+        assert not policy.is_retryable(server_error("42601"))
+        assert (policy.max_attempts, policy.initial_backoff, policy.ddl_attempt_timeout) == (
+            7,
+            0.3,
+            4.0,
+        )
+
+    def test_busy_error_is_retried_even_against_a_users_retry_on(self) -> None:
+        never = schema_change_policy(RetryPolicy(retry_on=lambda error: False))
+        assert never.is_retryable(server_error("0A000", BUSY_MESSAGE))
+        assert not never.is_retryable(server_error("40001"))
+
+    def test_one_attempt_turns_the_retry_off(self) -> None:
+        calls = 0
+
+        def busy() -> None:
+            nonlocal calls
+            calls += 1
+            raise server_error("0A000", BUSY_MESSAGE)
+
+        with pytest.raises(psycopg.Error):
+            schema_change_policy(RetryPolicy(max_attempts=1)).run(busy, label="ttl")
+        assert calls == 1
+        calls = 0
+        with pytest.raises(psycopg.Error):
+            schema_change_policy(RetryPolicy(max_attempts=3, initial_backoff=0.0)).run(
+                busy, label="ttl"
+            )
+        assert calls == 3

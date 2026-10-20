@@ -107,6 +107,17 @@ NON_TRANSIENT_MESSAGES: tuple[str, ...] = (
     "permission denied",
 )
 
+# CockroachDB v25.4 refuses to change a table's TTL settings while another
+# schema change on that table runs. Several processes setting up the same
+# tables at once then fail each other's TTL step. The other change finishes
+# soon, so schema_change_policy retries an error with this SQLSTATE and one of
+# these phrases. 0A000 alone means "feature not supported", so the phrase is
+# required too.
+SCHEMA_CHANGE_BUSY_SQLSTATE: str = "0A000"
+SCHEMA_CHANGE_BUSY_MESSAGES: tuple[str, ...] = (
+    "another schema change on the table is being processed",
+)
+
 _MAX_CHAIN = 16
 
 
@@ -422,6 +433,42 @@ class RetryPolicy:
 
 
 DEFAULT_RETRY_POLICY = RetryPolicy()
+
+
+def is_schema_change_busy(
+    error: BaseException, messages: Iterable[str] = SCHEMA_CHANGE_BUSY_MESSAGES
+) -> bool:
+    """True if ``error`` says another schema change on the table is still running.
+
+    The error must carry SCHEMA_CHANGE_BUSY_SQLSTATE and one of ``messages``
+    (default: SCHEMA_CHANGE_BUSY_MESSAGES), matched without regard to case.
+    """
+    if get_sqlstate(error) != SCHEMA_CHANGE_BUSY_SQLSTATE:
+        return False
+    phrases = _as_phrases(messages, "messages")
+    return any(
+        phrase in str(current).lower() for current in _error_chain(error) for phrase in phrases
+    )
+
+
+def schema_change_policy(
+    policy: RetryPolicy, messages: Iterable[str] = SCHEMA_CHANGE_BUSY_MESSAGES
+) -> RetryPolicy:
+    """``policy``, also retrying a schema change that met another running one.
+
+    For idempotent schema changes, such as TTL settings, that several
+    processes may run at once. The busy error (see is_schema_change_busy) is
+    retried even when the policy's own ``retry_on`` would return False for
+    it. Every other error is decided by ``policy`` as it is, including its
+    ``retry_on``. Attempts, backoff and timeouts are the policy's, so
+    ``max_attempts=1`` turns the retry off.
+    """
+    phrases = _as_phrases(messages, "messages")
+
+    def retry_on(error: BaseException) -> bool:
+        return is_schema_change_busy(error, phrases) or policy.is_retryable(error)
+
+    return dataclasses.replace(policy, retry_on=retry_on)
 
 
 def is_retryable_error(error: BaseException) -> bool:

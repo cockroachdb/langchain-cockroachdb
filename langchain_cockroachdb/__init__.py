@@ -14,12 +14,16 @@ from langchain_cockroachdb.retry import (
     NON_TRANSIENT_MESSAGES,
     RETRYABLE_SQLSTATE_CLASSES,
     RETRYABLE_SQLSTATES,
+    SCHEMA_CHANGE_BUSY_MESSAGES,
+    SCHEMA_CHANGE_BUSY_SQLSTATE,
     TRANSIENT_MESSAGES,
     UNCATEGORIZED_SQLSTATES,
     RetryPolicy,
     async_retry_with_backoff,
     get_sqlstate,
     is_retryable_error,
+    is_schema_change_busy,
+    schema_change_policy,
     sync_retry_with_backoff,
 )
 from langchain_cockroachdb.store import (
@@ -56,6 +60,10 @@ __all__ = [
     "UNCATEGORIZED_SQLSTATES",
     "TRANSIENT_MESSAGES",
     "NON_TRANSIENT_MESSAGES",
+    "SCHEMA_CHANGE_BUSY_SQLSTATE",
+    "SCHEMA_CHANGE_BUSY_MESSAGES",
+    "is_schema_change_busy",
+    "schema_change_policy",
 ]
 
 __version__ = "0.4.1"
