@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _check_component(cls: type) -> None:
+    """Raise TypeError unless a host class names itself in ``component``."""
+    component = getattr(cls, "component", None)
+    if not isinstance(component, str) or not component:
+        raise TypeError(
+            f"{cls.__name__} must set the class attribute component, a non-empty "
+            'string such as "checkpointer" or "store", used in log and error messages'
+        )
+
+
+def _operation_label(component: str) -> str:
+    """The default hang-guard label: "checkpoint operation" keeps the 0.4.1 text."""
+    noun = "checkpoint" if component == "checkpointer" else component
+    return f"{noun} operation"
+
+
 class PsycopgOps:
     """Sync mixin: retries, the hang guard and one-batch writes on psycopg.
 
@@ -41,9 +57,11 @@ class PsycopgOps:
     __init__, and ``component`` on the class.
     """
 
-    # Names the host in log and error messages: "checkpointer" or "store"
+    # Names the host in log and error messages: "checkpointer" or "store". A
+    # subclass that does not set it fails with TypeError when it is defined.
     component: ClassVar[str]
-    # Where _can_retry logs; a host can point it at its own module's logger
+    # Where _can_retry logs. The default is this module's logger; a host can
+    # point it at its own module's logger
     _log: ClassVar[logging.Logger] = logger
 
     conn: _internal.Conn
@@ -54,6 +72,10 @@ class PsycopgOps:
     retry_policy: RetryPolicy
     # Set while a write batch of ours is between BEGIN and COMMIT on a single connection
     _batch_open: bool
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _check_component(cls)
 
     def _retry(self, fn: Callable[[], T], *, label: str) -> T:
         """Run ``fn`` under the retry policy."""
@@ -239,7 +261,7 @@ class PsycopgOps:
         pipeline: bool = False,
         transaction: bool = False,
         timeout: float | None = None,
-        label: str = "checkpoint operation",
+        label: str | None = None,
     ) -> Iterator[Cursor[DictRow]]:
         """Create a database cursor as a context manager, with the hang guard.
 
@@ -255,8 +277,11 @@ class PsycopgOps:
         ``conn.transaction()`` runs the statements; in an open transaction it
         nests a savepoint. A single statement commits on its own and needs no
         transaction. An error inside a transaction the caller opened is marked,
-        so the component raises it at once instead of retrying.
+        so the component raises it at once instead of retrying. Without a
+        ``label``, the hang guard names the operation after ``component``.
         """
+        if label is None:
+            label = _operation_label(self.component)
         with self._operation_lock(), _internal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             with abandon_after(fileno, timeout, label=label):
@@ -310,9 +335,11 @@ class AsyncPsycopgOps:
     on the class.
     """
 
-    # Names the host in log and error messages: "checkpointer" or "store"
+    # Names the host in log and error messages: "checkpointer" or "store". A
+    # subclass that does not set it fails with TypeError when it is defined.
     component: ClassVar[str]
-    # Where _can_retry logs; a host can point it at its own module's logger
+    # Where _can_retry logs. The default is this module's logger; a host can
+    # point it at its own module's logger
     _log: ClassVar[logging.Logger] = logger
     # What _run_sync raises from the host's own loop, and when it gives up on it
     _own_loop_message: ClassVar[str]
@@ -329,6 +356,10 @@ class AsyncPsycopgOps:
     # The event loop the host was created on, and the process that created it
     loop: asyncio.AbstractEventLoop
     _pid: int
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _check_component(cls)
 
     async def _retry(self, fn: Callable[[], Awaitable[T]], *, label: str) -> T:
         """Run ``fn`` under the retry policy."""
@@ -534,7 +565,7 @@ class AsyncPsycopgOps:
         pipeline: bool = False,
         transaction: bool = False,
         timeout: float | None = None,
-        label: str = "checkpoint operation",
+        label: str | None = None,
     ) -> AsyncIterator[AsyncCursor[DictRow]]:
         """Create a database cursor as a context manager, with the hang guard.
 
@@ -551,8 +582,11 @@ class AsyncPsycopgOps:
         an open transaction it nests a savepoint. A single statement commits on
         its own and needs no transaction. An error inside a transaction the
         caller opened is marked, so the component raises it at once instead
-        of retrying.
+        of retrying. Without a ``label``, the hang guard names the operation
+        after ``component``.
         """
+        if label is None:
+            label = _operation_label(self.component)
         async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             async with aabandon_after(fileno, timeout, label=label):

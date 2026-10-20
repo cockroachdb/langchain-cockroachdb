@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import psycopg
@@ -91,9 +93,60 @@ async def test_component_names_appear_in_messages(caplog: pytest.LogCaptureFixtu
             assert str(info.value) == stuck
 
 
-def test_savers_use_the_shared_mixins() -> None:
+async def test_savers_use_the_shared_mixins(caplog: pytest.LogCaptureFixture) -> None:
     from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver
     from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps, PsycopgOps
 
     assert issubclass(CockroachDBSaver, PsycopgOps)
     assert issubclass(AsyncCockroachDBSaver, AsyncPsycopgOps)
+
+    # The "Not retrying" warning still comes from each saver's own module logger
+    for saver, module in (
+        (CockroachDBSaver(_closed("sync")), "langchain_cockroachdb.checkpointer.saver"),
+        (
+            AsyncCockroachDBSaver(_closed("async")),
+            "langchain_cockroachdb.checkpointer.async_saver",
+        ),
+    ):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert saver._can_retry(psycopg.OperationalError("lost")) is False
+        assert [record.name for record in caplog.records] == [module]
+
+
+async def test_cursor_default_label_follows_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    from langchain_cockroachdb import _psycopg_ops
+
+    labels: list[str] = []
+
+    @contextlib.contextmanager
+    def record(fileno: Any, timeout: Any, *, label: str) -> Iterator[None]:
+        labels.append(label)
+        yield
+
+    @contextlib.asynccontextmanager
+    async def arecord(fileno: Any, timeout: Any, *, label: str) -> AsyncIterator[None]:
+        labels.append(label)
+        yield
+
+    monkeypatch.setattr(_psycopg_ops, "abandon_after", record)
+    monkeypatch.setattr(_psycopg_ops, "aabandon_after", arecord)
+    for component in ("checkpointer", "store"):
+        sync_host = _host("sync", component, FakeSingleConnection(None))
+        with sync_host._cursor():
+            pass
+        async_host = _host("async", component, FakeSingleAsyncConnection(None))
+        async with async_host._cursor():
+            pass
+    # The checkpointer keeps its 0.4.1 label, "checkpoint operation"
+    assert labels == ["checkpoint operation"] * 2 + ["store operation"] * 2
+
+
+def test_hosts_must_name_their_component() -> None:
+    from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps, PsycopgOps
+
+    for base in (PsycopgOps, AsyncPsycopgOps):
+        with pytest.raises(TypeError, match="component"):
+            type("Nameless", (base,), {})
+        with pytest.raises(TypeError, match="component"):
+            type("Blank", (base,), {"component": ""})

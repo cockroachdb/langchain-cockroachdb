@@ -38,10 +38,10 @@ def stuck_batch_error(component: str = "checkpointer") -> psycopg.Error:
 def mark_in_caller_transaction(error: BaseException) -> None:
     """Mark ``error`` as raised inside a transaction the caller opened.
 
-    The saver raises such an error at once. The transaction is the caller's: a
-    retry inside it would keep it open through the backoff, hide the error
-    from the caller's own retry logic, and cannot help after an error that
-    aborted the transaction. The caller can retry the whole transaction.
+    The component that runs the operation raises such an error at once. The
+    transaction is the caller's: a retry inside it would keep it open through
+    the backoff, hide the error from the caller's own retry logic, and cannot
+    help after an error that aborted the transaction. The caller can retry the whole transaction.
     """
     error.in_caller_transaction = True  # type: ignore[attr-defined]
 
