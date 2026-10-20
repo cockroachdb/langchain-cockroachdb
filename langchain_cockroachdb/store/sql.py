@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_cockroachdb._sql import validate_identifier, vector_literal
+from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
 from langchain_cockroachdb.store.filters import translate_filter
 from langchain_cockroachdb.store.namespaces import (
@@ -442,8 +443,6 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
 
         if self._index is None:
             raise ValueError("semantic_search requires an index configuration")
-
-        from langchain_cockroachdb.indexes import DistanceStrategy
 
         operator = self._index.distance.get_operator()
 

@@ -76,6 +76,12 @@ def test_unknown_operator():
         translate_filter({"n": {"$in": [1]}})
 
 
+def test_unknown_operator_below_nested_path_raises():
+    """Unknown $ operators below nested paths raise ValueError naming the operator."""
+    with pytest.raises(ValueError, match=r"\$regex"):
+        translate_filter({"p": {"n": {"$regex": "x"}}})
+
+
 def test_none_filter():
     """None and empty dict return no conditions."""
     conditions, params = translate_filter(None)

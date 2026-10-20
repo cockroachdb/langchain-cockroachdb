@@ -480,7 +480,6 @@ def test_every_builder_has_one_param_per_placeholder():
         omit_expired=True,
         over_fetch=100,
     )
-    # Subtract 2 because QUERY_VECTOR appears twice but is the same object
     assert query_sql.count("%s") == len(params)
 
     # list_namespaces
