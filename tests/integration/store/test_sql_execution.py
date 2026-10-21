@@ -101,7 +101,6 @@ def test_searches_with_refresh_update_only_returned_rows(admin, table_name) -> N
         limit=1,
         offset=0,
         omit_expired=True,
-        over_fetch=3,
         refresh=True,
     )
     query = vector_literal([1.0, 0.0, 0.0])

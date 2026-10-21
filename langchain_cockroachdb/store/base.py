@@ -69,6 +69,25 @@ def _check_paging(limit: int, offset: int) -> None:
         raise ValueError(f"offset must be non-negative, got {offset}")
 
 
+def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fetch: int) -> bool:
+    """Whether an indexed semantic search must run again in its exact form.
+
+    ``rows`` are what StoreSQL.semantic_search_in returned for one search,
+    after dedup and paging. Each row carries ``window_size``, the number of
+    vectors its ranked CTE kept. A result of ``limit`` rows is complete. A
+    shorter one from a window that was not full is exact too, because that
+    window held every vector of the namespaces. A shorter one from a full
+    window may have lost matches to candidates that failed the filter or
+    had expired, and with no rows at all the window size is unknown, so
+    both run again.
+    """
+    if len(rows) >= limit:
+        return False
+    if not rows:
+        return True
+    return int(rows[0]["window_size"]) >= over_fetch
+
+
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
     """Group ops by type, keeping each op's position in the batch.
 
@@ -123,19 +142,28 @@ class PutPlan:
 
 @dataclass
 class NamespaceLookup:
-    """The namespace lookup of a semantic search under a namespace.
+    """The namespace lookup of an indexed semantic search, and its exact forms.
 
     Attributes:
         position: The position of the search statement in the batch's
             search statements.
         statement: The lookup, StoreSQL.namespace_lookup.
-        fallback: The one-statement form of the search, used when the
-            lookup finds more than MAX_SEARCH_NAMESPACES namespaces.
+        fallback: StoreSQL.semantic_search over the namespace prefix, used
+            instead of the indexed search when the lookup finds more than
+            MAX_SEARCH_NAMESPACES namespaces.
+        exact: StoreSQL.exact_semantic_search_in, run after the indexed
+            search when needs_exact_search says so. None once nothing can
+            call for it: the fallback ran, or the lookup found no namespace.
+        limit: The search's limit.
+        over_fetch: The window of the indexed search.
     """
 
     position: int
     statement: tuple[str, list]
     fallback: tuple[str, list]
+    exact: tuple[str, list] | None
+    limit: int
+    over_fetch: int
 
 
 @dataclass
@@ -152,9 +180,12 @@ class BatchPlan:
         search_statements: One statement per search, in the order of ``searches``.
         search_to_embed: (statement position, query text) for every search
             statement that needs the embedding of its query.
-        search_lookups: The namespace lookup of every semantic search under
-            a namespace. The lookup finds the namespaces bound in place of
+        search_lookups: The namespace lookup of every indexed semantic
+            search. The lookup finds the namespaces bound in place of
             NAMESPACES.
+        exact_searches: The lookups whose indexed search came back short
+            from a full window, set once the search group ran. Their exact
+            form runs next, and its rows replace the search's result.
         search_session: Statements that run first in the search group, in
             its transaction: the beam size, when set and a query is present.
         listings: The list_namespaces ops, as (position, op).
@@ -171,6 +202,7 @@ class BatchPlan:
     search_statements: list[tuple[str, list]] = field(default_factory=list)
     search_to_embed: list[tuple[int, str]] = field(default_factory=list)
     search_lookups: list[NamespaceLookup] = field(default_factory=list)
+    exact_searches: list[NamespaceLookup] = field(default_factory=list)
     search_session: list[str] = field(default_factory=list)
     listings: list[tuple[int, ListNamespacesOp]] = field(default_factory=list)
     listing_statements: list[tuple[str, list]] = field(default_factory=list)
@@ -186,7 +218,8 @@ class BatchPlan:
         transaction when there are session statements, and pass ``fill``
         the rows of each statement, in order; it puts them into
         ``results``. Empty groups are left out. Bind the query vectors and
-        namespaces first.
+        namespaces first. Then run ``exact_statements()``, if any, as one
+        more group and pass its rows to ``fill_exact``.
         """
         groups = [
             ("store get", self.get_statements, self._fill_gets, []),
@@ -207,29 +240,46 @@ class BatchPlan:
                 self.search_statements[position], vectors[text]
             )
         for lookup in self.search_lookups:
-            lookup.fallback = StoreSQL.bind_query_vector(
-                lookup.fallback, vectors[texts[lookup.position]]
-            )
+            vector = vectors[texts[lookup.position]]
+            lookup.fallback = StoreSQL.bind_query_vector(lookup.fallback, vector)
+            if lookup.exact is not None:
+                lookup.exact = StoreSQL.bind_query_vector(lookup.exact, vector)
 
     def lookup_statements(self) -> list[tuple[str, list]]:
         """The namespace lookups, to run as one read group before the searches."""
         return [lookup.statement for lookup in self.search_lookups]
 
     def bind_namespaces(self, found: list[Any]) -> None:
-        """Put the namespaces each lookup found into its search statement.
+        """Put the namespaces each lookup found into its search statements.
 
         A search whose lookup found more than MAX_SEARCH_NAMESPACES
-        namespaces runs its one-statement form instead.
+        namespaces runs its exact one-statement form instead.
         """
         for lookup, rows in zip(self.search_lookups, found, strict=True):
             if len(rows) > MAX_SEARCH_NAMESPACES:
                 self.search_statements[lookup.position] = lookup.fallback
+                lookup.exact = None
                 continue
+            namespaces = [row["prefix"] for row in rows]
             self.search_statements[lookup.position] = bind(
-                self.search_statements[lookup.position],
-                NAMESPACES,
-                [row["prefix"] for row in rows],
+                self.search_statements[lookup.position], NAMESPACES, namespaces
             )
+            # With no namespace to search, the empty result is already exact
+            if lookup.exact is not None and namespaces:
+                lookup.exact = bind(lookup.exact, NAMESPACES, namespaces)
+            else:
+                lookup.exact = None
+
+    def exact_statements(self) -> list[tuple[str, list]]:
+        """The exact searches that indexed searches called for, once the search group ran."""
+        return [lookup.exact for lookup in self.exact_searches if lookup.exact is not None]
+
+    def fill_exact(self, found: list[Any]) -> None:
+        """Replace the result of each search that ran again with the exact rows."""
+        searches = [lookup for lookup in self.exact_searches if lookup.exact is not None]
+        for lookup, rows in zip(searches, found, strict=True):
+            i, _ = self.searches[lookup.position]
+            self.results[i] = [_row_to_search_item(row) for row in rows]
 
     def _fill_gets(self, found: list[Any]) -> None:
         for ((namespace, _), items), rows in zip(self.get_groups, found, strict=True):
@@ -241,6 +291,14 @@ class BatchPlan:
     def _fill_searches(self, found: list[Any]) -> None:
         for (i, _), rows in zip(self.searches, found, strict=True):
             self.results[i] = [_row_to_search_item(row) for row in rows]
+        self.exact_searches = [
+            lookup
+            for lookup in self.search_lookups
+            if lookup.exact is not None
+            and needs_exact_search(
+                found[lookup.position], limit=lookup.limit, over_fetch=lookup.over_fetch
+            )
+        ]
 
     def _fill_listings(self, found: list[Any]) -> None:
         for (i, _), rows in zip(self.listings, found, strict=True):
@@ -487,8 +545,12 @@ class BaseCockroachDBStore:
     ) -> tuple[list[tuple[str, list]], list[tuple[int, str]], list[NamespaceLookup]]:
         """Build one statement per search op.
 
-        A semantic search under a namespace gets a namespace lookup too, and
-        a one-statement fallback: see the notes above StoreSQL.semantic_search.
+        A semantic search under a namespace on a store with a vector index
+        gets a namespace lookup too, an exact fallback for too many
+        namespaces, and an exact form to run when its indexed pass comes
+        back short. A search of the whole store, or any search on a flat
+        store, runs the exact form at once. See the notes above
+        StoreSQL.semantic_search.
 
         Returns:
             The statements, in the order of ``search_ops``; the
@@ -502,38 +564,52 @@ class BaseCockroachDBStore:
         omit_expired = self.ttl.omit_expired
         for position, (_, op) in enumerate(search_ops):
             if op.query and self.index is not None:
-                # Room for every vector of each result up to the end of the
-                # page, twice. PostgresStore leaves out the offset and runs
-                # out of candidates on deep pages
-                over_fetch = (op.limit + op.offset) * self.index.estimated_vectors * 2 + 1
-                one_statement = self.sql.semantic_search(
+                refresh = self._refresh(op.refresh_ttl)
+                exact = self.sql.semantic_search(
                     namespace_prefix=op.namespace_prefix,
                     filter=op.filter,
                     limit=op.limit,
                     offset=op.offset,
                     omit_expired=omit_expired,
-                    over_fetch=over_fetch,
-                    refresh=self._refresh(op.refresh_ttl),
+                    refresh=refresh,
                 )
-                if op.namespace_prefix:
-                    statements.append(
-                        self.sql.semantic_search_in(
+                to_embed.append((position, op.query))
+                if not op.namespace_prefix or self.index.flat:
+                    # No vector index to narrow down to: one exact scan
+                    statements.append(exact)
+                    continue
+                # Room for every vector of each result up to the end of the
+                # page, twice. PostgresStore leaves out the offset and runs
+                # out of candidates on deep pages
+                over_fetch = (op.limit + op.offset) * self.index.estimated_vectors * 2 + 1
+                statements.append(
+                    self.sql.semantic_search_in(
+                        filter=op.filter,
+                        limit=op.limit,
+                        offset=op.offset,
+                        omit_expired=omit_expired,
+                        over_fetch=over_fetch,
+                        refresh=refresh,
+                    )
+                )
+                # If both passes run with refresh, the first may push back the
+                # expiry of an item the exact pass leaves out of the page
+                lookups.append(
+                    NamespaceLookup(
+                        position=position,
+                        statement=self.sql.namespace_lookup(op.namespace_prefix),
+                        fallback=exact,
+                        exact=self.sql.exact_semantic_search_in(
                             filter=op.filter,
                             limit=op.limit,
                             offset=op.offset,
                             omit_expired=omit_expired,
-                            over_fetch=over_fetch,
-                            refresh=self._refresh(op.refresh_ttl),
-                        )
+                            refresh=refresh,
+                        ),
+                        limit=op.limit,
+                        over_fetch=over_fetch,
                     )
-                    lookups.append(
-                        NamespaceLookup(
-                            position, self.sql.namespace_lookup(op.namespace_prefix), one_statement
-                        )
-                    )
-                else:
-                    statements.append(one_statement)
-                to_embed.append((position, op.query))
+                )
                 continue
             if op.query and self._first_query_without_index():
                 self._log.warning(
@@ -579,9 +655,9 @@ class BaseCockroachDBStore:
             return
         if self.index.flat:
             self._log.warning(
-                "The index is configured with flat=True, but the vector index %s exists, "
-                "so searches may still use it. Drop it with drop_vector_index() to search "
-                "without it.",
+                "The index is configured with flat=True, but the vector index %s exists. "
+                "Searches do not use it, but every put still updates it. Drop it with "
+                "drop_vector_index() if no other store needs it.",
                 name,
             )
             return

@@ -26,6 +26,7 @@ from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     PutPlan,
     _group_ops,
+    needs_exact_search,
 )
 from langchain_cockroachdb.store.config import resolve_index_config
 from langchain_cockroachdb.store.store import CockroachDBStore
@@ -537,13 +538,17 @@ def test_only_a_store_with_a_ttl_configuration_refreshes_expiry() -> None:
 class SearchConnection:
     """A fake connection for read groups. Every statement and its params is logged.
 
-    Namespace lookups return ``namespaces``; other statements return no rows.
-    The first attempt of the "store search" group fails with a retryable 40001
-    as its block ends, after its statements were sent.
+    Namespace lookups return ``namespaces``, indexed searches (the ones with
+    a window) ``indexed_rows``, exact searches (GROUP BY) ``exact_rows``, and
+    other statements no rows. The first attempt of the "store search" group
+    fails with a retryable 40001 as its block ends, after its statements
+    were sent.
     """
 
     def __init__(self, namespaces: list[str]) -> None:
         self.namespaces = namespaces
+        self.indexed_rows: list[dict[str, object]] = []
+        self.exact_rows: list[dict[str, object]] = []
         self.attempts: dict[str, int] = {}
         self.executed: list[tuple[str, str, list]] = []
         self.session: list[str] = []
@@ -580,6 +585,10 @@ class SearchCursor:
         self.conn.executed.append((self.conn.label, query, params))
         if query.startswith("WITH RECURSIVE"):
             self.rows = [{"prefix": ns} for ns in self.conn.namespaces]
+        elif "window_size" in query:
+            self.rows = self.conn.indexed_rows
+        elif "GROUP BY" in query:
+            self.rows = self.conn.exact_rows
 
     def fetchall(self) -> list[dict[str, object]]:
         return self.rows
@@ -628,14 +637,24 @@ def assert_query_statements(conn: SearchConnection) -> None:
     assert searches[:4] == searches[4:]
     first, second, root, plain = searches[4:]
     assert "prefix = ANY(CAST(%s AS STRING[]))" in first[0]
+    assert "count(*) OVER () AS window_size" in first[0]
     assert first[1][:3] == ["[1.0,0.0,0.0]", ["a", "a.x"], "[1.0,0.0,0.0]"]
     # over_fetch = (limit + offset) * estimated_vectors * 2 + 1
     assert first[1][3] == (2 + 3) * 1 * 2 + 1
     assert second[1][1] == ["a", "a.x"]
-    # A search of the whole store has no namespace condition and no lookup
-    assert "ANY(" not in root[0] and root[1][0] == "[1.0,0.0,0.0]"
+    # A search of the whole store has no lookup and ranks exactly at once
+    assert "ANY(" not in root[0] and "GROUP BY i.prefix, i.key" in root[0]
+    assert root[1][0] == "[1.0,0.0,0.0]"
     assert "embedding" not in plain[0]
-    for _, params in searches:
+    # No rows came back, so both indexed searches ran again, exactly
+    exact = [(sql, params) for label, sql, params in conn.executed if label == "store search exact"]
+    assert len(exact) == 2
+    for sql, params in exact:
+        assert "v.prefix = ANY(CAST(%s AS STRING[]))" in sql
+        assert "LIMIT %s OFFSET %s" in sql and sql.count("LIMIT") == 1
+        assert params[:2] == ["[1.0,0.0,0.0]", ["a", "a.x"]]
+    assert [params[-2:] for _, params in exact] == [[2, 3], [10, 0]]
+    for _, params in [*searches, *exact]:
         assert all(type(param) is not object for param in params)
 
 
@@ -659,7 +678,11 @@ def test_query_is_embedded_once_per_distinct_text_outside_retry() -> None:
     # Two distinct texts, each embedded once with embed_query, before any attempt
     assert embeddings.calls == 2
     assert embeddings.async_calls == 0
-    assert conn.attempts == {"store search namespaces": 1, "store search": 2}
+    assert conn.attempts == {
+        "store search namespaces": 1,
+        "store search": 2,
+        "store search exact": 1,
+    }
     assert_query_statements(conn)
     # No beam size configured: no session statement and no transaction
     assert conn.session == []
@@ -685,7 +708,11 @@ async def test_async_query_is_embedded_once_per_distinct_text_outside_retry() ->
     assert results == [[], [], [], []]
     assert embeddings.async_calls == 2
     assert embeddings.calls == 0
-    assert conn.attempts == {"store search namespaces": 1, "store search": 2}
+    assert conn.attempts == {
+        "store search namespaces": 1,
+        "store search": 2,
+        "store search exact": 1,
+    }
     assert_query_statements(conn)
     assert conn.session == []
 
@@ -742,10 +769,12 @@ def test_beam_size_runs_set_local_in_the_search_transaction() -> None:
     # Once per attempt of the search group, and only there
     assert conn.session == ["SET LOCAL vector_search_beam_size = 24"] * 2
     transactions = {str(kwargs["label"]): kwargs["transaction"] for kwargs in conn.kwargs}
+    # The exact search after the empty indexed one has no beam size to set
     assert transactions == {
         "store search namespaces": False,
         "store get": False,
         "store search": True,
+        "store search exact": False,
     }
     # A batch without a query needs no beam size
     conn.session.clear()
@@ -754,14 +783,16 @@ def test_beam_size_runs_set_local_in_the_search_transaction() -> None:
     assert conn.session == []
 
 
-def searches_with_namespaces(count: int) -> list[tuple[str, list]]:
-    """The search statements sent when the lookup finds ``count`` namespaces."""
+def fake_search_store(
+    namespaces: list[str], **index: object
+) -> tuple[CockroachDBStore, SearchConnection]:
+    """A store with an index whose reads go to a SearchConnection, with no injected failure."""
     store = CockroachDBStore(
         object(),  # type: ignore[arg-type]
-        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"], **index},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    conn = SearchConnection([f"a.n{i}" for i in range(count)])
+    conn = SearchConnection(namespaces)
     conn.attempts["store search"] = 1  # no injected failure
 
     @contextlib.contextmanager
@@ -770,23 +801,154 @@ def searches_with_namespaces(count: int) -> list[tuple[str, list]]:
         conn.exit()
 
     store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    return store, conn
+
+
+def statements_with_namespaces(count: int) -> list[tuple[str, str, list]]:
+    """The (label, SQL, params) sent when the lookup finds ``count`` namespaces."""
+    store, conn = fake_search_store([f"a.n{i}" for i in range(count)])
     store.batch([SearchOp(("a",), query="q", filter={"x": 1})])
-    return [(sql, params) for label, sql, params in conn.executed if label == "store search"]
+    return conn.executed
 
 
 def test_too_many_namespaces_fall_back_to_one_statement() -> None:
     assert MAX_SEARCH_NAMESPACES == 1000
-    [capped] = searches_with_namespaces(MAX_SEARCH_NAMESPACES)
+    executed = statements_with_namespaces(MAX_SEARCH_NAMESPACES)
+    [capped] = [(sql, params) for label, sql, params in executed if label == "store search"]
     assert "prefix = ANY(CAST(%s AS STRING[]))" in capped[0]
     assert len(capped[1][1]) == MAX_SEARCH_NAMESPACES
 
-    [fallback] = searches_with_namespaces(MAX_SEARCH_NAMESPACES + 1)
-    # The scan form: the namespace range in the vectors CTE, no array
-    assert "ANY(" not in fallback[0]
-    assert "(prefix = %s OR (prefix >= %s AND prefix < %s))" in fallback[0]
+    executed = statements_with_namespaces(MAX_SEARCH_NAMESPACES + 1)
+    [fallback] = [(sql, params) for label, sql, params in executed if label == "store search"]
+    # The exact form over the namespace range, no array and no window
+    assert "ANY(" not in fallback[0] and "window_size" not in fallback[0]
+    assert "(v.prefix = %s OR (v.prefix >= %s AND v.prefix < %s))" in fallback[0]
     vector = "[1.0,0.0,0.0]"
-    # over_fetch for the default limit of 10: 10 * 1 * 2 + 1
-    assert fallback[1] == [vector, "a", "a.", "a/", vector, 21, "x", "1", 10, 0]
+    assert fallback[1] == [vector, "a", "a.", "a/", "x", "1", 10, 0]
+    # It is exact already, so it never runs again, though it found nothing
+    assert [label for label, _, _ in executed] == ["store search namespaces", "store search"]
+
+
+def search_row(key: str, score: float, window_size: int | None = None) -> dict[str, object]:
+    row: dict[str, object] = {
+        "prefix": "a",
+        "key": key,
+        "value": {"text": key},
+        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "score": score,
+    }
+    if window_size is not None:
+        row["window_size"] = window_size
+    return row
+
+
+def test_needs_exact_search() -> None:
+    full, partial = 21, 5
+    short = [search_row("k1", 0.9, full)]
+    # Short from a full window: candidates may have failed the filter or expired
+    assert needs_exact_search(short, limit=10, over_fetch=full)
+    # Short from a window that was not full: it held every vector, so it is exact
+    assert not needs_exact_search([search_row("k1", 0.9, partial)], limit=10, over_fetch=full)
+    # Nothing came back: the window size is unknown
+    assert needs_exact_search([], limit=10, over_fetch=full)
+    # A full page is complete, whatever the window
+    page = [search_row(f"k{i}", 0.9, full) for i in range(10)]
+    assert not needs_exact_search(page, limit=10, over_fetch=full)
+    assert not needs_exact_search(page[:3], limit=3, over_fetch=full)
+
+
+EXACT_ROWS = [search_row("best", 0.99), search_row("next", 0.5)]
+
+
+@pytest.mark.parametrize(
+    ("indexed_rows", "namespaces", "runs_again"),
+    [
+        ([search_row("k1", 0.9, 21)], ["a"], True),
+        ([search_row("k1", 0.9, 20)], ["a"], False),
+        ([search_row(f"k{i}", 0.9, 21) for i in range(10)], ["a"], False),
+        ([], ["a"], True),
+        ([], [], False),
+    ],
+    ids=["short-full-window", "short-partial-window", "full-page", "empty", "no-namespace"],
+)
+def test_short_indexed_search_runs_again_exactly(
+    indexed_rows: list[dict[str, object]], namespaces: list[str], runs_again: bool
+) -> None:
+    store, conn = fake_search_store(namespaces)
+    conn.indexed_rows = indexed_rows
+    conn.exact_rows = EXACT_ROWS
+    # The default limit of 10, so over_fetch is 10 * 1 * 2 + 1 = 21
+    [result] = store.batch([SearchOp(("a",), query="q", filter={"x": 1})])
+    labels = [label for label, _, _ in conn.executed]
+    assert labels[:2] == ["store search namespaces", "store search"]
+    if runs_again:
+        assert labels[2:] == ["store search exact"]
+        _, sql, params = conn.executed[2]
+        assert "GROUP BY i.prefix, i.key" in sql
+        assert params == ["[1.0,0.0,0.0]", namespaces, "x", "1", 10, 0]
+        assert [(item.key, item.score) for item in result] == [("best", 0.99), ("next", 0.5)]
+    else:
+        assert labels[2:] == []
+        assert [item.key for item in result] == [row["key"] for row in indexed_rows]
+
+
+def test_exact_search_keeps_each_result_in_its_slot() -> None:
+    store, conn = fake_search_store(["a"])
+    conn.exact_rows = EXACT_ROWS
+    results = store.batch(
+        [
+            GetOp(("a",), "k"),
+            SearchOp(("a",), query="q"),
+            SearchOp(("a",)),
+            SearchOp(("b",), query="q", limit=2),
+        ]
+    )
+    assert results[0] is None and results[2] == []
+    assert [item.key for item in results[1]] == ["best", "next"]
+    assert [item.key for item in results[3]] == ["best", "next"]
+    exact = [params for label, _, params in conn.executed if label == "store search exact"]
+    assert [params[-2:] for params in exact] == [[10, 0], [2, 0]]
+
+
+async def test_async_short_indexed_search_runs_again_exactly() -> None:
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    conn = AsyncSearchConnection(["a"])
+    conn.attempts["store search"] = 1
+    conn.indexed_rows = [search_row("k1", 0.9, 21)]
+    conn.exact_rows = EXACT_ROWS
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncSearchConnection]:
+        yield conn.enter(kwargs)  # type: ignore[misc]
+        conn.exit()
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    [result] = await store.abatch([SearchOp(("a",), query="q")])
+    assert [label for label, _, _ in conn.executed] == [
+        "store search namespaces",
+        "store search",
+        "store search exact",
+    ]
+    assert [item.key for item in result] == ["best", "next"]
+
+
+@pytest.mark.parametrize("prefix", [("a",), ()])
+def test_flat_store_ranks_exactly_without_a_lookup(prefix: tuple[str, ...]) -> None:
+    store, conn = fake_search_store(["a"], flat=True)
+    conn.exact_rows = EXACT_ROWS
+    [result] = store.batch([SearchOp(prefix, query="q", filter={"x": 1}, limit=3)])
+    # One round trip: no lookup, since there is no vector index for it to serve
+    [(label, sql, params)] = conn.executed
+    assert label == "store search"
+    assert "GROUP BY i.prefix, i.key" in sql and "ANY(" not in sql
+    namespace = ["a", "a.", "a/"] if prefix else []
+    assert params == ["[1.0,0.0,0.0]", *namespace, "x", "1", 3, 0]
+    assert [item.key for item in result] == ["best", "next"]
 
 
 def test_query_vector_is_checked_before_any_statement() -> None:

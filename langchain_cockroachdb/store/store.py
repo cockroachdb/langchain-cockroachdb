@@ -60,8 +60,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
     ``pool_config``: a pool replaces broken connections and runs batches
     concurrently, while a single connection runs one batch at a time.
 
-    A batch runs its gets, searches and listings first, each group as one
-    round of reads, then all its puts and deletes in one transaction.
+    A batch runs its reads first, then all its puts and deletes in one
+    transaction. Its gets, its searches and its listings take one round trip
+    each. Semantic searches under a namespace add one before the searches, to
+    find their namespaces, and one after them when a search must run again
+    exactly, as the long-term memory guide explains.
 
     Example:
         ```python
@@ -300,6 +303,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             )
         for label, statements, fill, session in plan.reads():
             fill(self._read_all(statements, label, session))
+        exact = plan.exact_statements()
+        if exact:
+            plan.fill_exact(self._read_all(exact, "store search exact"))
         if plan.puts is not None:
             self._run_puts(plan.puts)
         return plan.results

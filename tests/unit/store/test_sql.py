@@ -123,29 +123,18 @@ def test_semantic_search_param_order():
         limit=5,
         offset=10,
         omit_expired=True,
-        over_fetch=100,
     )
 
-    # Order: QUERY_VECTOR, namespace params, QUERY_VECTOR, over_fetch, filter params, limit, offset
-    # First QUERY_VECTOR (in ranked CTE)
+    # Order: QUERY_VECTOR, namespace params, filter params, limit, offset
     assert params[0] is QUERY_VECTOR
-
     # Namespace params (exact match "a.b", then the range "a.b." to "a.b/")
     assert params[1:4] == ["a.b", "a.b.", "a.b/"]
-
-    # Second QUERY_VECTOR (ORDER BY in ranked CTE)
-    assert params[4] is QUERY_VECTOR
-
-    # over_fetch
-    assert params[5] == 100
-
     # Filter params (key "x", value "1")
-    assert params[6] == "x"
-    assert params[7] == "1"
-
+    assert params[4:6] == ["x", "1"]
     # limit, offset
-    assert params[8] == 5
-    assert params[9] == 10
+    assert params[6:] == [5, 10]
+    assert query_sql.count("%s") == len(params)
+    assert "(v.prefix = %s OR (v.prefix >= %s AND v.prefix < %s))" in query_sql
 
 
 def test_no_cast_shorthand():
@@ -178,7 +167,16 @@ def test_no_cast_shorthand():
         limit=10,
         offset=0,
         omit_expired=True,
-        over_fetch=100,
+    )
+    assert "::" not in query_sql
+
+    query_sql, _ = sql.semantic_search_in(
+        filter={"x": 1}, limit=10, offset=0, omit_expired=True, over_fetch=21
+    )
+    assert "::" not in query_sql
+
+    query_sql, _ = sql.exact_semantic_search_in(
+        filter={"x": 1}, limit=10, offset=0, omit_expired=True
     )
     assert "::" not in query_sql
 
@@ -247,7 +245,6 @@ def test_search_with_refresh_wraps_results():
         limit=3,
         offset=0,
         omit_expired=True,
-        over_fetch=7,
         refresh=True,
     )
     assert semantic_params[0] is QUERY_VECTOR
@@ -500,16 +497,29 @@ def test_every_builder_has_one_param_per_placeholder():
     )
     assert query_sql.count("%s") == len(params)
 
-    # semantic_search
+    # semantic searches, exact and indexed
     query_sql, params = sql.semantic_search(
         namespace_prefix=["a", "b", "c"],
         filter={"x": 1, "y": 2},
         limit=10,
         offset=5,
         omit_expired=True,
-        over_fetch=100,
     )
     assert query_sql.count("%s") == len(params)
+    for refresh in (False, True):
+        query_sql, params = sql.semantic_search_in(
+            filter={"x": 1, "y": 2},
+            limit=10,
+            offset=5,
+            omit_expired=True,
+            over_fetch=100,
+            refresh=refresh,
+        )
+        assert query_sql.count("%s") == len(params)
+        query_sql, params = sql.exact_semantic_search_in(
+            filter={"x": 1, "y": 2}, limit=10, offset=5, omit_expired=True, refresh=refresh
+        )
+        assert query_sql.count("%s") == len(params)
 
     # list_namespaces
     query_sql, params = sql.list_namespaces(
@@ -537,18 +547,73 @@ def test_vector_index_name_is_public():
     assert sql.vector_index_name == "my_store_vectors_embedding_idx"
 
 
-def test_ranked_vectors_carry_no_expiry_condition():
-    """The vector CTE ranks without the expiry check, so C-SPANN can serve it.
+def test_indexed_window_carries_no_filter_or_expiry():
+    """The indexed form's window ranks with no filter or expiry check, so C-SPANN can serve it.
 
-    The items join checks expiry, and vectors expire with their item.
+    The items join applies both, and every row reports the window size,
+    counted over the rows the inner LIMIT kept.
     """
     sql = StoreSQL("public", "store", index=_make_index())
-    query_sql, _ = sql.semantic_search(
-        namespace_prefix=["a"], filter=None, limit=3, offset=0, omit_expired=True, over_fetch=7
+    query_sql, params = sql.semantic_search_in(
+        filter={"x": 1}, limit=3, offset=0, omit_expired=True, over_fetch=7
     )
     ranked, rest = query_sql.split("\n),\nbest AS (", 1)
-    assert "expires_at" not in ranked
+    assert "expires_at" not in ranked and "value" not in ranked
+    assert "count(*) OVER () AS window_size" in ranked
+    # The count wraps the inner LIMIT, so it counts the window, not the namespaces
+    assert ranked.index("count(*) OVER ()") < ranked.index("LIMIT %s")
     assert "(i.expires_at IS NULL OR i.expires_at > now())" in rest
+    assert "i.value" in rest
+    assert rest.rstrip().endswith("LIMIT %s OFFSET %s")
+    assert "SELECT prefix, key, value, created_at, updated_at, score, window_size" in rest
+    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 7, "x", "1", 3, 0]
+
+
+@pytest.mark.parametrize("form", ["semantic_search", "exact_semantic_search_in"])
+def test_exact_forms_filter_before_they_rank(form: str):
+    """The exact forms join, filter and check expiry in the ranked CTE, with no LIMIT there.
+
+    Only the outer query cuts, so every match is ranked and no vector index
+    can serve the statement.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    kwargs = {"filter": {"x": 1}, "limit": 3, "offset": 2, "omit_expired": True}
+    if form == "semantic_search":
+        query_sql, params = sql.semantic_search(namespace_prefix=["a"], **kwargs)  # type: ignore[arg-type]
+        assert params == [QUERY_VECTOR, "a", "a.", "a/", "x", "1", 3, 2]
+    else:
+        query_sql, params = sql.exact_semantic_search_in(**kwargs)  # type: ignore[arg-type]
+        assert "v.prefix = ANY(CAST(%s AS STRING[]))" in query_sql
+        assert params == [QUERY_VECTOR, NAMESPACES, "x", "1", 3, 2]
+    ranked, outer = query_sql.split("\n)\nSELECT ", 1)
+    assert ranked.startswith("WITH ranked AS (")
+    assert "JOIN public.store AS i ON v.prefix = i.prefix AND v.key = i.key" in ranked
+    assert "(i.expires_at IS NULL OR i.expires_at > now())" in ranked
+    assert "i.value" in ranked
+    assert "min(v.embedding <=> CAST(%s AS VECTOR)) AS distance" in ranked
+    assert "GROUP BY i.prefix, i.key" in ranked
+    assert "LIMIT" not in ranked and "ORDER BY" not in ranked
+    assert outer.endswith("ORDER BY score DESC, prefix, key\nLIMIT %s OFFSET %s")
+    assert "1 - distance AS score" in outer
+    assert query_sql.count("%s") == len(params)
+
+    no_expiry, _ = sql.exact_semantic_search_in(filter=None, limit=3, offset=0, omit_expired=False)
+    assert "expires_at" not in no_expiry
+
+    l2 = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    l2_sql, _ = l2.semantic_search(
+        namespace_prefix=[], filter=None, limit=3, offset=0, omit_expired=False
+    )
+    assert "min(v.embedding <-> CAST(%s AS VECTOR))" in l2_sql
+    assert "-distance AS score" in l2_sql
+    assert "WHERE TRUE" in l2_sql
+
+    with pytest.raises(ValueError, match="index"):
+        StoreSQL("public", "store").exact_semantic_search_in(
+            filter=None, limit=1, offset=0, omit_expired=True
+        )
+    with pytest.raises(ValueError, match="limit"):
+        sql.exact_semantic_search_in(filter=None, limit=-1, offset=0, omit_expired=True)
 
 
 def test_semantic_search_in_ranks_within_found_namespaces():
@@ -571,6 +636,11 @@ def test_semantic_search_in_ranks_within_found_namespaces():
     assert refreshed_params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, 5, 0]
     assert refreshed_sql.startswith("WITH search_results AS (")
     assert refreshed_sql.count("%s") == len(refreshed_params)
+    # The window size reaches the caller through the refresh wrapper too
+    assert refreshed_sql.endswith(
+        "SELECT prefix, key, value, created_at, updated_at, score, window_size\n"
+        "FROM search_results\nORDER BY score DESC, prefix, key"
+    )
 
     with pytest.raises(ValueError, match="index"):
         StoreSQL("public", "store").semantic_search_in(

@@ -21,7 +21,7 @@ NAMESPACES = object()
 
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
-# more uses the one-statement scan form instead, so the lookup, the array
+# more uses the exact one-statement form instead, so the lookup, the array
 # and the index probes stay bounded.
 MAX_SEARCH_NAMESPACES = 1000
 
@@ -491,11 +491,11 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     #   turns every search into a scan of the primary key, and FORCE_INDEX
     #   reports that the index cannot be used.
     # - A namespace and its descendants, as the range from prefix_condition:
-    #   semantic_search with it (the full statement) scans the vectors
-    #   primary key over the prefix's key span on v25.4.14, and FORCE_INDEX
-    #   on the vector index fails with "cannot be used for this query". The
-    #   earlier LIKE 'x.%' ESCAPE form was not served by the index on any of
-    #   the three either, and v25.4 scanned the whole table for it.
+    #   a ranked CTE with it scans the vectors primary key over the prefix's
+    #   key span on v25.4.14, and FORCE_INDEX on the vector index fails with
+    #   "cannot be used for this query". The earlier LIKE 'x.%' ESCAPE form
+    #   was not served by the index on any of the three either, and v25.4
+    #   scanned the whole table for it.
     # - Nor are the namespaces computed in the same statement. Measured on
     #   the vectors CTE alone, on v25.4.14 and v26.3.2: with prefix =
     #   ANY(ARRAY(SELECT DISTINCT prefix FROM <items or vectors> WHERE
@@ -509,15 +509,41 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     # which is the same as the search having run a moment earlier.
     # namespace_lookup finds the namespaces that have vectors, seeking once
     # per namespace, and semantic_search_in ranks with prefix = ANY(those
-    # namespaces), which the index serves. When the lookup finds more than
-    # MAX_SEARCH_NAMESPACES, the search uses semantic_search
-    # instead, so the array stays bounded. A search of the whole store has no
-    # prefix to constrain and uses semantic_search too, a scan with exact
-    # ranking. Results are the same either way: expiry and filters are
-    # checked on the joined items, and vectors expire with their item. The
-    # vectors CTE has no expiry check, so that the index can serve it. As a
-    # result, expired vectors not yet deleted can occupy over_fetch slots,
-    # like filtered-out items: lower recall, never wrong results.
+    # namespaces), which the index serves. Its ranked CTE keeps the
+    # over_fetch nearest vectors with no filter and no expiry check, and only
+    # then are the items joined, filtered and checked for expiry. A
+    # candidate that fails the filter, or whose item expired and was not
+    # deleted yet, still takes a place in that window. So the statement
+    # returns the window size with every row, and when the result comes back
+    # short from a full window, the store runs exact_semantic_search_in over
+    # the same namespaces (needs_exact_search in base.py decides). A window
+    # that is not full held every vector of those namespaces, so its result
+    # is already exact: C-SPANN returns min(k, n) rows, checked on v26.3.2
+    # with beam sizes 1 and 4 and the default, for 40 to 900 vectors in a
+    # namespace.
+    #
+    # The exact forms, semantic_search and exact_semantic_search_in, join the
+    # items, filter and check expiry before they rank, as PostgresStore does.
+    # Their ranked CTE has no LIMIT that the vector index could serve, so
+    # they scan the vectors of their namespaces and rank every match. The
+    # store uses semantic_search for a search of the whole store, for every
+    # search of a flat store (no lookup either, since there is no index for
+    # it to serve), and when a lookup finds more than MAX_SEARCH_NAMESPACES
+    # namespaces.
+    #
+    # EXPLAIN on v26.3.2, with 60 namespaces of 100 vectors and one of 3,000,
+    # a C-SPANN index and a filter on the value, after ANALYZE:
+    # - semantic_search and exact_semantic_search_in: top-k, render, group
+    #   (streaming), render, lookup join (merge join without a filter),
+    #   filter, scan of the items primary key, over the namespace's spans
+    #   (FULL SCAN for the whole store). No vector search, though the vector
+    #   index exists.
+    # - semantic_search_in: top-k, render, distinct, render, sort, render,
+    #   lookup join into the items, window, top-k, render, lookup join into
+    #   the vectors primary key, vector search on the vector index. Where a
+    #   scan is cheaper, such as 100 vectors and a window of 21, the bottom
+    #   two are a scan of the vectors primary key instead, the same choice
+    #   the optimizer made before the window was added.
 
     def semantic_search(
         self,
@@ -527,13 +553,14 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         limit: int,
         offset: int,
         omit_expired: bool,
-        over_fetch: int,
         refresh: bool = False,
     ) -> tuple[str, list]:
-        """Build a semantic search in one statement, ranked by vector distance.
+        """Build an exact semantic search of a namespace and its descendants.
 
-        The store uses it for searches of the whole store, and
-        semantic_search_in for searches under a namespace.
+        It filters and checks expiry before it ranks, so it returns what
+        ranking every matching item would. The store uses it for a search of
+        the whole store, every search of a flat store, and a search whose
+        lookup finds more than MAX_SEARCH_NAMESPACES namespaces.
 
         Args:
             namespace_prefix: Namespace prefix to match.
@@ -541,25 +568,23 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
             limit: Maximum results.
             offset: Results to skip.
             omit_expired: Whether to exclude expired items.
-            over_fetch: Limit for the vector CTE (top-k from index).
             refresh: Whether to also push back the expiry of the rows returned.
 
         Returns:
             Tuple of (SQL, parameters). The query vector appears as the
-            QUERY_VECTOR placeholder twice.
+            QUERY_VECTOR placeholder once.
 
         Raises:
             ValueError: If limit or offset is negative, or there is no index.
         """
-        condition, condition_params = prefix_condition("prefix", namespace_prefix)
-        return self._semantic(
+        condition, condition_params = prefix_condition("v.prefix", namespace_prefix)
+        return self._exact(
             condition,
             condition_params,
             filter=filter,
             limit=limit,
             offset=offset,
             omit_expired=omit_expired,
-            over_fetch=over_fetch,
             refresh=refresh,
         )
 
@@ -573,11 +598,14 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         over_fetch: int,
         refresh: bool = False,
     ) -> tuple[str, list]:
-        """Build a semantic search within the namespaces namespace_lookup found.
+        """Build an indexed semantic search within the namespaces namespace_lookup found.
 
-        The vectors CTE matches ``prefix = ANY(...)``, which the C-SPANN
-        index serves. Bind the namespaces in place of NAMESPACES and the
-        query vector in place of QUERY_VECTOR.
+        The ranked CTE matches ``prefix = ANY(...)``, which the C-SPANN
+        index serves, and keeps the ``over_fetch`` nearest vectors. Every row
+        carries ``window_size``, the number of vectors the CTE kept, so the
+        store can tell a short result from a full window (see
+        needs_exact_search). Bind the namespaces in place of NAMESPACES and
+        the query vector in place of QUERY_VECTOR.
 
         Returns:
             Tuple of (SQL, parameters).
@@ -585,14 +613,83 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         Raises:
             ValueError: If limit or offset is negative, or there is no index.
         """
-        return self._semantic(
-            "prefix = ANY(CAST(%s AS STRING[]))",
+        _validate_paging(limit, offset)
+        if self._index is None:
+            raise ValueError("semantic_search requires an index configuration")
+
+        operator = self._index.distance.get_operator()
+        conditions, filter_params = self._item_conditions(filter, omit_expired)
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        # No filter or expiry check in ranked: see the notes above semantic_search.
+        # count(*) OVER () runs on the rows the inner LIMIT kept
+        sql = f"""WITH ranked AS (
+    SELECT prefix, key, distance, count(*) OVER () AS window_size
+    FROM (
+        SELECT prefix, key, embedding {operator} CAST(%s AS VECTOR) AS distance
+        FROM {self.vectors}
+        WHERE prefix = ANY(CAST(%s AS STRING[]))
+        ORDER BY embedding {operator} CAST(%s AS VECTOR)
+        LIMIT %s
+    ) AS nearest
+),
+best AS (
+    SELECT DISTINCT ON (i.prefix, i.key)
+        i.prefix, i.key, i.value, i.created_at, i.updated_at,
+        {self._score("r.distance")} AS score, r.window_size
+    FROM ranked AS r
+    JOIN {self.items} AS i ON r.prefix = i.prefix AND r.key = i.key
+    WHERE {where}
+    ORDER BY i.prefix, i.key, r.distance
+)
+SELECT prefix, key, value, created_at, updated_at, score, window_size
+FROM best
+ORDER BY score DESC, prefix, key
+LIMIT %s OFFSET %s"""
+        params: list[Any] = [
+            QUERY_VECTOR,
+            NAMESPACES,
+            QUERY_VECTOR,
+            over_fetch,
+            *filter_params,
+            limit,
+            offset,
+        ]
+        if refresh:
+            sql = self._with_refresh(
+                sql,
+                "prefix, key, value, created_at, updated_at, score, window_size",
+                "score DESC, prefix, key",
+            )
+        return (sql, params)
+
+    def exact_semantic_search_in(
+        self,
+        *,
+        filter: Mapping | None,
+        limit: int,
+        offset: int,
+        omit_expired: bool,
+        refresh: bool = False,
+    ) -> tuple[str, list]:
+        """Build an exact semantic search within the namespaces namespace_lookup found.
+
+        The store runs it when semantic_search_in comes back short from a
+        full window. Bind the namespaces in place of NAMESPACES and the query
+        vector in place of QUERY_VECTOR.
+
+        Returns:
+            Tuple of (SQL, parameters).
+
+        Raises:
+            ValueError: If limit or offset is negative, or there is no index.
+        """
+        return self._exact(
+            "v.prefix = ANY(CAST(%s AS STRING[]))",
             [NAMESPACES],
             filter=filter,
             limit=limit,
             offset=offset,
             omit_expired=omit_expired,
-            over_fetch=over_fetch,
             refresh=refresh,
         )
 
@@ -602,7 +699,7 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         A recursive CTE seeks to the next namespace in the primary key until
         none is left, so it reads one row per namespace, not every vector.
         It counts them and stops after MAX_SEARCH_NAMESPACES + 1, enough for
-        the store to know it must fall back to the scan form. Expired
+        the store to know it must fall back to semantic_search. Expired
         vectors count; the search itself checks expiry.
 
         Returns:
@@ -632,7 +729,25 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
 SELECT prefix FROM found WHERE prefix IS NOT NULL"""
         return (sql, [*params, *inner_params, MAX_SEARCH_NAMESPACES])
 
-    def _semantic(
+    def _score(self, distance: str) -> str:
+        """The score of a distance expression, higher is better.
+
+        1 - distance for cosine, the negated distance for L2 and inner product.
+        """
+        assert self._index is not None
+        if self._index.distance == DistanceStrategy.COSINE:
+            return f"1 - {distance}"
+        return f"-{distance}"
+
+    @staticmethod
+    def _item_conditions(filter: Mapping | None, omit_expired: bool) -> tuple[list[str], list]:
+        """The filter and expiry conditions on the joined items, ``i``."""
+        conditions, params = translate_filter(filter, value_column="i.value")
+        if omit_expired:
+            conditions = [*conditions, "(i.expires_at IS NULL OR i.expires_at > now())"]
+        return conditions, params
+
+    def _exact(
         self,
         condition: str,
         condition_params: Sequence[Any],
@@ -641,62 +756,36 @@ SELECT prefix FROM found WHERE prefix IS NOT NULL"""
         limit: int,
         offset: int,
         omit_expired: bool,
-        over_fetch: int,
         refresh: bool,
     ) -> tuple[str, list]:
-        """Build a semantic search whose vectors CTE matches ``condition``.
+        """Build an exact semantic search over the vectors that match ``condition``.
 
-        The vectors CTE has no expiry check, so that the C-SPANN index can
-        serve it. Expired vectors not yet deleted can therefore occupy
-        over_fetch slots: lower recall, never wrong results, since the
-        items join checks expiry.
-
-        The CTE ranks vectors by distance and keeps ``over_fetch`` of them.
-        The items join applies the filter and expiry, then DISTINCT ON keeps
-        the best distance of each item. Score is 1 - distance for cosine and
-        the negated distance for L2 and inner product, so higher is better.
+        ``condition`` is on ``v.prefix``. The ranked CTE joins the items and
+        applies the filter and the expiry check before anything is cut, then
+        keeps the best distance of each item. Only the outer query has a
+        LIMIT, so no vector index can serve it and every match is ranked.
         """
         _validate_paging(limit, offset)
         if self._index is None:
             raise ValueError("semantic_search requires an index configuration")
 
         operator = self._index.distance.get_operator()
-        if self._index.distance == DistanceStrategy.COSINE:
-            score = "1 - r.distance AS score"
-        else:
-            score = "-r.distance AS score"
-
-        # No expiry check here: see the notes above semantic_search
+        conditions, filter_params = self._item_conditions(filter, omit_expired)
+        where = " AND ".join([condition, *conditions])
+        # No LIMIT in ranked: see the notes above semantic_search
         sql = f"""WITH ranked AS (
-    SELECT prefix, key, field_name, embedding {operator} CAST(%s AS VECTOR) AS distance
-    FROM {self.vectors}
-    WHERE {condition}
-    ORDER BY embedding {operator} CAST(%s AS VECTOR)
-    LIMIT %s
-),
-best AS (
-    SELECT DISTINCT ON (i.prefix, i.key)
-        i.prefix, i.key, i.value, i.created_at, i.updated_at,
-        {score}
-    FROM ranked r
-    JOIN {self.items} i ON r.prefix = i.prefix AND r.key = i.key
-    WHERE """
-        params: list[Any] = [QUERY_VECTOR, *condition_params, QUERY_VECTOR, over_fetch]
-
-        conditions, filter_params = translate_filter(filter, value_column="i.value")
-        if omit_expired:
-            conditions = [*conditions, "(i.expires_at IS NULL OR i.expires_at > now())"]
-        sql += " AND ".join(conditions) if conditions else "TRUE"
-        params.extend(filter_params)
-
-        sql += """
-    ORDER BY i.prefix, i.key, r.distance
+    SELECT i.prefix, i.key, i.value, i.created_at, i.updated_at,
+        min(v.embedding {operator} CAST(%s AS VECTOR)) AS distance
+    FROM {self.vectors} AS v
+    JOIN {self.items} AS i ON v.prefix = i.prefix AND v.key = i.key
+    WHERE {where}
+    GROUP BY i.prefix, i.key
 )
-SELECT prefix, key, value, created_at, updated_at, score
-FROM best
+SELECT prefix, key, value, created_at, updated_at, {self._score("distance")} AS score
+FROM ranked
 ORDER BY score DESC, prefix, key
 LIMIT %s OFFSET %s"""
-        params.extend([limit, offset])
+        params: list[Any] = [QUERY_VECTOR, *condition_params, *filter_params, limit, offset]
         if refresh:
             sql = self._with_refresh(
                 sql, "prefix, key, value, created_at, updated_at, score", "score DESC, prefix, key"

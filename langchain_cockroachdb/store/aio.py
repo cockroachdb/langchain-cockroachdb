@@ -86,8 +86,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     others) are meant for other threads while that loop runs. From the loop
     itself they raise ``asyncio.InvalidStateError``.
 
-    A batch runs its gets, searches and listings first, each group as one
-    round of reads, then all its puts and deletes in one transaction.
+    A batch runs its reads first, then all its puts and deletes in one
+    transaction. Its gets, its searches and its listings take one round trip
+    each. Semantic searches under a namespace add one before the searches, to
+    find their namespaces, and one after them when a search must run again
+    exactly, as the long-term memory guide explains.
 
     Example:
         ```python
@@ -337,6 +340,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             )
         for label, statements, fill, session in plan.reads():
             fill(await self._read_all(statements, label, session))
+        exact = plan.exact_statements()
+        if exact:
+            plan.fill_exact(await self._read_all(exact, "store search exact"))
         if plan.puts is not None:
             await self._run_puts(plan.puts)
         return plan.results
