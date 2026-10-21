@@ -15,9 +15,19 @@ import os
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
-from langgraph.store.base import InvalidNamespaceError, Op, Result, TTLConfig
+from langgraph.store.base import (
+    NOT_PROVIDED,
+    InvalidNamespaceError,
+    Item,
+    NamespacePath,
+    NotProvided,
+    Op,
+    Result,
+    SearchItem,
+    TTLConfig,
+)
 from langgraph.store.base.batch import AsyncBatchedBaseStore
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
 from psycopg.rows import DictRow, dict_row
@@ -83,8 +93,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     AsyncBatchedBaseStore starts a task on it there. Awaited calls made in
     the same tick (``aget``, ``aput``, ``asearch`` and the others) are
     coalesced into one ``abatch``. The sync methods (``get``, ``put`` and the
-    others) are meant for other threads while that loop runs. From the loop
-    itself they raise ``asyncio.InvalidStateError``.
+    others) are meant for other threads while that loop runs. They run the
+    async methods on it, so ``get``, ``put``, ``search``, ``delete`` and
+    ``list_namespaces`` join the same queue, while ``batch`` runs ``abatch``
+    directly. From the loop itself they raise ``asyncio.InvalidStateError``. When the loop is closed or not
+    running, or the call comes from a forked child of the process that
+    created the store, they raise ``RuntimeError`` instead of waiting
+    forever, as AsyncCockroachDBSaver's sync methods do.
 
     A batch runs its reads first, then all its puts and deletes in one
     transaction. Its gets, its searches and its listings take one round trip
@@ -346,6 +361,115 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         if plan.puts is not None:
             await self._run_puts(plan.puts)
         return plan.results
+
+    # The sync methods. AsyncBatchedBaseStore's versions wait on the loop with
+    # no limit, so a stopped loop or a forked child would hang them.
+    # _run_sync checks the loop first and while it waits.
+
+    def batch(self, ops: Iterable[Op]) -> list[Result]:
+        """Run ``abatch`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        return self._run_sync(self.abatch(ops))
+
+    def get(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
+        """Run ``aget`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        return self._run_sync(self.aget(namespace, key, refresh_ttl=refresh_ttl))
+
+    def search(
+        self,
+        namespace_prefix: tuple[str, ...],
+        /,
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        refresh_ttl: bool | None = None,
+    ) -> list[SearchItem]:
+        """Run ``asearch`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        return self._run_sync(
+            self.asearch(
+                namespace_prefix,
+                query=query,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                refresh_ttl=refresh_ttl,
+            )
+        )
+
+    def put(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: Mapping[str, Any],
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+    ) -> None:
+        """Run ``aput`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        self._run_sync(self.aput(namespace, key, value, index, ttl=ttl))
+
+    def delete(self, namespace: tuple[str, ...], key: str) -> None:
+        """Run ``adelete`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        self._run_sync(self.adelete(namespace, key))
+
+    def list_namespaces(
+        self,
+        *,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        """Run ``alist_namespaces`` on the store's event loop, from another thread.
+
+        Raises:
+            asyncio.InvalidStateError: If called from the store's loop
+            RuntimeError: If that loop is closed, is not running or stops
+                before the work finishes, or in a forked child
+        """
+        return self._run_sync(
+            self.alist_namespaces(
+                prefix=prefix, suffix=suffix, max_depth=max_depth, limit=limit, offset=offset
+            )
+        )
 
     async def _read_all(
         self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
