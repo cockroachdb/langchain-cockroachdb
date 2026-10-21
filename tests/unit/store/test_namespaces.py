@@ -5,6 +5,7 @@ from langgraph.store.base import InvalidNamespaceError
 
 from langchain_cockroachdb.store.namespaces import (
     from_text,
+    literal_prefix,
     match_pattern,
     prefix_condition,
     to_text,
@@ -112,3 +113,12 @@ def test_truncate_expression():
 
     with pytest.raises(ValueError):
         truncate_expression("namespace", -1)
+
+
+def test_literal_prefix_stops_at_the_first_wildcard():
+    assert literal_prefix(("user", "alice")) == ("user", "alice")
+    assert literal_prefix(("user", "*", "memories")) == ("user",)
+    assert literal_prefix(("*", "b")) == ()
+    assert literal_prefix(()) == ()
+    # Only a whole "*" label is a wildcard
+    assert literal_prefix(("a*", "b")) == ("a*", "b")

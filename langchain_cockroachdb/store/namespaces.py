@@ -120,6 +120,20 @@ def match_pattern(path: Sequence[str], match_type: Literal["prefix", "suffix"]) 
         return rf"(^|\.){pattern}\z"
 
 
+def literal_prefix(path: Sequence[str]) -> tuple[str, ...]:
+    """The labels of a match path before its first ``*`` wildcard.
+
+    Every namespace a prefix condition on ``path`` matches starts with these
+    labels, so prefix_condition on them bounds the rows to read.
+    """
+    labels: list[str] = []
+    for label in path:
+        if label == "*":
+            break
+        labels.append(label)
+    return tuple(labels)
+
+
 def truncate_expression(column: str, max_depth: int) -> str:
     """Build a SQL expression to truncate namespace to max depth.
 

@@ -37,6 +37,7 @@ from langchain_cockroachdb.store.config import (
 )
 from langchain_cockroachdb.store.namespaces import (
     from_text,
+    literal_prefix,
     match_pattern,
     to_text,
     validate_labels,
@@ -721,14 +722,23 @@ class BaseCockroachDBStore:
         return statements
 
     def _listing_statement(self, op: ListNamespacesOp) -> tuple[str, list]:
-        """The statement for one list_namespaces op."""
+        """The statement for one list_namespaces op.
+
+        Prefix conditions also bound the rows read to the key span of their
+        labels before the first ``*``.
+        """
+        conditions = op.match_conditions or ()
         return self.sql.list_namespaces(
             match_conditions=[
-                match_pattern(condition.path, condition.match_type)
-                for condition in op.match_conditions or ()
+                match_pattern(condition.path, condition.match_type) for condition in conditions
             ],
             max_depth=op.max_depth,
             limit=op.limit,
             offset=op.offset,
             omit_expired=self.ttl.omit_expired,
+            prefixes=[
+                literal_prefix(condition.path)
+                for condition in conditions
+                if condition.match_type == "prefix"
+            ],
         )

@@ -512,6 +512,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         future = concurrent.futures.Future()
 
         def sweep_loop() -> None:
+            # Cancelling the future is how a caller stops the sweeper, and a
+            # cancelled future takes no result, so both calls check it first
             try:
                 while not self._ttl_stop_event.is_set():
                     if self._ttl_stop_event.wait(interval * 60):
@@ -522,9 +524,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                             logger.info("Store swept %d expired items", expired)
                     except Exception:
                         logger.exception("Store TTL sweep iteration failed")
-                future.set_result(None)
+                if not future.done():
+                    future.set_result(None)
             except Exception as error:
-                future.set_exception(error)
+                if not future.done():
+                    future.set_exception(error)
 
         thread = threading.Thread(target=sweep_loop, daemon=True, name="ttl-sweeper")
         self._ttl_sweeper_thread = thread

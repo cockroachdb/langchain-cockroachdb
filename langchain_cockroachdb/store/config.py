@@ -208,8 +208,10 @@ def resolve_index_config(index: CockroachDBIndexConfig | None) -> ResolvedIndex 
     # Validate C-SPANN config
     cspann_dict = _validate_cspann(index.get("cspann"))
 
-    # Validate flat
+    # Validate flat. A string such as "false" would be truthy and skip the index
     flat = index.get("flat", False)
+    if not isinstance(flat, bool):
+        raise ValueError(f"flat must be a bool, got {flat!r}")
 
     # Validate beam_size
     beam_size = index.get("beam_size")

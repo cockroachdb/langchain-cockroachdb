@@ -165,3 +165,13 @@ def test_ttl_job_cron_override_validated():
     # Invalid cron (SQL injection attempt)
     with pytest.raises(ValueError, match="cron"):
         resolve_ttl_config({"ttl_job_cron": "x; DROP"})
+
+
+def test_resolve_index_rejects_a_flat_that_is_not_a_bool():
+    """flat must be a bool: the string "false" would be truthy and skip the index."""
+    for bad in ("false", "true", 0, 1, None):
+        with pytest.raises(ValueError, match="flat must be a bool"):
+            resolve_index_config({"dims": 3, "embed": FakeEmbeddings(size=3), "flat": bad})  # type: ignore[typeddict-item]
+    for flat in (True, False):
+        resolved = resolve_index_config({"dims": 3, "embed": FakeEmbeddings(size=3), "flat": flat})
+        assert resolved is not None and resolved.flat is flat

@@ -367,6 +367,42 @@ def test_list_namespaces():
     assert "regexp_replace" not in query_sql  # no truncation
 
 
+def test_list_namespaces_bounds_prefixes_with_a_range():
+    """Each literal prefix adds the range next to the regexes; empty ones add nothing."""
+    sql = StoreSQL("public", "store", index=None)
+    query_sql, params = sql.list_namespaces(
+        match_conditions=[r"^user\.alice(\.|\z)", r"(^|\.)notes\z"],
+        max_depth=None,
+        limit=10,
+        offset=2,
+        omit_expired=True,
+        prefixes=[("user", "alice"), ()],
+    )
+    assert query_sql == (
+        "SELECT DISTINCT prefix AS ns\nFROM public.store\n"
+        "WHERE (expires_at IS NULL OR expires_at > now())"
+        " AND (prefix = %s OR (prefix >= %s AND prefix < %s))"
+        " AND prefix ~ %s AND prefix ~ %s"
+        "\nORDER BY ns\nLIMIT %s OFFSET %s"
+    )
+    assert params == [
+        "user.alice",
+        "user.alice.",
+        "user.alice/",
+        r"^user\.alice(\.|\z)",
+        r"(^|\.)notes\z",
+        10,
+        2,
+    ]
+
+    # Nothing to filter on
+    query_sql, params = sql.list_namespaces(
+        match_conditions=[], max_depth=None, limit=10, offset=0, omit_expired=False
+    )
+    assert "WHERE TRUE\n" in query_sql
+    assert params == [10, 0]
+
+
 def test_delete_namespace():
     """delete_namespace() is one statement; vectors go in a CTE with an index."""
     sql = StoreSQL("public", "store", index=_make_index())

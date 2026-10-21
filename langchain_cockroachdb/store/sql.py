@@ -800,8 +800,17 @@ LIMIT %s OFFSET %s"""
         limit: int,
         offset: int,
         omit_expired: bool,
+        prefixes: Sequence[Sequence[str]] = (),
     ) -> tuple[str, list]:
         """Build query to list distinct namespaces.
+
+        The regexes decide which namespaces match. Each of ``prefixes`` adds
+        the range from prefix_condition next to them, so a listing under
+        one user reads only that user's key span, whatever the optimizer
+        makes of the regex. (v26.3.2 already derives a wider span from an
+        anchored regex: [user.u007, user.u008) for user.u007.) A namespace a
+        prefix regex matches always starts with that condition's literal
+        labels, so the range leaves out nothing it would match.
 
         Args:
             match_conditions: Regex pattern strings (from match_pattern).
@@ -809,6 +818,8 @@ LIMIT %s OFFSET %s"""
             limit: Maximum results.
             offset: Results to skip.
             omit_expired: Whether to exclude expired items.
+            prefixes: The literal leading labels of each prefix condition
+                (from literal_prefix). Empty ones add nothing.
 
         Returns:
             Tuple of (SQL, parameters).
@@ -821,21 +832,24 @@ LIMIT %s OFFSET %s"""
         # Build truncation expression or use prefix directly
         ns_expr = truncate_expression("prefix", max_depth) if max_depth is not None else "prefix"
 
-        sql = f"SELECT DISTINCT {ns_expr} AS ns\nFROM {self.items}\nWHERE "
+        conditions: list[str] = []
         params: list[Any] = []
-
-        # Expiry clause
         if omit_expired:
-            sql += "(expires_at IS NULL OR expires_at > now())"
-        else:
-            sql += "TRUE"
-
-        # Match conditions (regex patterns)
+            conditions.append("(expires_at IS NULL OR expires_at > now())")
+        for labels in prefixes:
+            if labels:
+                condition, condition_params = prefix_condition("prefix", labels)
+                conditions.append(condition)
+                params.extend(condition_params)
         for pattern in match_conditions:
-            sql += " AND prefix ~ %s"
+            conditions.append("prefix ~ %s")
             params.append(pattern)
 
-        sql += "\nORDER BY ns\nLIMIT %s OFFSET %s"
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        sql = (
+            f"SELECT DISTINCT {ns_expr} AS ns\nFROM {self.items}\nWHERE {where}"
+            "\nORDER BY ns\nLIMIT %s OFFSET %s"
+        )
         params.extend([limit, offset])
 
         return (sql, params)

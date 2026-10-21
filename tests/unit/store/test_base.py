@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 
@@ -1134,3 +1135,51 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             with pytest.raises(psycopg.errors.FeatureNotSupported):
                 await getattr(store, operation)()
             assert len(ttl_statements(cursor)) == 1
+
+
+def test_cancelling_the_sweeper_future_stops_it_without_a_traceback(monkeypatch) -> None:
+    store = CockroachDBStore(object(), ttl={"default_ttl": 1})  # type: ignore[arg-type]
+    swept: list[int] = []
+    monkeypatch.setattr(store, "sweep_ttl", lambda: swept.append(1) or 0)
+    # What the sweeper thread would print as "Exception in thread ttl-sweeper"
+    uncaught: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", uncaught.append)
+    future = store.start_ttl_sweeper(sweep_interval_minutes=1)
+    thread = store._ttl_sweeper_thread
+    assert thread is not None and thread.is_alive()
+    assert future.cancel()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert uncaught == []
+    assert future.cancelled() and swept == []
+    assert store.stop_ttl_sweeper(timeout=1)
+
+
+def test_listing_bounds_prefix_conditions_to_their_literal_labels() -> None:
+    store = make_base()
+    op = ListNamespacesOp(
+        match_conditions=(
+            MatchCondition("prefix", ("user", "*", "memories")),
+            MatchCondition("suffix", ("notes",)),
+        ),
+        max_depth=3,
+        limit=5,
+        offset=1,
+    )
+    sql, params = store._listing_statement(op)
+    # The range for ("user",), then both regexes; a suffix adds no range
+    assert sql.count("(prefix = %s OR (prefix >= %s AND prefix < %s))") == 1
+    assert params == [
+        "user",
+        "user.",
+        "user/",
+        r"^user\.[^.]+\.memories(\.|\z)",
+        r"(^|\.)notes\z",
+        5,
+        1,
+    ]
+    # A path that starts with a wildcard has no literal labels to bound
+    _, params = store._listing_statement(
+        ListNamespacesOp(match_conditions=(MatchCondition("prefix", ("*", "b")),))
+    )
+    assert params == [r"^[^.]+\.b(\.|\z)", 100, 0]
