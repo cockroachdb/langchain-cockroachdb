@@ -124,13 +124,13 @@ A `CockroachDBStore` on a pool runs batches concurrently, each on its own pooled
 
 `AsyncCockroachDBStore` sends `aget`, `aput`, `asearch` and its other awaited calls through LangGraph's `AsyncBatchedBaseStore` queue. The queue runs one `abatch` at a time and merges the ops queued in the same event loop tick into one batch. So a larger pool does not run those calls in parallel, though it still replaces broken connections. Direct `abatch` calls, and `batch` calls from other threads, run concurrently on a pool.
 
-Create an `AsyncCockroachDBStore` inside a running event loop. Its sync methods (`get`, `put` and the others) are for other threads; called from the loop's own thread they raise `asyncio.InvalidStateError`.
+Create an `AsyncCockroachDBStore` inside a running event loop. Its sync methods (`get`, `put` and the others) are for other threads while that loop runs. They run the async methods on it, so `get`, `put`, `search`, `delete` and `list_namespaces` join the same queue. Called from the loop's own thread they raise `asyncio.InvalidStateError`. If the loop is closed or not running, or the call comes from a forked child process, they raise `RuntimeError` instead of waiting forever, as the sync methods of `AsyncCockroachDBSaver` do.
 
 ## Retries and Atomic Writes
 
 Every call retries transient CockroachDB errors under the store's `RetryPolicy`. Pass `retry_policy=` to change it; see [Retries and Resilience](resilience.md) for the fields. Every write is an UPSERT, a DELETE, or an UPDATE that pushes back an expiry. Each is safe to run twice, so a retry after an ambiguous result is safe.
 
-A `batch()` call validates every op and serializes every value before any statement runs. It then runs its gets, searches and listings, each kind as one round of reads, and commits all its puts and deletes together in one transaction. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
+A `batch()` call validates every op and serializes every value before any statement runs. It then runs its reads, one round trip each for its gets, its searches and its listings, and commits all its puts and deletes together in one transaction. Semantic searches under a namespace add a round trip before the searches, and sometimes one after them, as [How Searches Use the Index](#how-searches-use-the-index) explains. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
 
 On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table. The TTL step of `setup()`, `disable_ttl()` and `adisable_ttl()` retry that error, as described in [Configuring retries](resilience.md#configuring-retries).
 
@@ -164,7 +164,7 @@ store.list_namespaces(prefix=("user", "*"), max_depth=2)
 store.list_namespaces(suffix=("memories",))
 ```
 
-`*` matches one label. `max_depth` cuts each namespace to its first `max_depth` labels. Results are distinct and sorted, and `limit` (default 100) and `offset` page through them.
+`*` matches one label. `max_depth` cuts each namespace to its first `max_depth` labels. Results are distinct and sorted by their text with the labels joined by `.`, as in PostgresStore, and `limit` (default 100) and `offset` page through them. That is the order of the tuples unless a label holds a character that sorts before `.`, such as a space, `-` or `#`: `("a#b", "c")` comes before `("a", "b")`, where `InMemoryStore` puts it after. A `prefix` that starts with plain labels, such as `("user", "alice")` or `("user", "*", "memories")`, reads only the rows under those labels.
 
 ### Searching and Filtering
 
@@ -223,7 +223,7 @@ With an index, `setup()` also creates the vectors table and, unless `flat` is se
 | `fields` | `["$"]` | Paths in each value to embed. `"$"` embeds the whole value as JSON, and `"messages[*].content"` embeds each message on its own |
 | `distance_type` | `"cosine"` | `"cosine"`, `"l2"` or `"inner_product"` |
 | `cspann` | `None` | C-SPANN partition sizes, `{"min_partition_size": 10, "max_partition_size": 100}`. Give both or neither; the maximum must be at least 4 times the minimum. Without it the index uses CockroachDB's defaults |
-| `flat` | `False` | Do not create a vector index. Searches compare every vector, which suits small stores |
+| `flat` | `False` | Do not create a vector index. Searches rank every matching vector exactly, in one round trip, which suits small stores |
 | `beam_size` | `None` | C-SPANN beam width. A larger beam finds more of the true nearest neighbors and reads more of the index |
 
 A put can override `fields`: `index=False` stores the item without vectors, and `index=["text", "summary"]` embeds those paths instead.
@@ -238,9 +238,13 @@ Each embedded text is one vector row, so an item can have several. Putting an it
 
 The vector index has the namespace as a prefix column, because most memory searches name one user's namespace. A search with a `query` under a namespace prefix runs in two steps. First a short read lists the namespaces at or under the prefix that have vectors. Then the ranked search runs on the index, limited to those namespaces. For one user's namespace that list has one entry, so the search reads only that namespace's part of the index.
 
-If more than 1000 namespaces match (`MAX_SEARCH_NAMESPACES` in `langchain_cockroachdb.store.sql`), the search scans the vectors under the prefix instead, with exact ranking. A search of the whole store, with an empty prefix, scans too. Filters and expiry apply the same way in every case. The index finds approximate nearest neighbors, which `beam_size` tunes, while a scan ranks exactly.
+The index finds approximate nearest neighbors, which `beam_size` tunes. It gives the search a window of candidate vectors, twice as many as the page needs, and the filter and the expiry check then apply to those candidates. A selective filter, or many expired items that the TTL job has not deleted yet, can leave fewer matches in the window than the page asks for. When that happens and the window was full, or nothing matched, the search runs a second, exact query over the namespaces the first step found: it applies the filter and the expiry check first, ranks every match and returns that page instead. A window with fewer candidates than its size held every vector of those namespaces, so its result is already exact and no second query runs. For one user's memories the second query reads little, but it costs a round trip.
+
+Some searches skip the index and rank every match exactly in one query: a search of the whole store, with an empty prefix; every search of a store with `flat` set, which skips the first step too; and a search under a prefix where more than 1000 namespaces have vectors (`MAX_SEARCH_NAMESPACES` in `langchain_cockroachdb.store.sql`). Like PostgresStore, they apply the filter and the expiry check before they rank.
 
 `beam_size` is applied to each search with `SET LOCAL`, inside the search's own transaction, so it does not stay on a pooled connection.
+
+Expired items are never returned, but their vectors stay in the table until the TTL job or `sweep_ttl()` deletes them, and until then they take up places in the window. With TTLs of minutes and the default hourly job, they can fill it, and more searches then need the second query. Set `sweep_interval_minutes` (or `ttl_job_cron`) lower when TTLs are minutes.
 
 A `query` on a store without `index` runs a plain search: it filters and returns the newest items first, not the most similar ones. The store logs one WARNING about it, once per store.
 
@@ -253,7 +257,7 @@ A `query` on a store without `index` runs a plain search: it filters and returns
 | `dims` | `setup()` raises `ValueError`. Use the existing dims, or another `table_name` |
 | `distance_type` | `setup()` raises `ValueError`. Drop the index and run `setup()` again to build it with the new distance |
 | `cspann` sizes | `setup()` logs a WARNING and keeps the existing index. Drop it and run `setup()` again to use the new sizes |
-| `flat` turned on | `setup()` logs a WARNING and keeps the index, which searches may still use. Drop it to search without it |
+| `flat` turned on | `setup()` logs a WARNING and keeps the index. Searches no longer use it, but puts still update it. Drop it if no other store needs it |
 | `fields` | Applies to items put from then on. Existing items keep their vectors until they are put again |
 
 ```python
@@ -296,7 +300,7 @@ with CockroachDBStore.from_conn_string(
 
 CockroachDB deletes expired rows itself, with [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). With a `ttl` configuration, `setup()` sets `ttl_expiration_expression` to the `expires_at` column on the items table, and on the vectors table when there is an index. The job runs on the cron that `sweep_interval_minutes` gives, or `ttl_job_cron`, and hourly (`@hourly`) by default. A changed `sweep_interval_minutes` or `ttl_job_cron` takes effect at the next `setup()`. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.
 
-The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because `omit_expired` is on by default. That holds even for a store built without `ttl`, since another process may write items with an expiry to the same tables. Pass `ttl={"omit_expired": False}` to see expired items until the job deletes them.
+The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because `omit_expired` is on by default. That holds even for a store built without `ttl`, since another process may write items with an expiry to the same tables. Pass `ttl={"omit_expired": False}` to see expired items until the job deletes them. Their vectors stay as well, and make semantic searches run their second query more often, so with TTLs of minutes set `sweep_interval_minutes` lower than the default hour, as [How Searches Use the Index](#how-searches-use-the-index) explains.
 
 ### Refresh on Read
 
@@ -519,12 +523,13 @@ This snippet was checked against the Deep Agents documentation (deepagents 0.5 a
 1. **Expiry on the server.** CockroachDB's row-level TTL job deletes expired items, so no sweeper thread is needed. Expired items are left out of reads, searches and listings by default (`omit_expired` is on).
 2. **Atomic batches, retries and concurrency.** All puts and deletes of one batch commit in one transaction, every call retries transient errors under the store's `RetryPolicy`, and a `CockroachDBStore` on a pool runs batches concurrently.
 3. **No stale vectors.** Putting an item again replaces all its vectors, and deleting an item deletes them.
-4. **Filters as in `InMemoryStore`.** Comparisons with a number match numbers only, nested dictionaries match nested keys, and `$ne` also matches items without the key.
+4. **Filters.** A comparison with a number matches numeric values only, where PostgresStore compares text and `InMemoryStore` converts values with `float()`. Nested dictionaries match nested keys, and `$ne` also matches items without the key.
 5. **Deterministic paging.** Results with the same score, or the same `updated_at`, are ordered by namespace and key, so paging with `offset` is stable.
 6. **Configurable tables.** `table_name` and `schema` set the table names, so one database can hold several stores.
 7. **`delete_namespace`.** `delete_namespace(namespace_prefix)` and `adelete_namespace` delete a namespace and its descendants in one transaction and return the number of items deleted.
 8. **Warnings and checks.** A `query` on a store without `index` logs a WARNING. Changing the index configuration after `setup()` raises an error or logs a warning, as described in [Changing the Index Configuration](#changing-the-index-configuration).
 9. **`disable_ttl` and `drop_vector_index`.** `disable_ttl()` and `adisable_ttl()` remove the table TTL setting, and `drop_vector_index()` and `adrop_vector_index()` drop the vector index so that `setup()` can build it again, for example with another distance.
+10. **No `deserializer`.** psycopg decodes JSONB values before the store sees them, so the store does not take PostgresStore's `deserializer=` argument. To transform values as they are read, wrap `get` and `search`.
 
 ## Next Steps
 

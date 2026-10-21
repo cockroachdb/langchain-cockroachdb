@@ -1,7 +1,9 @@
 """The store's single-statement reads and deletes run on CockroachDB.
 
-These run StoreSQL statements directly, with a vectors table, because the
-store itself does not accept an index yet.
+These run StoreSQL statements directly on a store's tables, with a flat
+vectors table, to check each statement on its own: the refresh CTEs change
+only the rows a read returns, and delete_namespace removes the items and
+their vectors in one statement.
 """
 
 from __future__ import annotations
