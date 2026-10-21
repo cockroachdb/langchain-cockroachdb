@@ -865,3 +865,110 @@ def test_index_check_warns_on_partition_sizes_and_flat(caplog: pytest.LogCapture
     assert len(caplog.records) == 1
     assert "flat" in caplog.records[0].getMessage()
     assert "drop_vector_index()" in caplog.records[0].getMessage()
+
+
+# CockroachDB v25.4 refuses a TTL change while another schema change on the
+# table runs. RetryPolicy() alone does not retry that error, so these tests
+# pin that setup() and disable_ttl run their TTL statements under
+# schema_change_policy.
+BUSY_MESSAGE = (
+    "cannot modify TTL settings while another schema change on the table is being processed"
+)
+
+
+def busy_error() -> psycopg.Error:
+    """The error v25.4 raises for a TTL change during another schema change."""
+    error = psycopg.errors.lookup("0A000")(BUSY_MESSAGE)
+    error.sqlstate = "0A000"
+    return error
+
+
+class BusyOnceCursor:
+    """A cursor that fails the first TTL statement with the busy error.
+
+    It records every statement, and reports ``latest`` as the migration
+    version, so setup() goes straight to its TTL step.
+    """
+
+    def __init__(self, latest: int) -> None:
+        self.latest = latest
+        self.statements: list[str] = []
+        self.failed = False
+
+    def run(self, statement: str) -> None:
+        self.statements.append(statement)
+        if statement.startswith("ALTER TABLE") and not self.failed:
+            self.failed = True
+            raise busy_error()
+
+    def execute(self, statement: str, *args: object) -> "BusyOnceCursor":
+        self.run(statement)
+        return self
+
+    def fetchone(self) -> dict:
+        return {"v": self.latest}
+
+
+class AsyncBusyOnceCursor(BusyOnceCursor):
+    async def execute(self, statement: str, *args: object) -> "AsyncBusyOnceCursor":  # type: ignore[override]
+        self.run(statement)
+        return self
+
+    async def fetchone(self) -> dict:  # type: ignore[override]
+        return {"v": self.latest}
+
+
+def ttl_statements(cursor: BusyOnceCursor) -> list[str]:
+    return [statement for statement in cursor.statements if statement.startswith("ALTER TABLE")]
+
+
+@pytest.mark.parametrize("operation", ["setup", "disable_ttl"])
+def test_ttl_changes_retry_a_busy_schema_change(operation: str) -> None:
+    assert not FAST.is_retryable(busy_error())
+    for policy, retried in ((FAST, True), (RetryPolicy(max_attempts=1), False)):
+        store = CockroachDBStore(object(), ttl={"default_ttl": 5}, retry_policy=policy)  # type: ignore[arg-type]
+        cursor = BusyOnceCursor(latest=len(store.sql.migrations()) - 1)
+
+        @contextlib.contextmanager
+        def fake_cursor(
+            cursor: BusyOnceCursor = cursor, **kwargs: object
+        ) -> Iterator[BusyOnceCursor]:
+            yield cursor
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+        if retried:
+            getattr(store, operation)()
+            # The busy statement ran again, under the store's own backoff
+            statements = ttl_statements(cursor)
+            assert len(statements) == 2 and statements[0] == statements[1]
+        else:
+            # max_attempts=1 turns the retry off
+            with pytest.raises(psycopg.errors.FeatureNotSupported):
+                getattr(store, operation)()
+            assert len(ttl_statements(cursor)) == 1
+
+
+@pytest.mark.parametrize("operation", ["setup", "adisable_ttl"])
+async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> None:
+    for policy, retried in ((FAST, True), (RetryPolicy(max_attempts=1), False)):
+        store = AsyncCockroachDBStore(
+            AsyncConnectionPool("", open=False), ttl={"default_ttl": 5}, retry_policy=policy
+        )
+        assert not hasattr(store, "disable_ttl")
+        cursor = AsyncBusyOnceCursor(latest=len(store.sql.migrations()) - 1)
+
+        @contextlib.asynccontextmanager
+        async def fake_cursor(
+            cursor: AsyncBusyOnceCursor = cursor, **kwargs: object
+        ) -> AsyncIterator[AsyncBusyOnceCursor]:
+            yield cursor
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+        if retried:
+            await getattr(store, operation)()
+            statements = ttl_statements(cursor)
+            assert len(statements) == 2 and statements[0] == statements[1]
+        else:
+            with pytest.raises(psycopg.errors.FeatureNotSupported):
+                await getattr(store, operation)()
+            assert len(ttl_statements(cursor)) == 1

@@ -422,7 +422,7 @@ def test_setup_without_ttl_leaves_existing_settings_and_disable_ttl_resets_them(
     with_ttl.disable_ttl()
 
 
-async def test_async_setup_without_ttl_leaves_existing_settings_and_disable_ttl_resets_them(
+async def test_async_setup_without_ttl_leaves_existing_settings_and_adisable_ttl_resets_them(
     astore_factory, aadmin
 ) -> None:
     with_ttl = await astore_factory("pool", index=index_config(), ttl={"sweep_interval_minutes": 5})
@@ -430,10 +430,10 @@ async def test_async_setup_without_ttl_leaves_existing_settings_and_disable_ttl_
     await astore_factory("pool", index=index_config())
     for table in tables:
         assert SETTING in await acreate_statement(aadmin, table)
-    await with_ttl.disable_ttl()
+    await with_ttl.adisable_ttl()
     for table in tables:
         assert "ttl_expiration_expression" not in await acreate_statement(aadmin, table)
-    await with_ttl.disable_ttl()
+    await with_ttl.adisable_ttl()
 
 
 def put_sweep_rows(store: Any) -> None:
@@ -641,7 +641,7 @@ async def test_async_ttl_expiry_refresh_and_sweep(astore_factory, aadmin, table_
     assert await store.sweep_ttl() == 1
     assert await store.sweep_ttl() == 0
     assert "ttl_expiration_expression" in await acreate_statement(aadmin, table_name)
-    await store.disable_ttl()
+    await store.adisable_ttl()
     assert "ttl_expiration_expression" not in await acreate_statement(aadmin, table_name)
 
 

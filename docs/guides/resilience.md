@@ -65,7 +65,7 @@ policy = RetryPolicy(**{"max_attempts": 6, "retryable_sqlstates": ["40001", "400
 
 The older `retry_max_attempts`, `retry_initial_backoff`, `retry_max_backoff`, `retry_backoff_multiplier` and `retry_jitter` arguments still work as shorthand.
 
-TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE `0A000`. Several processes running checkpointer `enable_ttl` or `disable_ttl`, or store `setup()` with a TTL configuration, at once can hit it. These TTL statements are idempotent, so they retry that error under your policy (`schema_change_policy`), even if your `retry_on` would refuse it. `max_attempts=1` turns this off. The code and phrase are `SCHEMA_CHANGE_BUSY_SQLSTATE` and `SCHEMA_CHANGE_BUSY_MESSAGES`, and `is_schema_change_busy()` checks an error.
+TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE `0A000`. Several processes running checkpointer `enable_ttl` or `disable_ttl`, or store `setup()` with a TTL configuration or `disable_ttl`, at once can hit it. These TTL statements are idempotent, so they retry that error under your policy (`schema_change_policy`), even if your `retry_on` would refuse it. `max_attempts=1` turns this off. The code and phrase are `SCHEMA_CHANGE_BUSY_SQLSTATE` and `SCHEMA_CHANGE_BUSY_MESSAGES`, and `is_schema_change_busy()` checks an error.
 
 ## Idempotency
 

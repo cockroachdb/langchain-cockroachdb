@@ -82,10 +82,10 @@ Connection pool settings, passed as `pool_config` to `from_conn_string`.
 | `sweep_ttl()` | `sweep_ttl()` | Delete expired items now, return the count |
 | `start_ttl_sweeper()` | `start_ttl_sweeper()` | Sweep periodically in a background thread or task |
 | `stop_ttl_sweeper()` | `stop_ttl_sweeper()` | Stop the sweeper |
-| `disable_ttl()` | `disable_ttl()` | Turn off row-level TTL on the store's tables |
+| `disable_ttl()` | `adisable_ttl()` | Turn off row-level TTL on the store's tables |
 | `drop_vector_index()` | `adrop_vector_index()` | Drop the vector index, to rebuild it with `setup()` |
 
-On `AsyncCockroachDBStore`, `setup()`, `sweep_ttl()`, `start_ttl_sweeper()`, `stop_ttl_sweeper()` and `disable_ttl()` are coroutines.
+On `AsyncCockroachDBStore`, `setup()`, `sweep_ttl()`, `start_ttl_sweeper()` and `stop_ttl_sweeper()` are coroutines without the `a` prefix, as in AsyncPostgresStore.
 
 ### Factory Methods
 

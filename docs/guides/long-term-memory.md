@@ -132,7 +132,7 @@ Every call retries transient CockroachDB errors under the store's `RetryPolicy`.
 
 A `batch()` call validates every op and serializes every value before any statement runs. It then runs its gets, searches and listings, each kind as one round of reads, and commits all its puts and deletes together in one transaction. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
 
-On CockroachDB v25.4, the TTL step of `setup()` can meet a schema change that another process runs on the same table. That error is retried, as described in [Configuring retries](resilience.md#configuring-retries).
+On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table. The TTL step of `setup()`, `disable_ttl()` and `adisable_ttl()` retry that error, as described in [Configuring retries](resilience.md#configuring-retries).
 
 ## Namespaces and Items
 
@@ -322,13 +322,13 @@ store.start_ttl_sweeper(sweep_interval_minutes=5)
 store.stop_ttl_sweeper()
 ```
 
-`disable_ttl()` turns off row-level TTL on the store's tables. `setup()` never does, even without a `ttl` configuration. Expired items stay hidden while `omit_expired` is on.
+`disable_ttl()` (async: `adisable_ttl()`) turns off row-level TTL on the store's tables. `setup()` never does, even without a `ttl` configuration. Expired items stay hidden while `omit_expired` is on.
 
 ```python
-store.disable_ttl()
+store.disable_ttl()  # async: await store.adisable_ttl()
 ```
 
-On `AsyncCockroachDBStore` these are coroutines with the same names: `await store.sweep_ttl()`, `await store.start_ttl_sweeper()` (it returns an `asyncio.Task`), `await store.stop_ttl_sweeper()` and `await store.disable_ttl()`.
+On `AsyncCockroachDBStore`, `sweep_ttl()`, `start_ttl_sweeper()` (it returns an `asyncio.Task`) and `stop_ttl_sweeper()` are coroutines with the same names, as in AsyncPostgresStore. Turning TTL off is `await store.adisable_ttl()`.
 
 ## Deleting a Namespace
 
@@ -520,7 +520,7 @@ This snippet was checked against the Deep Agents documentation (deepagents 0.5 a
 6. **Configurable tables.** `table_name` and `schema` set the table names, so one database can hold several stores.
 7. **`delete_namespace`.** `delete_namespace(namespace_prefix)` and `adelete_namespace` delete a namespace and its descendants in one transaction and return the number of items deleted.
 8. **Warnings and checks.** A `query` on a store without `index` logs a WARNING. Changing the index configuration after `setup()` raises an error or logs a warning, as described in [Changing the Index Configuration](#changing-the-index-configuration).
-9. **`disable_ttl` and `drop_vector_index`.** `disable_ttl()` removes the table TTL setting, and `drop_vector_index()` drops the vector index so that `setup()` can build it again, for example with another distance.
+9. **`disable_ttl` and `drop_vector_index`.** `disable_ttl()` and `adisable_ttl()` remove the table TTL setting, and `drop_vector_index()` and `adrop_vector_index()` drop the vector index so that `setup()` can build it again, for example with another distance.
 
 ## Next Steps
 

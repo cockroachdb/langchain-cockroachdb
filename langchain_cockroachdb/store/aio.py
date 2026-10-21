@@ -580,13 +580,18 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         logger.info("TTL sweeper task stopped")
         return True
 
-    async def disable_ttl(self) -> None:
+    async def adisable_ttl(self) -> None:
         """Turn off CockroachDB row-level TTL on the store's tables.
 
         Expired items are still left out of reads while omit_expired is on.
+        Safe to run from several processes at once. On CockroachDB v25.4 a
+        TTL change fails while another schema change runs on the same table;
+        that error is retried under the store's retry policy, even if its
+        ``retry_on`` would refuse it. ``max_attempts=1`` turns this off.
         """
+        policy = schema_change_policy(self.retry_policy)
         for statement in self.sql.disable_ttl_statements():
-            await self._run_ddl(statement, "store disable TTL")
+            await self._run_ddl(statement, "store disable TTL", policy=policy)
 
     def __del__(self) -> None:
         # AsyncBatchedBaseStore.__del__ reads _task, which a failed __init__ never set
