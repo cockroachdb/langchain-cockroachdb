@@ -39,6 +39,7 @@ every write it makes is safe to run twice.
 | `langchain_cockroachdb/store/` | `store.py` (`CockroachDBStore`), `aio.py` (`AsyncCockroachDBStore`), `base.py` (batch planning both share), `sql.py`, `config.py`, `filters.py`, `namespaces.py` |
 | `langchain_cockroachdb/retry.py` | `RetryPolicy` and error classification by SQLSTATE |
 | `langchain_cockroachdb/_psycopg_ops.py` | Retries, hang guard and one-batch writes shared by the checkpointers and the store |
+| `langchain_cockroachdb/_psycopg_conn.py` | Connection checkout for a psycopg connection or pool, and the errors shared by the checkpointers and the store |
 | `langchain_cockroachdb/_guard.py` | Hang guard that abandons an attempt the server never answers |
 | `langchain_cockroachdb/_loop.py` | Background event loop for the sync API, reset after `fork()` |
 | `langchain_cockroachdb/_connection.py` | URL normalization and connection defaults (`connect_timeout`, `gssencmode`) |
