@@ -33,10 +33,10 @@ from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
-from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
@@ -127,7 +127,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
     def __init__(
         self,
-        conn: _ainternal.Conn,
+        conn: _psycopg_conn.AsyncConn,
         *,
         pipe: AsyncPipeline | None = None,
         index: CockroachDBIndexConfig | None = None,
@@ -230,7 +230,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         url = to_libpq_url(conn_string)
         options = dict(connect_kwargs or {})
 
-        def make(conn: _ainternal.Conn, pipe: AsyncPipeline | None = None) -> AsyncCockroachDBStore:
+        def make(
+            conn: _psycopg_conn.AsyncConn, pipe: AsyncPipeline | None = None
+        ) -> AsyncCockroachDBStore:
             return cls(
                 conn,
                 pipe=pipe,

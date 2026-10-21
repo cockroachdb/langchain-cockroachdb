@@ -29,7 +29,7 @@ from langgraph.store.base import (
 )
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
-from langchain_cockroachdb.async_vectorstore import _find_vector_index
+from langchain_cockroachdb.indexes import _find_vector_index
 from langchain_cockroachdb.store.config import (
     ResolvedIndex,
     ResolvedTTL,

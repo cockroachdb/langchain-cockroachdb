@@ -33,15 +33,15 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
-from langchain_cockroachdb.checkpointer import _internal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
 
-Conn = _internal.Conn
+Conn = _psycopg_conn.Conn
 
 
 def _sanitize_conn_string(conn_string: str) -> str:
@@ -90,7 +90,7 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
     def __init__(
         self,
-        conn: _internal.Conn,
+        conn: _psycopg_conn.Conn,
         pipe: Pipeline | None = None,
         serde: SerializerProtocol | None = None,
         *,

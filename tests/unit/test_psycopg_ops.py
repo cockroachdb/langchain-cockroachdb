@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -150,3 +152,42 @@ def test_hosts_must_name_their_component() -> None:
             type("Nameless", (base,), {})
         with pytest.raises(TypeError, match="component"):
             type("Blank", (base,), {"component": ""})
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "langchain_cockroachdb._psycopg_ops",
+        "langchain_cockroachdb.store",
+        "langchain_cockroachdb.checkpointer.saver",
+        "langchain_cockroachdb.indexes",
+    ],
+)
+def test_module_imports_first_in_a_fresh_interpreter(module: str) -> None:
+    # The shared machinery used to import the checkpointer package, which
+    # imports the savers, which import the machinery. Nothing may depend on
+    # which of these a program imports first.
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_old_internal_paths_reexport_the_shared_helpers() -> None:
+    from langchain_cockroachdb import _psycopg_conn
+    from langchain_cockroachdb.checkpointer import _ainternal, _internal
+
+    for name in (
+        "OPEN_TRANSACTION",
+        "Conn",
+        "check_committed",
+        "flag_broken_connection",
+        "get_connection",
+        "in_caller_transaction",
+        "mark_in_caller_transaction",
+        "stuck_batch_error",
+    ):
+        assert getattr(_internal, name) is getattr(_psycopg_conn, name), name
+    assert _ainternal.Conn is _psycopg_conn.AsyncConn
+    assert _ainternal.get_connection is _psycopg_conn.aget_connection
+    assert _ainternal.flag_broken_connection is _psycopg_conn.flag_broken_connection

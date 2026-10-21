@@ -27,9 +27,9 @@ from psycopg import Capabilities, Connection, Cursor, Pipeline
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import ConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
-from langchain_cockroachdb.checkpointer import _internal
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
@@ -87,7 +87,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
     def __init__(
         self,
-        conn: _internal.Conn,
+        conn: _psycopg_conn.Conn,
         *,
         pipe: Pipeline | None = None,
         index: CockroachDBIndexConfig | None = None,
@@ -178,7 +178,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         url = to_libpq_url(conn_string)
         options = dict(connect_kwargs or {})
 
-        def make(conn: _internal.Conn, pipe: Pipeline | None = None) -> CockroachDBStore:
+        def make(conn: _psycopg_conn.Conn, pipe: Pipeline | None = None) -> CockroachDBStore:
             return cls(
                 conn,
                 pipe=pipe,

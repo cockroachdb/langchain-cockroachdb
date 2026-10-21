@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -27,7 +26,13 @@ from langchain_cockroachdb.hybrid_search_config import (
     HybridSearchConfig,
     min_max_normalize,
 )
-from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
+from langchain_cockroachdb.indexes import (
+    CSPANNIndex,
+    CSPANNQueryOptions,
+    DistanceStrategy,
+    _ExistingVectorIndex,
+    _find_vector_index,
+)
 from langchain_cockroachdb.retry import RetryPolicy, resolve_retry_policy
 
 logger = logging.getLogger(__name__)
@@ -105,45 +110,6 @@ class _Rows:
     ids: list[str]
     batch_size: int
     caller_supplied_ids: list[str]
-
-
-@dataclass
-class _ExistingVectorIndex:
-    """A vector index as SHOW CREATE TABLE renders it."""
-
-    definition: str
-    columns: list[str]
-    options: dict[str, str]
-
-
-def _find_vector_index(create_statement: str, name: str) -> _ExistingVectorIndex | None:
-    """Find the vector index ``name`` in a SHOW CREATE TABLE statement.
-
-    SHOW CREATE TABLE renders a line such as
-    ``VECTOR INDEX idx ("tenant", ns, embedding vector_cosine_ops) WITH
-    (min_partition_size=10, max_partition_size=50)`` on every supported
-    version. Column names that are keywords come back quoted. Returns None
-    when no such line exists.
-    """
-    match = re.search(
-        rf'^\s*VECTOR INDEX "?{re.escape(name)}"? \((?P<columns>[^)]*)\)'
-        r"(?: WITH \((?P<options>[^)]*)\))?",
-        create_statement,
-        re.MULTILINE | re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    columns = [
-        part.split()[0].strip('"').lower()
-        for part in match.group("columns").split(",")
-        if part.strip()
-    ]
-    options = {}
-    for option in (match.group("options") or "").split(","):
-        key, sep, value = option.partition("=")
-        if sep:
-            options[key.strip().lower()] = value.strip()
-    return _ExistingVectorIndex(match.group(0), columns, options)
 
 
 def _check_batch_size(batch_size: Any) -> int:

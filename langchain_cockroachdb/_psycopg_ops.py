@@ -23,9 +23,9 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._guard import aabandon_after, abandon_after
 from langchain_cockroachdb._loop import LoopMessages, run_on_external_loop
-from langchain_cockroachdb.checkpointer import _ainternal, _internal
 from langchain_cockroachdb.retry import RetryPolicy
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ class PsycopgOps:
     # point it at its own module's logger
     _log: ClassVar[logging.Logger] = logger
 
-    conn: _internal.Conn
+    conn: _psycopg_conn.Conn
     pipe: Pipeline | None
     # Runs operations one at a time on a single connection; a pool needs no lock
     lock: threading.Lock
@@ -96,7 +96,7 @@ class PsycopgOps:
             )
             return False
         # The caller owns its transaction, so it decides whether to retry all of it
-        return not _internal.in_caller_transaction(error)
+        return not _psycopg_conn.in_caller_transaction(error)
 
     def _run_ddl(self, statement: str, label: str, *, policy: RetryPolicy | None = None) -> None:
         """Run a single DDL statement with retry and timeout.
@@ -148,7 +148,7 @@ class PsycopgOps:
             with contextlib.suppress(Exception):
                 self.pipe.sync()
                 synced = True
-        if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+        if conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
             with contextlib.suppress(Exception):
                 conn.rollback()
                 synced = True
@@ -187,8 +187,8 @@ class PsycopgOps:
                 synced = self._roll_back_batch(conn, synced=synced)
             finally:
                 self._settle_batch_flag(conn, synced=synced)
-            if self._batch_open and conn.info.transaction_status in _internal.OPEN_TRANSACTION:
-                raise _internal.stuck_batch_error(self.component)
+            if self._batch_open and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
+                raise _psycopg_conn.stuck_batch_error(self.component)
         return (
             transaction
             and pipeline
@@ -224,7 +224,7 @@ class PsycopgOps:
                     pipe.sync()
                     synced = True
                 if batched:
-                    _internal.check_committed(tx)
+                    _psycopg_conn.check_committed(tx)
         except BaseException:
             # A pipeline only exists on a single connection, so the lock is held
             # here. Resync before releasing it, so other threads' queued statements
@@ -258,7 +258,7 @@ class PsycopgOps:
             finally:
                 if own_connection:
                     self._settle_batch_flag(conn, synced=True)
-            _internal.check_committed(tx)
+            _psycopg_conn.check_committed(tx)
 
     @contextmanager
     def _cursor(
@@ -288,14 +288,14 @@ class PsycopgOps:
         """
         if label is None:
             label = _operation_label(self.component)
-        with self._operation_lock(), _internal.get_connection(self.conn) as conn:
+        with self._operation_lock(), _psycopg_conn.get_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             with abandon_after(fileno, timeout, label=label):
                 batched = self._prepare_batch(conn, pipeline=pipeline, transaction=transaction)
                 # Open now and not a stopped batch of ours: the caller's transaction
                 in_callers_transaction = (
                     not self._batch_open
-                    and conn.info.transaction_status in _internal.OPEN_TRANSACTION
+                    and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
                 try:
                     if self.pipe:
@@ -327,7 +327,7 @@ class PsycopgOps:
                             yield cur
                 except Exception as error:
                     if in_callers_transaction:
-                        _internal.mark_in_caller_transaction(error)
+                        _psycopg_conn.mark_in_caller_transaction(error)
                     raise
 
 
@@ -351,7 +351,7 @@ class AsyncPsycopgOps:
     _own_loop_message: ClassVar[str]
     _loop_messages: ClassVar[LoopMessages]
 
-    conn: _ainternal.Conn
+    conn: _psycopg_conn.AsyncConn
     pipe: AsyncPipeline | None
     # Runs operations one at a time on a single connection; a pool needs no lock
     lock: asyncio.Lock
@@ -388,7 +388,7 @@ class AsyncPsycopgOps:
             )
             return False
         # The caller owns its transaction, so it decides whether to retry all of it
-        return not _internal.in_caller_transaction(error)
+        return not _psycopg_conn.in_caller_transaction(error)
 
     def _run_sync(self, coro: Coroutine[Any, Any, T]) -> T:
         """Run ``coro`` on the component's loop and wait for the result.
@@ -446,7 +446,7 @@ class AsyncPsycopgOps:
             with contextlib.suppress(Exception):
                 await self.pipe.sync()
                 synced = True
-        if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
+        if conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
             with contextlib.suppress(Exception):
                 await conn.rollback()
                 synced = True
@@ -485,8 +485,8 @@ class AsyncPsycopgOps:
                 synced = await self._roll_back_batch(conn, synced=synced)
             finally:
                 self._settle_batch_flag(conn, synced=synced)
-            if self._batch_open and conn.info.transaction_status in _internal.OPEN_TRANSACTION:
-                raise _internal.stuck_batch_error(self.component)
+            if self._batch_open and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
+                raise _psycopg_conn.stuck_batch_error(self.component)
         return (
             transaction
             and pipeline
@@ -525,7 +525,7 @@ class AsyncPsycopgOps:
                     await pipe.sync()
                     synced = True
                 if batched:
-                    _internal.check_committed(tx)
+                    _psycopg_conn.check_committed(tx)
         except BaseException:
             # A pipeline only exists on a single connection, so the lock is held
             # here. Resync before releasing it, so other tasks' queued statements
@@ -564,7 +564,7 @@ class AsyncPsycopgOps:
             finally:
                 if own_connection:
                     self._settle_batch_flag(conn, synced=True)
-            _internal.check_committed(tx)
+            _psycopg_conn.check_committed(tx)
 
     @asynccontextmanager
     async def _cursor(
@@ -595,7 +595,7 @@ class AsyncPsycopgOps:
         """
         if label is None:
             label = _operation_label(self.component)
-        async with self._operation_lock(), _ainternal.get_connection(self.conn) as conn:
+        async with self._operation_lock(), _psycopg_conn.aget_connection(self.conn) as conn:
             fileno = conn.fileno() if timeout is not None else None
             async with aabandon_after(fileno, timeout, label=label):
                 batched = await self._prepare_batch(
@@ -604,7 +604,7 @@ class AsyncPsycopgOps:
                 # Open now and not a stopped batch of ours: the caller's transaction
                 in_callers_transaction = (
                     not self._batch_open
-                    and conn.info.transaction_status in _internal.OPEN_TRANSACTION
+                    and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
                 try:
                     if self.pipe:
@@ -636,7 +636,7 @@ class AsyncPsycopgOps:
                             yield cur
                 except Exception as error:
                     if in_callers_transaction:
-                        _internal.mark_in_caller_transaction(error)
+                        _psycopg_conn.mark_in_caller_transaction(error)
                     raise
 
     async def _run_ddl(

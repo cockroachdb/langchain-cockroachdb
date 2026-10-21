@@ -39,16 +39,16 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
-from langchain_cockroachdb.checkpointer import _ainternal
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
 
-Conn = _ainternal.Conn
+Conn = _psycopg_conn.AsyncConn
 
 _OWN_LOOP = (
     "Synchronous calls to AsyncCockroachDBSaver are only allowed from a "
@@ -139,7 +139,7 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
 
     def __init__(
         self,
-        conn: _ainternal.Conn,
+        conn: _psycopg_conn.AsyncConn,
         pipe: AsyncPipeline | None = None,
         serde: SerializerProtocol | None = None,
         *,
