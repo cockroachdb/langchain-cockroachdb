@@ -48,6 +48,9 @@ python examples/chat_history.py
 # Checkpointer - LangGraph state persistence
 python examples/checkpointer.py
 
+# Long-term memory - LangGraph store with semantic search and TTL
+python examples/long_term_memory.py
+
 # Multi-tenancy - namespace-based tenant isolation
 python examples/multi_tenancy.py
 ```
@@ -158,6 +161,18 @@ Namespace-based multi-tenancy:
 - Admin view (no namespace) for cross-tenant access
 
 **Good for**: SaaS applications, multi-tenant RAG pipelines
+
+### 11. long_term_memory.py
+
+LangGraph long-term memory store with CockroachDB:
+- A LangGraph agent that saves a memory in one thread and recalls it in another
+- Semantic search on a C-SPANN index, with a scripted model and fake embeddings (no API key)
+- Row-level TTL, and items that never expire
+- Store and checkpointer on one connection pool
+- Listing namespaces and deleting a user with `delete_namespace`
+- Sync and async stores
+
+**Good for**: LangGraph and Deep Agents memory, per-user data, requests to forget a user
 
 ## Next Steps
 

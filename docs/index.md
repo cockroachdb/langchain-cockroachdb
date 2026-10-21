@@ -40,6 +40,12 @@ This package provides LangChain abstractions backed by CockroachDB, leveraging C
 - **Fault Tolerance**: Recover from process restarts without losing progress
 - **Sync & Async**: Both `CockroachDBSaver` and `AsyncCockroachDBSaver`
 
+### LangGraph Long-Term Memory
+- **Long-Term Memory**: [Memory that every thread can read](guides/long-term-memory.md), for LangGraph agents and Deep Agents
+- **Semantic Search**: C-SPANN vector index with the namespace as a prefix column
+- **Expiry**: CockroachDB row-level TTL deletes expired memories, with no sweeper thread
+- **Sync & Async**: Both `CockroachDBStore` and `AsyncCockroachDBStore`
+
 ### 🔄 Async & Sync APIs
 - **Async-First**: High-performance async operations for I/O concurrency
 - **Sync Wrapper**: Simple synchronous API for scripts and batch jobs

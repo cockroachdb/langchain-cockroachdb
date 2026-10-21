@@ -15,10 +15,12 @@ A LangChain and LangGraph integration for CockroachDB:
 - hybrid search (full-text plus vector)
 - chat message history
 - the LangGraph checkpointers `CockroachDBSaver` and `AsyncCockroachDBSaver`
+- the LangGraph long-term memory stores `CockroachDBStore` and
+  `AsyncCockroachDBStore`, with semantic search and row-level TTL
 
 The vector store, chat history and engine use SQLAlchemy's async engine with
-psycopg 3. The checkpointers use psycopg directly, like LangGraph's
-PostgresSaver.
+psycopg 3. The checkpointers and the store use psycopg directly, like
+LangGraph's PostgresSaver and PostgresStore.
 
 CockroachDB runs every transaction at SERIALIZABLE. The library does not ask
 users to switch to READ COMMITTED. Instead it retries transient errors, and
@@ -34,7 +36,9 @@ every write it makes is safe to run twice.
 | `langchain_cockroachdb/hybrid_search_config.py` | Hybrid search settings and score fusion |
 | `langchain_cockroachdb/chat_message_histories.py` | `CockroachDBChatMessageHistory` |
 | `langchain_cockroachdb/checkpointer/` | `base.py` (SQL, migrations), `saver.py`, `async_saver.py` |
+| `langchain_cockroachdb/store/` | `store.py` (`CockroachDBStore`), `aio.py` (`AsyncCockroachDBStore`), `base.py` (batch planning both share), `sql.py`, `config.py`, `filters.py`, `namespaces.py` |
 | `langchain_cockroachdb/retry.py` | `RetryPolicy` and error classification by SQLSTATE |
+| `langchain_cockroachdb/_psycopg_ops.py` | Retries, hang guard and one-batch writes shared by the checkpointers and the store |
 | `langchain_cockroachdb/_guard.py` | Hang guard that abandons an attempt the server never answers |
 | `langchain_cockroachdb/_loop.py` | Background event loop for the sync API, reset after `fork()` |
 | `langchain_cockroachdb/_connection.py` | URL normalization and connection defaults (`connect_timeout`, `gssencmode`) |
