@@ -172,6 +172,8 @@ LangGraph long-term memory store with CockroachDB:
 - Listing namespaces and deleting a user with `delete_namespace`
 - Sync and async stores
 
+Needs the `langchain` package: `pip install langchain`.
+
 **Good for**: LangGraph and Deep Agents memory, per-user data, requests to forget a user
 
 ## Next Steps

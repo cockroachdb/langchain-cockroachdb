@@ -1,5 +1,9 @@
 """Long-term memory for a LangGraph agent, kept in CockroachDB.
 
+It uses create_agent from the langchain package, which also installs langgraph:
+
+    pip install langchain-cockroachdb langchain
+
 Run it against a local cluster:
 
     COCKROACHDB_URL="cockroachdb://root@localhost:26257/defaultdb?sslmode=disable" \\

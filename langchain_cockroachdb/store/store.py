@@ -2,8 +2,8 @@
 
 Provides the interface of langgraph-checkpoint-postgres's PostgresStore on
 CockroachDB. Every operation retries transient errors under the store's
-RetryPolicy, and every write is an UPSERT or a DELETE, so a retry after an
-ambiguous result is safe.
+RetryPolicy. Every write is an UPSERT, a DELETE, or an UPDATE that pushes
+back an expiry, so a retry after an ambiguous result is safe.
 """
 
 from __future__ import annotations

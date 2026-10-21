@@ -3,8 +3,8 @@
 Provides the interface of langgraph-checkpoint-postgres's AsyncPostgresStore
 on CockroachDB. It plans batches with the same code as CockroachDBStore and
 runs the same SQL. Every operation retries transient errors under the
-store's RetryPolicy, and every write is an UPSERT or a DELETE, so a retry
-after an ambiguous result is safe.
+store's RetryPolicy. Every write is an UPSERT, a DELETE, or an UPDATE that
+pushes back an expiry, so a retry after an ambiguous result is safe.
 """
 
 from __future__ import annotations

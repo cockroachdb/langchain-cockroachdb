@@ -5,6 +5,9 @@
 ## Running the Example
 
 ```bash
+# Install the package, and langchain for create_agent (it also installs langgraph)
+pip install langchain-cockroachdb langchain
+
 # Start CockroachDB
 docker-compose up -d
 

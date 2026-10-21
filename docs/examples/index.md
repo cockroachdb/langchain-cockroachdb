@@ -63,7 +63,7 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 
 2. **Install package:**
    ```bash
-   pip install langchain-cockroachdb langchain-openai
+   pip install langchain-cockroachdb langchain-openai langchain
    ```
 
 3. **Set connection string (optional):**

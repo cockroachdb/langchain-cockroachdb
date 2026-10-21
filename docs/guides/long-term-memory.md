@@ -128,7 +128,7 @@ Create an `AsyncCockroachDBStore` inside a running event loop. Its sync methods 
 
 ## Retries and Atomic Writes
 
-Every call retries transient CockroachDB errors under the store's `RetryPolicy`. Pass `retry_policy=` to change it; see [Retries and Resilience](resilience.md) for the fields. Every write is an UPSERT or a DELETE, so a retry after an ambiguous result is safe.
+Every call retries transient CockroachDB errors under the store's `RetryPolicy`. Pass `retry_policy=` to change it; see [Retries and Resilience](resilience.md) for the fields. Every write is an UPSERT, a DELETE, or an UPDATE that pushes back an expiry. Each is safe to run twice, so a retry after an ambiguous result is safe.
 
 A `batch()` call validates every op and serializes every value before any statement runs. It then runs its gets, searches and listings, each kind as one round of reads, and commits all its puts and deletes together in one transaction. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
 
@@ -136,7 +136,7 @@ On CockroachDB v25.4, a TTL change can meet a schema change that another process
 
 ## Namespaces and Items
 
-An item is a JSON object, addressed by a namespace (a tuple of labels) and a key. The store keeps a namespace as its labels joined with `.`, so a label must be a non-empty string without `.`. LangGraph reserves `"langgraph"` as the first label.
+An item is a JSON object, addressed by a namespace (a tuple of labels) and a key. LangGraph's `BaseStore` requires every label to be a non-empty string without `.`, in every store, and reserves `"langgraph"` as the first label. This store keeps a namespace as its labels joined with `.`, as PostgresStore does, and checks the labels again for ops passed straight to `batch()`.
 
 ```python
 store.put(("user", "alice", "memories"), "seat", {"text": "Prefers window seats", "stars": 5})
@@ -151,6 +151,8 @@ store.delete(("user", "alice", "profile"), "name")
 A value that cannot be stored as JSON, including NaN and infinity, raises `ValueError` before anything is written.
 
 ### Listing Namespaces
+
+With items in `("user", "alice", "memories")`, `("user", "alice", "profile")` and `("user", "bob", "memories")`:
 
 ```python
 store.list_namespaces(prefix=("user", "alice"))
@@ -292,7 +294,7 @@ with CockroachDBStore.from_conn_string(
 
 ### The TTL Job
 
-CockroachDB deletes expired rows itself, with [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). With a `ttl` configuration, `setup()` sets `ttl_expiration_expression` to the `expires_at` column on the items table, and on the vectors table when there is an index. The job runs on the cron that `sweep_interval_minutes` gives, or `ttl_job_cron`, and hourly (`@hourly`) by default. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.
+CockroachDB deletes expired rows itself, with [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). With a `ttl` configuration, `setup()` sets `ttl_expiration_expression` to the `expires_at` column on the items table, and on the vectors table when there is an index. The job runs on the cron that `sweep_interval_minutes` gives, or `ttl_job_cron`, and hourly (`@hourly`) by default. A changed `sweep_interval_minutes` or `ttl_job_cron` takes effect at the next `setup()`. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.
 
 The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because `omit_expired` is on by default. That holds even for a store built without `ttl`, since another process may write items with an expiry to the same tables. Pass `ttl={"omit_expired": False}` to see expired items until the job deletes them.
 
@@ -347,6 +349,8 @@ deleted = store.delete_namespace(("user", "alice"))  # async: await store.adelet
 | `store_migrations` | The migration versions applied |
 
 `table_name="memories"` names the tables `memories`, `memories_vectors` and `memories_migrations`, so several stores can share a database. `schema=` puts them in another schema, which must exist. The default schema is `public`.
+
+The store creates plain tables, with no multi-region locality such as `REGIONAL BY ROW` or `GLOBAL`. You can set one yourself with `ALTER TABLE`; `setup()` leaves it as you set it.
 
 ## Use with LangGraph
 
@@ -506,7 +510,7 @@ with CockroachDBStore.from_conn_string(DB_URI, pool_config={"max_size": 10}) as 
     )
 ```
 
-Files under `/memories/` go to the store and outlive the thread. Other files stay in the thread's state. Deep Agents accepts `.` in namespace labels and this store does not, so build labels from ids without dots: replace the dots in an email address, for example.
+Files under `/memories/` go to the store and outlive the thread. Other files stay in the thread's state. Deep Agents accepts `.` in namespace labels, but LangGraph's `BaseStore` rejects such a label with `InvalidNamespaceError` in every store, `InMemoryStore` and `PostgresStore` included. Build labels from ids without dots: replace the dots in an email address, for example.
 
 This snippet was checked against the Deep Agents documentation (deepagents 0.5 and later), not run in this project's tests.
 
