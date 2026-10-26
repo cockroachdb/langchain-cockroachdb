@@ -48,6 +48,8 @@ from langchain_cockroachdb.store.sql import NAMESPACES, StoreSQL, bind
 DIMS = 16
 FORMS = ("indexed", "flat", "root", "fallback")
 MODEL = DeterministicFakeEmbedding(size=DIMS)
+# How long the plan test plans again, until every node has the new statistics
+STATS_WAIT = 60
 
 Item = tuple[tuple[str, ...], str, dict[str, Any]]
 
@@ -520,12 +522,14 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     # seconds after ANALYZE. Until then the optimizer may plan with the empty
     # table it saw at creation and scan, so plan again until it sees them.
     statement = bound(store.sql.semantic_search_in(over_fetch=7, **common))
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + STATS_WAIT
     while "vector search" not in (indexed := explain(admin, statement)):
         if time.monotonic() > deadline:
             break
         time.sleep(1)
-    assert "vector search" in indexed, indexed
+    assert "vector search" in indexed, (
+        f"no vector search after {STATS_WAIT} s of planning again:\n{indexed}"
+    )
     assert store.sql.vector_index_name in indexed, indexed
     assert "window" in indexed, indexed
     # The count of the namespace's vectors is a scan of the primary key over

@@ -13,9 +13,9 @@ buffer, so a write of about a megabyte cannot leave in one flush. Each write
 must finish within DEADLINE seconds. One that does not is stopped by cutting
 the proxy, and the test fails.
 
-The components now send what libpq still holds before each sync. On a link
-that went dead that wait cannot end, and the hang guard must cut it off like
-any other.
+The components now send what libpq still holds as each operation starts and
+before each sync. On a link that went dead that wait cannot end, and the
+hang guard must cut it off like any other.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import uuid
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, TypeVar
 
@@ -34,7 +35,7 @@ import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.store.base import PutOp
-from psycopg import AsyncConnection, AsyncPipeline, Connection, Pipeline
+from psycopg import AsyncConnection, AsyncPipeline, Connection, Pipeline, sql
 
 from langchain_cockroachdb import (
     AsyncCockroachDBSaver,
@@ -72,7 +73,10 @@ def table_name(libpq_url: str) -> Iterator[str]:
     """A fresh items table name, whose tables are dropped after the test."""
     name = f"store_{uuid.uuid4().hex[:10]}"
     yield name
-    drop_store_tables(libpq_url, name)
+    try:
+        drop_store_tables(libpq_url, name)
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(f"store table cleanup failed: {error!r}", UserWarning, stacklevel=1)
 
 
 def index_config() -> dict[str, Any]:
@@ -111,6 +115,23 @@ def write_rows(libpq_url: str, thread: str) -> int:
         ).fetchone()
     assert row is not None
     return row[0]
+
+
+def delete_thread(libpq_url: str, thread: str) -> None:
+    """Delete the checkpoint rows of ``thread`` without the proxy; warn if that fails.
+
+    The checkpoint tables are shared, so rows left behind pile up in a
+    database that is not thrown away after the run.
+    """
+    try:
+        with psycopg.connect(libpq_url, autocommit=True) as conn:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                conn.execute(
+                    sql.SQL("DELETE FROM {} WHERE thread_id = %s").format(sql.Identifier(table)),
+                    (thread,),
+                )
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(f"checkpoint row cleanup failed: {error!r}", UserWarning, stacklevel=1)
 
 
 @contextlib.contextmanager
@@ -229,50 +250,69 @@ async def test_async_store_put_finishes_on_a_slow_link(libpq_url: str, table_nam
 @pytest.mark.timeout(120)
 def test_sync_saver_put_writes_finishes_on_a_slow_link(libpq_url: str) -> None:
     thread = str(uuid.uuid4())
-    with SlowProxy.to(libpq_url) as proxy, pipelined(libpq_url, proxy) as (conn, pipe):
-        saver = CockroachDBSaver(conn, pipe, retry_policy=ONE_ATTEMPT)
-        saver.setup()
-        saved = saver.put(config(thread), empty_checkpoint(), {}, {})
-        writes = large_writes()
-        finish_within(proxy, lambda: saver.put_writes(saved, writes, task_id="t1"))
-        found = saver.get_tuple(saved)
-        assert found is not None
-        assert {channel: value for _, channel, value in found.pending_writes} == dict(writes)
-        assert proxy.connections == 1
-    assert write_rows(libpq_url, thread) == WRITES
+    try:
+        with SlowProxy.to(libpq_url) as proxy, pipelined(libpq_url, proxy) as (conn, pipe):
+            saver = CockroachDBSaver(conn, pipe, retry_policy=ONE_ATTEMPT)
+            saver.setup()
+            saved = saver.put(config(thread), empty_checkpoint(), {}, {})
+            writes = large_writes()
+            finish_within(proxy, lambda: saver.put_writes(saved, writes, task_id="t1"))
+            found = saver.get_tuple(saved)
+            assert found is not None
+            pending = {channel: value for _, channel, value in found.pending_writes}
+            assert pending == dict(writes)
+            assert proxy.connections == 1
+        assert write_rows(libpq_url, thread) == WRITES
+    finally:
+        delete_thread(libpq_url, thread)
 
 
 @pytest.mark.timeout(120)
 async def test_async_saver_put_writes_finishes_on_a_slow_link(libpq_url: str) -> None:
     thread = str(uuid.uuid4())
-    with SlowProxy.to(libpq_url) as proxy:
-        async with apipelined(libpq_url, proxy) as (conn, pipe):
-            saver = AsyncCockroachDBSaver(conn, pipe, retry_policy=ONE_ATTEMPT)
-            await saver.setup()
-            saved = await saver.aput(config(thread), empty_checkpoint(), {}, {})
-            writes = large_writes()
-            await afinish_within(proxy, saver.aput_writes(saved, writes, task_id="t1"))
-            found = await saver.aget_tuple(saved)
-            assert found is not None
-            assert {channel: value for _, channel, value in found.pending_writes} == dict(writes)
-            assert proxy.connections == 1
-    assert write_rows(libpq_url, thread) == WRITES
+    try:
+        with SlowProxy.to(libpq_url) as proxy:
+            async with apipelined(libpq_url, proxy) as (conn, pipe):
+                saver = AsyncCockroachDBSaver(conn, pipe, retry_policy=ONE_ATTEMPT)
+                await saver.setup()
+                saved = await saver.aput(config(thread), empty_checkpoint(), {}, {})
+                writes = large_writes()
+                await afinish_within(proxy, saver.aput_writes(saved, writes, task_id="t1"))
+                found = await saver.aget_tuple(saved)
+                assert found is not None
+                pending = {channel: value for _, channel, value in found.pending_writes}
+                assert pending == dict(writes)
+                assert proxy.connections == 1
+        assert write_rows(libpq_url, thread) == WRITES
+    finally:
+        delete_thread(libpq_url, thread)
 
 
 class Stall:
-    """Stops the proxy as a drain starts, and records how each drain ended."""
+    """Stops the proxy when a drain finds bytes to send, and records how each drain ended.
+
+    The drain that starts an operation finds nothing to send, so it passes.
+    The drain at the end of the write finds the rest of the batch.
+    """
 
     def __init__(self, proxy: SlowProxy) -> None:
         self.proxy = proxy
         self.ended: list[str] = []
+        # Where in ``ended`` the drain that stalled the proxy is
+        self.stalled: int | None = None
+
+    def _start(self, conn: Any) -> None:
+        if self.stalled is None and conn.pgconn.flush():
+            self.stalled = len(self.ended)
+            self.proxy.stall()
 
     def _end(self, error: BaseException | None) -> None:
         self.ended.append("sent" if error is None else type(error).__name__)
 
     def around(self, drain: Callable[[Any], None]) -> Callable[[Any], None]:
         def stall_then_drain(conn: Any) -> None:
-            self.proxy.stall()
             try:
+                self._start(conn)
                 drain(conn)
             except BaseException as error:
                 self._end(error)
@@ -285,8 +325,8 @@ class Stall:
         self, drain: Callable[[Any], Awaitable[None]]
     ) -> Callable[[Any], Awaitable[None]]:
         async def stall_then_drain(conn: Any) -> None:
-            self.proxy.stall()
             try:
+                self._start(conn)
                 await drain(conn)
             except BaseException as error:
                 self._end(error)
@@ -296,10 +336,10 @@ class Stall:
         return stall_then_drain
 
     def assert_cut_off_by_the_guard(self, caplog: pytest.LogCaptureFixture) -> None:
-        assert self.ended, "the write never reached the drain"
-        # The first drain never finished: the guard shut its socket after
-        # GUARD seconds, long before the test would have cut the proxy
-        assert self.ended[0] == "OperationalError"
+        assert self.stalled is not None, "no drain found bytes left to send"
+        # That drain never finished: the guard shut its socket after GUARD
+        # seconds, long before the test would have cut the proxy
+        assert self.ended[self.stalled] == "OperationalError"
         assert ABANDONED in caplog.text
 
 

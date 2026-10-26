@@ -205,6 +205,8 @@ def test_old_internal_paths_reexport_the_shared_helpers() -> None:
 # send() takes a readable socket too, and reads what the server sent meanwhile
 LEFT_OVER = [("flush", 1), ("wait", Wait.RW)]
 EMPTY = ("flush", 0)
+# A drain that finds bytes the last flush left behind
+DRAIN = [*LEFT_OVER, EMPTY]
 
 
 @pytest.fixture
@@ -220,6 +222,23 @@ def _single(kind: str, error: BaseException | None = None, **kwargs: Any) -> Any
 
 async def _maybe_await(result: Any) -> Any:
     return await result if asyncio.iscoroutine(result) else result
+
+
+def test_psycopg_still_has_the_send_that_the_drain_imports(psycopg_send: object) -> None:
+    assert callable(psycopg_send), (
+        "psycopg.generators.send is gone. _drain_output in _psycopg_ops imports it, so "
+        "pipeline mode needs another way to send what libpq's output buffer holds"
+    )
+
+
+def test_the_package_imports_without_psycopgs_send() -> None:
+    # The drain imports send() when it runs, so a psycopg without it would
+    # break pipeline mode only, not every import of the package
+    code = "import psycopg.generators as g; del g.send; import langchain_cockroachdb"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
@@ -259,9 +278,19 @@ async def _run_async_path(host: Any, where: str) -> None:
             await cur.execute("INSERT INTO t VALUES (1)")
 
 
+# How each path drains and syncs a component-wide pipeline. Every block
+# starts with a drain, and every sync comes right after a drain of its own
+STEPS = {
+    "write": ("drain", "drain", "sync"),
+    "statement": ("drain", "drain", "sync"),
+    "error": ("drain", "drain", "sync"),
+    "stopped batch": ("drain", "sync", "drain"),
+}
+
+
 @pytest.mark.usefixtures("_sockets")
 @pytest.mark.parametrize("kind", ["sync", "async"])
-@pytest.mark.parametrize("where", ["write", "statement", "error", "stopped batch"])
+@pytest.mark.parametrize("where", list(STEPS))
 async def test_every_component_pipeline_sync_comes_after_a_drain(kind: str, where: str) -> None:
     # The places that sync a component-wide pipeline: the end of a write, a
     # sync after a single statement, the resync after an error, and the sync
@@ -269,8 +298,9 @@ async def test_every_component_pipeline_sync_comes_after_a_drain(kind: str, wher
     error = psycopg.errors.UndefinedTable("relation does not exist")
     conn = _single(kind, error if where == "error" else None, fail_at=2)
     conn.in_pipeline_mode = True
-    # The first drain finds bytes that the last flush left behind
-    conn.pgconn = FakePGconn([1])
+    steps = STEPS[where]
+    # Every drain finds bytes that the last flush left behind
+    conn.pgconn = FakePGconn([1, 0] * steps.count("drain"))
     host = _host(kind, "store", conn)
     host.pipe = FakePipe(conn.pgconn.io) if kind == "sync" else FakeAsyncPipe(conn.pgconn.io)
     if where == "stopped batch":
@@ -280,7 +310,44 @@ async def test_every_component_pipeline_sync_comes_after_a_drain(kind: str, wher
     with pytest.raises(type(error)) if where == "error" else contextlib.nullcontext():
         await _maybe_await(run(host, where))
     assert host.pipe.syncs == 1
-    assert conn.pgconn.io == [*LEFT_OVER, EMPTY, ("sync",)]
+    assert conn.pgconn.io == [
+        event for step in steps for event in (DRAIN if step == "drain" else [("sync",)])
+    ]
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("opened_by", ["caller", "batch"])
+async def test_a_block_drains_first_what_the_caller_left_unsent(kind: str, opened_by: str) -> None:
+    # A caller that shares the pipelined connection can leave part of a large
+    # statement in libpq's buffer. psycopg syncs without draining as its
+    # conn.transaction() starts, so the block drains before that, and before
+    # it sends BEGIN
+    conn = _single(kind)
+    conn.in_pipeline_mode = True
+    if opened_by == "caller":
+        conn.info.transaction_status = TransactionStatus.INTRANS
+    conn.pgconn = FakePGconn([1], io=conn.events)
+    host = _host(kind, "store", conn)
+    host.pipe = FakePipe(conn.events) if kind == "sync" else FakeAsyncPipe(conn.events)
+    await _maybe_await((_run_sync_path if kind == "sync" else _run_async_path)(host, "write"))
+    insert = ("statement", "INSERT INTO t VALUES (1)")
+    if opened_by == "caller":
+        assert conn.events == [
+            *DRAIN,
+            ("transaction", "open"),
+            insert,
+            ("transaction", "close", None),
+        ]
+    else:
+        assert conn.events == [
+            *DRAIN,
+            ("statement", "BEGIN"),
+            insert,
+            ("statement", "COMMIT"),
+            EMPTY,
+            ("sync",),
+        ]
 
 
 @pytest.mark.usefixtures("_sockets")

@@ -19,7 +19,6 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, ClassVar, TypeVar
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Connection, Cursor, Pipeline
-from psycopg.generators import send
 from psycopg.pq import TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
@@ -92,7 +91,13 @@ class PsycopgOps:
         or TLS link the end of a batch and its Sync can stay behind, so the
         server waits for them while the client waits for the server. send()
         flushes until the buffer is empty, waiting for the socket in between.
+        While it waits it also reads what the server sends, so a server
+        blocked on its own output cannot deadlock it.
         """
+        # Imported here, so that a psycopg without send() breaks pipeline mode
+        # only, not every import of this package
+        from psycopg.generators import send
+
         conn.wait(send(conn.pgconn))
 
     def _sync_pipeline(self) -> None:
@@ -225,6 +230,10 @@ class PsycopgOps:
         batched: bool,
     ) -> Iterator[Cursor[DictRow]]:
         """Run the block on the component-wide pipeline, resyncing it after an error."""
+        # First send what a caller left unsent on the shared connection. A sync
+        # that psycopg runs itself, as when conn.transaction() starts, does not
+        # drain, so it would wait forever for a server still missing those bytes
+        self._drain_output(conn)
         # Whether a sync completed, so that libpq's status is current
         synced = False
         try:
@@ -401,8 +410,13 @@ class AsyncPsycopgOps:
         slow or TLS link the end of a batch and its Sync can stay behind, so
         the server waits for them while the client waits for the server.
         send() flushes until the buffer is empty, waiting for the socket in
-        between.
+        between. While it waits it also reads what the server sends, so a
+        server blocked on its own output cannot deadlock it.
         """
+        # Imported here, so that a psycopg without send() breaks pipeline mode
+        # only, not every import of this package
+        from psycopg.generators import send
+
         await conn.wait(send(conn.pgconn))
 
     async def _sync_pipeline(self) -> None:
@@ -542,6 +556,10 @@ class AsyncPsycopgOps:
         batched: bool,
     ) -> AsyncIterator[AsyncCursor[DictRow]]:
         """Run the block on the component-wide pipeline, resyncing it after an error."""
+        # First send what a caller left unsent on the shared connection. A sync
+        # that psycopg runs itself, as when conn.transaction() starts, does not
+        # drain, so it would wait forever for a server still missing those bytes
+        await self._drain_output(conn)
         # Whether a sync completed, so that libpq's status is current
         synced = False
         try:
