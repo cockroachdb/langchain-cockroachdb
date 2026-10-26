@@ -493,15 +493,18 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
 
     The window is small next to the namespace, so the optimizer prefers the
     index for the indexed form. The exact forms have no LIMIT it could
-    serve, so they scan, even though the index exists.
+    serve, so they scan, even though the index exists. Whether the index
+    wins is a cost decision: with 500 vectors a CockroachDB Cloud cluster
+    scanned the namespace instead, while 3,000 used the index there and
+    on every local version.
     """
     items: list[Item] = [
         (
             ("user", "big"),
-            f"k{i:03}",
+            f"k{i:04}",
             {"text": f"memory {i}", "type": "rare" if i % 25 == 3 else "c"},
         )
-        for i in range(500)
+        for i in range(3000)
     ]
     store = store_factory("pool", index=index_config())
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
