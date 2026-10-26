@@ -274,7 +274,8 @@ class SlowProxy:
     time and pauses ``pause`` seconds after each, behind a small receive
     buffer. From server to client it runs at full speed. Once the client's
     socket send buffer is full, libpq's flush() returns 1 with bytes still
-    to send; limit_send_buffer() keeps that buffer small. Connect with
+    to send; limit_send_buffer() keeps that buffer small. stall() stops the
+    client's bytes altogether, like a link that went dead. Connect with
     ``connect_kwargs``: libpq reaches the proxy but still checks TLS against
     the host name in the URL. Use it as a context manager; on exit it cuts
     every connection it forwards.
@@ -294,6 +295,9 @@ class SlowProxy:
         self._pause = pause
         self._lock = threading.Lock()
         self._closed = False
+        # Cleared by stall(), which holds the client's bytes back
+        self._flowing = threading.Event()
+        self._flowing.set()
         self._sockets: list[socket.socket] = []
         self._threads: list[threading.Thread] = []
         self.connections = 0
@@ -348,19 +352,29 @@ class SlowProxy:
                     return
                 self._sockets += [client, server]
                 self.connections += 1
-            self._start(self._pump, client, server, self._chunk, self._pause)
-            self._start(self._pump, server, client, 65536, 0.0)
+            self._start(self._pump, client, server, self._chunk, self._pause, self._flowing)
+            self._start(self._pump, server, client, 65536, 0.0, None)
 
     @staticmethod
-    def _pump(source: socket.socket, target: socket.socket, chunk: int, pause: float) -> None:
+    def _pump(
+        source: socket.socket,
+        target: socket.socket,
+        chunk: int,
+        pause: float,
+        flowing: threading.Event | None,
+    ) -> None:
         with contextlib.suppress(OSError):
-            while data := source.recv(chunk):
+            while (flowing is None or flowing.wait()) and (data := source.recv(chunk)):
                 target.sendall(data)
                 if pause:
                     time.sleep(pause)
         # Pass the end of the stream on, so each side sees the other close
         with contextlib.suppress(OSError):
             target.shutdown(socket.SHUT_WR)
+
+    def stall(self) -> None:
+        """Stop passing the client's bytes to the server, until close()."""
+        self._flowing.clear()
 
     def close(self) -> None:
         """Stop accepting and cut every forwarded connection."""
@@ -372,6 +386,8 @@ class SlowProxy:
         for sock in sockets:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
+        # Let stalled pumps see the shut down sockets and end
+        self._flowing.set()
         for thread in threads:
             thread.join(timeout=5)
         for sock in sockets:

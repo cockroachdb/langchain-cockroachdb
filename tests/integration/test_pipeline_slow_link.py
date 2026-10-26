@@ -12,12 +12,17 @@ on a few KB at a time, and the client's socket gets a small fixed send
 buffer, so a write of about a megabyte cannot leave in one flush. Each write
 must finish within DEADLINE seconds. One that does not is stopped by cutting
 the proxy, and the test fails.
+
+The components now send what libpq still holds before each sync. On a link
+that went dead that wait cannot end, and the hang guard must cut it off like
+any other.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 import uuid
@@ -44,7 +49,7 @@ from tests.integration.store.conftest import drop_store_tables
 
 T = TypeVar("T")
 
-# How long a write may take. Through the proxy each one takes a second or two
+# How long a write may take. Through the proxy each one takes about a second
 DEADLINE = 20.0
 SEND_BUFFER = 32 * 1024
 # 200 items with 256 dimensions: two vector statements of about 500 KB each
@@ -56,6 +61,10 @@ WRITES = 5
 WRITE_BYTES = 200_000
 # One attempt, so a failed write shows up as an error instead of a retry
 ONE_ATTEMPT = RetryPolicy(max_attempts=1)
+# The hang guard's attempt timeout: the write reaches its drain well within it
+GUARD = 5.0
+GUARDED = RetryPolicy(max_attempts=1, attempt_timeout=GUARD)
+ABANDONED = "attempt timeout; abandoning its connection"
 
 
 @pytest.fixture
@@ -75,7 +84,7 @@ def put_ops() -> list[PutOp]:
 
 
 def large_writes() -> list[tuple[str, str]]:
-    """Checkpoint writes whose values do not compress."""
+    """WRITES checkpoint writes of WRITE_BYTES characters each."""
     return [(f"channel{i}", os.urandom(WRITE_BYTES // 2).hex()) for i in range(WRITES)]
 
 
@@ -86,11 +95,12 @@ def config(thread: str) -> dict[str, Any]:
 def store_rows(libpq_url: str, table_name: str) -> tuple[int, int]:
     """Item rows and vector rows of the store, read without the proxy."""
     with psycopg.connect(libpq_url, autocommit=True) as conn:
-        counts = [
+        items, vectors = (
             conn.execute(f"SELECT count(*) FROM {table_name}{suffix}").fetchone()
             for suffix in ("", "_vectors")
-        ]
-    return counts[0][0], counts[1][0]  # type: ignore[index]
+        )
+    assert items is not None and vectors is not None
+    return items[0], vectors[0]
 
 
 def write_rows(libpq_url: str, thread: str) -> int:
@@ -105,12 +115,22 @@ def write_rows(libpq_url: str, thread: str) -> int:
 
 @contextlib.contextmanager
 def pipelined(libpq_url: str, proxy: SlowProxy) -> Iterator[tuple[Connection[Any], Pipeline]]:
-    """A single connection through ``proxy`` with a small send buffer, in pipeline mode."""
+    """A single connection through ``proxy`` with a small send buffer, in pipeline mode.
+
+    When the block finished after its connection was cut, leaving the
+    pipeline fails too. That error is dropped: the block expected the cut.
+    """
     options = connection_options(libpq_url, proxy.connect_kwargs, 10.0, 5)
     with Connection.connect(libpq_url, **options) as conn:
         limit_send_buffer(conn, SEND_BUFFER)
-        with conn.pipeline() as pipe:
-            yield conn, pipe
+        finished = False
+        try:
+            with conn.pipeline() as pipe:
+                yield conn, pipe
+                finished = True
+        except psycopg.OperationalError:
+            if not (finished and conn.closed):
+                raise
 
 
 @contextlib.asynccontextmanager
@@ -121,8 +141,14 @@ async def apipelined(
     options = connection_options(libpq_url, proxy.connect_kwargs, 10.0, 5)
     async with await AsyncConnection.connect(libpq_url, **options) as conn:
         limit_send_buffer(conn, SEND_BUFFER)
-        async with conn.pipeline() as pipe:
-            yield conn, pipe
+        finished = False
+        try:
+            async with conn.pipeline() as pipe:
+                yield conn, pipe
+                finished = True
+        except psycopg.OperationalError:
+            if not (finished and conn.closed):
+                raise
 
 
 def finish_within(proxy: SlowProxy, call: Callable[[], T]) -> T:
@@ -162,6 +188,8 @@ async def afinish_within(proxy: SlowProxy, call: Awaitable[T]) -> T:
         if done:
             # The error the cut caused, retrieved so asyncio does not log it
             task.exception()
+        else:
+            task.cancel()
         pytest.fail(f"the write was still waiting for the server after {DEADLINE} s")
     return task.result()
 
@@ -229,3 +257,80 @@ async def test_async_saver_put_writes_finishes_on_a_slow_link(libpq_url: str) ->
             assert {channel: value for _, channel, value in found.pending_writes} == dict(writes)
             assert proxy.connections == 1
     assert write_rows(libpq_url, thread) == WRITES
+
+
+class Stall:
+    """Stops the proxy as a drain starts, and records how each drain ended."""
+
+    def __init__(self, proxy: SlowProxy) -> None:
+        self.proxy = proxy
+        self.ended: list[str] = []
+
+    def _end(self, error: BaseException | None) -> None:
+        self.ended.append("sent" if error is None else type(error).__name__)
+
+    def around(self, drain: Callable[[Any], None]) -> Callable[[Any], None]:
+        def stall_then_drain(conn: Any) -> None:
+            self.proxy.stall()
+            try:
+                drain(conn)
+            except BaseException as error:
+                self._end(error)
+                raise
+            self._end(None)
+
+        return stall_then_drain
+
+    def around_async(
+        self, drain: Callable[[Any], Awaitable[None]]
+    ) -> Callable[[Any], Awaitable[None]]:
+        async def stall_then_drain(conn: Any) -> None:
+            self.proxy.stall()
+            try:
+                await drain(conn)
+            except BaseException as error:
+                self._end(error)
+                raise
+            self._end(None)
+
+        return stall_then_drain
+
+    def assert_cut_off_by_the_guard(self, caplog: pytest.LogCaptureFixture) -> None:
+        assert self.ended, "the write never reached the drain"
+        # The first drain never finished: the guard shut its socket after
+        # GUARD seconds, long before the test would have cut the proxy
+        assert self.ended[0] == "OperationalError"
+        assert ABANDONED in caplog.text
+
+
+@pytest.mark.timeout(120)
+def test_sync_drain_on_a_dead_link_is_cut_off_by_the_hang_guard(
+    libpq_url: str, table_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with SlowProxy.to(libpq_url) as proxy, pipelined(libpq_url, proxy) as (conn, pipe):
+        store = CockroachDBStore(
+            conn, pipe=pipe, index=index_config(), table_name=table_name, retry_policy=GUARDED
+        )
+        store.setup()
+        stall = Stall(proxy)
+        store._drain_output = stall.around(store._drain_output)  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING), pytest.raises(psycopg.OperationalError):
+            finish_within(proxy, lambda: store.batch(put_ops()))
+        stall.assert_cut_off_by_the_guard(caplog)
+
+
+@pytest.mark.timeout(120)
+async def test_async_drain_on_a_dead_link_is_cut_off_by_the_hang_guard(
+    libpq_url: str, table_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with SlowProxy.to(libpq_url) as proxy:
+        async with apipelined(libpq_url, proxy) as (conn, pipe):
+            store = AsyncCockroachDBStore(
+                conn, pipe=pipe, index=index_config(), table_name=table_name, retry_policy=GUARDED
+            )
+            await store.setup()
+            stall = Stall(proxy)
+            store._drain_output = stall.around_async(store._drain_output)  # type: ignore[method-assign]
+            with caplog.at_level(logging.WARNING), pytest.raises(psycopg.OperationalError):
+                await afinish_within(proxy, store.abatch(put_ops()))
+            stall.assert_cut_off_by_the_guard(caplog)

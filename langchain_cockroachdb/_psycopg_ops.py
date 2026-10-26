@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, ClassVar, TypeVar
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Connection, Cursor, Pipeline
+from psycopg.generators import send
 from psycopg.pq import TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
@@ -82,9 +83,24 @@ class PsycopgOps:
         active = policy if policy is not None else self.retry_policy
         return active.run(fn, label=label, can_retry=self._can_retry)
 
+    @staticmethod
+    def _drain_output(conn: Connection[DictRow]) -> None:
+        """Send everything left in libpq's output buffer, before a pipeline sync.
+
+        psycopg's Pipeline.sync() flushes that buffer once and then waits for
+        results, without checking that the flush sent everything. On a slow
+        or TLS link the end of a batch and its Sync can stay behind, so the
+        server waits for them while the client waits for the server. send()
+        flushes until the buffer is empty, waiting for the socket in between.
+        """
+        conn.wait(send(conn.pgconn))
+
     def _sync_pipeline(self) -> None:
         """Sync pipeline if one is in use. Each statement runs in its own transaction."""
         if self.pipe:
+            # A pipeline is only allowed on a single connection
+            assert isinstance(self.conn, Connection)
+            self._drain_output(self.conn)
             self.pipe.sync()
 
     def _can_retry(self, error: BaseException) -> bool:
@@ -146,6 +162,7 @@ class PsycopgOps:
         """
         if self.pipe and not synced:
             with contextlib.suppress(Exception):
+                self._drain_output(conn)
                 self.pipe.sync()
                 synced = True
         if conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
@@ -221,6 +238,7 @@ class PsycopgOps:
                     tx.execute("COMMIT", prepare=False)
                 # psycopg's transaction syncs the pipeline itself as it ends
                 if batched or (pipeline and not transaction):
+                    self._drain_output(conn)
                     pipe.sync()
                     synced = True
                 if batched:
@@ -230,6 +248,7 @@ class PsycopgOps:
             # here. Resync before releasing it, so other threads' queued statements
             # are untouched, and roll back what a stopped batch left open
             with contextlib.suppress(Exception):
+                self._drain_output(conn)
                 pipe.sync()
                 synced = True
             if batched:
@@ -373,9 +392,25 @@ class AsyncPsycopgOps:
         """Run ``fn`` under ``policy``, by default the host's retry policy."""
         return await (policy or self.retry_policy).arun(fn, label=label, can_retry=self._can_retry)
 
+    @staticmethod
+    async def _drain_output(conn: AsyncConnection[DictRow]) -> None:
+        """Send everything left in libpq's output buffer, before a pipeline sync.
+
+        psycopg's AsyncPipeline.sync() flushes that buffer once and then waits
+        for results, without checking that the flush sent everything. On a
+        slow or TLS link the end of a batch and its Sync can stay behind, so
+        the server waits for them while the client waits for the server.
+        send() flushes until the buffer is empty, waiting for the socket in
+        between.
+        """
+        await conn.wait(send(conn.pgconn))
+
     async def _sync_pipeline(self) -> None:
         """Sync pipeline if one is in use. Each statement runs in its own transaction."""
         if self.pipe:
+            # A pipeline is only allowed on a single connection
+            assert isinstance(self.conn, AsyncConnection)
+            await self._drain_output(self.conn)
             await self.pipe.sync()
 
     def _can_retry(self, error: BaseException) -> bool:
@@ -444,6 +479,7 @@ class AsyncPsycopgOps:
         """
         if self.pipe and not synced:
             with contextlib.suppress(Exception):
+                await self._drain_output(conn)
                 await self.pipe.sync()
                 synced = True
         if conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION:
@@ -522,6 +558,7 @@ class AsyncPsycopgOps:
                     await tx.execute("COMMIT", prepare=False)
                 # psycopg's transaction syncs the pipeline itself as it ends
                 if batched or (pipeline and not transaction):
+                    await self._drain_output(conn)
                     await pipe.sync()
                     synced = True
                 if batched:
@@ -531,6 +568,7 @@ class AsyncPsycopgOps:
             # here. Resync before releasing it, so other tasks' queued statements
             # are untouched, and roll back what a stopped batch left open
             with contextlib.suppress(Exception):
+                await self._drain_output(conn)
                 await pipe.sync()
                 synced = True
             if batched:

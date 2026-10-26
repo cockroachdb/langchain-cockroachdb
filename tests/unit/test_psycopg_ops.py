@@ -14,8 +14,16 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg.pq import TransactionStatus
+from psycopg.waiting import Wait
 
-from tests.unit.checkpointer_fakes import FakeSingleAsyncConnection, FakeSingleConnection
+from tests.unit.checkpointer_fakes import (
+    FakeAsyncPipe,
+    FakePGconn,
+    FakePipe,
+    FakeSingleAsyncConnection,
+    FakeSingleConnection,
+    close_sockets,
+)
 
 CHECKPOINTER_CLOSED = (
     "Not retrying: the checkpointer's only connection is closed and cannot be "
@@ -191,3 +199,97 @@ def test_old_internal_paths_reexport_the_shared_helpers() -> None:
     assert _ainternal.Conn is _psycopg_conn.AsyncConn
     assert _ainternal.get_connection is _psycopg_conn.aget_connection
     assert _ainternal.flag_broken_connection is _psycopg_conn.flag_broken_connection
+
+
+# The wait for the socket between two flushes, and the flushes around it. RW:
+# send() takes a readable socket too, and reads what the server sent meanwhile
+LEFT_OVER = [("flush", 1), ("wait", Wait.RW)]
+EMPTY = ("flush", 0)
+
+
+@pytest.fixture
+def _sockets() -> Iterator[None]:
+    yield
+    close_sockets()
+
+
+def _single(kind: str, error: BaseException | None = None, **kwargs: Any) -> Any:
+    cls = FakeSingleConnection if kind == "sync" else FakeSingleAsyncConnection
+    return cls(error, **kwargs)
+
+
+async def _maybe_await(result: Any) -> Any:
+    return await result if asyncio.iscoroutine(result) else result
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_drain_flushes_until_libpq_has_sent_everything(kind: str) -> None:
+    conn = _single(kind)
+    conn.pgconn = FakePGconn([1, 1, 0])
+    host = _host(kind, "store", conn)
+    await _maybe_await(host._drain_output(conn))
+    # Three flushes, and a wait for the socket to take more before each retry
+    assert conn.pgconn.io == [*LEFT_OVER, *LEFT_OVER, EMPTY]
+    assert all(state & Wait.W for event, state in conn.pgconn.io if event == "wait")
+
+
+def _run_sync_path(host: Any, where: str) -> None:
+    if where == "statement":
+        with host._cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)")
+            host._sync_pipeline()
+    elif where == "stopped batch":
+        with host._cursor() as cur:
+            cur.execute("SELECT 1")
+    else:
+        with host._cursor(pipeline=True, transaction=True) as cur:
+            cur.execute("INSERT INTO t VALUES (1)")
+
+
+async def _run_async_path(host: Any, where: str) -> None:
+    if where == "statement":
+        async with host._cursor() as cur:
+            await cur.execute("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)")
+            await host._sync_pipeline()
+    elif where == "stopped batch":
+        async with host._cursor() as cur:
+            await cur.execute("SELECT 1")
+    else:
+        async with host._cursor(pipeline=True, transaction=True) as cur:
+            await cur.execute("INSERT INTO t VALUES (1)")
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("where", ["write", "statement", "error", "stopped batch"])
+async def test_every_component_pipeline_sync_comes_after_a_drain(kind: str, where: str) -> None:
+    # The places that sync a component-wide pipeline: the end of a write, a
+    # sync after a single statement, the resync after an error, and the sync
+    # before a stopped batch of ours is rolled back
+    error = psycopg.errors.UndefinedTable("relation does not exist")
+    conn = _single(kind, error if where == "error" else None, fail_at=2)
+    conn.in_pipeline_mode = True
+    # The first drain finds bytes that the last flush left behind
+    conn.pgconn = FakePGconn([1])
+    host = _host(kind, "store", conn)
+    host.pipe = FakePipe(conn.pgconn.io) if kind == "sync" else FakeAsyncPipe(conn.pgconn.io)
+    if where == "stopped batch":
+        host._batch_open = True
+        conn.info.transaction_status = TransactionStatus.INTRANS
+    run = _run_sync_path if kind == "sync" else _run_async_path
+    with pytest.raises(type(error)) if where == "error" else contextlib.nullcontext():
+        await _maybe_await(run(host, where))
+    assert host.pipe.syncs == 1
+    assert conn.pgconn.io == [*LEFT_OVER, EMPTY, ("sync",)]
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_a_write_in_its_own_pipeline_block_is_not_drained(kind: str) -> None:
+    # Without a component-wide pipeline a write gets its own pipeline block,
+    # and psycopg flushes everything as the block ends
+    conn = _single(kind)
+    host = _host(kind, "store", conn)
+    await _maybe_await((_run_sync_path if kind == "sync" else _run_async_path)(host, "write"))
+    assert ("pipeline", "open") in conn.events
+    assert conn.pgconn.io == []
