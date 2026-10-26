@@ -830,7 +830,10 @@ def test_too_many_namespaces_fall_back_to_one_statement() -> None:
     assert [label for label, _, _ in executed] == ["store search namespaces", "store search"]
 
 
-def search_row(key: str, score: float, window_size: int | None = None) -> dict[str, object]:
+def search_row(
+    key: str, score: float, window_size: int | None = None, held: int | None = None
+) -> dict[str, object]:
+    """A search row; an indexed one has a window size and namespace_vectors (default: equal)."""
     row: dict[str, object] = {
         "prefix": "a",
         "key": key,
@@ -841,22 +844,28 @@ def search_row(key: str, score: float, window_size: int | None = None) -> dict[s
     }
     if window_size is not None:
         row["window_size"] = window_size
+        row["namespace_vectors"] = window_size if held is None else held
     return row
 
 
 def test_needs_exact_search() -> None:
-    full, partial = 21, 5
-    short = [search_row("k1", 0.9, full)]
-    # Short from a full window: candidates may have failed the filter or expired
-    assert needs_exact_search(short, limit=10, over_fetch=full)
-    # Short from a window that was not full: it held every vector, so it is exact
-    assert not needs_exact_search([search_row("k1", 0.9, partial)], limit=10, over_fetch=full)
-    # Nothing came back: the window size is unknown
-    assert needs_exact_search([], limit=10, over_fetch=full)
+    over_fetch = 21
+    # Short, and the window equals the count of the namespaces' vectors: the
+    # index returned every vector, so the page is exact
+    assert not needs_exact_search([search_row("k1", 0.9, 5, 5)], limit=10, over_fetch=over_fetch)
+    # Short, and the namespaces hold more than the window: the index cut it
+    # short, as a small beam_size or small partitions can
+    assert needs_exact_search([search_row("k1", 0.9, 5, 6)], limit=10, over_fetch=over_fetch)
+    assert needs_exact_search([search_row("k1", 0.9, 5, 21)], limit=10, over_fetch=over_fetch)
+    # Nothing came back: the sizes are unknown
+    assert needs_exact_search([], limit=10, over_fetch=over_fetch)
     # A full page is complete, whatever the window
-    page = [search_row(f"k{i}", 0.9, full) for i in range(10)]
-    assert not needs_exact_search(page, limit=10, over_fetch=full)
-    assert not needs_exact_search(page[:3], limit=3, over_fetch=full)
+    page = [search_row(f"k{i}", 0.9, 5, 21) for i in range(10)]
+    assert not needs_exact_search(page, limit=10, over_fetch=over_fetch)
+    assert not needs_exact_search(page[:3], limit=3, over_fetch=over_fetch)
+    # Short from a full window: the count stops at over_fetch, so equal sizes
+    # cannot show that the namespaces hold no more vectors
+    assert needs_exact_search([search_row("k1", 0.9, 21, 21)], limit=10, over_fetch=over_fetch)
 
 
 EXACT_ROWS = [search_row("best", 0.99), search_row("next", 0.5)]
@@ -867,11 +876,19 @@ EXACT_ROWS = [search_row("best", 0.99), search_row("next", 0.5)]
     [
         ([search_row("k1", 0.9, 21)], ["a"], True),
         ([search_row("k1", 0.9, 20)], ["a"], False),
+        ([search_row("k1", 0.9, 20, 21)], ["a"], True),
         ([search_row(f"k{i}", 0.9, 21) for i in range(10)], ["a"], False),
         ([], ["a"], True),
         ([], [], False),
     ],
-    ids=["short-full-window", "short-partial-window", "full-page", "empty", "no-namespace"],
+    ids=[
+        "short-full-window",
+        "short-window-equals-count",
+        "short-window-below-count",
+        "full-page",
+        "empty",
+        "no-namespace",
+    ],
 )
 def test_short_indexed_search_runs_again_exactly(
     indexed_rows: list[dict[str, object]], namespaces: list[str], runs_again: bool

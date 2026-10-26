@@ -20,6 +20,12 @@ that the lookup finds more than one. That item does not change the answer.
 Each query is chosen so that the nearest vectors, as many as the indexed
 window holds, include no match. The first pass then finds nothing, which
 is how the review saw it, and the second pass must find everything.
+
+The re-review found that a window that is not full does not prove the
+index returned every vector: with a small beam_size, C-SPANN returns far
+fewer than the window asks for. The tests after the review's cases check
+the count of the namespaces' vectors that catches it, including the
+re-review's reproduction with beam_size=1.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from langgraph.store.base import PutOp, SearchItem
 from langgraph.store.memory import InMemoryStore
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
+from langchain_cockroachdb._sql import vector_literal
 from langchain_cockroachdb.store.sql import NAMESPACES, StoreSQL, bind
 
 DIMS = 16
@@ -120,6 +127,25 @@ def record_reads(store: CockroachDBStore) -> list[tuple[str, list[str]]]:
 
     store._read_all = recording  # type: ignore[method-assign]
     return reads
+
+
+def record_read_rows(store: CockroachDBStore) -> list[tuple[str, list[list[dict[str, Any]]]]]:
+    """Record the label and the rows of every read group the store runs from now on."""
+    reads: list[tuple[str, list[list[dict[str, Any]]]]] = []
+    original = store._read_all
+
+    def recording(statements: list[tuple[str, list]], label: str, session: Any = None) -> Any:
+        rows = original(statements, label, session)
+        reads.append((label, rows))
+        return rows
+
+    store._read_all = recording  # type: ignore[method-assign]
+    return reads
+
+
+def first_pass(reads: list[tuple[str, list[list[dict[str, Any]]]]]) -> list[dict[str, Any]]:
+    """The rows the indexed form returned for the first search of a batch."""
+    return [groups for label, groups in reads if label == "store search"][0][0]
 
 
 def arecord_reads(store: AsyncCockroachDBStore) -> list[tuple[str, list[str]]]:
@@ -264,14 +290,167 @@ def test_partial_window_is_exact_without_a_second_pass(store_factory, mode) -> N
     ]
     store = store_factory(mode, index=index_config())
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
-    reads = record_reads(store)
-    # The window of 7 holds all 4 vectors, so filtering it is exact
+    reads = record_read_rows(store)
+    # The window of 7 holds all 4 vectors, and the count of the namespace's
+    # vectors says so, so filtering the window is exact
     mine = store.search(("mem",), query="memory", filter={"type": "rare"}, limit=3)
     assert_same_results(
         mine, reference(items).search(("mem",), query="memory", filter={"type": "rare"}, limit=3)
     )
     assert [item.key for item in mine] == ["k2"]
     assert [label for label, _ in reads] == ["store search namespaces", "store search"]
+    [row] = first_pass(reads)
+    assert row["window_size"] == row["namespace_vectors"] == 4
+
+
+def test_full_window_short_page_runs_again_exactly(store_factory, mode) -> None:
+    # 240 vectors in the namespace and a window of (5 + 0) * 1 * 2 + 1 = 11:
+    # the count stops at 11 too, so a short page from that window runs again
+    items = [item for item in alice_items() if item[1].startswith("a")]
+    store = store_factory(mode, index=index_config())
+    store.batch([PutOp(ns, key, value) for ns, key, value in items])
+    rare = sorted(key for _, key, value in items if value["type"] == "rare")
+    texts = {key: value["text"] for _, key, value in items}
+    vectors = {key: MODEL.embed_query(text) for key, text in texts.items()}
+
+    def rare_nearby(key: str) -> int:
+        nearest = sorted(vectors, key=lambda other: -cosine(vectors[key], vectors[other]))[:22]
+        return len(set(nearest) & set(rare))
+
+    # A rare item's own text puts it first, and few other rare items are near
+    query = texts[min(rare, key=rare_nearby)]
+    reads = record_read_rows(store)
+    prefix = ("user", "alice")
+    mine = store.search(prefix, query=query, filter={"type": "rare"}, limit=5)
+    theirs = reference(items).search(prefix, query=query, filter={"type": "rare"}, limit=5)
+    assert len(theirs) == 5
+    assert_same_results(mine, theirs)
+    rows = first_pass(reads)
+    assert 0 < len(rows) < 5
+    assert rows[0]["window_size"] == rows[0]["namespace_vectors"] == 11
+    assert [label for label, _ in reads][-1] == "store search exact"
+
+
+def test_window_cut_short_by_the_index_runs_again_exactly(store_factory, mode, monkeypatch) -> None:
+    """A window smaller than the namespace's vectors, as a small beam returns it, runs again.
+
+    The window's LIMIT is lowered to 5 here, standing in for an index that
+    returns fewer vectors than it was asked for. The count of the
+    namespace's vectors still stops at over_fetch, 21, so the store sees
+    that the window is short of the namespace, whatever C-SPANN's
+    partitions look like at the time.
+    """
+    items = rare_items()
+    store = store_factory(mode, index=index_config())
+    store.batch([PutOp(ns, key, value) for ns, key, value in items])
+    build = store.sql.semantic_search_in
+
+    def capped(**kwargs: Any) -> tuple[str, list]:
+        sql, params = build(**kwargs)
+        assert params[3] == kwargs["over_fetch"]
+        return sql, [*params[:3], 5, *params[4:]]
+
+    monkeypatch.setattr(store.sql, "semantic_search_in", capped)
+    reads = record_read_rows(store)
+    # k27 is rare, and its own text puts it first in the window
+    mine = store.search(("mem",), query="memory 27", filter={"type": "rare"}, limit=10)
+    theirs = reference(items).search(("mem",), query="memory 27", filter={"type": "rare"}, limit=10)
+    assert {item.key for item in theirs} == RARE
+    assert_same_results(mine, theirs)
+    rows = first_pass(reads)
+    assert 0 < len(rows) < 3
+    assert rows[0]["window_size"] <= 5 < rows[0]["namespace_vectors"] == 21
+    assert [label for label, _ in reads][-1] == "store search exact"
+
+
+def steady_capped_queries(
+    admin: Any,
+    store: CockroachDBStore,
+    namespace: str,
+    texts: list[str],
+    window: int,
+    tried: set[str],
+    deadline: float,
+) -> list[str]:
+    """Texts whose beam-1 window from the vector index held steady, above 0 and below ``window``.
+
+    Right after a bulk insert C-SPANN has few, large partitions, and a beam
+    of 1 still reaches every vector. Searches set off the splits it put
+    off, and a search through a partition that is being split can return
+    nothing. Once the partitions on a query's path are small, the beam caps
+    what the index returns. This polls the window of every text not in
+    ``tried`` and returns, as soon as there is one, the texts whose window
+    kept one size for five polls in a row.
+    """
+    vectors = {text: vector_literal(MODEL.embed_query(text)) for text in texts if text not in tried}
+    seen: dict[str, list[int]] = {text: [] for text in vectors}
+    while time.monotonic() < deadline:
+        with admin.transaction():
+            admin.execute("SET LOCAL vector_search_beam_size = 1")
+            for text, vector in vectors.items():
+                row = admin.execute(
+                    f"SELECT count(*) AS n FROM (SELECT 1 FROM {store.sql.vectors}"
+                    f"@{store.sql.vector_index_name} WHERE prefix = ANY(CAST(%s AS STRING[])) "
+                    "ORDER BY embedding <=> CAST(%s AS VECTOR) LIMIT %s) AS w",
+                    [[namespace], vector, window],
+                ).fetchone()
+                seen[text].append(row["n"])
+        steady = [
+            text
+            for text, sizes in seen.items()
+            if len(sizes) >= 5 and 0 < sizes[-1] < window and len(set(sizes[-5:])) == 1
+        ]
+        if steady:
+            return steady
+        time.sleep(0.5)
+    last = {text: sizes[-5:] for text, sizes in seen.items()}
+    raise AssertionError(f"no beam-1 window held steady below {window}: {last}")
+
+
+@pytest.mark.timeout(300)
+def test_beam_capped_window_runs_again_exactly(store_factory, admin) -> None:
+    """The re-review's reproduction: beam_size=1 cuts the window short of the namespace.
+
+    3,000 items in ("mem",), 60 of them rare, limit=150, so the window is
+    301 vectors and every page is short. With statistics the optimizer
+    serves the window from the vector index, and once C-SPANN has split its
+    partitions a beam of 1 returns far fewer than 301 vectors. Such a
+    window used to count as exact, and the search returned a few of the 60.
+    The count of the namespace's vectors, 301 here, shows the window is
+    short, so the search runs again exactly. This takes about 40 seconds,
+    most of it the insert.
+    """
+    items: list[Item] = [
+        (("mem",), f"k{i:04}", {"text": f"memory {i}", "type": "rare" if i % 50 == 7 else "c"})
+        for i in range(3000)
+    ]
+    store = store_factory("pool", index=index_config(beam_size=1))
+    store.batch([PutOp(ns, key, value) for ns, key, value in items])
+    admin.execute(f"ANALYZE {store.sql.items}")
+    admin.execute(f"ANALYZE {store.sql.vectors}")
+    ref = reference(items)
+    reads = record_read_rows(store)
+    # A rare item's own text puts it first, so its first pass finds it when
+    # the beam reaches its partition
+    texts = [f"memory {i}" for i in range(7, 3000, 50)][:10]
+    tried: set[str] = set()
+    deadline = time.monotonic() + 180
+    while len(tried) < len(texts):
+        for query in steady_capped_queries(admin, store, "mem", texts, 301, tried, deadline):
+            tried.add(query)
+            reads.clear()
+            mine = store.search(("mem",), query=query, filter={"type": "rare"}, limit=150)
+            theirs = ref.search(("mem",), query=query, filter={"type": "rare"}, limit=150)
+            assert len(theirs) == 60
+            assert_same_results(mine, theirs)
+            assert [label for label, _ in reads][-1] == "store search exact"
+            rows = first_pass(reads)
+            if rows:
+                # The index cut the window short of the 301 vectors counted
+                assert len(rows) < 60
+                assert rows[0]["window_size"] < rows[0]["namespace_vectors"] == 301
+                return
+    raise AssertionError("no capped first pass returned a row, so the capped window was not tested")
 
 
 def test_second_pass_refreshes_what_it_returns(store_factory, admin, mode) -> None:
@@ -329,6 +508,14 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     assert "vector search" in indexed, indexed
     assert store.sql.vector_index_name in indexed, indexed
     assert "window" in indexed, indexed
+    # The count of the namespace's vectors is a scan of the primary key over
+    # the namespace's span that stops after over_fetch rows
+    count = indexed[indexed.index("• subquery") :]
+    vectors = store.sql.vectors.split(".", 1)[1]
+    assert f"table: {vectors}@{vectors}_pkey" in count, indexed
+    assert "spans: [/'user.big' - /'user.big']" in count, indexed
+    assert "limit: 7" in count, indexed
+    assert "FULL SCAN" not in count, indexed
     for statement in (
         store.sql.semantic_search(namespace_prefix=("user",), **common),
         store.sql.semantic_search(namespace_prefix=(), **common),

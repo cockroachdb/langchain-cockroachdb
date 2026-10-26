@@ -601,8 +601,17 @@ def test_indexed_window_carries_no_filter_or_expiry():
     assert "(i.expires_at IS NULL OR i.expires_at > now())" in rest
     assert "i.value" in rest
     assert rest.rstrip().endswith("LIMIT %s OFFSET %s")
-    assert "SELECT prefix, key, value, created_at, updated_at, score, window_size" in rest
-    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 7, "x", "1", 3, 0]
+    assert "SELECT prefix, key, value, created_at, updated_at, score, window_size, (" in rest
+    # The namespaces' vectors, counted from the primary key up to over_fetch,
+    # with the same namespaces and bound as the window
+    assert (
+        "    SELECT count(*) FROM (\n"
+        "        SELECT 1 FROM public.store_vectors WHERE prefix = ANY(CAST(%s AS STRING[])) LIMIT %s\n"
+        "    ) AS c\n"
+        ") AS namespace_vectors"
+    ) in rest
+    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 7, "x", "1", NAMESPACES, 7, 3, 0]
+    assert query_sql.count("%s") == len(params)
 
 
 @pytest.mark.parametrize("form", ["semantic_search", "exact_semantic_search_in"])
@@ -662,20 +671,20 @@ def test_semantic_search_in_ranks_within_found_namespaces():
     assert "LIKE" not in query_sql
     assert "-r.distance AS score" in query_sql
     assert "embedding <-> CAST(%s AS VECTOR)" in query_sql
-    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, "x", "1", 5, 2]
+    assert params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, "x", "1", NAMESPACES, 11, 5, 2]
     assert query_sql.count("%s") == len(params)
     assert "::" not in query_sql
 
     refreshed_sql, refreshed_params = sql.semantic_search_in(
         filter=None, limit=5, offset=0, omit_expired=True, over_fetch=11, refresh=True
     )
-    assert refreshed_params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, 5, 0]
+    assert refreshed_params == [QUERY_VECTOR, NAMESPACES, QUERY_VECTOR, 11, NAMESPACES, 11, 5, 0]
     assert refreshed_sql.startswith("WITH search_results AS (")
     assert refreshed_sql.count("%s") == len(refreshed_params)
-    # The window size reaches the caller through the refresh wrapper too
+    # The window size and the count reach the caller through the refresh wrapper too
     assert refreshed_sql.endswith(
-        "SELECT prefix, key, value, created_at, updated_at, score, window_size\n"
-        "FROM search_results\nORDER BY score DESC, prefix, key"
+        "SELECT prefix, key, value, created_at, updated_at, score, window_size, "
+        "namespace_vectors\nFROM search_results\nORDER BY score DESC, prefix, key"
     )
 
     with pytest.raises(ValueError, match="index"):

@@ -564,13 +564,14 @@ def test_drop_vector_index_then_setup_rebuilds(store_factory, admin, mode) -> No
 def beam_probe(**_: Any) -> tuple[str, list]:
     """A search statement that returns the session's beam size as the score.
 
-    Its window of one vector is not full, so the store keeps its one row.
+    Its window of one vector holds every vector it counts, so the store
+    keeps its one row.
     """
     return (
         "SELECT 'docs' AS prefix, 'probe' AS key, CAST('{}' AS JSONB) AS value, "
         "now() AS created_at, now() AS updated_at, "
         "CAST(current_setting('vector_search_beam_size') AS FLOAT8) AS score, "
-        "CAST(1 AS INT8) AS window_size",
+        "CAST(1 AS INT8) AS window_size, CAST(1 AS INT8) AS namespace_vectors",
         [],
     )
 

@@ -513,14 +513,18 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     # over_fetch nearest vectors with no filter and no expiry check, and only
     # then are the items joined, filtered and checked for expiry. A
     # candidate that fails the filter, or whose item expired and was not
-    # deleted yet, still takes a place in that window. So the statement
-    # returns the window size with every row, and when the result comes back
-    # short from a full window, the store runs exact_semantic_search_in over
-    # the same namespaces (needs_exact_search in base.py decides). A window
-    # that is not full held every vector of those namespaces, so its result
-    # is already exact: C-SPANN returns min(k, n) rows, checked on v26.3.2
-    # with beam sizes 1 and 4 and the default, for 40 to 900 vectors in a
-    # namespace.
+    # deleted yet, still takes a place in that window. So when the page
+    # comes back short, the store runs exact_semantic_search_in over the
+    # same namespaces (needs_exact_search in base.py decides), unless the
+    # index returned every vector those namespaces hold. A window that is
+    # not full does not show that by itself: C-SPANN can return fewer than
+    # LIMIT rows while more exist. On v26.3.2, with 3,000 vectors in one
+    # namespace, beam size 1 returned 57 rows and beam size 4 returned 273
+    # for every LIMIT above that, and small partitions can cap it the same
+    # way. So every row carries window_size, the rows the window kept, and
+    # namespace_vectors, a count of the namespaces' vectors that stops at
+    # over_fetch, read from the primary key. A short page is exact only when
+    # the window is not full and the two are equal.
     #
     # The exact forms, semantic_search and exact_semantic_search_in, join the
     # items, filter and check expiry before they rank, as PostgresStore does.
@@ -543,7 +547,10 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
     #   the vectors primary key, vector search on the vector index. Where a
     #   scan is cheaper, such as 100 vectors and a window of 21, the bottom
     #   two are a scan of the vectors primary key instead, the same choice
-    #   the optimizer made before the window was added.
+    #   the optimizer made before the window was added. Next to it, under
+    #   root, namespace_vectors is a subquery: group (scalar) over a scan of
+    #   the vectors primary key, over the namespaces' spans, with limit:
+    #   over_fetch.
 
     def semantic_search(
         self,
@@ -602,8 +609,10 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
 
         The ranked CTE matches ``prefix = ANY(...)``, which the C-SPANN
         index serves, and keeps the ``over_fetch`` nearest vectors. Every row
-        carries ``window_size``, the number of vectors the CTE kept, so the
-        store can tell a short result from a full window (see
+        carries ``window_size``, the number of vectors the CTE kept, and
+        ``namespace_vectors``, the number of vectors the namespaces hold,
+        counted from the primary key up to ``over_fetch``. The store compares
+        them to tell an exact short result from one the index cut short (see
         needs_exact_search). Bind the namespaces in place of NAMESPACES and
         the query vector in place of QUERY_VECTOR.
 
@@ -621,7 +630,8 @@ ON CONFLICT (prefix, key, field_name) DO UPDATE SET
         conditions, filter_params = self._item_conditions(filter, omit_expired)
         where = " AND ".join(conditions) if conditions else "TRUE"
         # No filter or expiry check in ranked: see the notes above semantic_search.
-        # count(*) OVER () runs on the rows the inner LIMIT kept
+        # count(*) OVER () runs on the rows the inner LIMIT kept. The count in
+        # the outer SELECT reads at most over_fetch rows of the primary key
         sql = f"""WITH ranked AS (
     SELECT prefix, key, distance, count(*) OVER () AS window_size
     FROM (
@@ -641,7 +651,11 @@ best AS (
     WHERE {where}
     ORDER BY i.prefix, i.key, r.distance
 )
-SELECT prefix, key, value, created_at, updated_at, score, window_size
+SELECT prefix, key, value, created_at, updated_at, score, window_size, (
+    SELECT count(*) FROM (
+        SELECT 1 FROM {self.vectors} WHERE prefix = ANY(CAST(%s AS STRING[])) LIMIT %s
+    ) AS c
+) AS namespace_vectors
 FROM best
 ORDER BY score DESC, prefix, key
 LIMIT %s OFFSET %s"""
@@ -651,13 +665,15 @@ LIMIT %s OFFSET %s"""
             QUERY_VECTOR,
             over_fetch,
             *filter_params,
+            NAMESPACES,
+            over_fetch,
             limit,
             offset,
         ]
         if refresh:
             sql = self._with_refresh(
                 sql,
-                "prefix, key, value, created_at, updated_at, score, window_size",
+                "prefix, key, value, created_at, updated_at, score, window_size, namespace_vectors",
                 "score DESC, prefix, key",
             )
         return (sql, params)

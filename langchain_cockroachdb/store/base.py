@@ -75,18 +75,26 @@ def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fe
 
     ``rows`` are what StoreSQL.semantic_search_in returned for one search,
     after dedup and paging. Each row carries ``window_size``, the number of
-    vectors its ranked CTE kept. A result of ``limit`` rows is complete. A
-    shorter one from a window that was not full is exact too, because that
-    window held every vector of the namespaces. A shorter one from a full
-    window may have lost matches to candidates that failed the filter or
-    had expired, and with no rows at all the window size is unknown, so
-    both run again.
+    vectors the index returned into the window, and ``namespace_vectors``,
+    the number of vectors the namespaces hold, counted up to ``over_fetch``.
+
+    A result of ``limit`` rows is complete. A shorter one is exact only when
+    the index returned every vector the namespaces hold: the window is not
+    full and its size equals the count. A full window may have left out
+    vectors beyond it, and the count cannot show otherwise, since it stops
+    at the window's size. A window smaller than the count was cut short by
+    the index itself, which a small beam_size or small partitions can do.
+    In both cases matches may be missing, because candidates that failed
+    the filter or had expired took their places. With no rows at all the
+    sizes are unknown. All of these run again.
     """
     if len(rows) >= limit:
         return False
     if not rows:
         return True
-    return int(rows[0]["window_size"]) >= over_fetch
+    window = int(rows[0]["window_size"])
+    held = int(rows[0]["namespace_vectors"])
+    return window >= over_fetch or window < held
 
 
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
