@@ -516,7 +516,15 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     def bound(statement: tuple[str, list]) -> tuple[str, list]:
         return StoreSQL.bind_query_vector(bind(statement, NAMESPACES, ["user.big"]), query)
 
-    indexed = explain(admin, bound(store.sql.semantic_search_in(over_fetch=7, **common)))
+    # On a cluster with several nodes, each node picks up new statistics a few
+    # seconds after ANALYZE. Until then the optimizer may plan with the empty
+    # table it saw at creation and scan, so plan again until it sees them.
+    statement = bound(store.sql.semantic_search_in(over_fetch=7, **common))
+    deadline = time.monotonic() + 60
+    while "vector search" not in (indexed := explain(admin, statement)):
+        if time.monotonic() > deadline:
+            break
+        time.sleep(1)
     assert "vector search" in indexed, indexed
     assert store.sql.vector_index_name in indexed, indexed
     assert "window" in indexed, indexed
