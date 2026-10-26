@@ -8,7 +8,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from langchain_cockroachdb import get_sqlstate
-from tests.integration.faults import FaultInjector, PsycopgFaults, hold_row_lock, kill_sessions
+from tests.integration.faults import (
+    FaultInjector,
+    PsycopgFaults,
+    SlowProxy,
+    hold_row_lock,
+    kill_sessions,
+    limit_send_buffer,
+)
 
 
 async def test_fault_injector_raises_the_requested_sqlstate(
@@ -62,3 +69,20 @@ async def test_hold_row_lock_makes_writers_wait(engine_factory, libpq_url) -> No
                 await conn.execute(text("SET statement_timeout = '300ms'"))
                 await conn.execute(text("UPSERT INTO lock_probe VALUES (1, 'b')"))
         assert get_sqlstate(info.value) == "57014"
+
+
+def test_slow_proxy_leaves_bytes_in_libpqs_output_buffer(libpq_url) -> None:
+    # Through the proxy, with a small send buffer, a large statement in
+    # pipeline mode cannot leave in one flush
+    size = 1_000_000
+    with (
+        SlowProxy.to(libpq_url) as proxy,
+        psycopg.connect(libpq_url, autocommit=True, **proxy.connect_kwargs) as conn,
+    ):
+        limit_send_buffer(conn, 32 * 1024)
+        with conn.pipeline():
+            cur = conn.execute("SELECT length(CAST(%s AS STRING))", ("x" * size,))
+            assert conn.pgconn.flush() == 1
+        # Leaving the pipeline block sends the rest before it reads
+        assert cur.fetchone() == (size,)
+        assert proxy.connections == 1

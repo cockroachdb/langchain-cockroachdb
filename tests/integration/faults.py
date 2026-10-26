@@ -9,21 +9,27 @@ see exactly what they would see in production:
 - an open transaction holding a row's write intent makes writers wait, the way
   a stuck range does
 
-Interruption is the one client-side fault: it stops a write between
-statements, the way a cancelled task or a crashed caller does.
+Interruption is a client-side fault: it stops a write between statements,
+the way a cancelled task or a crashed caller does. SlowProxy is the other
+one: it slows the link from the client to the server, the way a congested
+network or a TLS link to a distant cluster does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from types import TracebackType
 from typing import Any
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -258,6 +264,145 @@ class Interruption:
                 return await super().executemany(query, params_seq, **kwargs)
 
         return InterruptingAsyncCursor
+
+
+class SlowProxy:
+    """A TCP proxy that passes the client's bytes to the server slowly.
+
+    It listens on 127.0.0.1 on a free port and forwards each connection to
+    the server. From client to server it moves at most ``chunk`` bytes at a
+    time and pauses ``pause`` seconds after each, behind a small receive
+    buffer. From server to client it runs at full speed. Once the client's
+    socket send buffer is full, libpq's flush() returns 1 with bytes still
+    to send; limit_send_buffer() keeps that buffer small. Connect with
+    ``connect_kwargs``: libpq reaches the proxy but still checks TLS against
+    the host name in the URL. Use it as a context manager; on exit it cuts
+    every connection it forwards.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        chunk: int = 4096,
+        pause: float = 0.002,
+        receive_buffer: int = 16384,
+    ) -> None:
+        self._upstream = (host, port)
+        self._chunk = chunk
+        self._pause = pause
+        self._lock = threading.Lock()
+        self._closed = False
+        self._sockets: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
+        self.connections = 0
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Set before listen(), so that accepted sockets advertise a small window
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(0.05)
+        self._listener = listener
+        self.port: int = listener.getsockname()[1]
+        self._start(self._accept)
+
+    @classmethod
+    def to(cls, libpq_url: str, **kwargs: Any) -> SlowProxy:
+        """A proxy in front of the server that ``libpq_url`` names."""
+        params = conninfo_to_dict(libpq_url)
+        host = params.get("hostaddr") or params.get("host") or "localhost"
+        return cls(str(host), int(params.get("port") or 26257), **kwargs)
+
+    @property
+    def connect_kwargs(self) -> dict[str, Any]:
+        """psycopg connection options that send a connection through the proxy."""
+        return {"hostaddr": "127.0.0.1", "port": self.port}
+
+    def _start(self, target: Callable[..., None], *args: Any) -> None:
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
+
+    def _accept(self) -> None:
+        while not self._closed:
+            try:
+                client, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            try:
+                server = socket.create_connection(self._upstream, timeout=10)
+            except OSError:
+                client.close()
+                continue
+            server.settimeout(None)
+            for sock in (client, server):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with self._lock:
+                if self._closed:
+                    client.close()
+                    server.close()
+                    return
+                self._sockets += [client, server]
+                self.connections += 1
+            self._start(self._pump, client, server, self._chunk, self._pause)
+            self._start(self._pump, server, client, 65536, 0.0)
+
+    @staticmethod
+    def _pump(source: socket.socket, target: socket.socket, chunk: int, pause: float) -> None:
+        with contextlib.suppress(OSError):
+            while data := source.recv(chunk):
+                target.sendall(data)
+                if pause:
+                    time.sleep(pause)
+        # Pass the end of the stream on, so each side sees the other close
+        with contextlib.suppress(OSError):
+            target.shutdown(socket.SHUT_WR)
+
+    def close(self) -> None:
+        """Stop accepting and cut every forwarded connection."""
+        with self._lock:
+            self._closed = True
+            sockets, self._sockets = self._sockets, []
+            threads = list(self._threads)
+        self._listener.close()
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for thread in threads:
+            thread.join(timeout=5)
+        for sock in sockets:
+            sock.close()
+
+    def __enter__(self) -> SlowProxy:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+def limit_send_buffer(
+    conn: psycopg.Connection[Any] | psycopg.AsyncConnection[Any], size: int
+) -> None:
+    """Give the socket of ``conn`` a fixed send buffer of ``size`` bytes.
+
+    The operating system grows a socket's send buffer by itself, to several
+    megabytes, so a local test would need a huge write before libpq is left
+    holding bytes it could not send. A fixed size stops that growth.
+    """
+    sock = socket.socket(fileno=os.dup(conn.fileno()))
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, size)
+    finally:
+        sock.close()
 
 
 def kill_sessions(libpq_url: str, application_name: str) -> int:
