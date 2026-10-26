@@ -62,9 +62,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
     A batch runs its reads first, then all its puts and deletes in one
     transaction. Its gets, its searches and its listings take one round trip
-    each. Semantic searches under a namespace add one before the searches, to
-    find their namespaces, and one after them when a search must run again
-    exactly, as the long-term memory guide explains.
+    each. On a store with a vector index, semantic searches under a namespace
+    add one before the searches, to find their namespaces, and one after them
+    when a search must run again exactly. A flat store adds neither. The
+    long-term memory guide explains why.
 
     Example:
         ```python
