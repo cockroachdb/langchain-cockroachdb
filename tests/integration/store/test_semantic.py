@@ -84,7 +84,9 @@ CSPANN_OPTIONS = "WITH (min_partition_size=16, max_partition_size=64)"
 # Sync store
 
 
-def test_setup_creates_vectors_table_and_index(store_factory, admin, table_name, mode) -> None:
+def test_setup_creates_vectors_table_and_index(
+    store_factory, admin, libpq_url, table_name, mode
+) -> None:
     store = store_factory(mode, index=index_config())
     statement = create_statement(admin, store.sql.vectors)
     assert f"VECTOR({DIMS})" in statement
@@ -106,8 +108,8 @@ def test_setup_creates_vectors_table_and_index(store_factory, admin, table_name,
         assert f"VECTOR({DIMS})" in statement
         assert "VECTOR INDEX" not in statement
     finally:
-        drop_store_tables(admin.info.dsn, sized)
-        drop_store_tables(admin.info.dsn, flat)
+        drop_store_tables(libpq_url, sized)
+        drop_store_tables(libpq_url, flat)
 
 
 def test_put_writes_one_vector_per_field_text(store_factory, admin, mode) -> None:
@@ -470,7 +472,9 @@ def dot(a: list[float], b: list[float]) -> float:
 
 
 @pytest.mark.parametrize("distance", ["l2", "inner_product"])
-def test_l2_and_inner_product_scores(store_factory, table_name, admin, mode, distance) -> None:
+def test_l2_and_inner_product_scores(
+    store_factory, table_name, admin, libpq_url, mode, distance
+) -> None:
     store = store_factory(
         mode, table_name=f"{table_name}_{distance}", index=index_config(distance_type=distance)
     )
@@ -496,7 +500,7 @@ def test_l2_and_inner_product_scores(store_factory, table_name, admin, mode, dis
         if distance == "l2":
             assert results[0].key == "sky" and abs(results[0].score) < 1e-3  # type: ignore[arg-type]
     finally:
-        drop_store_tables(admin.info.dsn, f"{table_name}_{distance}")
+        drop_store_tables(libpq_url, f"{table_name}_{distance}")
 
 
 def test_query_without_index_warns_once_and_searches_plainly(store_factory, mode, caplog) -> None:
