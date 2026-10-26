@@ -193,8 +193,9 @@ class BatchPlan:
             search. The lookup finds the namespaces bound in place of
             NAMESPACES.
         exact_searches: The lookups whose indexed search came back short
-            from a full window, set once the search group ran. Their exact
-            form runs next, and its rows replace the search's result.
+            and may have missed vectors (see needs_exact_search), set once
+            the search group ran. Their exact form runs next, and its rows
+            replace the search's result.
         search_session: Statements that run first in the search group, in
             its transaction: the beam size, when set and a query is present.
         listings: The list_namespaces ops, as (position, op).

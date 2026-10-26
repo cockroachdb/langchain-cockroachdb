@@ -224,7 +224,7 @@ With an index, `setup()` also creates the vectors table and, unless `flat` is se
 | `distance_type` | `"cosine"` | `"cosine"`, `"l2"` or `"inner_product"` |
 | `cspann` | `None` | C-SPANN partition sizes, `{"min_partition_size": 10, "max_partition_size": 100}`. Give both or neither; the maximum must be at least 4 times the minimum. Without it the index uses CockroachDB's defaults |
 | `flat` | `False` | Do not create a vector index. Searches rank every matching vector exactly, in one round trip, which suits small stores |
-| `beam_size` | `None` | C-SPANN beam width. A larger beam finds more of the true nearest neighbors and reads more of the index. A small one can return fewer candidates than a search asks for, and the search then runs its second, exact query |
+| `beam_size` | `None` | C-SPANN beam width. A larger beam finds more of the true nearest neighbors and reads more of the index. A small one can return fewer candidates than a search asks for. If that leaves a page short, the search runs its second, exact query |
 
 A put can override `fields`: `index=False` stores the item without vectors, and `index=["text", "summary"]` embeds those paths instead.
 

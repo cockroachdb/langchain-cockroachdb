@@ -689,9 +689,10 @@ LIMIT %s OFFSET %s"""
     ) -> tuple[str, list]:
         """Build an exact semantic search within the namespaces namespace_lookup found.
 
-        The store runs it when semantic_search_in comes back short from a
-        full window. Bind the namespaces in place of NAMESPACES and the query
-        vector in place of QUERY_VECTOR.
+        The store runs it when semantic_search_in comes back short and its
+        window may have missed vectors, as needs_exact_search decides. Bind
+        the namespaces in place of NAMESPACES and the query vector in place
+        of QUERY_VECTOR.
 
         Returns:
             Tuple of (SQL, parameters).
