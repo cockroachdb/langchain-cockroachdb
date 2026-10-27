@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -33,10 +33,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -813,6 +813,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../long-term-memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../async-vs-sync/" class="md-nav__link">
         
   
@@ -1220,6 +1248,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/long-term-memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1408,6 +1464,34 @@
     
   
     Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Store
   
 
     
@@ -1875,7 +1959,7 @@
 
 
 <h1 id="retries-and-resilience">Retries and Resilience<a class="headerlink" href="#retries-and-resilience" title="Permanent link">&para;</a></h1>
-<p>CockroachDB runs every transaction at SERIALIZABLE isolation and keeps serving through node restarts, drains and region failures. Clients are expected to retry a few kinds of errors, and langchain-cockroachdb does it on every database call: the vector store, chat history and both LangGraph checkpointers.</p>
+<p>CockroachDB runs every transaction at SERIALIZABLE isolation and keeps serving through node restarts, drains and region failures. Clients are expected to retry a few kinds of errors, and langchain-cockroachdb does it on every database call: the vector store, chat history, both LangGraph checkpointers and the long-term memory store.</p>
 <h2 id="what-gets-retried">What gets retried<a class="headerlink" href="#what-gets-retried" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -2024,6 +2108,7 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">policy</span> <span class="o">=</span> <span class="n">RetryPolicy</span><span class="p">(</span><span class="o">**</span><span class="p">{</span><span class="s2">"max_attempts"</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span> <span class="s2">"retryable_sqlstates"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"40001"</span><span class="p">,</span> <span class="s2">"40003"</span><span class="p">,</span> <span class="s2">"57P01"</span><span class="p">]})</span>
 </code></pre></div>
 <p>The older <code>retry_max_attempts</code>, <code>retry_initial_backoff</code>, <code>retry_max_backoff</code>, <code>retry_backoff_multiplier</code> and <code>retry_jitter</code> arguments still work as shorthand.</p>
+<p>TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE <code>0A000</code>. Several processes running checkpointer <code>enable_ttl</code> or <code>disable_ttl</code>, or store <code>setup()</code> with a TTL configuration or <code>disable_ttl</code>, at once can hit it. These TTL statements are idempotent, so they retry that error under your policy (<code>schema_change_policy</code>), even if your <code>retry_on</code> would refuse it. <code>max_attempts=1</code> turns this off. The code and phrase are <code>SCHEMA_CHANGE_BUSY_SQLSTATE</code> and <code>SCHEMA_CHANGE_BUSY_MESSAGES</code>, and <code>is_schema_change_busy()</code> checks an error.</p>
 <h2 id="idempotency">Idempotency<a class="headerlink" href="#idempotency" title="Permanent link">&para;</a></h2>
 <p>A <code>40001</code> means the transaction did not commit. After a <code>40003</code> or a dropped connection it may have. Retrying is only safe when running the work twice has the same effect as running it once, and every write the library makes is built that way: vector inserts are UPSERTs, deletes are deletes, chat messages carry ids chosen before the first attempt and are written with <code>ON CONFLICT DO NOTHING</code>, checkpoints are UPSERTs, and schema changes use <code>IF [NOT] EXISTS</code>.</p>
 <p>For your own code, <code>async_retry_with_backoff</code> and <code>sync_retry_with_backoff</code> use the same rules. If the work is not idempotent, retry serialization failures only:</p>
@@ -2049,7 +2134,7 @@
 <p>On Linux, also add <code>tcp_user_timeout=10000</code> to the connection URL. <code>attempt_timeout</code> starts only once a connection is checked out, so this is what keeps a pool's pre-ping on a connection to a lost node from hanging for minutes.</p>
 <h2 id="cutting-off-hung-attempts">Cutting off hung attempts<a class="headerlink" href="#cutting-off-hung-attempts" title="Permanent link">&para;</a></h2>
 <p><code>attempt_timeout</code> gives each attempt a deadline. When it passes, the library shuts down the connection's socket, so the stuck call fails as a lost connection and the normal retry runs on a fresh connection. It starts once a connection is checked out, so it does not cover getting a connection: <code>connect_timeout</code> bounds opening a new one, and a <code>pool_pre_ping</code> on a pooled connection whose peer went silent is only cut short by <code>tcp_user_timeout</code> (see Connection settings). This works even when the server ignores cancel requests, which CockroachDB can do for a <code>COMMIT</code> while a range it wrote to has lost quorum, and it ends reads stalled by a network partition long before the operating system's TCP timeouts would.</p>
-<p>It is off by default. Good starting points are 10 to 30 seconds for interactive paths and 60 to 120 seconds for batch work. Schema changes use <code>ddl_attempt_timeout</code>, also off by default, which bounds each schema change: one statement in the vector store, chat history and engine setup, and one migration step or one TTL statement in the checkpointers. Building an index on a large table can legitimately take minutes.</p>
+<p>It is off by default. Good starting points are 10 to 30 seconds for interactive paths and 60 to 120 seconds for batch work. Schema changes use <code>ddl_attempt_timeout</code>, also off by default, which bounds each schema change: one statement in the vector store, chat history and engine setup, one migration step or one TTL statement in the checkpointers, and one migration step or one schema statement (vectors table, vector index, TTL) in the store. Building an index on a large table can legitimately take minutes.</p>
 <h2 id="checkpointers-use-a-connection-pool">Checkpointers: use a connection pool<a class="headerlink" href="#checkpointers-use-a-connection-pool" title="Permanent link">&para;</a></h2>
 <p>A single connection cannot recover once it drops, so the savers do not retry a dead single connection. Give them a pool, which replaces broken connections and enables concurrent operations:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
@@ -2141,10 +2226,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

@@ -1,0 +1,3149 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="LangChain integration for CockroachDB with native vector support">
+      
+      
+        <meta name="author" content="Virag Tripathi">
+      
+      
+        <link rel="canonical" href="https://cockroachdb.github.io/langchain-cockroachdb/guides/long-term-memory/">
+      
+      
+        <link rel="prev" href="../checkpointer/">
+      
+      
+        <link rel="next" href="../async-vs-sync/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>LangGraph Long-Term Memory - langchain-cockroachdb</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#langgraph-long-term-memory" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="langchain-cockroachdb" class="md-header__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            langchain-cockroachdb
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              LangGraph Long-Term Memory
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/cockroachdb/langchain-cockroachdb" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    cockroachdb/langchain-cockroachdb
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../getting-started/installation/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../vector-store/" class="md-tabs__link">
+          
+  
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../examples/" class="md-tabs__link">
+          
+  
+  
+  Examples
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../api/engine/" class="md-tabs__link">
+          
+  
+  
+  API Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../development/contributing/" class="md-tabs__link">
+          
+  
+  
+  Development
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../about/changelog/" class="md-tabs__link">
+          
+  
+  
+  About
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="langchain-cockroachdb" class="md-nav__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    langchain-cockroachdb
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/cockroachdb/langchain-cockroachdb" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    cockroachdb/langchain-cockroachdb
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/quick-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../vector-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../multi-tenancy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Multi-Tenancy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../vector-indexes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Indexes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../hybrid-search/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hybrid Search
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../chat-history/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quick-start" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick Start
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Quick Start">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#synchronous-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Synchronous Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asynchronous-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Asynchronous Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#connections-and-pools" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connections and Pools
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Connections and Pools">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#factory-method-recommended" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Factory Method (Recommended)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#your-own-pool-or-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Your Own Pool or Connection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrency
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retries-and-atomic-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries and Atomic Writes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#namespaces-and-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Namespaces and Items
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Namespaces and Items">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#listing-namespaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Listing Namespaces
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#searching-and-filtering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Searching and Filtering
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#semantic-search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Semantic Search
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Semantic Search">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#index-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Index Settings
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-searches-use-the-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How Searches Use the Index
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#changing-the-index-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changing the Index Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TTL
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="TTL">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-ttl-job" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The TTL Job
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#refresh-on-read" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refresh on Read
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stores-without-a-ttl-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stores Without a TTL Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sweeping-and-disabling-ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sweeping and Disabling TTL
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deleting-a-namespace" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deleting a Namespace
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tables
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#use-with-langgraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Use with LangGraph
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Use with LangGraph">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#with-create_agent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With create_agent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#in-a-stategraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        In a StateGraph
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#with-deep-agents" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With Deep Agents
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#differences-from-postgresstore" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Differences from PostgresStore
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#next-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Next Steps
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../async-vs-sync/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Async vs Sync
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../resilience/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retries and Resilience
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Examples
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/basic-usage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Basic Usage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/advanced-filtering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Advanced Filtering
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/index-optimization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Index Optimization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/long-term-memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    API Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/engine/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Engine
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/vectorstore/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/indexes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Indexes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/chat-history/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Chat History
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/checkpointer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/retry/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Retry
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    About
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    About
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../about/changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../about/license/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    License
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quick-start" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick Start
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Quick Start">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#synchronous-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Synchronous Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asynchronous-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Asynchronous Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#connections-and-pools" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connections and Pools
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Connections and Pools">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#factory-method-recommended" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Factory Method (Recommended)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#your-own-pool-or-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Your Own Pool or Connection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrency
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retries-and-atomic-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries and Atomic Writes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#namespaces-and-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Namespaces and Items
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Namespaces and Items">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#listing-namespaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Listing Namespaces
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#searching-and-filtering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Searching and Filtering
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#semantic-search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Semantic Search
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Semantic Search">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#index-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Index Settings
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-searches-use-the-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How Searches Use the Index
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#changing-the-index-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changing the Index Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TTL
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="TTL">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-ttl-job" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The TTL Job
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#refresh-on-read" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refresh on Read
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stores-without-a-ttl-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stores Without a TTL Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sweeping-and-disabling-ttl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sweeping and Disabling TTL
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deleting-a-namespace" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deleting a Namespace
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tables
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#use-with-langgraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Use with LangGraph
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Use with LangGraph">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#with-create_agent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With create_agent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#in-a-stategraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        In a StateGraph
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#with-deep-agents" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        With Deep Agents
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#differences-from-postgresstore" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Differences from PostgresStore
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#next-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Next Steps
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="langgraph-long-term-memory">LangGraph Long-Term Memory<a class="headerlink" href="#langgraph-long-term-memory" title="Permanent link">&para;</a></h1>
+<p>Keep memories that outlive a conversation thread in CockroachDB: user preferences, facts an agent learned, profiles.</p>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>A LangGraph checkpointer keeps the state of one thread, which is short-term memory. A store keeps what every thread can read, which is long-term memory. <code>CockroachDBStore</code> and <code>AsyncCockroachDBStore</code> implement LangGraph's <code>BaseStore</code>, so they work wherever LangGraph takes a store: <code>create_agent(store=...)</code>, <code>StateGraph.compile(store=...)</code> and Deep Agents.</p>
+<p>The API follows <code>PostgresStore</code> from <a href="https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres">langgraph-checkpoint-postgres</a>: <code>from_conn_string</code>, <code>setup()</code>, the <code>index</code> and <code>ttl</code> arguments and the TTL sweeper methods work the same way. What this store adds or does differently is listed in <a href="#differences-from-postgresstore">Differences from PostgresStore</a>.</p>
+<h2 id="installation">Installation<a class="headerlink" href="#installation" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span>langchain-cockroachdb
+</code></pre></div>
+<p>The store needs <code>langgraph-checkpoint&gt;=2.1.2</code> and psycopg 3, which are dependencies. <code>create_agent</code> comes from the <code>langchain</code> package. Semantic search needs an embedding model, for example <code>OpenAIEmbeddings</code> from <code>langchain-openai</code>.</p>
+<h2 id="quick-start">Quick Start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h2>
+<h3 id="synchronous-usage">Synchronous Usage<a class="headerlink" href="#synchronous-usage" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">DB_URI</span> <span class="o">=</span> <span class="s2">"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">})</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>    <span class="n">item</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="s2">"seat"</span><span class="p">)</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>  <span class="c1"># {'text': 'Prefers window seats'}</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>    <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">)):</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>        <span class="nb">print</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">namespace</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">key</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+</code></pre></div>
+<h3 id="asynchronous-usage">Asynchronous Usage<a class="headerlink" href="#asynchronous-usage" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncCockroachDBStore</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncCockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">aput</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">})</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    <span class="n">item</span> <span class="o">=</span> <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">aget</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="s2">"seat"</span><span class="p">)</span>
+</code></pre></div>
+<p><code>setup()</code> must run before the store is used for the first time. It creates the tables and runs the migrations. It is idempotent and safe to run from several processes at once.</p>
+<h2 id="connections-and-pools">Connections and Pools<a class="headerlink" href="#connections-and-pools" title="Permanent link">&para;</a></h2>
+<h3 id="factory-method-recommended">Factory Method (Recommended)<a class="headerlink" href="#factory-method-recommended" title="Permanent link">&para;</a></h3>
+<p><code>from_conn_string</code> opens one connection, or a pool when you pass <code>pool_config</code>. Use a pool for services: it replaces broken connections, while a single connection cannot recover once it drops.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="n">DB_URI</span><span class="p">,</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="n">pool_config</span><span class="o">=</span><span class="p">{</span><span class="s2">"min_size"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"max_size"</span><span class="p">:</span> <span class="mi">20</span><span class="p">},</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+</code></pre></div>
+<p><code>pool_config</code> is a <code>PoolConfig</code>, with the same meaning as in PostgresStore:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>min_size</code></td>
+<td><code>1</code></td>
+<td>Connections the pool keeps open</td>
+</tr>
+<tr>
+<td><code>max_size</code></td>
+<td><code>None</code></td>
+<td>Most connections the pool opens. <code>None</code> means <code>min_size</code></td>
+</tr>
+<tr>
+<td><code>kwargs</code></td>
+<td><code>{}</code></td>
+<td>Extra psycopg connection options for every pooled connection. The store sets <code>autocommit</code>, <code>row_factory</code> and <code>prepare_threshold</code> itself, and they raise <code>ValueError</code> here</td>
+</tr>
+</tbody>
+</table>
+<p>Without <code>max_size</code>, the pool has <code>min_size</code> connections, so set it for the concurrency you need.</p>
+<p>All <code>from_conn_string</code> options:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pipeline</code></td>
+<td><code>False</code></td>
+<td>Pipeline mode on the single connection. Ignored with <code>pool_config</code></td>
+</tr>
+<tr>
+<td><code>pool_config</code></td>
+<td><code>None</code></td>
+<td>Open a pool with these settings instead of one connection</td>
+</tr>
+<tr>
+<td><code>index</code></td>
+<td><code>None</code></td>
+<td>Semantic search settings, see <a href="#semantic-search">Semantic Search</a></td>
+</tr>
+<tr>
+<td><code>ttl</code></td>
+<td><code>None</code></td>
+<td>Expiry settings, see <a href="#ttl">TTL</a></td>
+</tr>
+<tr>
+<td><code>retry_policy</code></td>
+<td><code>RetryPolicy()</code></td>
+<td>How operations retry</td>
+</tr>
+<tr>
+<td><code>connect_timeout</code></td>
+<td><code>10.0</code></td>
+<td>Seconds to wait when connecting, or <code>None</code></td>
+</tr>
+<tr>
+<td><code>prepare_threshold</code></td>
+<td><code>5</code></td>
+<td>psycopg prepared statement threshold, or <code>None</code> to disable</td>
+</tr>
+<tr>
+<td><code>connect_kwargs</code></td>
+<td><code>None</code></td>
+<td>Extra psycopg connection options, for example <code>{"application_name": "my-service"}</code></td>
+</tr>
+<tr>
+<td><code>table_name</code></td>
+<td><code>"store"</code></td>
+<td>Name of the items table</td>
+</tr>
+<tr>
+<td><code>schema</code></td>
+<td><code>"public"</code></td>
+<td>Schema of the store's tables</td>
+</tr>
+</tbody>
+</table>
+<h3 id="your-own-pool-or-connection">Your Own Pool or Connection<a class="headerlink" href="#your-own-pool-or-connection" title="Permanent link">&para;</a></h3>
+<p>The constructor takes a psycopg connection or a <code>psycopg_pool</code> pool, plus <code>pipe</code>, <code>index</code>, <code>ttl</code>, <code>retry_policy</code>, <code>table_name</code> and <code>schema</code>. The connection or pool must use autocommit and <code>dict_row</code>. One pool can serve the store and the checkpointer:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="k">with</span> <span class="n">ConnectionPool</span><span class="p">(</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="n">max_size</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    <span class="nb">open</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="p">)</span> <span class="k">as</span> <span class="n">pool</span><span class="p">:</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>    <span class="n">store</span> <span class="o">=</span> <span class="n">CockroachDBStore</span><span class="p">(</span><span class="n">pool</span><span class="p">)</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>    <span class="n">checkpointer</span> <span class="o">=</span> <span class="n">CockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">)</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>    <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+</code></pre></div>
+<p>Use <code>postgresql://</code> for raw psycopg connections; <code>from_conn_string</code> converts <code>cockroachdb://</code> for you. Pools you build yourself do not get the library's <code>gssencmode=disable</code> default. On macOS with prefork servers, add <code>gssencmode=disable</code> to the pool's conninfo or kwargs.</p>
+<h3 id="concurrency">Concurrency<a class="headerlink" href="#concurrency" title="Permanent link">&para;</a></h3>
+<p>A <code>CockroachDBStore</code> on a pool runs batches concurrently, each on its own pooled connection. On a single connection, including <code>pipeline=True</code>, it runs one batch at a time.</p>
+<p><code>AsyncCockroachDBStore</code> sends <code>aget</code>, <code>aput</code>, <code>asearch</code> and its other awaited calls through LangGraph's <code>AsyncBatchedBaseStore</code> queue. The queue runs one <code>abatch</code> at a time and merges the ops queued in the same event loop tick into one batch. So a larger pool does not run those calls in parallel, though it still replaces broken connections. Direct <code>abatch</code> calls, and <code>batch</code> calls from other threads, run concurrently on a pool.</p>
+<p>Create an <code>AsyncCockroachDBStore</code> inside a running event loop. Its sync methods (<code>get</code>, <code>put</code> and the others) are for other threads while that loop runs. They run the async methods on it, so <code>get</code>, <code>put</code>, <code>search</code>, <code>delete</code> and <code>list_namespaces</code> join the same queue. Called from the loop's own thread they raise <code>asyncio.InvalidStateError</code>. If the loop is closed or not running, or the call comes from a forked child process, they raise <code>RuntimeError</code> instead of waiting forever, as the sync methods of <code>AsyncCockroachDBSaver</code> do.</p>
+<h2 id="retries-and-atomic-writes">Retries and Atomic Writes<a class="headerlink" href="#retries-and-atomic-writes" title="Permanent link">&para;</a></h2>
+<p>Every call retries transient CockroachDB errors under the store's <code>RetryPolicy</code>. Pass <code>retry_policy=</code> to change it; see <a href="../resilience/">Retries and Resilience</a> for the fields. Every write is an UPSERT, a DELETE, or an UPDATE that pushes back an expiry. Each is safe to run twice, so a retry after an ambiguous result is safe.</p>
+<p>A <code>batch()</code> call validates every op and serializes every value before any statement runs. It then runs its reads, one round trip each for its gets, its searches and its listings, and commits all its puts and deletes together in one transaction. Semantic searches under a namespace add a round trip before the searches, and sometimes one after them, as <a href="#how-searches-use-the-index">How Searches Use the Index</a> explains. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.</p>
+<p>On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table. The TTL step of <code>setup()</code>, <code>disable_ttl()</code> and <code>adisable_ttl()</code> retry that error, as described in <a href="../resilience/#configuring-retries">Configuring retries</a>.</p>
+<h2 id="namespaces-and-items">Namespaces and Items<a class="headerlink" href="#namespaces-and-items" title="Permanent link">&para;</a></h2>
+<p>An item is a JSON object, addressed by a namespace (a tuple of labels) and a key. LangGraph's <code>BaseStore</code> requires every label to be a non-empty string without <code>.</code>, in every store, and reserves <code>"langgraph"</code> as the first label. This store keeps a namespace as its labels joined with <code>.</code>, as PostgresStore does, and checks the labels again for ops passed straight to <code>batch()</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">),</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">,</span> <span class="s2">"stars"</span><span class="p">:</span> <span class="mi">5</span><span class="p">})</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"profile"</span><span class="p">),</span> <span class="s2">"name"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">})</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">item</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"profile"</span><span class="p">),</span> <span class="s2">"name"</span><span class="p">)</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="nb">print</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">created_at</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">updated_at</span><span class="p">)</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">store</span><span class="o">.</span><span class="n">delete</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"profile"</span><span class="p">),</span> <span class="s2">"name"</span><span class="p">)</span>
+</code></pre></div>
+<p>A value that cannot be stored as JSON, including NaN and infinity, raises <code>ValueError</code> before anything is written.</p>
+<h3 id="listing-namespaces">Listing Namespaces<a class="headerlink" href="#listing-namespaces" title="Permanent link">&para;</a></h3>
+<p>With items in <code>("user", "alice", "memories")</code>, <code>("user", "alice", "profile")</code> and <code>("user", "bob", "memories")</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">store</span><span class="o">.</span><span class="n">list_namespaces</span><span class="p">(</span><span class="n">prefix</span><span class="o">=</span><span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">))</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="c1"># [('user', 'alice', 'memories'), ('user', 'alice', 'profile')]</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">store</span><span class="o">.</span><span class="n">list_namespaces</span><span class="p">(</span><span class="n">prefix</span><span class="o">=</span><span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"*"</span><span class="p">),</span> <span class="n">max_depth</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1"># [('user', 'alice'), ('user', 'bob')]</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="n">store</span><span class="o">.</span><span class="n">list_namespaces</span><span class="p">(</span><span class="n">suffix</span><span class="o">=</span><span class="p">(</span><span class="s2">"memories"</span><span class="p">,))</span>
+</code></pre></div>
+<p><code>*</code> matches one label. <code>max_depth</code> cuts each namespace to its first <code>max_depth</code> labels. Results are distinct and sorted by their text with the labels joined by <code>.</code>, as in PostgresStore, and <code>limit</code> (default 100) and <code>offset</code> page through them. That is the order of the tuples unless a label holds a character that sorts before <code>.</code>, such as a space, <code>-</code> or <code>#</code>: <code>("a#b", "c")</code> comes before <code>("a", "b")</code>, where <code>InMemoryStore</code> puts it after. A <code>prefix</code> that starts with plain labels, such as <code>("user", "alice")</code> or <code>("user", "*", "memories")</code>, reads only the rows under those labels.</p>
+<h3 id="searching-and-filtering">Searching and Filtering<a class="headerlink" href="#searching-and-filtering" title="Permanent link">&para;</a></h3>
+<p><code>search</code> returns the items in a namespace and its descendants, so <code>("user", "alice")</code> also finds items in <code>("user", "alice", "memories")</code>. Without a <code>query</code>, the newest items come first.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">results</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">),</span> <span class="nb">filter</span><span class="o">=</span><span class="p">{</span><span class="s2">"stars"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"$gte"</span><span class="p">:</span> <span class="mi">4</span><span class="p">}},</span> <span class="n">limit</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">offset</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Filter</th>
+<th>Matches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>{"topic": "travel"}</code></td>
+<td><code>topic</code> equals <code>"travel"</code>. A list compares as JSON</td>
+</tr>
+<tr>
+<td><code>{"topic": {"$eq": "travel"}}</code></td>
+<td>The same</td>
+</tr>
+<tr>
+<td><code>{"topic": {"$ne": "travel"}}</code></td>
+<td><code>topic</code> is something else, or is missing</td>
+</tr>
+<tr>
+<td><code>{"stars": {"$gt": 3}}</code></td>
+<td><code>stars</code> is a number greater than 3. Also <code>$gte</code>, <code>$lt</code> and <code>$lte</code></td>
+</tr>
+<tr>
+<td><code>{"name": {"$lt": "m"}}</code></td>
+<td>The text of <code>name</code> sorts before <code>"m"</code></td>
+</tr>
+<tr>
+<td><code>{"address": {"city": "Lisbon"}}</code></td>
+<td>The nested key <code>address.city</code> equals <code>"Lisbon"</code></td>
+</tr>
+</tbody>
+</table>
+<p>Every condition must match. A comparison with a number only matches numeric values, and a comparison with a string compares text. Comparison operators do not take booleans, and an unknown operator raises <code>ValueError</code>.</p>
+<h2 id="semantic-search">Semantic Search<a class="headerlink" href="#semantic-search" title="Permanent link">&para;</a></h2>
+<p>Pass <code>index</code> to embed items when they are put and to rank searches by similarity:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAIEmbeddings</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>    <span class="n">DB_URI</span><span class="p">,</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>    <span class="n">index</span><span class="o">=</span><span class="p">{</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>        <span class="s2">"dims"</span><span class="p">:</span> <span class="mi">1536</span><span class="p">,</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>        <span class="s2">"embed"</span><span class="p">:</span> <span class="n">OpenAIEmbeddings</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"text-embedding-3-small"</span><span class="p">),</span>
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>        <span class="s2">"fields"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>    <span class="p">},</span>
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">),</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">})</span>
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>
+<a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a>    <span class="n">results</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">),</span> <span class="n">query</span><span class="o">=</span><span class="s2">"Where does Alice sit on planes?"</span><span class="p">)</span>
+<a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a>    <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+<a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a>        <span class="nb">print</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">score</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
+</code></pre></div>
+<p>With an index, <code>setup()</code> also creates the vectors table and, unless <code>flat</code> is set, a C-SPANN vector index on it.</p>
+<h3 id="index-settings">Index Settings<a class="headerlink" href="#index-settings" title="Permanent link">&para;</a></h3>
+<p><code>index</code> is a <code>CockroachDBIndexConfig</code>: LangGraph's <code>IndexConfig</code> with CockroachDB options added.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dims</code></td>
+<td>required</td>
+<td>Vector dimensions, fixed when the vectors table is created</td>
+</tr>
+<tr>
+<td><code>embed</code></td>
+<td>required</td>
+<td>An <code>Embeddings</code> object, a sync or async embedding function, or a provider string such as <code>"openai:text-embedding-3-small"</code> (needs the <code>langchain</code> package)</td>
+</tr>
+<tr>
+<td><code>fields</code></td>
+<td><code>["$"]</code></td>
+<td>Paths in each value to embed. <code>"$"</code> embeds the whole value as JSON, and <code>"messages[*].content"</code> embeds each message on its own</td>
+</tr>
+<tr>
+<td><code>distance_type</code></td>
+<td><code>"cosine"</code></td>
+<td><code>"cosine"</code>, <code>"l2"</code> or <code>"inner_product"</code></td>
+</tr>
+<tr>
+<td><code>cspann</code></td>
+<td><code>None</code></td>
+<td>C-SPANN partition sizes, <code>{"min_partition_size": 10, "max_partition_size": 100}</code>. Give both or neither; the maximum must be at least 4 times the minimum. Without it the index uses CockroachDB's defaults</td>
+</tr>
+<tr>
+<td><code>flat</code></td>
+<td><code>False</code></td>
+<td>Do not create a vector index. Searches rank every matching vector exactly, in one round trip, which suits small stores</td>
+</tr>
+<tr>
+<td><code>beam_size</code></td>
+<td><code>None</code></td>
+<td>C-SPANN beam width. A larger beam finds more of the true nearest neighbors and reads more of the index. A small one can return fewer candidates than a search asks for. If that leaves a page short, the search runs its second, exact query</td>
+</tr>
+</tbody>
+</table>
+<p>A put can override <code>fields</code>: <code>index=False</code> stores the item without vectors, and <code>index=["text", "summary"]</code> embeds those paths instead.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"profile"</span><span class="p">),</span> <span class="s2">"name"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">},</span> <span class="n">index</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+<p>Each embedded text is one vector row, so an item can have several. Putting an item again replaces all its vectors, and deleting it deletes them. A search returns each item once, with the score of its best match. Higher scores are better: the score is <code>1 - distance</code> for cosine, and the negated distance for <code>l2</code> and <code>inner_product</code>. Results are ordered by score, then by namespace and key.</p>
+<h3 id="how-searches-use-the-index">How Searches Use the Index<a class="headerlink" href="#how-searches-use-the-index" title="Permanent link">&para;</a></h3>
+<p>The vector index has the namespace as a prefix column, because most memory searches name one user's namespace. A search with a <code>query</code> under a namespace prefix runs in two steps. First a short read lists the namespaces at or under the prefix that have vectors. Then the ranked search runs on the index, limited to those namespaces. For one user's namespace that list has one entry, so the search reads only that namespace's part of the index.</p>
+<p>The index finds approximate nearest neighbors, which <code>beam_size</code> tunes. It gives the search a window of candidate vectors, twice as many as the page needs, and the filter and the expiry check then apply to those candidates. A selective filter, or many expired items that the TTL job has not deleted yet, can leave fewer matches in the window than the page asks for. Then the search runs a second, exact query over the namespaces the first step found: it applies the filter and the expiry check first, ranks every match and returns that page instead. A short first page counts as exact only when the index returned every vector those namespaces hold, which the store checks with a count of their vectors that stops at the window's size. That is the usual case when the namespaces hold fewer vectors than the window. A small <code>beam_size</code> or small partitions can cap what the index returns, and then the second query runs as well. For one user's memories the second query reads little, but it costs a round trip.</p>
+<p>Some searches skip the index and rank every match exactly in one query: a search of the whole store, with an empty prefix; every search of a store with <code>flat</code> set, which skips the first step too; and a search under a prefix where more than 1000 namespaces have vectors (<code>MAX_SEARCH_NAMESPACES</code> in <code>langchain_cockroachdb.store.sql</code>). Like PostgresStore, they apply the filter and the expiry check before they rank.</p>
+<p><code>beam_size</code> is applied to each search with <code>SET LOCAL</code>, inside the search's own transaction, so it does not stay on a pooled connection.</p>
+<p>Expired items are never returned, but their vectors stay in the table until the TTL job or <code>sweep_ttl()</code> deletes them, and until then they take up places in the window. With TTLs of minutes and the default hourly job, they can fill it, and more searches then need the second query. Set <code>sweep_interval_minutes</code> (or <code>ttl_job_cron</code>) lower when TTLs are minutes.</p>
+<p>A <code>query</code> on a store without <code>index</code> runs a plain search: it filters and returns the newest items first, not the most similar ones. The store logs one WARNING about it, once per store.</p>
+<h3 id="changing-the-index-configuration">Changing the Index Configuration<a class="headerlink" href="#changing-the-index-configuration" title="Permanent link">&para;</a></h3>
+<p><code>setup()</code> compares the configuration with the existing vectors table and index:</p>
+<table>
+<thead>
+<tr>
+<th>Change after the first <code>setup()</code></th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dims</code></td>
+<td><code>setup()</code> raises <code>ValueError</code>. Use the existing dims, or another <code>table_name</code></td>
+</tr>
+<tr>
+<td><code>distance_type</code></td>
+<td><code>setup()</code> raises <code>ValueError</code>. Drop the index and run <code>setup()</code> again to build it with the new distance</td>
+</tr>
+<tr>
+<td><code>cspann</code> sizes</td>
+<td><code>setup()</code> logs a WARNING and keeps the existing index. Drop it and run <code>setup()</code> again to use the new sizes</td>
+</tr>
+<tr>
+<td><code>flat</code> turned on</td>
+<td><code>setup()</code> logs a WARNING and keeps the index. Searches no longer use it, but puts still update it. Drop it if no other store needs it</td>
+</tr>
+<tr>
+<td><code>fields</code></td>
+<td>Applies to items put from then on. Existing items keep their vectors until they are put again</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">store</span><span class="o">.</span><span class="n">drop_vector_index</span><span class="p">()</span>  <span class="c1"># async: await store.adrop_vector_index()</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>  <span class="c1"># builds the index again with the store's current settings</span>
+</code></pre></div>
+<p>Searches scan the vectors until the new index is built. Adding <code>index</code> to a store that already holds items creates the vectors table and index, and semantic search finds the existing items once they are put again.</p>
+<h2 id="ttl">TTL<a class="headerlink" href="#ttl" title="Permanent link">&para;</a></h2>
+<p>Pass <code>ttl</code> to give items an expiry. <code>default_ttl</code> and the <code>ttl</code> argument of <code>put</code> are in minutes.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="n">DB_URI</span><span class="p">,</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>    <span class="n">ttl</span><span class="o">=</span><span class="p">{</span><span class="s2">"default_ttl"</span><span class="p">:</span> <span class="mi">60</span> <span class="o">*</span> <span class="mi">24</span> <span class="o">*</span> <span class="mi">30</span><span class="p">,</span> <span class="s2">"refresh_on_read"</span><span class="p">:</span> <span class="kc">True</span><span class="p">},</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>  <span class="c1"># turns on CockroachDB row-level TTL</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>
+<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>    <span class="n">memories</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">})</span>  <span class="c1"># expires in 30 days</span>
+<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"code"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Door code 4321"</span><span class="p">},</span> <span class="n">ttl</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>  <span class="c1"># expires in 10 minutes</span>
+<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"profile"</span><span class="p">),</span> <span class="s2">"name"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">},</span> <span class="n">ttl</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>  <span class="c1"># never expires</span>
+</code></pre></div>
+<p><code>ttl</code> is a <code>CockroachDBTTLConfig</code>: LangGraph's <code>TTLConfig</code> with CockroachDB options added.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>default_ttl</code></td>
+<td><code>None</code></td>
+<td>Minutes until an item expires when <code>put</code> gets no <code>ttl</code>. <code>None</code> means no expiry</td>
+</tr>
+<tr>
+<td><code>refresh_on_read</code></td>
+<td><code>True</code></td>
+<td>Whether <code>get</code> and <code>search</code> push back the expiry of the items they return</td>
+</tr>
+<tr>
+<td><code>omit_expired</code></td>
+<td><code>True</code></td>
+<td>Whether reads, searches and listings leave out expired items</td>
+</tr>
+<tr>
+<td><code>sweep_interval_minutes</code></td>
+<td><code>None</code></td>
+<td>How often CockroachDB's TTL job runs: every N minutes below 60 (N must be a whole number), hourly at 60 or more. Also the default interval of <code>start_ttl_sweeper()</code></td>
+</tr>
+<tr>
+<td><code>ttl_job_cron</code></td>
+<td><code>None</code></td>
+<td>A cron expression for the TTL job, such as <code>"@daily"</code>. Overrides <code>sweep_interval_minutes</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-ttl-job">The TTL Job<a class="headerlink" href="#the-ttl-job" title="Permanent link">&para;</a></h3>
+<p>CockroachDB deletes expired rows itself, with <a href="https://www.cockroachlabs.com/docs/stable/row-level-ttl">row-level TTL</a>. With a <code>ttl</code> configuration, <code>setup()</code> sets <code>ttl_expiration_expression</code> to the <code>expires_at</code> column on the items table, and on the vectors table when there is an index. The job runs on the cron that <code>sweep_interval_minutes</code> gives, or <code>ttl_job_cron</code>, and hourly (<code>@hourly</code>) by default. A changed <code>sweep_interval_minutes</code> or <code>ttl_job_cron</code> takes effect at the next <code>setup()</code>. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.</p>
+<p>The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because <code>omit_expired</code> is on by default. That holds even for a store built without <code>ttl</code>, since another process may write items with an expiry to the same tables. Pass <code>ttl={"omit_expired": False}</code> to see expired items until the job deletes them. Their vectors stay as well, and make semantic searches run their second query more often, so with TTLs of minutes set <code>sweep_interval_minutes</code> lower than the default hour, as <a href="#how-searches-use-the-index">How Searches Use the Index</a> explains.</p>
+<h3 id="refresh-on-read">Refresh on Read<a class="headerlink" href="#refresh-on-read" title="Permanent link">&para;</a></h3>
+<p>With <code>refresh_on_read</code>, a <code>get</code> or a <code>search</code> sets the expiry of the items it returns to now plus their TTL. Only items that have a TTL change, and vectors are refreshed with their item. The refresh is an UPDATE inside the read statement, so reading items that have a TTL is also a write. For memory that is read very often, set <code>refresh_on_read</code> to <code>False</code> or use a longer TTL. One call can decide for itself with <code>refresh_ttl</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">store</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">),</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="n">refresh_ttl</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+<p>With <code>omit_expired</code> off and refresh on, reading an expired item that the job has not deleted yet gives it a new expiry, so it stays.</p>
+<h3 id="stores-without-a-ttl-configuration">Stores Without a TTL Configuration<a class="headerlink" href="#stores-without-a-ttl-configuration" title="Permanent link">&para;</a></h3>
+<p>A store built without <code>ttl</code> applies no default expiry and never refreshes one. An explicit <code>put(..., ttl=10)</code> still writes an expiry. Its <code>setup()</code> does not turn on the TTL job, and it leaves an existing TTL setting alone, so a process that starts without <code>ttl</code> cannot switch off another's expiry. The items it writes with a TTL are hidden once they expire, and are deleted by <code>sweep_ttl()</code>, or by the TTL job if another store turned it on.</p>
+<h3 id="sweeping-and-disabling-ttl">Sweeping and Disabling TTL<a class="headerlink" href="#sweeping-and-disabling-ttl" title="Permanent link">&para;</a></h3>
+<p><code>sweep_ttl()</code> deletes expired items now and returns how many it deleted. <code>start_ttl_sweeper()</code> runs it in a background thread, every <code>sweep_interval_minutes</code> or else every 5 minutes, and <code>stop_ttl_sweeper()</code> stops it, as in PostgresStore. They are optional here: the TTL job already deletes expired rows, and the sweeper only deletes them sooner. Without a <code>ttl</code> configuration, <code>start_ttl_sweeper()</code> does nothing, as in PostgresStore.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="n">deleted</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">sweep_ttl</span><span class="p">()</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="n">store</span><span class="o">.</span><span class="n">start_ttl_sweeper</span><span class="p">(</span><span class="n">sweep_interval_minutes</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="o">...</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="n">store</span><span class="o">.</span><span class="n">stop_ttl_sweeper</span><span class="p">()</span>
+</code></pre></div>
+<p><code>disable_ttl()</code> (async: <code>adisable_ttl()</code>) turns off row-level TTL on the store's tables. <code>setup()</code> never does, even without a <code>ttl</code> configuration. Expired items stay hidden while <code>omit_expired</code> is on.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="n">store</span><span class="o">.</span><span class="n">disable_ttl</span><span class="p">()</span>  <span class="c1"># async: await store.adisable_ttl()</span>
+</code></pre></div>
+<p>On <code>AsyncCockroachDBStore</code>, <code>sweep_ttl()</code>, <code>start_ttl_sweeper()</code> (it returns an <code>asyncio.Task</code>) and <code>stop_ttl_sweeper()</code> are coroutines with the same names, as in AsyncPostgresStore. Turning TTL off is <code>await store.adisable_ttl()</code>.</p>
+<h2 id="deleting-a-namespace">Deleting a Namespace<a class="headerlink" href="#deleting-a-namespace" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">deleted</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">delete_namespace</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">))</span>  <span class="c1"># async: await store.adelete_namespace(...)</span>
+</code></pre></div>
+<p><code>delete_namespace</code> deletes every item in a namespace and its descendants, with their vectors, and returns the number of items deleted. <code>("user", "alice")</code> covers <code>("user", "alice", "memories")</code> but not <code>("user", "alice2")</code>. It runs as one statement, so it commits completely or not at all. If a retry follows a commit whose result was lost, the count is that of the retry, usually 0. An empty prefix raises <code>InvalidNamespaceError</code>. <code>BaseStore</code> has no such method; it is specific to this store.</p>
+<h2 id="tables">Tables<a class="headerlink" href="#tables" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Table</th>
+<th>Holds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>store</code></td>
+<td>Items: <code>prefix</code> (the namespace), <code>key</code>, <code>value</code> (JSONB), <code>created_at</code>, <code>updated_at</code>, <code>expires_at</code> and <code>ttl_minutes</code></td>
+</tr>
+<tr>
+<td><code>store_vectors</code></td>
+<td>One row per embedded text, with the item's expiry. Created only with <code>index</code></td>
+</tr>
+<tr>
+<td><code>store_migrations</code></td>
+<td>The migration versions applied</td>
+</tr>
+</tbody>
+</table>
+<p><code>table_name="memories"</code> names the tables <code>memories</code>, <code>memories_vectors</code> and <code>memories_migrations</code>, so several stores can share a database. <code>schema=</code> puts them in another schema, which must exist. The default schema is <code>public</code>.</p>
+<p>The store creates plain tables, with no multi-region locality such as <code>REGIONAL BY ROW</code> or <code>GLOBAL</code>. You can set one yourself with <code>ALTER TABLE</code>; <code>setup()</code> leaves it as you set it.</p>
+<h2 id="use-with-langgraph">Use with LangGraph<a class="headerlink" href="#use-with-langgraph" title="Permanent link">&para;</a></h2>
+<h3 id="with-create_agent">With create_agent<a class="headerlink" href="#with-create_agent" title="Permanent link">&para;</a></h3>
+<p>The tools annotate their runtime as plain <code>ToolRuntime</code>. On Python 3.10, pydantic cannot build the tool schema for <code>ToolRuntime[Context]</code>, so the subscripted form fails there.</p>
+<p>Tools reach the store through <code>ToolRuntime</code>, and the user id comes from the run's context:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain.agents</span><span class="w"> </span><span class="kn">import</span> <span class="n">create_agent</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain.tools</span><span class="w"> </span><span class="kn">import</span> <span class="n">ToolRuntime</span><span class="p">,</span> <span class="n">tool</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAIEmbeddings</span>
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>
+<a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a><span class="n">DB_URI</span> <span class="o">=</span> <span class="s2">"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"</span>
+<a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a>
+<a id="__codelineno-16-12" name="__codelineno-16-12" href="#__codelineno-16-12"></a>
+<a id="__codelineno-16-13" name="__codelineno-16-13" href="#__codelineno-16-13"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-16-14" name="__codelineno-16-14" href="#__codelineno-16-14"></a><span class="k">class</span><span class="w"> </span><span class="nc">Context</span><span class="p">:</span>
+<a id="__codelineno-16-15" name="__codelineno-16-15" href="#__codelineno-16-15"></a>    <span class="n">user_id</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-16-16" name="__codelineno-16-16" href="#__codelineno-16-16"></a>
+<a id="__codelineno-16-17" name="__codelineno-16-17" href="#__codelineno-16-17"></a>
+<a id="__codelineno-16-18" name="__codelineno-16-18" href="#__codelineno-16-18"></a><span class="nd">@tool</span>
+<a id="__codelineno-16-19" name="__codelineno-16-19" href="#__codelineno-16-19"></a><span class="k">def</span><span class="w"> </span><span class="nf">save_memory</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-16-20" name="__codelineno-16-20" href="#__codelineno-16-20"></a><span class="w">    </span><span class="sd">"""Save a fact about the user for later conversations."""</span>
+<a id="__codelineno-16-21" name="__codelineno-16-21" href="#__codelineno-16-21"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+<a id="__codelineno-16-22" name="__codelineno-16-22" href="#__codelineno-16-22"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-16-23" name="__codelineno-16-23" href="#__codelineno-16-23"></a>    <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">uuid</span><span class="o">.</span><span class="n">uuid4</span><span class="p">()),</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="n">text</span><span class="p">})</span>
+<a id="__codelineno-16-24" name="__codelineno-16-24" href="#__codelineno-16-24"></a>    <span class="k">return</span> <span class="sa">f</span><span class="s2">"Saved: </span><span class="si">{</span><span class="n">text</span><span class="si">}</span><span class="s2">"</span>
+<a id="__codelineno-16-25" name="__codelineno-16-25" href="#__codelineno-16-25"></a>
+<a id="__codelineno-16-26" name="__codelineno-16-26" href="#__codelineno-16-26"></a>
+<a id="__codelineno-16-27" name="__codelineno-16-27" href="#__codelineno-16-27"></a><span class="nd">@tool</span>
+<a id="__codelineno-16-28" name="__codelineno-16-28" href="#__codelineno-16-28"></a><span class="k">def</span><span class="w"> </span><span class="nf">recall</span><span class="p">(</span><span class="n">query</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-16-29" name="__codelineno-16-29" href="#__codelineno-16-29"></a><span class="w">    </span><span class="sd">"""Search the user's memories."""</span>
+<a id="__codelineno-16-30" name="__codelineno-16-30" href="#__codelineno-16-30"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+<a id="__codelineno-16-31" name="__codelineno-16-31" href="#__codelineno-16-31"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-16-32" name="__codelineno-16-32" href="#__codelineno-16-32"></a>    <span class="n">items</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-16-33" name="__codelineno-16-33" href="#__codelineno-16-33"></a>    <span class="k">return</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"No memories found."</span>
+<a id="__codelineno-16-34" name="__codelineno-16-34" href="#__codelineno-16-34"></a>
+<a id="__codelineno-16-35" name="__codelineno-16-35" href="#__codelineno-16-35"></a>
+<a id="__codelineno-16-36" name="__codelineno-16-36" href="#__codelineno-16-36"></a><span class="k">with</span> <span class="p">(</span>
+<a id="__codelineno-16-37" name="__codelineno-16-37" href="#__codelineno-16-37"></a>    <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span>
+<a id="__codelineno-16-38" name="__codelineno-16-38" href="#__codelineno-16-38"></a>        <span class="n">DB_URI</span><span class="p">,</span>
+<a id="__codelineno-16-39" name="__codelineno-16-39" href="#__codelineno-16-39"></a>        <span class="n">pool_config</span><span class="o">=</span><span class="p">{</span><span class="s2">"max_size"</span><span class="p">:</span> <span class="mi">10</span><span class="p">},</span>
+<a id="__codelineno-16-40" name="__codelineno-16-40" href="#__codelineno-16-40"></a>        <span class="n">index</span><span class="o">=</span><span class="p">{</span>
+<a id="__codelineno-16-41" name="__codelineno-16-41" href="#__codelineno-16-41"></a>            <span class="s2">"dims"</span><span class="p">:</span> <span class="mi">1536</span><span class="p">,</span>
+<a id="__codelineno-16-42" name="__codelineno-16-42" href="#__codelineno-16-42"></a>            <span class="s2">"embed"</span><span class="p">:</span> <span class="n">OpenAIEmbeddings</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"text-embedding-3-small"</span><span class="p">),</span>
+<a id="__codelineno-16-43" name="__codelineno-16-43" href="#__codelineno-16-43"></a>            <span class="s2">"fields"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+<a id="__codelineno-16-44" name="__codelineno-16-44" href="#__codelineno-16-44"></a>        <span class="p">},</span>
+<a id="__codelineno-16-45" name="__codelineno-16-45" href="#__codelineno-16-45"></a>        <span class="n">ttl</span><span class="o">=</span><span class="p">{</span><span class="s2">"default_ttl"</span><span class="p">:</span> <span class="mi">60</span> <span class="o">*</span> <span class="mi">24</span> <span class="o">*</span> <span class="mi">30</span><span class="p">},</span>
+<a id="__codelineno-16-46" name="__codelineno-16-46" href="#__codelineno-16-46"></a>    <span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">,</span>
+<a id="__codelineno-16-47" name="__codelineno-16-47" href="#__codelineno-16-47"></a>    <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">checkpointer</span><span class="p">,</span>
+<a id="__codelineno-16-48" name="__codelineno-16-48" href="#__codelineno-16-48"></a><span class="p">):</span>
+<a id="__codelineno-16-49" name="__codelineno-16-49" href="#__codelineno-16-49"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-16-50" name="__codelineno-16-50" href="#__codelineno-16-50"></a>    <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-16-51" name="__codelineno-16-51" href="#__codelineno-16-51"></a>    <span class="n">agent</span> <span class="o">=</span> <span class="n">create_agent</span><span class="p">(</span>
+<a id="__codelineno-16-52" name="__codelineno-16-52" href="#__codelineno-16-52"></a>        <span class="s2">"openai:gpt-4o-mini"</span><span class="p">,</span>
+<a id="__codelineno-16-53" name="__codelineno-16-53" href="#__codelineno-16-53"></a>        <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="n">save_memory</span><span class="p">,</span> <span class="n">recall</span><span class="p">],</span>
+<a id="__codelineno-16-54" name="__codelineno-16-54" href="#__codelineno-16-54"></a>        <span class="n">context_schema</span><span class="o">=</span><span class="n">Context</span><span class="p">,</span>
+<a id="__codelineno-16-55" name="__codelineno-16-55" href="#__codelineno-16-55"></a>        <span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">,</span>
+<a id="__codelineno-16-56" name="__codelineno-16-56" href="#__codelineno-16-56"></a>        <span class="n">store</span><span class="o">=</span><span class="n">store</span><span class="p">,</span>
+<a id="__codelineno-16-57" name="__codelineno-16-57" href="#__codelineno-16-57"></a>    <span class="p">)</span>
+<a id="__codelineno-16-58" name="__codelineno-16-58" href="#__codelineno-16-58"></a>
+<a id="__codelineno-16-59" name="__codelineno-16-59" href="#__codelineno-16-59"></a>    <span class="n">alice</span> <span class="o">=</span> <span class="n">Context</span><span class="p">(</span><span class="n">user_id</span><span class="o">=</span><span class="s2">"alice"</span><span class="p">)</span>
+<a id="__codelineno-16-60" name="__codelineno-16-60" href="#__codelineno-16-60"></a>    <span class="n">agent</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span>
+<a id="__codelineno-16-61" name="__codelineno-16-61" href="#__codelineno-16-61"></a>        <span class="p">{</span><span class="s2">"messages"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"Remember that I prefer window seats."</span><span class="p">}]},</span>
+<a id="__codelineno-16-62" name="__codelineno-16-62" href="#__codelineno-16-62"></a>        <span class="p">{</span><span class="s2">"configurable"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"thread_id"</span><span class="p">:</span> <span class="s2">"thread-1"</span><span class="p">}},</span>
+<a id="__codelineno-16-63" name="__codelineno-16-63" href="#__codelineno-16-63"></a>        <span class="n">context</span><span class="o">=</span><span class="n">alice</span><span class="p">,</span>
+<a id="__codelineno-16-64" name="__codelineno-16-64" href="#__codelineno-16-64"></a>    <span class="p">)</span>
+<a id="__codelineno-16-65" name="__codelineno-16-65" href="#__codelineno-16-65"></a>    <span class="c1"># A new thread starts with no messages, but the store still has the memory</span>
+<a id="__codelineno-16-66" name="__codelineno-16-66" href="#__codelineno-16-66"></a>    <span class="n">result</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span>
+<a id="__codelineno-16-67" name="__codelineno-16-67" href="#__codelineno-16-67"></a>        <span class="p">{</span><span class="s2">"messages"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"Where do I like to sit on a plane?"</span><span class="p">}]},</span>
+<a id="__codelineno-16-68" name="__codelineno-16-68" href="#__codelineno-16-68"></a>        <span class="p">{</span><span class="s2">"configurable"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"thread_id"</span><span class="p">:</span> <span class="s2">"thread-2"</span><span class="p">}},</span>
+<a id="__codelineno-16-69" name="__codelineno-16-69" href="#__codelineno-16-69"></a>        <span class="n">context</span><span class="o">=</span><span class="n">alice</span><span class="p">,</span>
+<a id="__codelineno-16-70" name="__codelineno-16-70" href="#__codelineno-16-70"></a>    <span class="p">)</span>
+<a id="__codelineno-16-71" name="__codelineno-16-71" href="#__codelineno-16-71"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="p">[</span><span class="s2">"messages"</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+</code></pre></div>
+<p>With <code>AsyncCockroachDBStore</code>, write the tools as async functions that call <code>runtime.store.aput</code> and <code>runtime.store.asearch</code>, and call <code>agent.ainvoke</code>. <a href="../../examples/long-term-memory/"><code>examples/long_term_memory.py</code></a> runs both versions with a scripted model.</p>
+<h3 id="in-a-stategraph">In a StateGraph<a class="headerlink" href="#in-a-stategraph" title="Permanent link">&para;</a></h3>
+<p>A node gets the store from its <code>Runtime</code>, and <code>compile</code> takes it next to the checkpointer:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>
+<a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChatOpenAI</span><span class="p">,</span> <span class="n">OpenAIEmbeddings</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langgraph.graph</span><span class="w"> </span><span class="kn">import</span> <span class="n">START</span><span class="p">,</span> <span class="n">MessagesState</span><span class="p">,</span> <span class="n">StateGraph</span>
+<a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langgraph.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">Runtime</span>
+<a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a>
+<a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a>
+<a id="__codelineno-17-9" name="__codelineno-17-9" href="#__codelineno-17-9"></a><span class="n">DB_URI</span> <span class="o">=</span> <span class="s2">"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"</span>
+<a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">ChatOpenAI</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"gpt-4o-mini"</span><span class="p">)</span>
+<a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a><span class="n">index</span> <span class="o">=</span> <span class="p">{</span>
+<a id="__codelineno-17-12" name="__codelineno-17-12" href="#__codelineno-17-12"></a>    <span class="s2">"dims"</span><span class="p">:</span> <span class="mi">1536</span><span class="p">,</span>
+<a id="__codelineno-17-13" name="__codelineno-17-13" href="#__codelineno-17-13"></a>    <span class="s2">"embed"</span><span class="p">:</span> <span class="n">OpenAIEmbeddings</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"text-embedding-3-small"</span><span class="p">),</span>
+<a id="__codelineno-17-14" name="__codelineno-17-14" href="#__codelineno-17-14"></a>    <span class="s2">"fields"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+<a id="__codelineno-17-15" name="__codelineno-17-15" href="#__codelineno-17-15"></a><span class="p">}</span>
+<a id="__codelineno-17-16" name="__codelineno-17-16" href="#__codelineno-17-16"></a>
+<a id="__codelineno-17-17" name="__codelineno-17-17" href="#__codelineno-17-17"></a>
+<a id="__codelineno-17-18" name="__codelineno-17-18" href="#__codelineno-17-18"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-17-19" name="__codelineno-17-19" href="#__codelineno-17-19"></a><span class="k">class</span><span class="w"> </span><span class="nc">Context</span><span class="p">:</span>
+<a id="__codelineno-17-20" name="__codelineno-17-20" href="#__codelineno-17-20"></a>    <span class="n">user_id</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-17-21" name="__codelineno-17-21" href="#__codelineno-17-21"></a>
+<a id="__codelineno-17-22" name="__codelineno-17-22" href="#__codelineno-17-22"></a>
+<a id="__codelineno-17-23" name="__codelineno-17-23" href="#__codelineno-17-23"></a><span class="k">def</span><span class="w"> </span><span class="nf">chatbot</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">MessagesState</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">Runtime</span><span class="p">[</span><span class="n">Context</span><span class="p">]):</span>
+<a id="__codelineno-17-24" name="__codelineno-17-24" href="#__codelineno-17-24"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+<a id="__codelineno-17-25" name="__codelineno-17-25" href="#__codelineno-17-25"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-17-26" name="__codelineno-17-26" href="#__codelineno-17-26"></a>    <span class="n">memories</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="n">query</span><span class="o">=</span><span class="n">state</span><span class="p">[</span><span class="s2">"messages"</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-17-27" name="__codelineno-17-27" href="#__codelineno-17-27"></a>    <span class="n">known</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">memories</span><span class="p">)</span>
+<a id="__codelineno-17-28" name="__codelineno-17-28" href="#__codelineno-17-28"></a>    <span class="n">system</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"What you know about the user:</span><span class="se">\n</span><span class="si">{</span><span class="n">known</span><span class="si">}</span><span class="s2">"</span><span class="p">}</span>
+<a id="__codelineno-17-29" name="__codelineno-17-29" href="#__codelineno-17-29"></a>    <span class="k">return</span> <span class="p">{</span><span class="s2">"messages"</span><span class="p">:</span> <span class="p">[</span><span class="n">llm</span><span class="o">.</span><span class="n">invoke</span><span class="p">([</span><span class="n">system</span><span class="p">,</span> <span class="o">*</span><span class="n">state</span><span class="p">[</span><span class="s2">"messages"</span><span class="p">]])]}</span>
+<a id="__codelineno-17-30" name="__codelineno-17-30" href="#__codelineno-17-30"></a>
+<a id="__codelineno-17-31" name="__codelineno-17-31" href="#__codelineno-17-31"></a>
+<a id="__codelineno-17-32" name="__codelineno-17-32" href="#__codelineno-17-32"></a><span class="n">builder</span> <span class="o">=</span> <span class="n">StateGraph</span><span class="p">(</span><span class="n">MessagesState</span><span class="p">,</span> <span class="n">context_schema</span><span class="o">=</span><span class="n">Context</span><span class="p">)</span>
+<a id="__codelineno-17-33" name="__codelineno-17-33" href="#__codelineno-17-33"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_node</span><span class="p">(</span><span class="s2">"chatbot"</span><span class="p">,</span> <span class="n">chatbot</span><span class="p">)</span>
+<a id="__codelineno-17-34" name="__codelineno-17-34" href="#__codelineno-17-34"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_edge</span><span class="p">(</span><span class="n">START</span><span class="p">,</span> <span class="s2">"chatbot"</span><span class="p">)</span>
+<a id="__codelineno-17-35" name="__codelineno-17-35" href="#__codelineno-17-35"></a>
+<a id="__codelineno-17-36" name="__codelineno-17-36" href="#__codelineno-17-36"></a><span class="k">with</span> <span class="p">(</span>
+<a id="__codelineno-17-37" name="__codelineno-17-37" href="#__codelineno-17-37"></a>    <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">index</span><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">,</span>
+<a id="__codelineno-17-38" name="__codelineno-17-38" href="#__codelineno-17-38"></a>    <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">checkpointer</span><span class="p">,</span>
+<a id="__codelineno-17-39" name="__codelineno-17-39" href="#__codelineno-17-39"></a><span class="p">):</span>
+<a id="__codelineno-17-40" name="__codelineno-17-40" href="#__codelineno-17-40"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-17-41" name="__codelineno-17-41" href="#__codelineno-17-41"></a>    <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-17-42" name="__codelineno-17-42" href="#__codelineno-17-42"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">,</span> <span class="n">store</span><span class="o">=</span><span class="n">store</span><span class="p">)</span>
+<a id="__codelineno-17-43" name="__codelineno-17-43" href="#__codelineno-17-43"></a>    <span class="n">graph</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span>
+<a id="__codelineno-17-44" name="__codelineno-17-44" href="#__codelineno-17-44"></a>        <span class="p">{</span><span class="s2">"messages"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"Where do I like to sit on a plane?"</span><span class="p">}]},</span>
+<a id="__codelineno-17-45" name="__codelineno-17-45" href="#__codelineno-17-45"></a>        <span class="p">{</span><span class="s2">"configurable"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"thread_id"</span><span class="p">:</span> <span class="s2">"thread-3"</span><span class="p">}},</span>
+<a id="__codelineno-17-46" name="__codelineno-17-46" href="#__codelineno-17-46"></a>        <span class="n">context</span><span class="o">=</span><span class="n">Context</span><span class="p">(</span><span class="n">user_id</span><span class="o">=</span><span class="s2">"alice"</span><span class="p">),</span>
+<a id="__codelineno-17-47" name="__codelineno-17-47" href="#__codelineno-17-47"></a>    <span class="p">)</span>
+</code></pre></div>
+<h3 id="with-deep-agents">With Deep Agents<a class="headerlink" href="#with-deep-agents" title="Permanent link">&para;</a></h3>
+<p><a href="https://docs.langchain.com/oss/python/deepagents/long-term-memory">Deep Agents</a> keeps files in a store when you route a path to a <code>StoreBackend</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">deepagents</span><span class="w"> </span><span class="kn">import</span> <span class="n">create_deep_agent</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">deepagents.backends</span><span class="w"> </span><span class="kn">import</span> <span class="n">CompositeBackend</span><span class="p">,</span> <span class="n">StateBackend</span><span class="p">,</span> <span class="n">StoreBackend</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a>
+<a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a>
+<a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">,</span> <span class="n">pool_config</span><span class="o">=</span><span class="p">{</span><span class="s2">"max_size"</span><span class="p">:</span> <span class="mi">10</span><span class="p">})</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a>    <span class="n">agent</span> <span class="o">=</span> <span class="n">create_deep_agent</span><span class="p">(</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a>        <span class="n">model</span><span class="o">=</span><span class="s2">"openai:gpt-4o-mini"</span><span class="p">,</span>
+<a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a>        <span class="n">backend</span><span class="o">=</span><span class="n">CompositeBackend</span><span class="p">(</span>
+<a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a>            <span class="n">default</span><span class="o">=</span><span class="n">StateBackend</span><span class="p">(),</span>
+<a id="__codelineno-18-12" name="__codelineno-18-12" href="#__codelineno-18-12"></a>            <span class="n">routes</span><span class="o">=</span><span class="p">{</span><span class="s2">"/memories/"</span><span class="p">:</span> <span class="n">StoreBackend</span><span class="p">(</span><span class="n">namespace</span><span class="o">=</span><span class="k">lambda</span> <span class="n">rt</span><span class="p">:</span> <span class="p">(</span><span class="s2">"memories"</span><span class="p">,))},</span>
+<a id="__codelineno-18-13" name="__codelineno-18-13" href="#__codelineno-18-13"></a>        <span class="p">),</span>
+<a id="__codelineno-18-14" name="__codelineno-18-14" href="#__codelineno-18-14"></a>        <span class="n">store</span><span class="o">=</span><span class="n">store</span><span class="p">,</span>
+<a id="__codelineno-18-15" name="__codelineno-18-15" href="#__codelineno-18-15"></a>    <span class="p">)</span>
+</code></pre></div>
+<p>Files under <code>/memories/</code> go to the store and outlive the thread. Other files stay in the thread's state. Deep Agents accepts <code>.</code> in namespace labels, but LangGraph's <code>BaseStore</code> rejects such a label with <code>InvalidNamespaceError</code> in every store, <code>InMemoryStore</code> and <code>PostgresStore</code> included. Build labels from ids without dots: replace the dots in an email address, for example.</p>
+<p>This snippet was checked against the Deep Agents documentation (deepagents 0.5 and later), not run in this project's tests.</p>
+<h2 id="differences-from-postgresstore">Differences from PostgresStore<a class="headerlink" href="#differences-from-postgresstore" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Expiry on the server.</strong> CockroachDB's row-level TTL job deletes expired items, so no sweeper thread is needed. Expired items are left out of reads, searches and listings by default (<code>omit_expired</code> is on).</li>
+<li><strong>Atomic batches, retries and concurrency.</strong> All puts and deletes of one batch commit in one transaction, every call retries transient errors under the store's <code>RetryPolicy</code>, and a <code>CockroachDBStore</code> on a pool runs batches concurrently.</li>
+<li><strong>No stale vectors.</strong> Putting an item again replaces all its vectors, and deleting an item deletes them.</li>
+<li><strong>Filters.</strong> A comparison with a number matches numeric values only, where PostgresStore compares text and <code>InMemoryStore</code> converts values with <code>float()</code>. Nested dictionaries match nested keys, and <code>$ne</code> also matches items without the key.</li>
+<li><strong>Deterministic paging.</strong> Results with the same score, or the same <code>updated_at</code>, are ordered by namespace and key, so paging with <code>offset</code> is stable.</li>
+<li><strong>Configurable tables.</strong> <code>table_name</code> and <code>schema</code> set the table names, so one database can hold several stores.</li>
+<li><strong><code>delete_namespace</code>.</strong> <code>delete_namespace(namespace_prefix)</code> and <code>adelete_namespace</code> delete a namespace and its descendants in one transaction and return the number of items deleted.</li>
+<li><strong>Warnings and checks.</strong> A <code>query</code> on a store without <code>index</code> logs a WARNING. Changing the index configuration after <code>setup()</code> raises an error or logs a warning, as described in <a href="#changing-the-index-configuration">Changing the Index Configuration</a>.</li>
+<li><strong><code>disable_ttl</code> and <code>drop_vector_index</code>.</strong> <code>disable_ttl()</code> and <code>adisable_ttl()</code> remove the table TTL setting, and <code>drop_vector_index()</code> and <code>adrop_vector_index()</code> drop the vector index so that <code>setup()</code> can build it again, for example with another distance.</li>
+<li><strong>No <code>deserializer</code>.</strong> psycopg decodes JSONB values before the store sees them, so the store does not take PostgresStore's <code>deserializer=</code> argument. To transform values as they are read, wrap <code>get</code> and <code>search</code>.</li>
+</ol>
+<h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="../../examples/long-term-memory/">Long-Term Memory Example</a> - The runnable example, step by step</li>
+<li><a href="../../api/store/">API Reference</a> - Every class, method and setting</li>
+<li><a href="../checkpointer/">Checkpointer Guide</a> - Short-term memory for LangGraph threads</li>
+<li><a href="../resilience/">Retries and Resilience</a> - Retry settings and hang guards</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>

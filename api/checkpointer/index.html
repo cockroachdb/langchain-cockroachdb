@@ -18,14 +18,14 @@
         <link rel="prev" href="../chat-history/">
       
       
-        <link rel="next" href="../retry/">
+        <link rel="next" href="../store/">
       
       
         
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -33,10 +33,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -810,6 +810,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../guides/long-term-memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LangGraph Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../guides/async-vs-sync/" class="md-nav__link">
         
   
@@ -1047,6 +1075,34 @@
     
   
     Checkpointer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/long-term-memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Long-Term Memory
   
 
     
@@ -1704,6 +1760,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -2469,7 +2553,7 @@
 
     <div class="doc doc-contents first">
             <p class="doc doc-class-bases">
-              Bases: <code><span title="langchain_cockroachdb.checkpointer.base.BaseCockroachDBSaver">BaseCockroachDBSaver</span></code></p>
+              Bases: <code><span title="langchain_cockroachdb._psycopg_ops.PsycopgOps">PsycopgOps</span></code>, <code><span title="langchain_cockroachdb.checkpointer.base.BaseCockroachDBSaver">BaseCockroachDBSaver</span></code></p>
 
 
 
@@ -2489,18 +2573,18 @@ not retried, so the caller can retry the whole transaction.</p>
 
 <details class="example" open>
   <summary>Example</summary>
-  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">pool</span> <span class="o">=</span> <span class="n">ConnectionPool</span><span class="p">(</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="nb">open</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">)</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">checkpointer</span> <span class="o">=</span> <span class="n">CockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
+  <div class="highlight"><pre><span></span><code><a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-1" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-1" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-2" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-2" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-3" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-3" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-4" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-4" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-4"></a>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-5" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-5" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-5"></a><span class="n">pool</span> <span class="o">=</span> <span class="n">ConnectionPool</span><span class="p">(</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-6" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-6" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-7" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-7" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-8" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-8" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-8"></a>    <span class="nb">open</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-9" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-9" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-9"></a><span class="p">)</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-10" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-10" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-10"></a><span class="n">checkpointer</span> <span class="o">=</span> <span class="n">CockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-11" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-11" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-11"></a><span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-12" name="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-12" href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver--__codelineno-0-12"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
 </code></pre></div>
 </details>
 
@@ -2585,6 +2669,10 @@ not retried, so the caller can retry the whole transaction.</p>
     <div class="doc doc-contents ">
 
         <p>Disable CockroachDB row-level TTL on checkpoint tables.</p>
+<p>Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+change fails while another one runs on the same table; that error is
+retried under the saver's retry policy, even if its <code>retry_on</code> would
+refuse it. <code>max_attempts=1</code> turns this off.</p>
 
 
     </div>
@@ -2605,6 +2693,10 @@ not retried, so the caller can retry the whole transaction.</p>
         <p>Enable CockroachDB row-level TTL on checkpoint tables.</p>
 <p>Rows older than ttl_interval will be automatically deleted by a
 background CockroachDB job on the specified cron schedule.</p>
+<p>Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+change fails while another one runs on the same table; that error is
+retried under the saver's retry policy, even if its <code>retry_on</code> would
+refuse it. <code>max_attempts=1</code> turns this off.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -3291,7 +3383,7 @@ ON CONFLICT DO NOTHING.</p>
 
     <div class="doc doc-contents first">
             <p class="doc doc-class-bases">
-              Bases: <code><span title="langchain_cockroachdb.checkpointer.base.BaseCockroachDBSaver">BaseCockroachDBSaver</span></code></p>
+              Bases: <code><span title="langchain_cockroachdb._psycopg_ops.AsyncPsycopgOps">AsyncPsycopgOps</span></code>, <code><span title="langchain_cockroachdb.checkpointer.base.BaseCockroachDBSaver">BaseCockroachDBSaver</span></code></p>
 
 
 
@@ -3316,17 +3408,17 @@ forked child, they raise <code>RuntimeError</code> instead of waiting forever.</
 
 <details class="example" open>
   <summary>Example</summary>
-  <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncConnectionPool</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncConnectionPool</span><span class="p">(</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">)</span> <span class="k">as</span> <span class="n">pool</span><span class="p">:</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">checkpointer</span> <span class="o">=</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="k">await</span> <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
+  <div class="highlight"><pre><span></span><code><a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-1" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-1" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-2" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-2" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncConnectionPool</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-3" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-3" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">,</span> <span class="n">RetryPolicy</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-4" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-4" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-4"></a>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-5" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-5" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-5"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncConnectionPool</span><span class="p">(</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-6" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-6" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-6"></a>    <span class="s2">"postgresql://root@localhost:26257/defaultdb?sslmode=disable"</span><span class="p">,</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-7" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-7" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-7"></a>    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"autocommit"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"row_factory"</span><span class="p">:</span> <span class="n">dict_row</span><span class="p">},</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-8" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-8" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-8"></a><span class="p">)</span> <span class="k">as</span> <span class="n">pool</span><span class="p">:</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-9" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-9" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-9"></a>    <span class="n">checkpointer</span> <span class="o">=</span> <span class="n">AsyncCockroachDBSaver</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">retry_policy</span><span class="o">=</span><span class="n">RetryPolicy</span><span class="p">(</span><span class="n">max_attempts</span><span class="o">=</span><span class="mi">8</span><span class="p">))</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-10" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-10" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-10"></a>    <span class="k">await</span> <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-11" name="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-11" href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver--__codelineno-0-11"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">workflow</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
 </code></pre></div>
 </details>
 
@@ -3419,6 +3511,10 @@ forked child, they raise <code>RuntimeError</code> instead of waiting forever.</
     <div class="doc doc-contents ">
 
         <p>Disable CockroachDB row-level TTL on checkpoint tables.</p>
+<p>Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+change fails while another one runs on the same table; that error is
+retried under the saver's retry policy, even if its <code>retry_on</code> would
+refuse it. <code>max_attempts=1</code> turns this off.</p>
 
 
     </div>
@@ -3441,6 +3537,10 @@ forked child, they raise <code>RuntimeError</code> instead of waiting forever.</
     <div class="doc doc-contents ">
 
         <p>Enable CockroachDB row-level TTL on checkpoint tables.</p>
+<p>Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+change fails while another one runs on the same table; that error is
+retried under the saver's retry policy, even if its <code>retry_on</code> would
+refuse it. <code>max_attempts=1</code> turns this off.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -4446,10 +4546,10 @@ ON CONFLICT DO NOTHING.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>
