@@ -60,13 +60,13 @@ class Context:
     user_id: str
 
 
-def memories(runtime: ToolRuntime[Context]) -> tuple[str, ...]:
+def memories(runtime: ToolRuntime) -> tuple[str, ...]:
     """The namespace of the current user's memories."""
     return ("user", runtime.context.user_id, "memories")
 
 
 @tool
-def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
+def save_memory(text: str, runtime: ToolRuntime) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     runtime.store.put(memories(runtime), str(uuid.uuid4()), {"text": text})
@@ -74,7 +74,7 @@ def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
 
 
 @tool
-def recall(query: str, runtime: ToolRuntime[Context]) -> str:
+def recall(query: str, runtime: ToolRuntime) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     found = runtime.store.search(memories(runtime), query=query, limit=1)

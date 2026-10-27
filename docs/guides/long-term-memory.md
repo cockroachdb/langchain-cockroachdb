@@ -360,6 +360,8 @@ The store creates plain tables, with no multi-region locality such as `REGIONAL 
 
 ### With create_agent
 
+The tools annotate their runtime as plain `ToolRuntime`. On Python 3.10, pydantic cannot build the tool schema for `ToolRuntime[Context]`, so the subscripted form fails there.
+
 Tools reach the store through `ToolRuntime`, and the user id comes from the run's context:
 
 ```python
@@ -381,7 +383,7 @@ class Context:
 
 
 @tool
-def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
+def save_memory(text: str, runtime: ToolRuntime) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     namespace = ("user", runtime.context.user_id, "memories")
@@ -390,7 +392,7 @@ def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
 
 
 @tool
-def recall(query: str, runtime: ToolRuntime[Context]) -> str:
+def recall(query: str, runtime: ToolRuntime) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     namespace = ("user", runtime.context.user_id, "memories")

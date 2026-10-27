@@ -103,13 +103,15 @@ class ScriptedModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def memories(runtime: ToolRuntime[Context]) -> tuple[str, ...]:
+# The tools take a plain ToolRuntime. On Python 3.10, pydantic cannot build
+# the tool schema for ToolRuntime[Context], so the context type stays unnamed.
+def memories(runtime: ToolRuntime) -> tuple[str, ...]:
     """The namespace of the current user's memories."""
     return ("user", runtime.context.user_id, "memories")
 
 
 @tool
-def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
+def save_memory(text: str, runtime: ToolRuntime) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     runtime.store.put(memories(runtime), str(uuid.uuid4()), {"text": text})
@@ -117,7 +119,7 @@ def save_memory(text: str, runtime: ToolRuntime[Context]) -> str:
 
 
 @tool
-def recall(query: str, runtime: ToolRuntime[Context]) -> str:
+def recall(query: str, runtime: ToolRuntime) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     found = runtime.store.search(memories(runtime), query=query, limit=1)
@@ -126,7 +128,7 @@ def recall(query: str, runtime: ToolRuntime[Context]) -> str:
 
 # The async agent awaits async tools, which call the store's a-prefixed methods
 @tool("save_memory")
-async def asave_memory(text: str, runtime: ToolRuntime[Context]) -> str:
+async def asave_memory(text: str, runtime: ToolRuntime) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     await runtime.store.aput(memories(runtime), str(uuid.uuid4()), {"text": text})
@@ -134,7 +136,7 @@ async def asave_memory(text: str, runtime: ToolRuntime[Context]) -> str:
 
 
 @tool("recall")
-async def arecall(query: str, runtime: ToolRuntime[Context]) -> str:
+async def arecall(query: str, runtime: ToolRuntime) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     found = await runtime.store.asearch(memories(runtime), query=query, limit=1)
