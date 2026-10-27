@@ -40,6 +40,12 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 |---------|-------------|----------|
 | [checkpointer.py](checkpointer.md) | LangGraph state persistence | Short-term memory, human-in-the-loop |
 
+### LangGraph Long-Term Memory
+
+| Example | Description | Features |
+|---------|-------------|----------|
+| [long_term_memory.py](long-term-memory.md) | Agent memory across threads | Semantic search, TTL, `delete_namespace` |
+
 ### Multi-Tenancy
 
 | Example | Description | Features |
@@ -57,7 +63,7 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 
 2. **Install package:**
    ```bash
-   pip install langchain-cockroachdb langchain-openai
+   pip install langchain-cockroachdb langchain-openai langchain
    ```
 
 3. **Set connection string (optional):**

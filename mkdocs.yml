@@ -72,6 +72,7 @@ nav:
     - Hybrid Search: guides/hybrid-search.md
     - Chat History: guides/chat-history.md
     - LangGraph Checkpointer: guides/checkpointer.md
+    - LangGraph Long-Term Memory: guides/long-term-memory.md
     - Async vs Sync: guides/async-vs-sync.md
     - Retries and Resilience: guides/resilience.md
   - Examples:
@@ -80,12 +81,14 @@ nav:
     - Advanced Filtering: examples/advanced-filtering.md
     - Index Optimization: examples/index-optimization.md
     - Checkpointer: examples/checkpointer.md
+    - Long-Term Memory: examples/long-term-memory.md
   - API Reference:
     - Engine: api/engine.md
     - Vector Store: api/vectorstore.md
     - Indexes: api/indexes.md
     - Chat History: api/chat-history.md
     - Checkpointer: api/checkpointer.md
+    - Store: api/store.md
     - Retry: api/retry.md
   - Development:
     - Contributing: development/contributing.md

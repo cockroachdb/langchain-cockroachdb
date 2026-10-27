@@ -6,6 +6,8 @@ that failure "unexpected eof while reading", which CockroachDB Cloud showed
 after the hang guard shut the socket of a stuck write.
 
 Test modules that use the fakes call ``close_sockets()`` after each test.
+The unit tests' conftest has psycopg's Python send() drain them: its C
+version only takes a real libpq connection.
 """
 
 from __future__ import annotations
@@ -13,12 +15,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
-from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any
+from collections.abc import AsyncIterator, Callable, Generator, Iterator, Sequence
+from typing import Any, TypeVar
 
 import psycopg
 from psycopg.pq import TransactionStatus
+from psycopg.waiting import Ready
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
+
+T = TypeVar("T")
 
 _sockets: list[socket.socket] = []
 
@@ -59,6 +64,29 @@ class FakeInfo:
 
     def __init__(self) -> None:
         self.transaction_status = TransactionStatus.IDLE
+
+
+class FakePGconn:
+    """The part of libpq's connection that psycopg's send() uses.
+
+    flush() returns the next of ``flushes``, then 0: nothing is left to send.
+    ``io`` records each flush() and each wait for the socket, in order. Pass
+    a connection's ``events`` as ``io`` to see them among its statements.
+    """
+
+    def __init__(
+        self, flushes: Sequence[int] = (), io: list[tuple[Any, ...]] | None = None
+    ) -> None:
+        self.flushes = list(flushes)
+        self.io: list[tuple[Any, ...]] = [] if io is None else io
+
+    def flush(self) -> int:
+        result = self.flushes.pop(0) if self.flushes else 0
+        self.io.append(("flush", result))
+        return result
+
+    def consume_input(self) -> None:
+        self.io.append(("consume_input",))
 
 
 class FakeConnection:
@@ -114,10 +142,24 @@ class FakeConnection:
         self._info = FakeInfo()
         self._broken = False
         self._socket: socket.socket | None = None
+        self.pgconn = FakePGconn()
+
+    def __del__(self) -> None:
+        """Nothing to close, so psycopg's warning about open connections does not apply."""
 
     @property
     def info(self) -> FakeInfo:
         return self._info
+
+    def wait(self, gen: Generator[Any, Any, T]) -> T:
+        """Run a psycopg generator. The socket is ready to write at every wait."""
+        try:
+            state = next(gen)
+            while True:
+                self.pgconn.io.append(("wait", state))
+                state = gen.send(Ready.W)
+        except StopIteration as stop:
+            return stop.value
 
     @property
     def broken(self) -> bool:
@@ -201,6 +243,9 @@ class FakeAsyncConnection(FakeConnection):
 
     def cursor(self, **kwargs: Any) -> FakeAsyncCursor:
         return FakeAsyncCursor(self)
+
+    async def wait(self, gen: Generator[Any, Any, T]) -> T:  # type: ignore[override]
+        return FakeConnection.wait(self, gen)
 
     async def rollback(self) -> None:
         self._roll_back(asyncio.CancelledError)

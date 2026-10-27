@@ -10,13 +10,12 @@ DELETEs, so retrying after an ambiguous result is safe.
 from __future__ import annotations
 
 import builtins
-import contextlib
 import logging
 import threading
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, TypeVar
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -30,22 +29,19 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from psycopg import Capabilities, Connection, Cursor, Pipeline
-from psycopg.pq import TransactionStatus
-from psycopg.rows import DictRow, dict_row
+from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import to_libpq_url
-from langchain_cockroachdb._guard import abandon_after
-from langchain_cockroachdb.checkpointer import _internal
+from langchain_cockroachdb._psycopg_ops import PsycopgOps
 from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
-from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-
-Conn = _internal.Conn
+Conn = _psycopg_conn.Conn
 
 
 def _sanitize_conn_string(conn_string: str) -> str:
@@ -53,7 +49,7 @@ def _sanitize_conn_string(conn_string: str) -> str:
     return to_libpq_url(conn_string)
 
 
-class CockroachDBSaver(BaseCockroachDBSaver):
+class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
     """Synchronous checkpointer that stores checkpoints in CockroachDB.
 
     Uses raw psycopg3 connections (not SQLAlchemy) for compatibility
@@ -86,12 +82,15 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         ```
     """
 
+    component = "checkpointer"
+    _log = logger
+
     # Runs operations one at a time on a single connection; a pool needs no lock
     lock: threading.Lock
 
     def __init__(
         self,
-        conn: _internal.Conn,
+        conn: _psycopg_conn.Conn,
         pipe: Pipeline | None = None,
         serde: SerializerProtocol | None = None,
         *,
@@ -153,25 +152,6 @@ class CockroachDBSaver(BaseCockroachDBSaver):
                     yield cls(conn, pipe, serde=serde, retry_policy=policy)
             else:
                 yield cls(conn, serde=serde, retry_policy=policy)
-
-    def _retry(self, fn: Callable[[], T], *, label: str) -> T:
-        """Run ``fn`` under the retry policy."""
-        return self.retry_policy.run(fn, label=label, can_retry=self._can_retry)
-
-    def _sync_pipeline(self) -> None:
-        """Sync pipeline if one is in use. Each statement runs in its own transaction."""
-        if self.pipe:
-            self.pipe.sync()
-
-    def _can_retry(self, error: BaseException) -> bool:
-        if isinstance(self.conn, Connection) and self.conn.closed:
-            logger.warning(
-                "Not retrying: the checkpointer's only connection is closed and cannot be "
-                "reopened. Pass a psycopg_pool.ConnectionPool so broken connections are replaced."
-            )
-            return False
-        # The caller owns its transaction, so it decides whether to retry all of it
-        return not _internal.in_caller_transaction(error)
 
     def setup(self) -> None:
         """Set up the checkpoint database.
@@ -469,243 +449,32 @@ class CockroachDBSaver(BaseCockroachDBSaver):
         Rows older than ttl_interval will be automatically deleted by a
         background CockroachDB job on the specified cron schedule.
 
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+
         Args:
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
         self._validate_ttl_params(ttl_interval, cron)
         statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        policy = schema_change_policy(self.retry_policy)
         for statement in statements:
-            self._run_ddl(statement, "enable TTL")
+            self._run_ddl(statement, "enable TTL", policy=policy)
 
     def disable_ttl(self) -> None:
-        """Disable CockroachDB row-level TTL on checkpoint tables."""
+        """Disable CockroachDB row-level TTL on checkpoint tables.
+
+        Safe to run from several processes at once. On CockroachDB v25.4 a TTL
+        change fails while another one runs on the same table; that error is
+        retried under the saver's retry policy, even if its ``retry_on`` would
+        refuse it. ``max_attempts=1`` turns this off.
+        """
+        policy = schema_change_policy(self.retry_policy)
         for statement in self.DISABLE_TTL_SQL:
-            self._run_ddl(statement, "disable TTL")
-
-    def _run_ddl(self, statement: str, label: str) -> None:
-        """Run a single DDL statement with retry and timeout."""
-
-        def execute() -> None:
-            with self._cursor(timeout=self.retry_policy.ddl_attempt_timeout, label=label) as cur:
-                cur.execute(statement)
-                self._sync_pipeline()
-
-        self._retry(execute, label=label)
-
-    def _operation_lock(self) -> contextlib.AbstractContextManager[object]:
-        """The lock an operation holds while it uses the connection.
-
-        A single connection runs one operation at a time. A pool gives every
-        operation its own connection, so pooled operations take no lock and run
-        concurrently. What they share is the pool, which is thread-safe, and
-        attributes that are only set in __init__.
-        """
-        if isinstance(self.conn, ConnectionPool):
-            return contextlib.nullcontext()
-        return self.lock
-
-    @staticmethod
-    def _transaction(
-        conn: Connection[DictRow], transaction: bool
-    ) -> contextlib.AbstractContextManager[object]:
-        """``conn.transaction()`` if the statements must commit together, else nothing."""
-        return conn.transaction() if transaction else contextlib.nullcontext()
-
-    def _roll_back_batch(self, conn: Connection[DictRow], *, synced: bool) -> bool:
-        """Roll back a write batch of ours that stopped between BEGIN and COMMIT.
-
-        ``synced`` says whether libpq's status is current. On a saver-wide
-        pipeline it is only current once a sync has completed: until then it
-        can read IDLE while the batch is open. So this syncs first if needed,
-        then rolls back an open transaction; psycopg's rollback() syncs a
-        pipeline before and after the ROLLBACK. Errors are ignored, each step
-        on its own: results still on their way often carry the batch's error,
-        and a connection that broke cannot roll back. Returns whether the
-        status is now current.
-        """
-        if self.pipe and not synced:
-            with contextlib.suppress(Exception):
-                self.pipe.sync()
-                synced = True
-        if conn.info.transaction_status in _internal.OPEN_TRANSACTION:
-            with contextlib.suppress(Exception):
-                conn.rollback()
-                synced = True
-        return synced
-
-    def _settle_batch_flag(self, conn: Connection[DictRow], *, synced: bool) -> None:
-        """Clear the batch flag once no transaction of ours can be open on ``conn``.
-
-        Called in a finally, so an interruption cannot skip it. UNKNOWN means
-        the connection is gone. IDLE counts only when the status is current
-        (``synced``): then the batch committed or rolled back. Otherwise the
-        flag stays set, and the next operation looks again after a sync.
-        """
-        status = conn.info.transaction_status
-        if status == TransactionStatus.UNKNOWN or (synced and status == TransactionStatus.IDLE):
-            self._batch_open = False
-
-    def _prepare_batch(
-        self, conn: Connection[DictRow], *, pipeline: bool, transaction: bool
-    ) -> bool:
-        """Finish rolling back a stopped batch of ours, then say whether to batch.
-
-        If that batch is still open and cannot be rolled back, this raises
-        instead of letting the operation nest in it. A write is batched when
-        its statements must commit together, it is pipelined, the connection
-        is in autocommit mode, and libpq reports it idle, so no transaction
-        the caller opened is open on it: BEGIN there would fail and abort the
-        caller's transaction. On a saver-wide pipeline the saver's own last
-        read can still hold an implicit transaction while the status reads
-        idle; the batch's BEGIN then joins it.
-        """
-        if self._batch_open:
-            # Outside pipeline mode libpq's status is current
-            synced = not self.pipe
-            try:
-                synced = self._roll_back_batch(conn, synced=synced)
-            finally:
-                self._settle_batch_flag(conn, synced=synced)
-            if self._batch_open and conn.info.transaction_status in _internal.OPEN_TRANSACTION:
-                raise _internal.stuck_batch_error()
-        return (
-            transaction
-            and pipeline
-            and conn.autocommit
-            and conn.info.transaction_status == TransactionStatus.IDLE
-            and (bool(self.pipe) or self.supports_pipeline)
-        )
-
-    @contextmanager
-    def _on_saver_pipeline(
-        self,
-        conn: Connection[DictRow],
-        pipe: Pipeline,
-        *,
-        pipeline: bool,
-        transaction: bool,
-        batched: bool,
-    ) -> Iterator[Cursor[DictRow]]:
-        """Run the block on the saver-wide pipeline, resyncing it after an error."""
-        # Whether a sync completed, so that libpq's status is current
-        synced = False
-        try:
-            with conn.cursor() as tx, conn.cursor(binary=True, row_factory=dict_row) as cur:
-                if batched:
-                    self._batch_open = True
-                    tx.execute("BEGIN", prepare=False)
-                with self._transaction(conn, transaction and not batched):
-                    yield cur
-                if batched:
-                    tx.execute("COMMIT", prepare=False)
-                # psycopg's transaction syncs the pipeline itself as it ends
-                if batched or (pipeline and not transaction):
-                    pipe.sync()
-                    synced = True
-                if batched:
-                    _internal.check_committed(tx)
-        except BaseException:
-            # A pipeline only exists on a single connection, so the lock is held
-            # here. Resync before releasing it, so other threads' queued statements
-            # are untouched, and roll back what a stopped batch left open
-            with contextlib.suppress(Exception):
-                pipe.sync()
-                synced = True
-            if batched:
-                synced = self._roll_back_batch(conn, synced=synced)
-            raise
-        finally:
-            if batched:
-                self._settle_batch_flag(conn, synced=synced)
-
-    @contextmanager
-    def _in_one_batch(self, conn: Connection[DictRow]) -> Iterator[Cursor[DictRow]]:
-        """Send BEGIN, the block's statements and COMMIT with one pipeline sync."""
-        own_connection = not isinstance(self.conn, ConnectionPool)
-        with conn.cursor() as tx, conn.cursor(binary=True, row_factory=dict_row) as cur:
-            try:
-                with conn.pipeline():
-                    if own_connection:
-                        self._batch_open = True
-                    tx.execute("BEGIN", prepare=False)
-                    yield cur
-                    tx.execute("COMMIT", prepare=False)
-            except BaseException:
-                # The pipeline's exit has synced, so the status is current
-                self._roll_back_batch(conn, synced=True)
-                raise
-            finally:
-                if own_connection:
-                    self._settle_batch_flag(conn, synced=True)
-            _internal.check_committed(tx)
-
-    @contextmanager
-    def _cursor(
-        self,
-        *,
-        pipeline: bool = False,
-        transaction: bool = False,
-        timeout: float | None = None,
-        label: str = "checkpoint operation",
-    ) -> Iterator[Cursor[DictRow]]:
-        """Create a database cursor as a context manager, with the hang guard.
-
-        ``pipeline`` sends the statements together, in pipeline mode when libpq
-        has it. ``transaction`` makes them commit together: without it, the sync
-        that ends a pipeline commits whatever was sent, even when the block
-        stopped partway through. On an idle autocommit connection in pipeline
-        mode, BEGIN, the statements and COMMIT go to the server as one batch.
-        That takes one round trip, and CockroachDB can retry the whole batch
-        itself. If the block stops between BEGIN and COMMIT, the transaction is
-        rolled back before the connection is used again. Inside a transaction
-        the caller opened, and on other connections, psycopg's
-        ``conn.transaction()`` runs the statements; in an open transaction it
-        nests a savepoint. A single statement commits on its own and needs no
-        transaction. An error inside a transaction the caller opened is marked,
-        so the saver raises it at once instead of retrying.
-        """
-        with self._operation_lock(), _internal.get_connection(self.conn) as conn:
-            fileno = conn.fileno() if timeout is not None else None
-            with abandon_after(fileno, timeout, label=label):
-                batched = self._prepare_batch(conn, pipeline=pipeline, transaction=transaction)
-                # Open now and not a stopped batch of ours: the caller's transaction
-                in_callers_transaction = (
-                    not self._batch_open
-                    and conn.info.transaction_status in _internal.OPEN_TRANSACTION
-                )
-                try:
-                    if self.pipe:
-                        with self._on_saver_pipeline(
-                            conn,
-                            self.pipe,
-                            pipeline=pipeline,
-                            transaction=transaction,
-                            batched=batched,
-                        ) as cur:
-                            yield cur
-                    elif batched:
-                        with self._in_one_batch(conn) as cur:
-                            yield cur
-                    elif pipeline and self.supports_pipeline:
-                        # psycopg's transaction goes around the pipeline, which saves a
-                        # round trip
-                        with (
-                            self._transaction(conn, transaction),
-                            conn.pipeline(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                    else:
-                        with (
-                            self._transaction(conn, transaction),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                except Exception as error:
-                    if in_callers_transaction:
-                        _internal.mark_in_caller_transaction(error)
-                    raise
+            self._run_ddl(statement, "disable TTL", policy=policy)
 
     def _load_checkpoint_tuple_with_cursor(
         self, cur: Cursor[DictRow], value: DictRow

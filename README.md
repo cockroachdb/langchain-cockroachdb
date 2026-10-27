@@ -82,6 +82,28 @@ async def main():
 asyncio.run(main())
 ```
 
+### Long-Term Memory for LangGraph
+
+`CockroachDBStore` gives LangGraph agents memory that every thread can read, with semantic search and expiry:
+
+```python
+from langchain_cockroachdb import CockroachDBStore
+from langchain_openai import OpenAIEmbeddings
+
+with CockroachDBStore.from_conn_string(
+    "cockroachdb://user:pass@host:26257/db",
+    pool_config={"max_size": 10},
+    index={"dims": 1536, "embed": OpenAIEmbeddings(model="text-embedding-3-small")},
+    ttl={"default_ttl": 60 * 24 * 30},  # minutes
+) as store:
+    store.setup()
+    store.put(("user", "alice", "memories"), "seat", {"text": "Prefers window seats"})
+    results = store.search(("user", "alice"), query="Where does Alice like to sit?")
+    # Pass store=store to create_agent, StateGraph.compile or create_deep_agent
+```
+
+See the [Long-Term Memory guide](https://cockroachdb.github.io/langchain-cockroachdb/guides/long-term-memory/).
+
 ## Features
 
 ### Vector Store
@@ -100,6 +122,13 @@ asyncio.run(main())
 - Human-in-the-loop with interrupt/resume support
 - Both `CockroachDBSaver` (sync) and `AsyncCockroachDBSaver`
 - Compatible with LangGraph's `compile(checkpointer=...)` interface
+
+### LangGraph Long-Term Memory Store
+- Memory that every thread can read, for LangGraph agents and Deep Agents
+- Both `CockroachDBStore` (sync) and `AsyncCockroachDBStore`, with the API of LangGraph's `PostgresStore`
+- Semantic search on a C-SPANN vector index, with metadata filters
+- Expiry through CockroachDB row-level TTL, with no sweeper thread
+- `delete_namespace` deletes a user's memories in one transaction
 
 ### Reliability and Retries
 - Retries transient CockroachDB errors (40001, 40003, 08xxx, 57P01, 58C00, 58C01, 53300) on every operation
@@ -136,6 +165,7 @@ asyncio.run(main())
 - [Chat History](https://cockroachdb.github.io/langchain-cockroachdb/guides/chat-history/)
 - [Multi-Tenancy](https://cockroachdb.github.io/langchain-cockroachdb/guides/multi-tenancy/)
 - [LangGraph Checkpointer](https://cockroachdb.github.io/langchain-cockroachdb/guides/checkpointer/)
+- [LangGraph Long-Term Memory](https://cockroachdb.github.io/langchain-cockroachdb/guides/long-term-memory/)
 - [Async vs Sync](https://cockroachdb.github.io/langchain-cockroachdb/guides/async-vs-sync/)
 - [Retries and Resilience](https://cockroachdb.github.io/langchain-cockroachdb/guides/resilience/)
 
@@ -150,6 +180,7 @@ asyncio.run(main())
 - [`metadata_filtering.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/metadata_filtering.py) - Advanced queries
 - [`chat_history.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/chat_history.py) - Persistent conversations
 - [`checkpointer.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/checkpointer.py) - LangGraph checkpointer
+- [`long_term_memory.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/long_term_memory.py) - LangGraph long-term memory store
 - [`multi_tenancy.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/multi_tenancy.py) - Namespace-based multi-tenancy
 - [`retry_configuration.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/retry_configuration.py) - Configuration patterns
 

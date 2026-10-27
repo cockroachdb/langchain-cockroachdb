@@ -250,6 +250,64 @@ def test_parallel_setup_converges(libpq_url) -> None:
             admin.execute(f"DROP DATABASE {database} CASCADE")
 
 
+CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+
+
+@contextlib.contextmanager
+def fresh_database(libpq_url: str):
+    """A new database with the checkpoint tables set up, dropped afterwards."""
+    database = f"ttl_race_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(libpq_url, autocommit=True) as admin:
+        admin.execute(f"CREATE DATABASE {database}")
+    url = urlsplit(libpq_url)._replace(path=f"/{database}").geturl()
+    try:
+        with CockroachDBSaver.from_conn_string(url) as saver:
+            saver.setup()
+        yield url
+    finally:
+        with psycopg.connect(libpq_url, autocommit=True) as admin:
+            admin.execute(f"DROP DATABASE {database} CASCADE")
+
+
+def assert_ttl_set_once(url: str, cron: str) -> None:
+    """Every checkpoint table has the TTL expression and cron exactly once."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        for table in CHECKPOINT_TABLES:
+            row = conn.execute(f"SELECT create_statement FROM [SHOW CREATE TABLE {table}]")
+            found = row.fetchone()
+            assert found is not None
+            assert found[0].count("ttl_expiration_expression") == 1, found[0]
+            assert found[0].count(f"ttl_job_cron = '{cron}'") == 1, found[0]
+
+
+@pytest.mark.timeout(240)
+def test_parallel_enable_ttl_converges(libpq_url) -> None:
+    # On v25.4 a TTL change fails while another runs on the same table. Six
+    # savers with the default retry policy enable TTL at once, as six
+    # processes starting together would
+    cron = "@weekly"
+    with fresh_database(libpq_url) as url:
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(6)
+
+        def run() -> None:
+            try:
+                with CockroachDBSaver.from_conn_string(url) as saver:
+                    barrier.wait(30)
+                    saver.enable_ttl("3 days", cron)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, daemon=True) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(180)
+        assert not any(thread.is_alive() for thread in threads), "an enable_ttl thread hung"
+        assert errors == []
+        assert_ttl_set_once(url, cron)
+
+
 @pytest.mark.timeout(60)
 def test_list_does_not_hold_the_lock_while_the_caller_iterates(sync_pool) -> None:
     saver = CockroachDBSaver(sync_pool(app_name()), retry_policy=FAST)
@@ -594,6 +652,19 @@ async def test_async_parallel_setup_converges(libpq_url) -> None:
     finally:
         with psycopg.connect(libpq_url, autocommit=True) as admin:
             admin.execute(f"DROP DATABASE {database} CASCADE")
+
+
+@pytest.mark.timeout(240)
+async def test_async_parallel_enable_ttl_converges(libpq_url) -> None:
+    cron = "@weekly"
+    with fresh_database(libpq_url) as url:
+
+        async def run() -> None:
+            async with AsyncCockroachDBSaver.from_conn_string(url) as saver:
+                await saver.aenable_ttl("3 days", cron)
+
+        await asyncio.wait_for(asyncio.gather(*(run() for _ in range(6))), 180)
+        assert_ttl_set_once(url, cron)
 
 
 @pytest.mark.parametrize("pipeline", [False, True])

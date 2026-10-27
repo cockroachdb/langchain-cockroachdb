@@ -1,6 +1,6 @@
 # Retries and Resilience
 
-CockroachDB runs every transaction at SERIALIZABLE isolation and keeps serving through node restarts, drains and region failures. Clients are expected to retry a few kinds of errors, and langchain-cockroachdb does it on every database call: the vector store, chat history and both LangGraph checkpointers.
+CockroachDB runs every transaction at SERIALIZABLE isolation and keeps serving through node restarts, drains and region failures. Clients are expected to retry a few kinds of errors, and langchain-cockroachdb does it on every database call: the vector store, chat history, both LangGraph checkpointers and the long-term memory store.
 
 ## What gets retried
 
@@ -65,6 +65,8 @@ policy = RetryPolicy(**{"max_attempts": 6, "retryable_sqlstates": ["40001", "400
 
 The older `retry_max_attempts`, `retry_initial_backoff`, `retry_max_backoff`, `retry_backoff_multiplier` and `retry_jitter` arguments still work as shorthand.
 
+TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE `0A000`. Several processes running checkpointer `enable_ttl` or `disable_ttl`, or store `setup()` with a TTL configuration or `disable_ttl`, at once can hit it. These TTL statements are idempotent, so they retry that error under your policy (`schema_change_policy`), even if your `retry_on` would refuse it. `max_attempts=1` turns this off. The code and phrase are `SCHEMA_CHANGE_BUSY_SQLSTATE` and `SCHEMA_CHANGE_BUSY_MESSAGES`, and `is_schema_change_busy()` checks an error.
+
 ## Idempotency
 
 A `40001` means the transaction did not commit. After a `40003` or a dropped connection it may have. Retrying is only safe when running the work twice has the same effect as running it once, and every write the library makes is built that way: vector inserts are UPSERTs, deletes are deletes, chat messages carry ids chosen before the first attempt and are written with `ON CONFLICT DO NOTHING`, checkpoints are UPSERTs, and schema changes use `IF [NOT] EXISTS`.
@@ -103,7 +105,7 @@ On Linux, also add `tcp_user_timeout=10000` to the connection URL. `attempt_time
 
 `attempt_timeout` gives each attempt a deadline. When it passes, the library shuts down the connection's socket, so the stuck call fails as a lost connection and the normal retry runs on a fresh connection. It starts once a connection is checked out, so it does not cover getting a connection: `connect_timeout` bounds opening a new one, and a `pool_pre_ping` on a pooled connection whose peer went silent is only cut short by `tcp_user_timeout` (see Connection settings). This works even when the server ignores cancel requests, which CockroachDB can do for a `COMMIT` while a range it wrote to has lost quorum, and it ends reads stalled by a network partition long before the operating system's TCP timeouts would.
 
-It is off by default. Good starting points are 10 to 30 seconds for interactive paths and 60 to 120 seconds for batch work. Schema changes use `ddl_attempt_timeout`, also off by default, which bounds each schema change: one statement in the vector store, chat history and engine setup, and one migration step or one TTL statement in the checkpointers. Building an index on a large table can legitimately take minutes.
+It is off by default. Good starting points are 10 to 30 seconds for interactive paths and 60 to 120 seconds for batch work. Schema changes use `ddl_attempt_timeout`, also off by default, which bounds each schema change: one statement in the vector store, chat history and engine setup, one migration step or one TTL statement in the checkpointers, and one migration step or one schema statement (vectors table, vector index, TTL) in the store. Building an index on a large table can legitimately take minutes.
 
 ## Checkpointers: use a connection pool
 

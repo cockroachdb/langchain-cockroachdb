@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import random
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -25,10 +25,10 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 from langgraph.checkpoint.serde.types import TASKS
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from langchain_cockroachdb._connection import with_libpq_defaults
+# Imported here too, where the savers have always found it
+from langchain_cockroachdb._connection import connection_options  # noqa: F401
 
 MetadataInput = dict[str, Any] | None
 
@@ -220,31 +220,6 @@ INSERT_CHECKPOINT_WRITES_SQL = """
 INSERT_MIGRATION_SQL = (
     "INSERT INTO checkpoint_migrations (v) VALUES (%s) ON CONFLICT (v) DO NOTHING"
 )
-
-# The savers depend on these connection settings
-_MANAGED_OPTIONS = frozenset({"autocommit", "row_factory", "prepare_threshold"})
-
-
-def connection_options(
-    conn_string: str,
-    connect_kwargs: Mapping[str, Any] | None,
-    connect_timeout: float | None,
-    prepare_threshold: int | None,
-) -> dict[str, Any]:
-    """Keyword arguments for psycopg's connect(), shared by both savers.
-
-    Raises:
-        ValueError: If connect_kwargs sets an option the saver manages
-    """
-    managed = _MANAGED_OPTIONS & set(connect_kwargs or {})
-    if managed:
-        raise ValueError(
-            f"{', '.join(sorted(managed))} cannot go in connect_kwargs: the checkpointer sets "
-            "autocommit and row_factory itself, and prepare_threshold has its own argument"
-        )
-    options = with_libpq_defaults(conn_string, connect_kwargs, connect_timeout)
-    options.update(autocommit=True, row_factory=dict_row, prepare_threshold=prepare_threshold)
-    return options
 
 
 class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
