@@ -698,9 +698,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         vector count, then the similar memories and the scores. A namespace
         with at most ``reconcile_scan_limit`` vectors has all of them ranked.
         A larger one takes its similar candidates from a window of the
-        C-SPANN index. When that window holds nothing below ``threshold``,
-        matches may lie beyond it, and one more round trip ranks every
-        vector of the namespace.
+        C-SPANN index. When that window holds nothing below ``threshold``
+        and gave fewer than ``limit`` candidates, matches may lie beyond it,
+        and one more round trip ranks every vector of the namespace.
 
         Args:
             namespace: The new memory's namespace. It cannot be empty.

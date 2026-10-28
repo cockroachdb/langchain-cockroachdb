@@ -957,13 +957,14 @@ LIMIT %s OFFSET %s"""
     # the join, filter and expiry check. Rows that the filter, the expiry
     # check or the excluded keys remove still take places in the window, so
     # a match beyond it would be missed. The index form therefore reports
-    # the window's size and lowest score, over every vector in it. When the
-    # lowest score is below the threshold, every vector beyond the window
-    # scores lower still, up to the index's approximation, and the result
-    # stands. Otherwise matches may lie beyond the window, and the store
-    # runs the exact form for that vector (needs_exact_candidates in
-    # base.py). That costs one more round trip, and only when the
-    # namespace holds at least over_fetch vectors at or above the threshold.
+    # the window's size and lowest score, over every vector in it. When it
+    # returned limit rows, or the lowest score is below the threshold, no
+    # vector beyond the window can change the result, up to the index's
+    # approximation, and the result stands. Otherwise matches may lie
+    # beyond the window, and the store runs the exact form for that vector
+    # (needs_exact_candidates in base.py). That costs one more round trip,
+    # and only when the namespace holds at least over_fetch vectors at or
+    # above the threshold but fewer than limit of them pass.
     #
     # Measured with EXPLAIN on v26.3.3, with 3,000 vectors in one namespace
     # and a C-SPANN index: the index form computes nearest once, as a buffer,

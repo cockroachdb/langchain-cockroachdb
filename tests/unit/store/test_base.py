@@ -2423,21 +2423,34 @@ async def test_reconcile_scan_limit_is_a_positive_int_on_both_stores() -> None:
 
 def test_needs_exact_candidates() -> None:
     hit = candidate_row("a", score=0.9)
+    other = candidate_row("b", score=0.88)
+
+    def needs(rows: list[dict[str, object]], *, threshold: float = 0.8, limit: int = 10) -> bool:
+        return needs_exact_candidates(rows, threshold=threshold, limit=limit)
+
     # The window's lowest score is below the threshold: every vector beyond it
     # scores lower still, up to the index's approximation, so nothing is missing
-    assert not needs_exact_candidates(window_rows([], lowest=0.5), threshold=0.8)
-    assert not needs_exact_candidates(window_rows([hit], lowest=0.79), threshold=0.8)
+    assert not needs(window_rows([], lowest=0.5))
+    assert not needs(window_rows([hit], lowest=0.79))
     # At or above the threshold, matches may lie beyond the window: the filter,
     # the expiry check or the excluded keys may have taken every place in it
-    assert needs_exact_candidates(window_rows([], lowest=0.8), threshold=0.8)
-    assert needs_exact_candidates(window_rows([], lowest=0.95), threshold=0.8)
-    assert needs_exact_candidates(window_rows([hit], lowest=0.85), threshold=0.8)
+    assert needs(window_rows([], lowest=0.8))
+    assert needs(window_rows([], lowest=0.95))
+    assert needs(window_rows([hit], lowest=0.85))
+    # Unless the window already filled the limit: a vector beyond it scores no
+    # higher than its lowest, so it cannot outrank any of those hits
+    assert not needs(window_rows([hit, other], lowest=0.85), limit=2)
+    assert not needs(window_rows([hit], lowest=0.95), limit=1)
+    # Fewer hits than the limit with the lowest score at or above the
+    # threshold: the exact scan runs
+    assert needs(window_rows([hit], lowest=0.85), limit=2)
+    assert needs(window_rows([hit, other], lowest=0.8), limit=3)
     # An empty window tells nothing about the namespace
-    assert needs_exact_candidates(window_rows([], size=0, lowest=None), threshold=0.8)
-    assert needs_exact_candidates([], threshold=0.8)
+    assert needs(window_rows([], size=0, lowest=None))
+    assert needs([])
     # Negated distances (l2, inner product) compare the same way
-    assert not needs_exact_candidates(window_rows([], lowest=-0.9), threshold=-0.6)
-    assert needs_exact_candidates(window_rows([], lowest=-0.5), threshold=-0.6)
+    assert not needs(window_rows([], lowest=-0.9), threshold=-0.6)
+    assert needs(window_rows([], lowest=-0.5), threshold=-0.6)
 
 
 def test_find_conflicts_runs_the_exact_scan_where_the_window_may_hide_matches() -> None:
@@ -2504,6 +2517,23 @@ def test_find_conflicts_runs_the_exact_scan_where_the_window_may_hide_matches() 
         "store find conflicts similar",
     ]
     assert [c.key for c in conflicts.candidates] == ["b"]
+
+    # A window that ends above the threshold but already filled the limit:
+    # nothing beyond it can outrank its hits, so the index result stands too
+    hits = [candidate_row("a", score=0.95), candidate_row("b", score=0.9)]
+    reads = CandidateReads(rows=[], vectors=6, similar=hits, lowest=0.85)
+    store, _ = finding_store(reads, reconcile_scan_limit=5)
+    conflicts = store.find_conflicts(NS, "k", {"text": "aisle"}, limit=2)
+    assert [label for label, _, _ in reads.calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
+    assert [c.key for c in conflicts.candidates] == ["a", "b"]
+    # One hit short of the limit, the exact scan runs
+    reads = CandidateReads(rows=[], vectors=6, similar=hits, lowest=0.85)
+    store, _ = finding_store(reads, reconcile_scan_limit=5)
+    store.find_conflicts(NS, "k", {"text": "aisle"}, limit=3)
+    assert [label for label, _, _ in reads.calls][-1] == "store find conflicts exact"
 
     # A window that ends above the threshold with nothing beyond it: the exact
     # scan finds nothing either, and the empty row of the window is no candidate

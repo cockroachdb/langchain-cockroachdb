@@ -215,25 +215,32 @@ def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fe
     return window >= over_fetch or window < held
 
 
-def needs_exact_candidates(rows: Sequence[Mapping[str, Any]], *, threshold: float) -> bool:
+def needs_exact_candidates(
+    rows: Sequence[Mapping[str, Any]], *, threshold: float, limit: int
+) -> bool:
     """Whether an index scan for similar candidates must run again in its exact form.
 
     ``rows`` are what the index form of StoreSQL.similar_candidates returned
-    for one vector of a new memory. Each carries ``window_size``, the
-    vectors the C-SPANN index returned into the window, and
-    ``lowest_score``, the lowest score among them, counted before the
+    for one vector of a new memory, with ``limit`` its LIMIT. Each carries
+    ``window_size``, the vectors the C-SPANN index returned into the window,
+    and ``lowest_score``, the lowest score among them, counted before the
     filter, the expiry check and the excluded keys removed any.
 
-    A window whose lowest score is below ``threshold`` held every vector at
-    or above it, up to the index's approximation: the vectors beyond it
-    score lower still. So its result stands, however few rows passed.
-    When the lowest score is at or above the threshold, the rows the filter,
-    the expiry check or the excluded keys removed may have taken every
-    place in the window, and matches may lie beyond it. An empty window
-    tells nothing about the namespace. Both run again. Unlike
-    needs_exact_search, a short result alone never does: short results are
-    the normal case here.
+    A scan that returned ``limit`` hits is complete: a vector beyond the
+    window scores no higher than the window's lowest, so it cannot outrank
+    any hit. A window whose lowest score is below ``threshold`` held every
+    vector at or above it, up to the index's approximation: the vectors
+    beyond it score lower still. So that result stands too, however few
+    rows passed. When fewer than ``limit`` rows passed and the lowest score
+    is at or above the threshold, the rows the filter, the expiry check or
+    the excluded keys removed may have taken every place in the window,
+    and matches may lie beyond it. An empty window tells nothing about the
+    namespace. Both run again. Unlike needs_exact_search, a short result
+    alone never does: short results are the normal case here.
     """
+    hits = sum(1 for row in rows if row["key"] is not None)
+    if hits >= limit:
+        return False
     if not rows:
         return True
     lowest = rows[0]["lowest_score"]
@@ -570,6 +577,7 @@ class SimilarRead:
             window may have left matches out (needs_exact_candidates).
         threshold: The lowest score of a similar candidate, or None when
             ``similar`` is empty.
+        limit: The LIMIT of each statement in ``similar``.
     """
 
     scores: list[tuple[str, list]]
@@ -577,6 +585,7 @@ class SimilarRead:
     session: list[str]
     exact: list[tuple[str, list]] = field(default_factory=list)
     threshold: float | None = None
+    limit: int = 0
 
     def statements(self) -> list[tuple[str, list]]:
         """The statements to send as one round trip: the scores, then the similar reads."""
@@ -613,7 +622,7 @@ class SimilarRead:
         return [
             i
             for i, rows in enumerate(found[len(self.scores) :])
-            if needs_exact_candidates(rows, threshold=threshold)
+            if needs_exact_candidates(rows, threshold=threshold, limit=self.limit)
         ]
 
 
@@ -1644,7 +1653,11 @@ class BaseCockroachDBStore:
             built[scan] = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
         if not above:
             return SimilarRead(
-                scores=scores, similar=built["exact"], session=[], threshold=threshold
+                scores=scores,
+                similar=built["exact"],
+                session=[],
+                threshold=threshold,
+                limit=plan.limit,
             )
         session = [self.sql.beam_size_statement(index.beam_size)] if index.beam_size else []
         return SimilarRead(
@@ -1653,6 +1666,7 @@ class BaseCockroachDBStore:
             session=session,
             exact=built["exact"],
             threshold=threshold,
+            limit=plan.limit,
         )
 
     def _conflicts(
