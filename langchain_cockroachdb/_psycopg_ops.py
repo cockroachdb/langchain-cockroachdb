@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, ClassVar, TypeVar
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Connection, Cursor, Pipeline
-from psycopg.pq import TransactionStatus
+from psycopg.pq import PipelineStatus, TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
@@ -349,8 +349,15 @@ class PsycopgOps:
                     not self._batch_open
                     and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
-                # Every branch but the last sends the block in a pipeline (a batch needs one)
-                in_pipeline = bool(self.pipe) or (pipeline and self.supports_pipeline)
+                # Every branch but the last sends the block in a pipeline (a batch needs
+                # one), and so does the last on a connection already in pipeline mode.
+                # psycopg's executemany opens a pipeline of its own: give it a block
+                # with pipeline=True
+                in_pipeline = (
+                    bool(self.pipe)
+                    or (pipeline and self.supports_pipeline)
+                    or conn.pgconn.pipeline_status != PipelineStatus.OFF
+                )
                 try:
                     with _unprepared(conn) if in_pipeline else contextlib.nullcontext():
                         if self.pipe:
@@ -689,8 +696,15 @@ class AsyncPsycopgOps:
                     not self._batch_open
                     and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
-                # Every branch but the last sends the block in a pipeline (a batch needs one)
-                in_pipeline = bool(self.pipe) or (pipeline and self.supports_pipeline)
+                # Every branch but the last sends the block in a pipeline (a batch needs
+                # one), and so does the last on a connection already in pipeline mode.
+                # psycopg's executemany opens a pipeline of its own: give it a block
+                # with pipeline=True
+                in_pipeline = (
+                    bool(self.pipe)
+                    or (pipeline and self.supports_pipeline)
+                    or conn.pgconn.pipeline_status != PipelineStatus.OFF
+                )
                 try:
                     with _unprepared(conn) if in_pipeline else contextlib.nullcontext():
                         if self.pipe:
