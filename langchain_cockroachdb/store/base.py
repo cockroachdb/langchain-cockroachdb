@@ -44,8 +44,10 @@ from langchain_cockroachdb.store.namespaces import (
 )
 from langchain_cockroachdb.store.sql import (
     MAX_SEARCH_NAMESPACES,
+    MIGRATION_RECONCILE,
     NAMESPACES,
     ItemRow,
+    ItemRowV2,
     StoreSQL,
     VectorRow,
     bind,
@@ -53,8 +55,8 @@ from langchain_cockroachdb.store.sql import (
 
 logger = logging.getLogger(__name__)
 
-# Rows in one multi-row item upsert. Each row takes 4 bound parameters, so a
-# statement stays far below the limit of 65,535 parameters.
+# Rows in one multi-row item upsert. Each row takes at most 6 bound
+# parameters, so a statement stays far below the limit of 65,535 parameters.
 ITEMS_PER_STATEMENT = 500
 
 # Rows in one multi-row vector upsert. VECTOR rows are large, so batches stay
@@ -141,12 +143,17 @@ class PutPlan:
             embed, one per (prefix, key, field_name).
         reindexed: Namespace text to the put keys whose vectors are deleted
             before new ones are written. Every put item when the store has an index.
+        write_id: The batch's write id, chosen once before the first attempt
+            when migration 2's columns exist. The item upserts store it, so
+            a retry after a commit whose result was lost changes nothing.
+            None writes with the 0.5 statements.
     """
 
     deletes: dict[str, list[str]] = field(default_factory=dict)
     items: list[ItemRow] = field(default_factory=list)
     embed_requests: list[tuple[str, str, str, str]] = field(default_factory=list)
     reindexed: dict[str, list[str]] = field(default_factory=dict)
+    write_id: str | None = None
 
 
 @dataclass
@@ -355,6 +362,10 @@ class BaseCockroachDBStore:
     _warned_query_without_index: bool
     # Pooled batches run concurrently; the lock makes the warning appear once
     _warning_lock: threading.Lock
+    # Whether migration 2's columns exist. None until the schema check
+    # (_reconcile_columns, or _areconcile_columns on the async store) reads
+    # the latest migration, once per store. setup() clears it after migrating.
+    _columns_ready: bool | None
 
     def _configure(
         self,
@@ -371,6 +382,35 @@ class BaseCockroachDBStore:
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
         self._warning_lock = threading.Lock()
+        self._columns_ready = None
+
+    def _cache_columns(self, rows: Sequence[Mapping[str, Any]]) -> bool:
+        """Cache and return whether migration 2's columns exist.
+
+        ``rows`` are what StoreSQL.migration_version returned: the latest
+        migration recorded, or no row.
+        """
+        version = int(rows[0]["v"]) if rows else -1
+        ready = version >= MIGRATION_RECONCILE
+        self._columns_ready = ready
+        return ready
+
+    def _require_columns(self) -> None:
+        """Raise ValueError unless setup() has applied migration 2.
+
+        Reads what the schema check cached, so run that first:
+        _reconcile_columns, or _areconcile_columns on the async store.
+
+        Raises:
+            ValueError: If the items table lacks the columns that
+                reconciliation needs.
+        """
+        assert self._columns_ready is not None, "the schema check has not run"
+        if not self._columns_ready:
+            raise ValueError(
+                f"The table {self.sql.items} does not have the columns this method "
+                "needs yet; run setup() to add them."
+            )
 
     def _refresh(self, refresh_ttl: bool) -> bool:
         """Whether a read pushes back the expiry of the rows it returns.
@@ -712,13 +752,21 @@ class BaseCockroachDBStore:
         Old vectors of re-indexed items go first, then the item upserts, the
         vector upserts, and the deletes with their vectors. ``vector_rows``
         come from ``_vector_rows``, computed once before the first attempt.
+        With a write id on the plan, the item upserts store it and bump each
+        row's version. Without one they are the 0.5 statements.
         """
         statements: list[tuple[str, list]] = []
         for prefix, keys in plan.reindexed.items():
             statements.append(self.sql.delete_vectors(prefix, keys))
-        for start in range(0, len(plan.items), ITEMS_PER_STATEMENT):
+        rows: Sequence[ItemRow] | Sequence[ItemRowV2] = plan.items
+        if plan.write_id is not None:
+            # A plain put writes no provenance and no valid time
+            rows = [(prefix, key, value, ttl, None, None) for prefix, key, value, ttl in plan.items]
+        for start in range(0, len(rows), ITEMS_PER_STATEMENT):
             statements.append(
-                self.sql.upsert_items(plan.items[start : start + ITEMS_PER_STATEMENT])
+                self.sql.upsert_items(
+                    rows[start : start + ITEMS_PER_STATEMENT], write_id=plan.write_id
+                )
             )
         for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT):
             statements.append(

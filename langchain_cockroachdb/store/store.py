@@ -12,13 +12,17 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
-from collections.abc import Iterable, Iterator, Mapping
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from langgraph.store.base import (
+    NOT_PROVIDED,
     BaseStore,
     InvalidNamespaceError,
+    NotProvided,
     Op,
     Result,
     TTLConfig,
@@ -242,7 +246,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 an index while ``flat`` is set, logs a WARNING instead.
         """
         migrations = self.sql.migrations()
-        version_sql = f"SELECT v FROM {self.sql.migrations_table} ORDER BY v DESC LIMIT 1"
+        version_sql = self.sql.migration_version()
         record_sql = (
             f"INSERT INTO {self.sql.migrations_table} (v) VALUES (%s) ON CONFLICT DO NOTHING"
         )
@@ -273,6 +277,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     self._sync_pipeline()
 
             self._retry(apply_migration, label=f"store migration {v}")
+
+        # A write before setup() may have cached the schema without
+        # migration 2. The next write reads it again.
+        self._columns_ready = None
 
         for statement in self.sql.vector_statements():
             self._run_ddl(statement, "store vector setup")
@@ -392,6 +400,18 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         self._check_vector_index(self._retry(read, label="store index check"))
 
+    def _reconcile_columns(self) -> bool:
+        """Whether migration 2's columns exist, read once per store and cached.
+
+        Until setup() records migration 2, puts write with the 0.5 statements
+        and the methods that need the columns raise ValueError.
+        """
+        ready = self._columns_ready
+        if ready is None:
+            [rows] = self._read_all([(self.sql.migration_version(), [])], "store schema check")
+            ready = self._cache_columns(rows)
+        return ready
+
     def _run_puts(self, plan: PutPlan) -> None:
         # Embed once, before the first attempt: a retry reuses the vectors
         embeddings: list[list[float]] = []
@@ -399,7 +419,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             embeddings = self.index.embeddings.embed_documents(
                 [text for _, _, _, text in plan.embed_requests]
             )
-        statements = self._write_statements(plan, self._vector_rows(plan, embeddings))
+        vector_rows = self._vector_rows(plan, embeddings)
+        # The write id too: a retry after a commit whose result was lost
+        # finds it on the rows and changes nothing
+        if self._reconcile_columns():
+            plan.write_id = str(uuid.uuid4())
+        statements = self._write_statements(plan, vector_rows)
         if not statements:
             return
 
@@ -452,6 +477,34 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 return len(cur.fetchall())
 
         return self._retry(write, label="store delete namespace")
+
+    def reconcile(
+        self,
+        namespace: tuple[str, ...],
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        policy: Callable[..., Any],
+        slot: str | None = None,
+        threshold: float | None = None,
+        limit: int = 10,
+        filter: dict[str, Any] | None = None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> Any:
+        """Write a memory and settle the memories it may conflict with.
+
+        Not available yet: it raises NotImplementedError once the table has
+        migration 2's columns.
+
+        Raises:
+            ValueError: If setup() has not applied migration 2.
+        """
+        self._reconcile_columns()
+        self._require_columns()
+        raise NotImplementedError("reconcile arrives in a later task")
 
     def sweep_ttl(self) -> int:
         """Delete expired items now, without waiting for CockroachDB's TTL job.

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 
@@ -30,6 +31,7 @@ from langchain_cockroachdb.store.base import (
     needs_exact_search,
 )
 from langchain_cockroachdb.store.config import resolve_index_config
+from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE
 from langchain_cockroachdb.store.store import CockroachDBStore
 
 FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
@@ -331,6 +333,9 @@ def test_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: write as on a table
+    # that setup() has not given migration 2 yet
+    store._columns_ready = False
     flaky = FlakyCursor()
 
     @contextlib.contextmanager
@@ -355,6 +360,9 @@ async def test_async_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: write as on a table
+    # that setup() has not given migration 2 yet
+    store._columns_ready = False
     flaky = FlakyCursor()
 
     @contextlib.asynccontextmanager
@@ -472,6 +480,9 @@ def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: write as on a table
+    # that setup() has not given migration 2 yet
+    store._columns_ready = False
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -498,6 +509,9 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: write as on a table
+    # that setup() has not given migration 2 yet
+    store._columns_ready = False
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -516,6 +530,76 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
         f"DELETE {items}",
         f"DELETE {vectors}",
     ]
+
+
+def assert_same_write_each_attempt(
+    attempts: list[list[tuple[str, list]]], store: BaseCockroachDBStore, ready: bool
+) -> None:
+    """Both attempts sent the same statements; the item upsert matches the schema."""
+    assert len(attempts) == 2
+    # The write id, like the vectors, was chosen before the first attempt
+    assert attempts[0] == attempts[1]
+    assert_write_batch(attempts[1], store)
+    [(upsert, params)] = [
+        (sql, params)
+        for sql, params in attempts[1]
+        if sql.startswith(f"INSERT INTO {store.sql.items} ")
+    ]
+    if ready:
+        uuid.UUID(params[0])
+        assert f"version = {store.sql.items}.version + 1" in upsert
+        rows = [params[i : i + 6] for i in range(1, len(params), 6)]
+        # A plain put writes no provenance and no valid time
+        assert [row[4:] for row in rows] == [[None, None]] * 3
+    else:
+        assert "write_id" not in upsert and "version" not in upsert
+        rows = [params[i : i + 4] for i in range(0, len(params), 4)]
+    assert [row[1] for row in rows] == ["k1", "k2", "k3"]
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["migrated", "0.5-table"])
+def test_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    store._columns_ready = ready
+    attempts: list[list[tuple[str, list]]] = []
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+        attempts.append([])
+        yield StatementLog(attempts[-1])
+        # The first attempt fails as it ends, after all its statements were sent
+        if len(attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    store.batch(INDEXED_OPS)
+    assert_same_write_each_attempt(attempts, store, ready)
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["migrated", "0.5-table"])
+async def test_async_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    store._columns_ready = ready
+    attempts: list[list[tuple[str, list]]] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+        attempts.append([])
+        yield AsyncStatementLog(attempts[-1])
+        if len(attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    await store.abatch(INDEXED_OPS)
+    assert_same_write_each_attempt(attempts, store, ready)
 
 
 def test_batch_plan_keeps_search_queries_to_embed() -> None:
@@ -1152,6 +1236,96 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             with pytest.raises(psycopg.errors.FeatureNotSupported):
                 await getattr(store, operation)()
             assert len(ttl_statements(cursor)) == 1
+
+
+def test_cache_columns_compares_the_latest_migration() -> None:
+    store = make_base()
+    assert store._columns_ready is None
+    assert store._cache_columns([]) is False
+    assert store._columns_ready is False
+    assert store._cache_columns([{"v": MIGRATION_RECONCILE - 1}]) is False
+    assert store._cache_columns([{"v": MIGRATION_RECONCILE}]) is True
+    assert store._cache_columns([{"v": MIGRATION_RECONCILE + 1}]) is True
+    assert store._columns_ready is True
+
+
+class SchemaReads:
+    """A stand-in for a store's _read_all that answers the schema check.
+
+    It returns ``latest`` as the latest migration and records every call.
+    """
+
+    def __init__(self, latest: int) -> None:
+        self.latest = latest
+        self.calls: list[tuple[list[tuple[str, list]], str]] = []
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        self.calls.append((statements, label))
+        return [[{"v": self.latest}]]
+
+
+def test_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(latest=1)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    assert store._reconcile_columns() is False
+    assert store._reconcile_columns() is False
+    assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
+    with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
+        store._require_columns()
+
+    # setup() finds migration 2 recorded, as when another process ran it,
+    # and clears the cached answer, so the next check reads again
+    cursor = BusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[BusyOnceCursor]:
+        yield cursor
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    store.setup()
+    assert store._columns_ready is None
+    reads.latest = MIGRATION_RECONCILE
+    assert store._reconcile_columns() is True
+    assert len(reads.calls) == 2
+    store._require_columns()
+
+
+async def test_async_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
+    store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
+    reads = SchemaReads(latest=1)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    assert await store._areconcile_columns() is False
+    assert await store._areconcile_columns() is False
+    assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
+    with pytest.raises(ValueError, match=r"run setup\(\)"):
+        store._require_columns()
+
+    cursor = AsyncBusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncBusyOnceCursor]:
+        yield cursor
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    await store.setup()
+    assert store._columns_ready is None
+    reads.latest = MIGRATION_RECONCILE
+    assert await store._areconcile_columns() is True
+    assert len(reads.calls) == 2
+    store._require_columns()
 
 
 def test_cancelling_the_sweeper_future_stops_it_without_a_traceback(monkeypatch) -> None:

@@ -353,7 +353,7 @@ def test_setup_from_two_processes_at_once(libpq_url, table_name, admin) -> None:
     versions = [
         row["v"] for row in admin.execute(f"SELECT v FROM {table_name}_migrations ORDER BY v")
     ]
-    assert versions == [0, 1]
+    assert versions == [0, 1, 2]
     with CockroachDBStore.from_conn_string(libpq_url, table_name=table_name) as store:
         store.setup()
         store.put(("s",), "k", {"v": 1})

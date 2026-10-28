@@ -1,11 +1,14 @@
 """Tests for store SQL statement building."""
 
+from datetime import datetime, timezone
+
 import pytest
 
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
 from langchain_cockroachdb.store.sql import (
     MAX_SEARCH_NAMESPACES,
+    MIGRATION_RECONCILE,
     NAMESPACES,
     QUERY_VECTOR,
     StoreSQL,
@@ -45,20 +48,20 @@ def test_identifiers_are_validated():
 
 
 def test_vector_statements_are_separate_and_idempotent():
-    """migrations() returns only 2 statements; vector_statements() is separate."""
-    # Without index: migrations has 2 statements, vector_statements is empty
+    """migrations() returns only 3 statements; vector_statements() is separate."""
+    # Without index: migrations has 3 statements, vector_statements is empty
     sql_no_index = StoreSQL("public", "store", index=None)
-    assert len(sql_no_index.migrations()) == 2
+    assert len(sql_no_index.migrations()) == 3
     assert len(sql_no_index.vector_statements()) == 0
 
-    # With index (not flat): migrations still has 2, vector_statements has 2
+    # With index (not flat): migrations still has 3, vector_statements has 2
     sql_with_index = StoreSQL("public", "store", index=_make_index())
-    assert len(sql_with_index.migrations()) == 2
+    assert len(sql_with_index.migrations()) == 3
     assert len(sql_with_index.vector_statements()) == 2
 
-    # With flat index: migrations has 2, vector_statements has 1 (no index statement)
+    # With flat index: migrations has 3, vector_statements has 1 (no index statement)
     sql_flat = StoreSQL("public", "store", index=_make_index(flat=True))
-    assert len(sql_flat.migrations()) == 2
+    assert len(sql_flat.migrations()) == 3
     assert len(sql_flat.vector_statements()) == 1
 
     # All vector statements must have IF NOT EXISTS
@@ -271,6 +274,83 @@ def test_upsert_items():
     # Check params: prefix, key, value, ttl for each row
     assert params[:4] == ["a", "k1", '{"x": 1}', 60.0]
     assert params[4:8] == ["a", "k2", '{"x": 2}', None]
+
+
+def test_migration_2_adds_the_reconcile_columns_in_one_statement() -> None:
+    statements = StoreSQL("public", "store").migrations()
+    assert len(statements) == 3
+    migration = statements[MIGRATION_RECONCILE]
+    assert migration.startswith("ALTER TABLE public.store ")
+    for column in (
+        "version INT8 NOT NULL DEFAULT 1",
+        "provenance JSONB",
+        "confirmed_at TIMESTAMPTZ",
+        "confirmations INT8 NOT NULL DEFAULT 0",
+        "write_id UUID",
+        "valid_at TIMESTAMPTZ",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column}" in migration
+
+
+def test_upsert_with_a_write_id_bumps_the_version_only_for_a_new_write() -> None:
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [("user.a", "k", '{"text": "x"}', None, '{"source": "user"}', None)], write_id="w-1"
+    )
+    assert "version = public.store.version + 1" in sql
+    assert "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id" in sql
+    assert "w-1" in params and '{"source": "user"}' in params
+    assert "w-1" not in sql and "user" not in sql
+
+
+def test_upsert_with_a_write_id_binds_every_value() -> None:
+    when = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [
+            ("a", "k1", '{"x": 1}', 60.0, '{"source": "chat"}', when),
+            ("a", "k2", '{"x": 2}', None, None, None),
+        ],
+        write_id="w-2",
+    )
+    # The write id's placeholder is in the outer SELECT, before the rows'
+    assert params == [
+        "w-2",
+        *("a", "k1", '{"x": 1}', 60.0, '{"source": "chat"}', when),
+        *("a", "k2", '{"x": 2}', None, None, None),
+    ]
+    assert sql.count("%s") == len(params)
+    assert "CAST(%s AS UUID)" in sql
+    assert "CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at" in sql
+    assert "::" not in sql
+
+    builder = StoreSQL("public", "store")
+    with pytest.raises(ValueError, match="6 fields with a write id, got 4"):
+        builder.upsert_items([("a", "k", "{}", None)], write_id="w-3")  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="4 fields without a write id, got 6"):
+        builder.upsert_items([("a", "k", "{}", None, None, None)])
+
+
+def test_upsert_without_a_write_id_is_the_0_5_statement() -> None:
+    sql, _ = StoreSQL("public", "store").upsert_items([("user.a", "k", "{}", None)])
+    assert "version" not in sql and "write_id" not in sql and "provenance" not in sql
+
+
+def test_upsert_without_a_write_id_keeps_the_0_5_1_text() -> None:
+    """Until setup() applies migration 2, puts send the 0.5.1 statement byte for byte."""
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [("user.a", "k", "{}", None), ("user.a", "j", "{}", 5.0)]
+    )
+    assert sql == (
+        "INSERT INTO public.store (prefix, key, value, expires_at, ttl_minutes)\n"
+        "SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes\n"
+        "FROM (SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes\n"
+        "    UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), CAST(%s AS JSONB), CAST(%s AS DECIMAL)) AS rows_to_insert\n"
+        "ON CONFLICT (prefix, key) DO UPDATE SET\n"
+        "    value = EXCLUDED.value,\n"
+        "    updated_at = now(),\n"
+        "    expires_at = EXCLUDED.expires_at,\n"
+        "    ttl_minutes = EXCLUDED.ttl_minutes"
+    )
+    assert params == ["user.a", "k", "{}", None, "user.a", "j", "{}", 5.0]
 
 
 def test_delete_items():

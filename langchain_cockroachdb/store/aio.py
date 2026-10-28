@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from types import TracebackType
@@ -296,7 +297,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 an index while ``flat`` is set, logs a WARNING instead.
         """
         migrations = self.sql.migrations()
-        version_sql = f"SELECT v FROM {self.sql.migrations_table} ORDER BY v DESC LIMIT 1"
+        version_sql = self.sql.migration_version()
         record_sql = (
             f"INSERT INTO {self.sql.migrations_table} (v) VALUES (%s) ON CONFLICT DO NOTHING"
         )
@@ -327,6 +328,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                     await self._sync_pipeline()
 
             await self._retry(apply_migration, label=f"store migration {v}")
+
+        # A write before setup() may have cached the schema without
+        # migration 2. The next write reads it again.
+        self._columns_ready = None
 
         for statement in self.sql.vector_statements():
             await self._run_ddl(statement, "store vector setup")
@@ -558,6 +563,20 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         self._check_vector_index(await self._retry(read, label="store index check"))
 
+    async def _areconcile_columns(self) -> bool:
+        """Whether migration 2's columns exist, read once per store and cached.
+
+        Until setup() records migration 2, puts write with the 0.5 statements
+        and the methods that need the columns raise ValueError.
+        """
+        ready = self._columns_ready
+        if ready is None:
+            [rows] = await self._read_all(
+                [(self.sql.migration_version(), [])], "store schema check"
+            )
+            ready = self._cache_columns(rows)
+        return ready
+
     async def _run_puts(self, plan: PutPlan) -> None:
         # Embed once, before the first attempt: a retry reuses the vectors
         embeddings: list[list[float]] = []
@@ -565,7 +584,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             embeddings = await self.index.embeddings.aembed_documents(
                 [text for _, _, _, text in plan.embed_requests]
             )
-        statements = self._write_statements(plan, self._vector_rows(plan, embeddings))
+        vector_rows = self._vector_rows(plan, embeddings)
+        # The write id too: a retry after a commit whose result was lost
+        # finds it on the rows and changes nothing
+        if await self._areconcile_columns():
+            plan.write_id = str(uuid.uuid4())
+        statements = self._write_statements(plan, vector_rows)
         if not statements:
             return
 

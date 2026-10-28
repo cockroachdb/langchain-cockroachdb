@@ -26,7 +26,7 @@ from psycopg import Connection
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore, RetryPolicy, get_sqlstate
 from langchain_cockroachdb._sql import parse_vector
 from tests.integration.faults import (
-    FORCE_ERROR,
+    FailAfterCommit,
     PsycopgFaults,
     hold_row_lock,
     kill_sessions,
@@ -93,41 +93,6 @@ async def acounts(aadmin: Any, store: Any) -> tuple[int, int, int, int]:
     )
     vectors = await cur.fetchone()
     return items["n"], items["d"], vectors["n"], vectors["d"]
-
-
-class FailAfterCommit:
-    """Make the client see 40003 after a write batch committed.
-
-    Once armed, the cursor sends the next COMMIT and then
-    crdb_internal.force_error with 40003 in the same pipeline. The batch
-    commits, and the error reaches the store as the batch's result: an
-    ambiguous result after the write applied, as when a connection drops
-    while the COMMIT's answer is on its way.
-    """
-
-    def __init__(self, unsafe_internals: bool) -> None:
-        self.unsafe_internals = unsafe_internals
-        self.armed = False
-        self.fired = 0
-
-    def cursor_class(self) -> type[psycopg.Cursor[Any]]:
-        fault = self
-
-        class FailAfterCommitCursor(psycopg.Cursor):  # type: ignore[type-arg]
-            def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
-                result = super().execute(query, params, **kwargs)
-                if fault.armed and str(query).strip().upper() == "COMMIT":
-                    fault.armed = False
-                    fault.fired += 1
-                    if fault.unsafe_internals:
-                        super().execute("SET allow_unsafe_internals = true")
-                    super().execute(
-                        FORCE_ERROR,
-                        {"fault_code": "40003", "fault_message": "injected 40003 after COMMIT"},
-                    )
-                return result
-
-        return FailAfterCommitCursor
 
 
 # 40001 and 40003 on a write batch

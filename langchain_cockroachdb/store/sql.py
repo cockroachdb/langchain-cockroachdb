@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 from langchain_cockroachdb._sql import validate_identifier, vector_literal
@@ -19,6 +20,10 @@ QUERY_VECTOR = object()
 # Stands in the params for the namespaces found by namespace_lookup
 NAMESPACES = object()
 
+# The migration that adds the columns reconcile, history and confirm use.
+# Until setup() records it, the store writes with the 0.5 statements.
+MIGRATION_RECONCILE = 2
+
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
 # more uses the exact one-statement form instead, so the lookup, the array
@@ -27,6 +32,9 @@ MAX_SEARCH_NAMESPACES = 1000
 
 # Type aliases
 ItemRow = tuple[str, str, str, float | None]  # prefix, key, value_json, ttl_minutes
+ItemRowV2 = tuple[
+    str, str, str, float | None, str | None, datetime | None
+]  # prefix, key, value_json, ttl_minutes, provenance_json, valid_at
 VectorRow = tuple[
     str, str, str, list[float], float | None
 ]  # prefix, key, field_name, embedding, ttl_minutes
@@ -89,7 +97,8 @@ class StoreSQL:
         """Return numbered migration statements for items table.
 
         Returns:
-            List of 2 idempotent DDL statements: (0) migrations table, (1) items table.
+            List of 3 idempotent DDL statements: (0) migrations table, (1) items
+            table, (2) the columns reconcile, history and confirm use.
         """
         return [
             # Migration 0: migrations tracking table
@@ -107,7 +116,20 @@ class StoreSQL:
     ttl_minutes DECIMAL,
     PRIMARY KEY (prefix, key)
 );""",
+            # Migration 2 (MIGRATION_RECONCILE): one statement, so it is one
+            # schema change in its own implicit transaction, as a schema_locked
+            # table needs. Existing rows get version 1 and no confirmations.
+            f"""ALTER TABLE {self.items} ADD COLUMN IF NOT EXISTS version INT8 NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS provenance JSONB,
+    ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirmations INT8 NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS write_id UUID,
+    ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ;""",
         ]
+
+    def migration_version(self) -> str:
+        """The statement that reads the latest migration recorded, if any."""
+        return f"SELECT v FROM {self.migrations_table} ORDER BY v DESC LIMIT 1"
 
     def vector_statements(self) -> list[str]:
         """Return idempotent DDL statements for vectors table and index.
@@ -297,39 +319,60 @@ WHERE {where}"""
             + f"\nSELECT {columns}\nFROM search_results\nORDER BY {order_by}"
         )
 
-    def upsert_items(self, rows: Sequence[ItemRow]) -> tuple[str, list]:
+    def upsert_items(
+        self, rows: Sequence[ItemRow] | Sequence[ItemRowV2], *, write_id: str | None = None
+    ) -> tuple[str, list]:
         """Build multi-row INSERT for items with ON CONFLICT.
 
+        Without ``write_id`` this is the 0.5 statement, for a table that
+        setup() has not given migration 2's columns yet. With it, the rows'
+        provenance, valid time and the write id are written too, and an
+        update bumps the row's version. A row that already carries the write
+        id is left as it is, so a batch retried after its commit changes nothing.
+
         Args:
-            rows: Sequence of (prefix, key, value_json, ttl_minutes) tuples.
-                Callers must dedupe (prefix, key) rows (ON CONFLICT cannot touch a row twice).
+            rows: (prefix, key, value_json, ttl_minutes) tuples without
+                ``write_id``, (prefix, key, value_json, ttl_minutes,
+                provenance_json, valid_at) tuples with it. Callers must dedupe
+                (prefix, key) rows (ON CONFLICT cannot touch a row twice).
+            write_id: The batch's write id, chosen before its first attempt.
 
         Returns:
             Tuple of (SQL, parameters).
 
         Raises:
-            ValueError: If rows is empty.
+            ValueError: If rows is empty, or a row has the wrong number of fields.
         """
         if not rows:
             raise ValueError("rows cannot be empty")
 
+        columns = [
+            ("prefix", "STRING"),
+            ("key", "STRING"),
+            ("value", "JSONB"),
+            ("ttl_minutes", "DECIMAL"),
+        ]
+        if write_id is not None:
+            columns += [("provenance", "JSONB"), ("valid_at", "TIMESTAMPTZ")]
+
         # Use UNION ALL to reference ttl_minutes only once per row, with typed placeholders
-        selects = []
-        for i in range(len(rows)):
-            if i == 0:
-                selects.append(
-                    "SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
-                    "CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes"
-                )
-            else:
-                selects.append(
-                    "UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), "
-                    "CAST(%s AS JSONB), CAST(%s AS DECIMAL)"
-                )
+        first = "SELECT " + ", ".join(f"CAST(%s AS {kind}) AS {name}" for name, kind in columns)
+        others = "UNION ALL SELECT " + ", ".join(f"CAST(%s AS {kind})" for _, kind in columns)
+        union_sql = "\n    ".join([first] + [others] * (len(rows) - 1))
 
-        union_sql = "\n    ".join(selects)
+        # The write id's placeholder comes first, in the outer SELECT. Then
+        # each row's fields, in the order of columns
+        params: list[Any] = [] if write_id is None else [write_id]
+        for row in rows:
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"item rows have {len(columns)} fields "
+                    f"{'without' if write_id is None else 'with'} a write id, got {len(row)}"
+                )
+            params.extend(row)
 
-        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes)
+        if write_id is None:
+            sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes)
 SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key) DO UPDATE SET
@@ -337,12 +380,21 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     updated_at = now(),
     expires_at = EXCLUDED.expires_at,
     ttl_minutes = EXCLUDED.ttl_minutes"""
+            return (sql, params)
 
-        # Flatten parameters: for each row, emit prefix, key, value, ttl
-        params: list[Any] = []
-        for prefix, key, value_json, ttl_minutes in rows:
-            params.extend([prefix, key, value_json, ttl_minutes])
-
+        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id)
+SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID)
+FROM ({union_sql}) AS rows_to_insert
+ON CONFLICT (prefix, key) DO UPDATE SET
+    value = EXCLUDED.value,
+    updated_at = now(),
+    expires_at = EXCLUDED.expires_at,
+    ttl_minutes = EXCLUDED.ttl_minutes,
+    provenance = EXCLUDED.provenance,
+    valid_at = EXCLUDED.valid_at,
+    write_id = EXCLUDED.write_id,
+    version = {self.items}.version + 1
+WHERE {self.items}.write_id IS DISTINCT FROM EXCLUDED.write_id"""
         return (sql, params)
 
     def delete_items(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
