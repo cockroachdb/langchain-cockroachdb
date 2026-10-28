@@ -384,7 +384,9 @@ Blob data is read as raw BYTEA via psycopg3's binary cursor protocol, eliminatin
 
 ### Prepared Statement Caching
 
-The `from_conn_string()` factory sets `prepare_threshold=5` by default, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths. `prepare_threshold` is configurable via `from_conn_string(prepare_threshold=...)`.
+The `from_conn_string()` factory sets `prepare_threshold=5` by default, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths. `prepare_threshold` is configurable via `from_conn_string(prepare_threshold=...)`, and `None` turns prepared statements off.
+
+Statements sent in a pipeline are never prepared: the writes (`put`, `put_writes`, `delete_thread`) and, with `pipeline=True`, every statement. In pipeline mode psycopg records a statement as prepared before the server confirms it. If an earlier statement in the same batch fails, the server never prepares it, and each later run on that connection would fail with "prepared statement ... does not exist".
 
 ## CockroachDB-Specific Adaptations
 
@@ -422,7 +424,7 @@ FROM jsonb_each_text(checkpoint -> 'channel_versions') AS jt
 | Blob/write fetching | Correlated subqueries | Separate PK lookups + batch fetching |
 | Index creation | `CREATE INDEX CONCURRENTLY` | `CREATE INDEX` (non-blocking by default) |
 | Blob encoding | Native bytea arrays | Raw BYTEA via binary cursor |
-| Prepared statements | `prepare_threshold=0` (disabled) | `prepare_threshold=5` (enabled) |
+| Prepared statements | `prepare_threshold=0` (each query from its first run) | `prepare_threshold=5` (after five runs, outside pipelines) |
 | Row-level TTL | Not supported | `enable_ttl()` / `disable_ttl()` |
 | Async support | Yes | Yes |
 | Thread deletion | Yes | Yes |

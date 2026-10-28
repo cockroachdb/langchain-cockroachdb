@@ -113,6 +113,9 @@ class FakeConnection:
     """
 
     autocommit = True
+    # psycopg's default. Set as a class attribute, it also hides psycopg's own
+    # property in the subclasses below, which never run psycopg's __init__
+    prepare_threshold: int | None = 5
 
     def __init__(
         self,
