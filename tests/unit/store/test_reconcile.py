@@ -104,6 +104,14 @@ def test_supersede_same_slot_skips_an_older_value_for_the_same_key() -> None:
     )
 
 
+def test_supersede_same_slot_writes_over_an_older_target_in_the_slot() -> None:
+    proposal = make_proposal("k", valid_at=T1)
+    candidates = [candidate("k", reason="slot", valid_at=T0)]
+    decision = supersede_same_slot()(proposal, candidates)
+    assert decision == Decision()
+    validate_decision(proposal, candidates, decision)
+
+
 def test_skip_duplicates_confirms_the_closest_near_duplicate() -> None:
     found = [candidate("a", score=0.98), candidate("b", score=0.99), candidate("c", score=0.5)]
     assert skip_duplicates()(make_proposal("new"), found) == Decision(
@@ -132,6 +140,17 @@ def test_supersede_similar_uses_its_threshold() -> None:
 
     # At threshold 0.9, score 0.85 should be kept (writes normally)
     assert supersede_similar(threshold=0.9)(proposal, found) == Decision()
+
+
+def test_supersede_similar_does_not_supersede_the_target() -> None:
+    proposal = make_proposal("k", valid_at=T1)
+    candidates = [
+        candidate("k", reason="key", score=0.95, valid_at=T0),
+        candidate("other", score=0.95, valid_at=T0),
+    ]
+    decision = supersede_similar(threshold=0.9)(proposal, candidates)
+    assert decision == Decision(actions={"other": Action.SUPERSEDE})
+    validate_decision(proposal, candidates, decision)
 
 
 def test_keep_all_writes_and_keeps() -> None:

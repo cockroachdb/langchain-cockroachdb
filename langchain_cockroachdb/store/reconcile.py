@@ -239,15 +239,19 @@ def supersede_same_slot() -> Policy:
         if not slot_candidates:
             return Decision()
 
-        # Check if any slot candidate is newer
-        newer = [c for c in slot_candidates if c.valid_at > proposal.valid_at]
+        # Check if any slot candidate is newer (excluding target)
+        newer = [
+            c for c in slot_candidates if c.valid_at > proposal.valid_at and c.key != proposal.key
+        ]
         if newer:
             # Find the latest one
             latest = max(newer, key=lambda c: c.valid_at)
             return Decision(new="superseded", superseded_by=latest.key)
 
-        # Supersede all slot candidates
-        return Decision(actions={c.key: Action.SUPERSEDE for c in slot_candidates})
+        # Supersede all slot candidates (excluding target)
+        return Decision(
+            actions={c.key: Action.SUPERSEDE for c in slot_candidates if c.key != proposal.key}
+        )
 
     return policy
 
@@ -322,15 +326,15 @@ def supersede_similar(threshold: float = 0.9) -> Policy:
         if target and target.valid_at > proposal.valid_at:
             return Decision(new="skip")
 
-        # Check if any match is newer
-        newer = [c for c in matches if c.valid_at > proposal.valid_at]
+        # Check if any match is newer (excluding target)
+        newer = [c for c in matches if c.valid_at > proposal.valid_at and c.key != proposal.key]
         if newer:
             # Find the latest one
             latest = max(newer, key=lambda c: c.valid_at)
             return Decision(new="superseded", superseded_by=latest.key)
 
-        # Supersede all matches
-        return Decision(actions={c.key: Action.SUPERSEDE for c in matches})
+        # Supersede all matches (excluding target)
+        return Decision(actions={c.key: Action.SUPERSEDE for c in matches if c.key != proposal.key})
 
     return policy
 
