@@ -563,13 +563,17 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         self._check_vector_index(await self._retry(read, label="store index check"))
 
-    async def _areconcile_columns(self) -> bool:
-        """Whether migration 2's columns exist, read once per store and cached.
+    async def _areconcile_columns(self, *, refresh: bool = False) -> bool:
+        """Whether migration 2's columns exist, as the schema check last read it.
 
-        Until setup() records migration 2, puts write with the 0.5 statements
-        and the methods that need the columns raise ValueError.
+        It reads the latest migration the first time, and again when it last
+        found none and that answer is older than _SCHEMA_RECHECK_SECONDS, or
+        ``refresh`` is set. Methods that need the columns pass ``refresh``, so
+        they see a setup() that another process ran since. Until setup()
+        records migration 2, puts write with the 0.5 statements and those
+        methods raise ValueError.
         """
-        ready = self._columns_ready
+        ready = self._cached_columns(refresh=refresh)
         if ready is None:
             [rows] = await self._read_all(
                 [(self.sql.migration_version(), [])], "store schema check"

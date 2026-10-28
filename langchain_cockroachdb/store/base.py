@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -352,6 +353,10 @@ class BaseCockroachDBStore:
     # Names the store in log and error messages of the psycopg machinery
     component: ClassVar[str] = "store"
     _log: ClassVar[logging.Logger] = logger
+    # Seconds a plain write trusts a schema check that found no migration 2.
+    # Another process may run setup() meanwhile, so after that the next write
+    # reads the schema again. Found columns are trusted for good.
+    _SCHEMA_RECHECK_SECONDS: ClassVar[float] = 60.0
 
     sql: StoreSQL
     index: ResolvedIndex | None
@@ -364,8 +369,10 @@ class BaseCockroachDBStore:
     _warning_lock: threading.Lock
     # Whether migration 2's columns exist. None until the schema check
     # (_reconcile_columns, or _areconcile_columns on the async store) reads
-    # the latest migration, once per store. setup() clears it after migrating.
+    # the latest migration. setup() clears it after migrating.
     _columns_ready: bool | None
+    # When the schema check last read it, by time.monotonic()
+    _columns_read_at: float
 
     def _configure(
         self,
@@ -383,6 +390,21 @@ class BaseCockroachDBStore:
         self._warned_query_without_index = False
         self._warning_lock = threading.Lock()
         self._columns_ready = None
+        self._columns_read_at = 0.0
+
+    def _cached_columns(self, *, refresh: bool) -> bool | None:
+        """What the schema check can answer without a read, or None to read.
+
+        True holds for good: migrations are never undone. False holds for
+        _SCHEMA_RECHECK_SECONDS after the read that found it, because another
+        process may run setup() meanwhile, and not at all with ``refresh``.
+        """
+        ready = self._columns_ready
+        if ready is False and (
+            refresh or time.monotonic() - self._columns_read_at >= self._SCHEMA_RECHECK_SECONDS
+        ):
+            return None
+        return ready
 
     def _cache_columns(self, rows: Sequence[Mapping[str, Any]]) -> bool:
         """Cache and return whether migration 2's columns exist.
@@ -392,14 +414,17 @@ class BaseCockroachDBStore:
         """
         version = int(rows[0]["v"]) if rows else -1
         ready = version >= MIGRATION_RECONCILE
+        self._columns_read_at = time.monotonic()
         self._columns_ready = ready
         return ready
 
     def _require_columns(self) -> None:
         """Raise ValueError unless setup() has applied migration 2.
 
-        Reads what the schema check cached, so run that first:
-        _reconcile_columns, or _areconcile_columns on the async store.
+        Reads what the schema check cached, so run that first, with
+        refresh=True: _reconcile_columns, or _areconcile_columns on the async
+        store. A store that found no migration 2 earlier then sees a setup()
+        that another process ran since.
 
         Raises:
             ValueError: If the items table lacks the columns that

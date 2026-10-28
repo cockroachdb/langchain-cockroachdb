@@ -400,13 +400,17 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         self._check_vector_index(self._retry(read, label="store index check"))
 
-    def _reconcile_columns(self) -> bool:
-        """Whether migration 2's columns exist, read once per store and cached.
+    def _reconcile_columns(self, *, refresh: bool = False) -> bool:
+        """Whether migration 2's columns exist, as the schema check last read it.
 
-        Until setup() records migration 2, puts write with the 0.5 statements
-        and the methods that need the columns raise ValueError.
+        It reads the latest migration the first time, and again when it last
+        found none and that answer is older than _SCHEMA_RECHECK_SECONDS, or
+        ``refresh`` is set. Methods that need the columns pass ``refresh``, so
+        they see a setup() that another process ran since. Until setup()
+        records migration 2, puts write with the 0.5 statements and those
+        methods raise ValueError.
         """
-        ready = self._columns_ready
+        ready = self._cached_columns(refresh=refresh)
         if ready is None:
             [rows] = self._read_all([(self.sql.migration_version(), [])], "store schema check")
             ready = self._cache_columns(rows)
@@ -502,7 +506,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Raises:
             ValueError: If setup() has not applied migration 2.
         """
-        self._reconcile_columns()
+        self._reconcile_columns(refresh=True)
         self._require_columns()
         raise NotImplementedError("reconcile arrives in a later task")
 

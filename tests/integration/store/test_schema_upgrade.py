@@ -144,6 +144,42 @@ def test_setup_turns_on_versions_for_a_store_that_wrote_before_it(
     assert row["write_id"] is not None
 
 
+def test_a_store_that_checked_before_setup_sees_migration_2_later(
+    store_factory, admin, mode, monkeypatch
+) -> None:
+    # Two stores write to a 0.5 table, so each caches that migration 2 is missing
+    store = store_factory(mode, setup=False, index=seat_index())
+    for statement in schema_0_5(store):
+        admin.execute(statement)
+    other = store_factory(mode, setup=False, index=seat_index())
+    store.put(NS, "seat", {"text": "Prefers window seats"})
+    other.put(NS, "food", {"text": "Vegetarian"})
+
+    # Then another process runs setup()
+    store_factory(mode, index=seat_index())
+
+    # A method that needs migration 2 reads the schema again when it is called,
+    # and plain writes use what it read
+    with pytest.raises(NotImplementedError):
+        store.reconcile(
+            NS,
+            "seat",
+            {"text": "Prefers aisle seats"},
+            policy=lambda proposal, candidates: None,
+        )
+    store.put(NS, "seat", {"text": "Prefers aisle seats"})
+    assert row_of(admin, store, "seat")["version"] == 2
+
+    # A plain write trusts the missing migration for _SCHEMA_RECHECK_SECONDS,
+    # then reads the schema again
+    monkeypatch.setattr(other, "_SCHEMA_RECHECK_SECONDS", 3600.0)
+    other.put(NS, "food", {"text": "Allergic to peanuts"})
+    assert row_of(admin, other, "food")["version"] == 1
+    monkeypatch.setattr(other, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    other.put(NS, "food", {"text": "Vegetarian"})
+    assert row_of(admin, other, "food")["version"] == 2
+
+
 def test_every_write_bumps_the_version(store_factory, admin, mode) -> None:
     store = store_factory(mode, index=seat_index())
     store.put(NS, "seat", {"text": "Prefers window seats"})

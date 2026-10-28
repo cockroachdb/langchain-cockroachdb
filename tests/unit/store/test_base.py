@@ -22,6 +22,7 @@ from langgraph.store.base import (
 from psycopg_pool import AsyncConnectionPool
 
 from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.base import (
     MAX_SEARCH_NAMESPACES,
@@ -333,9 +334,9 @@ def test_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    # The fake cursor cannot answer the schema check: write as on a table
+    # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._columns_ready = False
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
     flaky = FlakyCursor()
 
     @contextlib.contextmanager
@@ -360,9 +361,9 @@ async def test_async_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    # The fake cursor cannot answer the schema check: write as on a table
+    # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._columns_ready = False
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
     flaky = FlakyCursor()
 
     @contextlib.asynccontextmanager
@@ -480,9 +481,9 @@ def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
-    # The fake cursor cannot answer the schema check: write as on a table
+    # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._columns_ready = False
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -509,9 +510,9 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
-    # The fake cursor cannot answer the schema check: write as on a table
+    # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._columns_ready = False
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -564,7 +565,7 @@ def test_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
         index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    store._columns_ready = ready
+    store._cache_columns([{"v": MIGRATION_RECONCILE if ready else MIGRATION_RECONCILE - 1}])
     attempts: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -587,7 +588,7 @@ async def test_async_put_batch_sends_one_write_id_in_every_attempt(ready: bool) 
         index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    store._columns_ready = ready
+    store._cache_columns([{"v": MIGRATION_RECONCILE if ready else MIGRATION_RECONCILE - 1}])
     attempts: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -1264,7 +1265,43 @@ class SchemaReads:
         return [[{"v": self.latest}]]
 
 
-def test_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
+class FakeClock:
+    """Stands in for the time module in store.base: monotonic() returns ``now``."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_cached_columns_keep_true_for_good_and_false_for_a_while(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_base()
+    assert store._cached_columns(refresh=False) is None
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    assert store._cached_columns(refresh=False) is False
+    # A method that needs migration 2 does not trust False at all
+    assert store._cached_columns(refresh=True) is None
+    # A plain write trusts it for _SCHEMA_RECHECK_SECONDS, then reads again
+    assert store._SCHEMA_RECHECK_SECONDS == 60.0
+    clock.now += 59.0
+    assert store._cached_columns(refresh=False) is False
+    clock.now += 1.0
+    assert store._cached_columns(refresh=False) is None
+    # The window starts again with each read that finds no migration 2
+    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    clock.now += 59.0
+    assert store._cached_columns(refresh=False) is False
+    # Migrations are never undone, so True holds for good
+    store._cache_columns([{"v": MIGRATION_RECONCILE}])
+    clock.now += 365 * 86400.0
+    assert store._cached_columns(refresh=False) is True
+    assert store._cached_columns(refresh=True) is True
+
+
+def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
     store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
     reads = SchemaReads(latest=1)
 
@@ -1279,6 +1316,13 @@ def test_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
     assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
     with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
         store._require_columns()
+    # A method that needs migration 2 reads again rather than trust the cached False
+    assert store._reconcile_columns(refresh=True) is False
+    assert len(reads.calls) == 2
+    # So does a plain write, once the False is older than _SCHEMA_RECHECK_SECONDS
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    assert store._reconcile_columns() is False
+    assert len(reads.calls) == 3
 
     # setup() finds migration 2 recorded, as when another process ran it,
     # and clears the cached answer, so the next check reads again
@@ -1293,11 +1337,14 @@ def test_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
     assert store._columns_ready is None
     reads.latest = MIGRATION_RECONCILE
     assert store._reconcile_columns() is True
-    assert len(reads.calls) == 2
+    # True is kept for good, even with refresh and a window of 0
+    assert store._reconcile_columns() is True
+    assert store._reconcile_columns(refresh=True) is True
+    assert len(reads.calls) == 4
     store._require_columns()
 
 
-async def test_async_schema_check_reads_once_per_store_and_setup_clears_it() -> None:
+async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
     store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
     reads = SchemaReads(latest=1)
 
@@ -1312,6 +1359,11 @@ async def test_async_schema_check_reads_once_per_store_and_setup_clears_it() -> 
     assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
     with pytest.raises(ValueError, match=r"run setup\(\)"):
         store._require_columns()
+    assert await store._areconcile_columns(refresh=True) is False
+    assert len(reads.calls) == 2
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    assert await store._areconcile_columns() is False
+    assert len(reads.calls) == 3
 
     cursor = AsyncBusyOnceCursor(latest=MIGRATION_RECONCILE)
 
@@ -1324,7 +1376,9 @@ async def test_async_schema_check_reads_once_per_store_and_setup_clears_it() -> 
     assert store._columns_ready is None
     reads.latest = MIGRATION_RECONCILE
     assert await store._areconcile_columns() is True
-    assert len(reads.calls) == 2
+    assert await store._areconcile_columns() is True
+    assert await store._areconcile_columns(refresh=True) is True
+    assert len(reads.calls) == 4
     store._require_columns()
 
 
