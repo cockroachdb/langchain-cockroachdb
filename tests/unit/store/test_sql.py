@@ -38,6 +38,32 @@ def _make_index(
     )
 
 
+def candidate_statements(sql: StoreSQL) -> list[tuple[str, list]]:
+    """Every statement that finds candidates or reads a record, in each of its forms."""
+    return [
+        sql.now(),
+        sql.key_slot_candidates("a.b", "k1", slot_field=None, slot_value_json=None, filter=None),
+        sql.key_slot_candidates(
+            "a.b", "k1", slot_field="seat", slot_value_json='"x"', filter={"x": 1, "y": {"$gt": 2}}
+        ),
+        *(
+            sql.similar_candidates(
+                "a.b",
+                threshold=0.8,
+                limit=3,
+                filter={"x": 1},
+                scan=scan,  # type: ignore[arg-type]
+                over_fetch=7,
+                exclude=["k1", "k2"],
+            )
+            for scan in ("exact", "index")
+        ),
+        sql.candidate_scores("a.b", ["k1", "k2"]),
+        sql.namespace_vector_count("a.b", 2001),
+        sql.record("a.b", "k1"),
+    ]
+
+
 def test_identifiers_are_validated():
     """StoreSQL validates identifiers and raises ValueError for invalid ones."""
     with pytest.raises(ValueError, match="Invalid"):
@@ -200,6 +226,7 @@ def test_no_cast_shorthand():
         sql.purge("a", "k1"),
         sql.delete_namespace(["a"], history=True),
         sql.upsert_items([("a", "k1", "{}", None, None, None)], write_id="w", history=True),
+        *candidate_statements(sql),
     ):
         assert "::" not in query_sql
 
@@ -689,6 +716,7 @@ def test_every_builder_has_one_param_per_placeholder():
         sql.history_exists(),
         sql.purge("a.b.c", "k1"),
         sql.upsert_items([("a.b.c", "k1", "{}", None, None, None)], write_id="w", history=True),
+        *candidate_statements(sql),
     ):
         assert query_sql.count("%s") == len(params)
 
@@ -1044,3 +1072,180 @@ def test_delete_namespace_without_history_keeps_the_0_5_1_text() -> None:
         f"DELETE FROM public.store\nWHERE {condition}\nRETURNING key",
         ["user.a", "user.a.", "user.a/"] * 2,
     )
+
+
+CANDIDATE_COLUMNS = (
+    "key, value, created_at, updated_at, version, COALESCE(valid_at, updated_at) AS valid_at, "
+    "provenance, confirmed_at, confirmations, write_id"
+)
+
+
+def test_key_slot_candidates_bind_the_slot() -> None:
+    """The target comes by its key alone; slot matches compare the bound slot field and value.
+
+    The filter narrows the slot matches only, and expired rows never come back.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    query_sql, params = sql.key_slot_candidates(
+        "user.alice",
+        "k",
+        slot_field="slot-field-xyz",
+        slot_value_json='"slot-value-xyz"',
+        filter={"source": "chat"},
+    )
+    assert "slot-field-xyz" not in query_sql and "slot-value-xyz" not in query_sql
+    assert "chat" not in query_sql and "alice" not in query_sql
+    assert query_sql.startswith(f"SELECT {CANDIDATE_COLUMNS}\nFROM public.store\n")
+    assert (
+        "WHERE prefix = %s AND (key = %s OR (value -> %s = CAST(%s AS JSONB) "
+        "AND value -> %s = CAST(%s AS JSONB)))"
+    ) in query_sql
+    assert query_sql.rstrip().endswith("AND (expires_at IS NULL OR expires_at > now())")
+    assert params == ["user.alice", "k", "slot-field-xyz", '"slot-value-xyz"', "source", '"chat"']
+    assert query_sql.count("%s") == len(params)
+
+    # Without a slot only the target is read, and the filter does not apply to it
+    query_sql, params = sql.key_slot_candidates(
+        "user.alice", "k", slot_field=None, slot_value_json=None, filter={"source": "chat"}
+    )
+    assert "WHERE prefix = %s AND key = %s\n" in query_sql
+    assert "->" not in query_sql
+    assert params == ["user.alice", "k"]
+
+    with pytest.raises(ValueError, match="Unknown filter operator"):
+        sql.key_slot_candidates(
+            "a", "k", slot_field="seat", slot_value_json='"x"', filter={"x": {"$bad": 1}}
+        )
+
+
+def test_similar_candidates_exact_and_index_shapes() -> None:
+    """The exact form ranks every vector of the namespace; the index form keeps a window.
+
+    Both skip the excluded keys, filter, check expiry and keep the scores at
+    or above the threshold, best first, up to the limit.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    kwargs = {"threshold": 0.8, "limit": 5, "filter": {"x": 1}, "over_fetch": 11}
+    exact_sql, exact_params = sql.similar_candidates(
+        "user.alice",
+        scan="exact",
+        exclude=["k", "s"],
+        **kwargs,  # type: ignore[arg-type]
+    )
+    ranked, outer = exact_sql.split("\n)\nSELECT ", 1)
+    assert ranked.startswith("WITH ranked AS (")
+    assert "JOIN public.store AS i ON v.prefix = i.prefix AND v.key = i.key" in ranked
+    assert (
+        "WHERE v.prefix = %s AND NOT (v.key = ANY(CAST(%s AS STRING[]))) "
+        "AND i.value -> %s = CAST(%s AS JSONB) AND (i.expires_at IS NULL OR i.expires_at > now())"
+    ) in ranked
+    assert "min(v.embedding <=> CAST(%s AS VECTOR)) AS distance" in ranked
+    assert "GROUP BY i.prefix, i.key" in ranked
+    # No inner LIMIT on the vectors, so no vector index can serve it
+    assert "LIMIT" not in ranked and "ORDER BY" not in ranked
+    assert outer.endswith(
+        "1 - distance AS score\nFROM ranked\nWHERE 1 - distance >= CAST(%s AS FLOAT8)\n"
+        "ORDER BY score DESC, key\nLIMIT %s"
+    )
+    assert exact_params == [QUERY_VECTOR, "user.alice", ["k", "s"], "x", "1", 0.8, 5]
+    assert exact_sql.count("%s") == len(exact_params)
+
+    index_sql, index_params = sql.similar_candidates(
+        "user.alice",
+        scan="index",
+        exclude=["k", "s"],
+        **kwargs,  # type: ignore[arg-type]
+    )
+    window, rest = index_sql.split("\n),\nbest AS (", 1)
+    # The window orders by distance with a LIMIT, which the C-SPANN index serves,
+    # and has no other filter
+    assert window.startswith("WITH nearest AS (")
+    assert "FROM public.store_vectors\n    WHERE prefix = %s\n" in window
+    assert "ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s" in window
+    assert "expires_at" not in window and "value" not in window and "ANY(" not in window
+    assert "JOIN public.store AS i ON r.prefix = i.prefix AND r.key = i.key" in rest
+    assert (
+        "WHERE NOT (i.key = ANY(CAST(%s AS STRING[]))) AND i.value -> %s = CAST(%s AS JSONB) "
+        "AND (i.expires_at IS NULL OR i.expires_at > now())"
+    ) in rest
+    assert "SELECT DISTINCT ON (i.key)" in rest and "ORDER BY i.key, r.distance" in rest
+    assert rest.endswith(
+        "WHERE 1 - distance >= CAST(%s AS FLOAT8)\nORDER BY score DESC, key\nLIMIT %s"
+    )
+    assert index_params == [
+        QUERY_VECTOR,
+        "user.alice",
+        QUERY_VECTOR,
+        11,
+        ["k", "s"],
+        "x",
+        "1",
+        0.8,
+        5,
+    ]
+    assert index_sql.count("%s") == len(index_params)
+
+    # An l2 store scores by the negated distance, as search does
+    l2 = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    for scan in ("exact", "index"):
+        l2_sql, _ = l2.similar_candidates(
+            "a",
+            scan=scan,  # type: ignore[arg-type]
+            exclude=[],
+            **kwargs,  # type: ignore[arg-type]
+        )
+        assert "<->" in l2_sql and "<=>" not in l2_sql
+        assert "-distance AS score" in l2_sql and "WHERE -distance >= CAST(%s AS FLOAT8)" in l2_sql
+
+    with pytest.raises(ValueError, match="scan"):
+        sql.similar_candidates("a", scan="fast", exclude=[], **kwargs)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="limit"):
+        sql.similar_candidates(
+            "a", threshold=0.8, limit=-1, filter=None, scan="exact", over_fetch=1, exclude=[]
+        )
+    with pytest.raises(ValueError, match="index"):
+        StoreSQL("public", "store").similar_candidates("a", scan="exact", exclude=[], **kwargs)  # type: ignore[arg-type]
+
+
+def test_candidate_scores_count_record_and_now_bind_everything() -> None:
+    sql = StoreSQL("public", "store", index=_make_index())
+
+    # The key and slot candidates are scored by their vectors alone: primary
+    # key lookups, no threshold and no filter
+    query_sql, params = sql.candidate_scores("user.alice", ["k", "s"])
+    assert query_sql == (
+        "SELECT key, 1 - min(embedding <=> CAST(%s AS VECTOR)) AS score\n"
+        "FROM public.store_vectors\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+        "GROUP BY key"
+    )
+    assert params == [QUERY_VECTOR, "user.alice", ["k", "s"]]
+    l2 = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    assert "-min(embedding <-> CAST(%s AS VECTOR)) AS score" in l2.candidate_scores("a", ["k"])[0]
+
+    # The namespace's own vectors, counted up to the cap from the primary key
+    query_sql, params = sql.namespace_vector_count("user.alice", 2001)
+    assert query_sql == (
+        "SELECT count(*) AS n FROM (\n"
+        "    SELECT 1 FROM public.store_vectors WHERE prefix = %s LIMIT %s\n"
+        ") AS c"
+    )
+    assert params == ["user.alice", 2001]
+
+    # A record is one live row with its metadata. It never pushes back the expiry
+    query_sql, params = sql.record("user.alice", "k")
+    assert query_sql == (
+        f"SELECT {CANDIDATE_COLUMNS}\nFROM public.store\n"
+        "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"
+    )
+    assert params == ["user.alice", "k"]
+    assert "UPDATE" not in query_sql
+
+    assert sql.now() == ("SELECT now() AS now", [])
+
+    for builder in (
+        lambda s: s.candidate_scores("a", ["k"]),
+        lambda s: s.namespace_vector_count("a", 1),
+    ):
+        with pytest.raises(ValueError, match="index"):
+            builder(StoreSQL("public", "store"))

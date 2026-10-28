@@ -47,12 +47,14 @@ from langchain_cockroachdb.store.base import (
     SchemaCheck,
 )
 from langchain_cockroachdb.store.config import (
+    DEFAULT_RECONCILE_SCAN_LIMIT,
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
     HistoryConfig,
     PoolConfig,
     resolve_history_config,
     resolve_index_config,
+    resolve_reconcile_scan_limit,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.store import DEFAULT_SWEEP_INTERVAL_MINUTES
@@ -139,6 +141,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
         history: bool | HistoryConfig | None = None,
+        reconcile_scan_limit: int = DEFAULT_RECONCILE_SCAN_LIMIT,
         retry_policy: RetryPolicy | None = None,
         table_name: str = "store",
         schema: str = "public",
@@ -158,6 +161,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 versions a TTL. setup() then creates the history table, and
                 every batch keeps the versions it overwrites or deletes there.
                 Default None, no history.
+            reconcile_scan_limit: The most vectors a namespace may hold for
+                find_conflicts to rank every one of them, by primary key
+                (default 2000). A namespace with more finds its similar
+                candidates through the C-SPANN index, which may miss some.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
@@ -165,11 +172,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             RuntimeError: If no event loop is running
             ValueError: If a pipeline is given with a pool, or a name or the
-                TTL, index or history settings are invalid
+                TTL, index, history or reconcile_scan_limit settings are invalid
         """
         # Validated first, so a bad index fails before anything starts
         resolved_index = resolve_index_config(index)
         resolved_history = resolve_history_config(history)
+        scan_limit = resolve_reconcile_scan_limit(reconcile_scan_limit)
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
             raise ValueError(
                 "Pipeline should be used only with a single AsyncConnection, "
@@ -189,6 +197,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             table_name=table_name,
             schema=schema,
             history=resolved_history,
+            reconcile_scan_limit=scan_limit,
         )
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
@@ -216,6 +225,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
         history: bool | HistoryConfig | None = None,
+        reconcile_scan_limit: int = DEFAULT_RECONCILE_SCAN_LIMIT,
         retry_policy: RetryPolicy | None = None,
         connect_timeout: float | None = 10.0,
         prepare_threshold: int | None = 5,
@@ -233,6 +243,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             index: Semantic search settings
             ttl: TTL settings
             history: Version history settings (default None, no history)
+            reconcile_scan_limit: The most vectors a namespace may hold for
+                find_conflicts to rank every one of them (default 2000)
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
             prepare_threshold: psycopg prepared statement threshold, None to disable
@@ -260,6 +272,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 index=index,
                 ttl=ttl,
                 history=history,
+                reconcile_scan_limit=reconcile_scan_limit,
                 retry_policy=policy,
                 table_name=table_name,
                 schema=schema,

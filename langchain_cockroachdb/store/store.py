@@ -39,22 +39,27 @@ from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
+    ProposalPlan,
     PutPlan,
     SchemaCheck,
     _check_paging,
     _memory_prefix,
+    _row_to_record,
     _row_to_version,
 )
 from langchain_cockroachdb.store.config import (
+    DEFAULT_RECONCILE_SCAN_LIMIT,
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
     HistoryConfig,
     PoolConfig,
     resolve_history_config,
     resolve_index_config,
+    resolve_reconcile_scan_limit,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
-from langchain_cockroachdb.store.reconcile import MemoryVersion
+from langchain_cockroachdb.store.reconcile import Conflicts, MemoryRecord, MemoryVersion
+from langchain_cockroachdb.store.sql import VectorRow
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
         history: bool | HistoryConfig | None = None,
+        reconcile_scan_limit: int = DEFAULT_RECONCILE_SCAN_LIMIT,
         retry_policy: RetryPolicy | None = None,
         table_name: str = "store",
         schema: str = "public",
@@ -130,17 +136,22 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 versions a TTL. setup() then creates the history table, and
                 every batch keeps the versions it overwrites or deletes there.
                 Default None, no history.
+            reconcile_scan_limit: The most vectors a namespace may hold for
+                find_conflicts to rank every one of them, by primary key
+                (default 2000). A namespace with more finds its similar
+                candidates through the C-SPANN index, which may miss some.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
 
         Raises:
             ValueError: If a pipeline is given with a pool, or a name or the
-                TTL, index or history settings are invalid
+                TTL, index, history or reconcile_scan_limit settings are invalid
         """
         # Validated first, so a bad index fails before anything starts
         resolved_index = resolve_index_config(index)
         resolved_history = resolve_history_config(history)
+        scan_limit = resolve_reconcile_scan_limit(reconcile_scan_limit)
         if isinstance(conn, ConnectionPool) and pipe is not None:
             raise ValueError(
                 "Pipeline should be used only with a single Connection, not ConnectionPool."
@@ -151,6 +162,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             table_name=table_name,
             schema=schema,
             history=resolved_history,
+            reconcile_scan_limit=scan_limit,
         )
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
@@ -176,6 +188,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
         history: bool | HistoryConfig | None = None,
+        reconcile_scan_limit: int = DEFAULT_RECONCILE_SCAN_LIMIT,
         retry_policy: RetryPolicy | None = None,
         connect_timeout: float | None = 10.0,
         prepare_threshold: int | None = 5,
@@ -193,6 +206,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             index: Semantic search settings
             ttl: TTL settings
             history: Version history settings (default None, no history)
+            reconcile_scan_limit: The most vectors a namespace may hold for
+                find_conflicts to rank every one of them (default 2000)
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
             prepare_threshold: psycopg prepared statement threshold, None to disable
@@ -218,6 +233,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 index=index,
                 ttl=ttl,
                 history=history,
+                reconcile_scan_limit=reconcile_scan_limit,
                 retry_policy=policy,
                 table_name=table_name,
                 schema=schema,
@@ -642,6 +658,145 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 return row is not None and bool(row["removed"])
 
         return self._retry(write, label="store purge")
+
+    def find_conflicts(
+        self,
+        namespace: tuple[str, ...],
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        slot: str | None = None,
+        threshold: float | None = None,
+        limit: int = 10,
+        filter: dict[str, Any] | None = None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> Conflicts:
+        """Find the memories a new one may conflict with, without writing anything.
+
+        Candidates are live memories in ``namespace`` itself, not in its
+        descendants, for one of three reasons, strongest first:
+
+        - ``"key"``: the memory under ``key``, whatever ``filter`` says.
+        - ``"slot"``: with ``slot``, the memories whose value holds the same
+          value in that field, compared as JSON.
+        - ``"similar"``: on a store with an index, the memories whose vectors
+          score at or above ``threshold`` against the new memory's, with the
+          scores search returns.
+
+        Key and slot matches carry their best score when they have vectors,
+        and similar ones always do. Candidates come strongest reason first,
+        then best score, then key. Expired memories are never candidates,
+        and no read pushes back an expiry.
+
+        The index fields of ``value`` are embedded once, and the embedding is
+        kept for the write. Then two round trips read the candidates: first
+        the database's clock, the key and slot matches and the namespace's
+        vector count, then the similar memories and the scores. A namespace
+        with at most ``reconcile_scan_limit`` vectors has all of them ranked.
+        A larger one takes its similar candidates from the C-SPANN index,
+        which may miss some.
+
+        Args:
+            namespace: The new memory's namespace. It cannot be empty.
+            key: The new memory's key, or None for a new uuid4.
+            value: The new memory's value.
+            slot: A top-level field of ``value`` naming the fact it states,
+                holding a string, number or boolean, or None.
+            threshold: The lowest score of a similar candidate. On a cosine
+                store it defaults to 0.8 and must lie between -1 and 1. On an
+                l2 or inner_product store, where scores are negated distances,
+                it must be given. Ignored without an index or with
+                ``index=False``.
+            limit: Most similar candidates (default 10). The key and slot
+                matches come on top of them; 0 keeps only those.
+            filter: Narrows the slot and similar candidates by value, as in
+                search. The memory under ``key`` is a candidate whatever it says.
+            index: Which fields of ``value`` to embed, as in put. False embeds
+                nothing and finds no similar candidates.
+            ttl: Minutes the new memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the new memory comes from, as a JSON object.
+            valid_at: When the fact became true, as a timezone-aware datetime.
+                By default the database's current time, raised to the latest
+                candidate's updated_at if that is later, so a correction
+                never looks older than the memory it corrects. A memory
+                written without one is valid from its updated_at.
+
+        Returns:
+            The new memory as a Proposal, its candidates, and the version
+            and updated_at of the live memory under ``key``. Nothing was written.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If another argument is invalid (above), or setup() has
+                not added the columns this method needs
+        """
+        plan = self._plan_proposal(
+            namespace,
+            key,
+            value,
+            slot=slot,
+            threshold=threshold,
+            limit=limit,
+            filter=filter,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+            method="find_conflicts",
+        )
+        self._require_columns(self._reconcile_columns(refresh=True))
+        vector_rows = self._embed_proposal(plan)
+        read = self._key_slot_read(
+            plan, self._read_all(self._key_slot_statements(plan), "store find conflicts")
+        )
+        similar = self._similar_read(plan, vector_rows, read)
+        statements = similar.statements()
+        found = (
+            self._read_all(statements, "store find conflicts similar", similar.session)
+            if statements
+            else []
+        )
+        return self._conflicts(plan, vector_rows, read, similar, found)
+
+    def record(self, namespace: tuple[str, ...], key: str) -> MemoryRecord | None:
+        """Read a live memory with its version, provenance, valid time and confirmations.
+
+        Reading a memory does not confirm it, so its expiry is never pushed back.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+
+        Returns:
+            The memory, or None if no live memory has that key: there is
+            none, or it expired.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If setup() has not added the columns this method needs
+        """
+        prefix = _memory_prefix(namespace, "record")
+        self._require_columns(self._reconcile_columns(refresh=True))
+        [rows] = self._read_all([self.sql.record(prefix, str(key))], "store record")
+        return _row_to_record(tuple(namespace), rows[0]) if rows else None
+
+    def _embed_proposal(self, plan: ProposalPlan) -> list[VectorRow]:
+        """Embed the new memory's index fields once, and pair the vectors with their rows.
+
+        Runs before the first attempt of any read, so a retry reuses the
+        vectors. embed_documents, not embed_query: the vectors are also the
+        ones its write stores.
+        """
+        embeddings: list[list[float]] = []
+        if self.index is not None and plan.embed_requests:
+            embeddings = self.index.embeddings.embed_documents(
+                [text for _, _, _, text in plan.embed_requests]
+            )
+        return self._vector_rows(plan.put, embeddings)
 
     def reconcile(
         self,

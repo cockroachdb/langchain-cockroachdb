@@ -12,9 +12,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from langgraph.store.base import Item, SearchItem
+
+if TYPE_CHECKING:
+    # base.py imports this module, so the store's private state is named for
+    # type checkers only
+    from langchain_cockroachdb.store.base import ConflictsState
 
 
 class Action(str, Enum):
@@ -180,6 +185,32 @@ class MemoryRecord:
     valid_at: datetime
     confirmed_at: datetime | None
     confirmations: int
+
+
+@dataclass(frozen=True)
+class Conflicts:
+    """What find_conflicts found: a new memory and the memories it may conflict with.
+
+    Nothing is written yet. resolve() applies a decision about them in one
+    transaction, once it has checked that the target and every candidate
+    the decision names still have the version and updated_at they had here.
+
+    Attributes:
+        proposal: The new memory, with its key and valid time.
+        candidates: The live memories it may conflict with, strongest
+            reason first, then best score, then key.
+        target_version: The version of the live memory under the new
+            memory's key, or None if there is none.
+        target_updated_at: When that memory was last written, or None.
+    """
+
+    proposal: Proposal
+    candidates: tuple[Candidate, ...]
+    target_version: int | None
+    target_updated_at: datetime | None
+    # The store's plan for the write: the item, its vectors and the versions
+    # resolve() checks. Left out of repr and comparison
+    _state: ConflictsState | None = field(default=None, repr=False, compare=False)
 
 
 class ConflictsChanged(Exception):

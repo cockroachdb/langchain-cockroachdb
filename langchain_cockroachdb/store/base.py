@@ -1,8 +1,9 @@
 """Code shared by the sync and async CockroachDB stores.
 
 Everything here runs without a database: grouping and validating ops,
-planning the rows a put batch writes, building search statements and
-turning result rows into items. The store classes run the statements.
+planning the rows a put batch writes, building search and candidate
+statements and turning result rows into items and candidates. The store
+classes run the statements.
 """
 
 from __future__ import annotations
@@ -13,16 +14,19 @@ import math
 import re
 import threading
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from datetime import datetime
+from typing import Any, ClassVar, Literal
 
 from langgraph.store.base import (
     GetOp,
     InvalidNamespaceError,
     Item,
     ListNamespacesOp,
+    NotProvided,
     Op,
     PutOp,
     Result,
@@ -31,13 +35,15 @@ from langgraph.store.base import (
 )
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
-from langchain_cockroachdb.indexes import _find_vector_index
+from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
 from langchain_cockroachdb.store.config import (
+    DEFAULT_RECONCILE_SCAN_LIMIT,
     ResolvedHistory,
     ResolvedIndex,
     ResolvedTTL,
     resolve_ttl_config,
 )
+from langchain_cockroachdb.store.filters import translate_filter
 from langchain_cockroachdb.store.namespaces import (
     from_text,
     literal_prefix,
@@ -45,7 +51,13 @@ from langchain_cockroachdb.store.namespaces import (
     to_text,
     validate_labels,
 )
-from langchain_cockroachdb.store.reconcile import MemoryVersion
+from langchain_cockroachdb.store.reconcile import (
+    Candidate,
+    Conflicts,
+    MemoryRecord,
+    MemoryVersion,
+    Proposal,
+)
 from langchain_cockroachdb.store.sql import (
     MAX_SEARCH_NAMESPACES,
     MIGRATION_RECONCILE,
@@ -67,6 +79,14 @@ ITEMS_PER_STATEMENT = 500
 # small, like the vector store's default batch_size.
 VECTORS_PER_STATEMENT = 100
 
+# The lowest score of a similar candidate on a cosine store when no threshold
+# is given. A cosine score is 1 minus the distance. On l2 and inner_product
+# stores scores are negated distances, and no default fits.
+DEFAULT_COSINE_THRESHOLD = 0.8
+
+# Why a memory is a candidate, strongest reason first
+_REASON_RANK = {"key": 0, "slot": 1, "similar": 2}
+
 
 def _check_paging(limit: int, offset: int) -> None:
     """Raise ValueError for negative paging, before any database work."""
@@ -86,6 +106,86 @@ def _memory_prefix(namespace: Sequence[str], method: str) -> str:
     if not labels:
         raise InvalidNamespaceError(f"{method} needs a non-empty namespace")
     return to_text(labels)
+
+
+def _check_limit(limit: object) -> None:
+    """Raise ValueError unless ``limit`` is a non-negative int."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError(f"limit must be a non-negative integer, got {limit!r}")
+    _check_paging(limit, 0)
+
+
+def _check_filter(filter: object) -> None:
+    """Raise ValueError unless ``filter`` is None or a filter dict that search accepts."""
+    if filter is not None and not isinstance(filter, Mapping):
+        raise ValueError(f"filter must be a dict or None, got {type(filter).__name__}")
+    translate_filter(filter)
+
+
+def _check_ttl(ttl: object) -> None:
+    """Raise ValueError unless ``ttl`` is None or a positive, finite number of minutes."""
+    if ttl is None:
+        return
+    if (
+        isinstance(ttl, bool)
+        or not isinstance(ttl, (int, float))
+        or not math.isfinite(ttl)
+        or ttl <= 0
+    ):
+        raise ValueError(f"ttl must be a positive number of minutes, or None, got {ttl!r}")
+
+
+def _check_valid_at(valid_at: object) -> None:
+    """Raise ValueError unless ``valid_at`` is None or a timezone-aware datetime."""
+    if valid_at is not None and (
+        not isinstance(valid_at, datetime) or valid_at.utcoffset() is None
+    ):
+        raise ValueError(f"valid_at must be a timezone-aware datetime, got {valid_at!r}")
+
+
+def _serialized_provenance(provenance: object) -> tuple[dict[str, Any] | None, str | None]:
+    """The provenance as its JSON reads back, and serialized, or (None, None).
+
+    Raises:
+        ValueError: If it is not a dict that serializes as JSON.
+    """
+    if provenance is None:
+        return None, None
+    if not isinstance(provenance, dict):
+        raise ValueError(
+            f"provenance must be a dict (a JSON object) or None, got {type(provenance).__name__}"
+        )
+    try:
+        text = json.dumps(provenance, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"provenance is not JSON serializable: {error}") from error
+    return json.loads(text), text
+
+
+def _slot_of(value: Mapping[str, Any], slot: object) -> tuple[Any, str | None]:
+    """The value of the slot field, and serialized, or (None, None) without a slot.
+
+    ``value`` is the new memory's value as its JSON reads back, so it holds
+    no NaN or infinite number.
+
+    Raises:
+        ValueError: If ``slot`` does not name a top-level field of the value
+            that holds a string, number or boolean.
+    """
+    if slot is None:
+        return None, None
+    if not isinstance(slot, str):
+        raise ValueError(f"slot must name a top-level field of the value, got {slot!r}")
+    if slot not in value:
+        raise ValueError(f"The slot field {slot!r} is not a top-level field of the value")
+    found = value[slot]
+    # bool is an int
+    if not isinstance(found, (str, int, float)):
+        raise ValueError(
+            f"The slot field {slot!r} must hold a string, number or boolean, "
+            f"got {type(found).__name__}"
+        )
+    return found, json.dumps(found)
 
 
 def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fetch: int) -> bool:
@@ -353,6 +453,118 @@ class BatchPlan:
             self.results[i] = [from_text(row["ns"]) for row in rows]
 
 
+@dataclass(frozen=True)
+class ProposalPlan:
+    """A new memory for find_conflicts or reconcile, checked before any I/O.
+
+    Attributes:
+        namespace: The memory's namespace.
+        prefix: The namespace as text.
+        key: The memory's key, a uuid4 when none was given.
+        value: The value, as its JSON reads back.
+        value_json: The value serialized.
+        slot: The top-level field that holds the slot, or None.
+        slot_value: The slot's value, or None without a slot.
+        slot_value_json: The slot's value serialized, or None without a slot.
+        threshold: The lowest score of a similar candidate, or None when no
+            similar candidates are searched: the store has no index, or the
+            call passed index=False.
+        limit: Most similar candidates, besides the key and slot matches.
+        filter: Narrows the slot and similar candidates by value.
+        index: Which fields to embed, as put takes it.
+        ttl: Minutes the memory lives once written, or None.
+        provenance: The provenance, as its JSON reads back, or None.
+        provenance_json: The provenance serialized, or None.
+        valid_at: The valid time the caller gave, or None. Without one the
+            new memory is valid from the database's now() (default_valid_at),
+            and its write stores no valid time, so the memory's valid time is
+            its updated_at, as after a plain put.
+        put: The write as a put plan of one item, with its write id and the
+            texts to embed.
+    """
+
+    namespace: tuple[str, ...]
+    prefix: str
+    key: str
+    value: dict[str, Any]
+    value_json: str
+    slot: str | None
+    slot_value: Any
+    slot_value_json: str | None
+    threshold: float | None
+    limit: int
+    filter: Mapping[str, Any] | None
+    index: Literal[False] | list[str] | None
+    ttl: float | None
+    provenance: dict[str, Any] | None
+    provenance_json: str | None
+    valid_at: datetime | None
+    put: PutPlan
+
+    @property
+    def embed_requests(self) -> list[tuple[str, str, str, str]]:
+        """(prefix, key, field_name, text) for every vector the memory gets."""
+        return self.put.embed_requests
+
+
+@dataclass(frozen=True)
+class KeySlotRead:
+    """What the first candidate read found.
+
+    Attributes:
+        now: The database's now(), the default valid time.
+        rows: The live target, if any, and the slot matches, as
+            StoreSQL.key_slot_candidates returns them.
+        vectors: The namespace's vectors, counted up to one past
+            reconcile_scan_limit, or None when the similar read has no scan
+            to choose.
+    """
+
+    now: datetime
+    rows: list[dict[str, Any]]
+    vectors: int | None
+
+
+@dataclass(frozen=True)
+class SimilarRead:
+    """The second candidate read, built from what the first found.
+
+    Attributes:
+        scores: One StoreSQL.candidate_scores statement per vector of the
+            new memory, or none without key and slot candidates.
+        similar: One StoreSQL.similar_candidates statement per vector of the
+            new memory, or none when the limit is 0.
+        session: Statements that run first, in the read's transaction: the
+            beam size of an index scan, when set.
+    """
+
+    scores: list[tuple[str, list]]
+    similar: list[tuple[str, list]]
+    session: list[str]
+
+    def statements(self) -> list[tuple[str, list]]:
+        """The statements to send as one round trip: the scores, then the similar reads."""
+        return [*self.scores, *self.similar]
+
+
+@dataclass(frozen=True)
+class ConflictsState:
+    """What Conflicts keeps from find_conflicts, for resolve().
+
+    Attributes:
+        plan: The new memory's plan, with its write id.
+        vector_rows: Its vectors, embedded once.
+        target: The (version, updated_at) of the live memory under its key,
+            or None if there was none or it had expired.
+        tokens: The (version, updated_at) of each candidate, by key.
+    """
+
+    plan: ProposalPlan
+    vector_rows: tuple[VectorRow, ...]
+    target: tuple[int, datetime] | None
+    tokens: dict[str, tuple[int, datetime]]
+
+
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
     """Build an Item from a get row."""
     return Item(
@@ -394,6 +606,119 @@ def _row_to_version(namespace: tuple[str, ...], key: str, row: Mapping[str, Any]
     )
 
 
+def _row_to_record(namespace: tuple[str, ...], row: dict[str, Any]) -> MemoryRecord:
+    """Build a MemoryRecord from a row of StoreSQL.record."""
+    return MemoryRecord(
+        item=_row_to_item(namespace, row),
+        version=int(row["version"]),
+        provenance=row["provenance"],
+        valid_at=row["valid_at"],
+        confirmed_at=row["confirmed_at"],
+        confirmations=int(row["confirmations"]),
+    )
+
+
+def _row_to_candidate(
+    namespace: tuple[str, ...],
+    row: Mapping[str, Any],
+    reason: Literal["key", "slot", "similar"],
+    score: float | None,
+) -> Candidate:
+    """Build a Candidate from a row of a candidate statement."""
+    return Candidate(
+        item=SearchItem(
+            namespace=namespace,
+            key=row["key"],
+            value=row["value"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            score=score,
+        ),
+        reason=reason,
+        version=int(row["version"]),
+        valid_at=row["valid_at"],
+        provenance=row["provenance"],
+        confirmed_at=row["confirmed_at"],
+        confirmations=int(row["confirmations"]),
+    )
+
+
+def _candidate_order(candidate: Candidate) -> tuple[int, bool, float, str]:
+    """Sort key of candidates: strongest reason, then best score (none last), then key."""
+    score = candidate.score
+    return (
+        _REASON_RANK[candidate.reason],
+        score is None,
+        0.0 if score is None else -score,
+        candidate.key,
+    )
+
+
+def merge_candidates(
+    namespace: tuple[str, ...],
+    key: str,
+    key_slot_rows: Sequence[Mapping[str, Any]],
+    score_rows: Sequence[Sequence[Mapping[str, Any]]],
+    similar_rows: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    limit: int,
+) -> tuple[Candidate, ...]:
+    """Merge the rows of the candidate statements into one candidate per key.
+
+    In ``key_slot_rows``, the rows of StoreSQL.key_slot_candidates, the row
+    under ``key`` is the target (reason "key") and the others are slot
+    matches. Each list in ``score_rows`` holds the rows of
+    StoreSQL.candidate_scores for one vector of the new memory, and each list
+    in ``similar_rows`` those of StoreSQL.similar_candidates. A key takes its
+    best score over all of them, so a key or slot match has a score whenever
+    it has vectors. Key matches come first, then slot matches, then similar
+    ones; then the best score, with no score last; then the key. ``limit``
+    caps the similar candidates only, never the key and slot matches.
+
+    A similar row under ``key`` is left out when the key read found no
+    target: the target is found by its key alone.
+    """
+    scores: dict[str, float] = {}
+    for rows in score_rows:
+        for row in rows:
+            scores[row["key"]] = max(float(row["score"]), scores.get(row["key"], -math.inf))
+    # The best similar row of each key, over every vector of the new memory
+    similar: dict[str, tuple[float, Mapping[str, Any]]] = {}
+    for rows in similar_rows:
+        for row in rows:
+            score = float(row["score"])
+            if row["key"] not in similar or score > similar[row["key"]][0]:
+                similar[row["key"]] = (score, row)
+
+    matches: list[Candidate] = []
+    for row in key_slot_rows:
+        found = [scores[row["key"]]] if row["key"] in scores else []
+        if row["key"] in similar:
+            found.append(similar.pop(row["key"])[0])
+        reason: Literal["key", "slot"] = "key" if row["key"] == key else "slot"
+        matches.append(_row_to_candidate(namespace, row, reason, max(found, default=None)))
+    similar.pop(key, None)
+    others = [
+        _row_to_candidate(namespace, row, "similar", score) for score, row in similar.values()
+    ]
+    matches.sort(key=_candidate_order)
+    others.sort(key=_candidate_order)
+    return tuple(matches + others[:limit])
+
+
+def default_valid_at(now: datetime, candidates: Sequence[Candidate]) -> datetime:
+    """The valid time of a new memory given without one.
+
+    The database's ``now``, or the latest updated_at of the candidates if
+    that is later. The database's clock sets every updated_at, but the node
+    that wrote a candidate may have a clock ahead of the node that read
+    ``now``, and a correction must not look older than the fact it corrects.
+    A candidate's valid_at is never taken: a valid time a caller set in the
+    future still counts as newer than the new memory.
+    """
+    return max([now, *(candidate.item.updated_at for candidate in candidates)])
+
+
 class BaseCockroachDBStore:
     """State and planning shared by CockroachDBStore and its async twin."""
 
@@ -409,6 +734,9 @@ class BaseCockroachDBStore:
     sql: StoreSQL
     index: ResolvedIndex | None
     ttl: ResolvedTTL
+    # The most vectors a namespace may hold for find_conflicts and reconcile
+    # to rank all of them. Above it they use the C-SPANN index
+    reconcile_scan_limit: int
     # Version history settings, or None for a store without history
     _history: ResolvedHistory | None
     # Whether a TTL configuration was given. Without one the store never
@@ -438,10 +766,12 @@ class BaseCockroachDBStore:
         table_name: str,
         schema: str,
         history: ResolvedHistory | None = None,
+        reconcile_scan_limit: int = DEFAULT_RECONCILE_SCAN_LIMIT,
     ) -> None:
         """Set the shared state from validated settings."""
         self.index = index
         self.ttl = resolve_ttl_config(ttl)
+        self.reconcile_scan_limit = reconcile_scan_limit
         self._history = history
         self._ttl_given = ttl is not None
         self.sql = StoreSQL(schema, table_name, index=index)
@@ -1012,4 +1342,244 @@ class BaseCockroachDBStore:
                 for condition in conditions
                 if condition.match_type == "prefix"
             ],
+        )
+
+    def _plan_proposal(
+        self,
+        namespace: Sequence[str],
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        slot: str | None,
+        threshold: float | None,
+        limit: int,
+        filter: Mapping[str, Any] | None,
+        index: Literal[False] | list[str] | None,
+        ttl: float | None | NotProvided,
+        provenance: dict[str, Any] | None,
+        valid_at: datetime | None,
+        method: str,
+    ) -> ProposalPlan:
+        """Check a new memory and plan its write, before anything is embedded or sent.
+
+        The arguments are those of find_conflicts. The key, a uuid4 when
+        None, and the write id are chosen here, once, so every attempt reuses
+        them. The write is one put: the value serialized, the TTL (the
+        store's default when not provided), and the texts to embed.
+
+        Args:
+            method: The calling method, named in errors.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid.
+            ValueError: If another argument is invalid, as find_conflicts
+                describes.
+        """
+        prefix = _memory_prefix(namespace, method)
+        if not isinstance(value, dict):
+            raise ValueError(f"{method} needs the value as a dict, got {type(value).__name__}")
+        _check_limit(limit)
+        resolved_threshold = self._proposal_threshold(threshold, index, method)
+        _check_filter(filter)
+        if isinstance(ttl, NotProvided):
+            minutes = self.ttl.default_ttl
+        else:
+            _check_ttl(ttl)
+            minutes = ttl
+        provenance_value, provenance_json = _serialized_provenance(provenance)
+        _check_valid_at(valid_at)
+
+        labels = tuple(namespace)
+        memory_key = str(uuid.uuid4()) if key is None else str(key)
+        put = self._plan_puts([PutOp(labels, memory_key, value, index=index, ttl=minutes)])
+        put.write_id = str(uuid.uuid4())
+        value_json = put.items[0][2]
+        plain = json.loads(value_json)
+        slot_value, slot_value_json = _slot_of(plain, slot)
+        return ProposalPlan(
+            namespace=labels,
+            prefix=prefix,
+            key=memory_key,
+            value=plain,
+            value_json=value_json,
+            slot=slot,
+            slot_value=slot_value,
+            slot_value_json=slot_value_json,
+            threshold=resolved_threshold,
+            limit=limit,
+            filter=filter,
+            index=index,
+            ttl=minutes,
+            provenance=provenance_value,
+            provenance_json=provenance_json,
+            valid_at=valid_at,
+            put=put,
+        )
+
+    def _proposal_threshold(
+        self, threshold: float | None, index: Literal[False] | list[str] | None, method: str
+    ) -> float | None:
+        """The lowest score of a similar candidate, or None when none are searched.
+
+        A store without an index, or a call with index=False, searches none,
+        and then the threshold is ignored. Scores are those search returns.
+
+        Raises:
+            ValueError: If the threshold is missing on an l2 or inner_product
+                store, is not a finite number, or lies outside -1 to 1 on a
+                cosine store.
+        """
+        if self.index is None or index is False:
+            return None
+        cosine = self.index.distance == DistanceStrategy.COSINE
+        if threshold is None:
+            if cosine:
+                return DEFAULT_COSINE_THRESHOLD
+            raise ValueError(
+                f"{method} needs a threshold on a store whose index uses l2 or "
+                "inner_product distance. Scores there are negated distances, so no "
+                "default fits: pass the lowest score a similar memory may have."
+            )
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold)
+        ):
+            raise ValueError(f"threshold must be a finite number, got {threshold!r}")
+        if cosine and not -1 <= threshold <= 1:
+            raise ValueError(
+                f"threshold must be between -1 and 1 on a cosine store, got {threshold!r}"
+            )
+        return float(threshold)
+
+    def _chooses_scan(self, plan: ProposalPlan) -> bool:
+        """Whether the similar read runs and must choose between the exact scan and the index.
+
+        A flat store has no index to choose. A limit of 0, or a new memory
+        without vectors, needs no similar read.
+        """
+        return (
+            self.index is not None
+            and not self.index.flat
+            and plan.threshold is not None
+            and plan.limit > 0
+            and bool(plan.embed_requests)
+        )
+
+    def _key_slot_statements(self, plan: ProposalPlan) -> list[tuple[str, list]]:
+        """The first candidate read, to send as one round trip.
+
+        The database's now(), the target and the slot matches, and, when the
+        similar read must choose a scan, the namespace's vectors counted up
+        to one past reconcile_scan_limit. Pass the rows to _key_slot_read.
+        """
+        statements = [
+            self.sql.now(),
+            self.sql.key_slot_candidates(
+                plan.prefix,
+                plan.key,
+                slot_field=plan.slot,
+                slot_value_json=plan.slot_value_json,
+                filter=plan.filter,
+            ),
+        ]
+        if self._chooses_scan(plan):
+            statements.append(
+                self.sql.namespace_vector_count(plan.prefix, self.reconcile_scan_limit + 1)
+            )
+        return statements
+
+    def _key_slot_read(
+        self, plan: ProposalPlan, found: Sequence[Sequence[dict[str, Any]]]
+    ) -> KeySlotRead:
+        """What the first candidate read found, from the rows of _key_slot_statements."""
+        vectors = int(found[2][0]["n"]) if self._chooses_scan(plan) else None
+        return KeySlotRead(now=found[0][0]["now"], rows=list(found[1]), vectors=vectors)
+
+    def _similar_read(
+        self, plan: ProposalPlan, vector_rows: Sequence[VectorRow], read: KeySlotRead
+    ) -> SimilarRead:
+        """The second candidate read, built from what the first found.
+
+        For each vector of the new memory, one statement scores the target
+        and the slot matches, and one finds the similar candidates, leaving
+        those keys and the new memory's own key out. The namespace's vectors
+        are ranked exactly when it holds at most reconcile_scan_limit of
+        them, or the index is flat. Otherwise the C-SPANN index gives a
+        window of the store search's over_fetch for ``limit``, with the beam
+        size set when the index configures one. Empty when the new memory
+        has no vectors. Run the session statements, then ``statements()``,
+        as one round trip, and pass the rows to _conflicts.
+        """
+        if not vector_rows:
+            return SimilarRead(scores=[], similar=[], session=[])
+        keys = [row["key"] for row in read.rows]
+        scores: list[tuple[str, list]] = []
+        similar: list[tuple[str, list]] = []
+        session: list[str] = []
+        if keys:
+            statement = self.sql.candidate_scores(plan.prefix, keys)
+            scores = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
+        if self.index is not None and plan.threshold is not None and plan.limit > 0:
+            above = read.vectors is not None and read.vectors > self.reconcile_scan_limit
+            scan: Literal["exact", "index"] = "index" if above else "exact"
+            statement = self.sql.similar_candidates(
+                plan.prefix,
+                threshold=plan.threshold,
+                limit=plan.limit,
+                filter=plan.filter,
+                scan=scan,
+                over_fetch=plan.limit * self.index.estimated_vectors * 2 + 1,
+                exclude=list(dict.fromkeys([plan.key, *keys])),
+            )
+            similar = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
+            if scan == "index" and self.index.beam_size:
+                session = [self.sql.beam_size_statement(self.index.beam_size)]
+        return SimilarRead(scores=scores, similar=similar, session=session)
+
+    def _conflicts(
+        self,
+        plan: ProposalPlan,
+        vector_rows: Sequence[VectorRow],
+        read: KeySlotRead,
+        similar: SimilarRead,
+        found: Sequence[Sequence[dict[str, Any]]],
+    ) -> Conflicts:
+        """Merge what both candidate reads found into Conflicts.
+
+        ``found`` are the rows of ``similar.statements()``, in order, or
+        nothing when there were none. Without a valid_at from the caller, the
+        new memory is valid from default_valid_at. The target's and each
+        candidate's (version, updated_at) go into the state for resolve().
+        """
+        split = len(similar.scores)
+        candidates = merge_candidates(
+            plan.namespace, plan.key, read.rows, found[:split], found[split:], limit=plan.limit
+        )
+        target = next((row for row in read.rows if row["key"] == plan.key), None)
+        token = None if target is None else (int(target["version"]), target["updated_at"])
+        valid_at = plan.valid_at
+        if valid_at is None:
+            valid_at = default_valid_at(read.now, candidates)
+        proposal = Proposal(
+            namespace=plan.namespace,
+            key=plan.key,
+            value=plan.value,
+            slot=plan.slot,
+            slot_value=plan.slot_value,
+            provenance=plan.provenance,
+            valid_at=valid_at,
+        )
+        state = ConflictsState(
+            plan=plan,
+            vector_rows=tuple(vector_rows),
+            target=token,
+            tokens={c.key: (c.version, c.item.updated_at) for c in candidates},
+        )
+        return Conflicts(
+            proposal=proposal,
+            candidates=candidates,
+            target_version=None if token is None else token[0],
+            target_updated_at=None if token is None else token[1],
+            _state=state,
         )

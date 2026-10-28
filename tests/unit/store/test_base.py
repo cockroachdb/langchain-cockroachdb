@@ -2,16 +2,19 @@
 
 import asyncio
 import contextlib
+import json
 import logging
+import math
 import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import psycopg
 import pytest
 from langchain_core.embeddings import Embeddings
 from langgraph.store.base import (
+    NOT_PROVIDED,
     GetOp,
     InvalidNamespaceError,
     ListNamespacesOp,
@@ -27,13 +30,17 @@ from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.base import (
     MAX_SEARCH_NAMESPACES,
     BaseCockroachDBStore,
+    ProposalPlan,
     PutPlan,
     SchemaCheck,
     _group_ops,
+    default_valid_at,
+    merge_candidates,
     needs_exact_search,
 )
 from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
-from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE
+from langchain_cockroachdb.store.reconcile import Candidate
+from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, StoreSQL
 from langchain_cockroachdb.store.store import CockroachDBStore
 
 FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
@@ -1836,3 +1843,534 @@ def test_listing_bounds_prefix_conditions_to_their_literal_labels() -> None:
         ListNamespacesOp(match_conditions=(MatchCondition("prefix", ("*", "b")),))
     )
     assert params == [r"^[^.]+\.b(\.|\z)", 100, 0]
+
+
+# Candidates, find_conflicts and record
+
+NS = ("user", "alice")
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+TEXT = {"text": "x"}
+
+
+def proposal_store(distance: str | None = "cosine", *, ttl=None) -> BaseCockroachDBStore:
+    """Shared store state with a 3-dimension index of the given distance, or no index."""
+    store = BaseCockroachDBStore()
+    index = None
+    if distance is not None:
+        index = resolve_index_config(
+            {
+                "dims": 3,
+                "embed": CountingEmbeddings(),
+                "fields": ["text"],
+                "distance_type": distance,  # type: ignore[typeddict-item]
+            }
+        )
+    store._configure(index=index, ttl=ttl, table_name="store", schema="public")
+    return store
+
+
+def plan_proposal(store: BaseCockroachDBStore, value: object = TEXT, **kwargs) -> ProposalPlan:
+    """_plan_proposal with the find_conflicts defaults, under NS and key "k" unless given."""
+    arguments: dict = {
+        "slot": None,
+        "threshold": None,
+        "limit": 10,
+        "filter": None,
+        "index": None,
+        "ttl": NOT_PROVIDED,
+        "provenance": None,
+        "valid_at": None,
+        "method": "find_conflicts",
+    }
+    arguments.update(kwargs)
+    namespace = arguments.pop("namespace", NS)
+    key = arguments.pop("key", "k")
+    return store._plan_proposal(namespace, key, value, **arguments)  # type: ignore[arg-type]
+
+
+def test_plan_proposal_threshold_rules() -> None:
+    cosine = proposal_store("cosine")
+    # A cosine score is 1 minus the distance: the default is 0.8, and any
+    # threshold lies between -1 and 1
+    assert plan_proposal(cosine).threshold == 0.8
+    for threshold in (-1, -0.5, 0, 0.95, 1):
+        assert plan_proposal(cosine, threshold=threshold).threshold == float(threshold)
+    for bad in (1.5, -1.01, math.nan, math.inf, True, "0.9"):
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(cosine, threshold=bad)
+
+    # l2 and inner product scores are negated distances: no default fits
+    for distance in ("l2", "inner_product"):
+        store = proposal_store(distance)
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(store)
+        assert plan_proposal(store, threshold=-0.6).threshold == -0.6
+        assert plan_proposal(store, threshold=3).threshold == 3.0
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(store, threshold=math.nan)
+
+    # Without an index, or with index=False, no similar candidates are
+    # searched, so the threshold is ignored
+    for store, extra in ((proposal_store(None), {}), (proposal_store("l2"), {"index": False})):
+        for threshold in (None, 1.5, "0.9"):
+            assert plan_proposal(store, threshold=threshold, **extra).threshold is None
+
+
+def test_plan_proposal_slot_rules() -> None:
+    store = proposal_store("cosine")
+    for slot_value, as_json in (
+        ("x", '"x"'),
+        ("it's", '"it\'s"'),
+        (42, "42"),
+        (1.5, "1.5"),
+        (True, "true"),
+        (False, "false"),
+    ):
+        plan = plan_proposal(store, {"seat": slot_value, "text": "x"}, slot="seat")
+        assert (plan.slot, plan.slot_value, plan.slot_value_json) == ("seat", slot_value, as_json)
+    plan = plan_proposal(store)
+    assert (plan.slot, plan.slot_value, plan.slot_value_json) == (None, None, None)
+
+    # The slot must name a top-level field of the value, holding a string,
+    # number or boolean
+    with pytest.raises(ValueError, match="seat"):
+        plan_proposal(store, {"text": "x"}, slot="seat")
+    with pytest.raises(ValueError, match="seat"):
+        plan_proposal(store, {"text": "x", "nested": {"seat": "x"}}, slot="seat")
+    for bad in ({"a": 1}, [1, 2], None):
+        with pytest.raises(ValueError, match="seat"):
+            plan_proposal(store, {"seat": bad, "text": "x"}, slot="seat")
+    with pytest.raises(ValueError, match="slot"):
+        plan_proposal(store, {"1": "x"}, slot=1)
+    # A value that is not JSON fails first, so a NaN or infinite slot value does too
+    for bad in (math.nan, math.inf):
+        with pytest.raises(ValueError, match="JSON"):
+            plan_proposal(store, {"seat": bad, "text": "x"}, slot="seat")
+
+
+def test_plan_proposal_valid_at_must_be_aware() -> None:
+    store = proposal_store("cosine")
+    aware = datetime(2026, 3, 1, 12, tzinfo=timezone(timedelta(hours=-5)))
+    assert plan_proposal(store, valid_at=aware).valid_at == aware
+    # Without one, the database's clock gives the valid time once the
+    # candidates are read (default_valid_at)
+    assert plan_proposal(store).valid_at is None
+    for bad in (
+        datetime(2026, 3, 1, 12),
+        "2026-03-01T12:00:00+00:00",
+        date(2026, 3, 1),
+        1767225600,
+    ):
+        with pytest.raises(ValueError, match="valid_at"):
+            plan_proposal(store, valid_at=bad)
+
+
+def test_plan_proposal_plans_one_put_with_a_write_id() -> None:
+    store = proposal_store("cosine", ttl={"default_ttl": 30.0})
+    plan = plan_proposal(
+        store,
+        {"text": "x", "pair": (1, 2)},
+        key=None,
+        provenance={"source": "chat", "turns": (3,)},
+    )
+    uuid.UUID(plan.key)  # a uuid4 when no key is given
+    assert (plan.namespace, plan.prefix) == (NS, "user.alice")
+    # The value and the provenance as their JSON reads back
+    assert plan.value == {"text": "x", "pair": [1, 2]}
+    assert json.loads(plan.value_json) == plan.value
+    assert plan.provenance == {"source": "chat", "turns": [3]}
+    assert plan.provenance_json is not None
+    assert json.loads(plan.provenance_json) == plan.provenance
+    # One put with the store's default TTL, the write id and the texts to embed
+    assert plan.ttl == 30.0
+    assert plan.put.items == [("user.alice", plan.key, plan.value_json, 30.0)]
+    assert plan.put.write_id is not None
+    uuid.UUID(plan.put.write_id)
+    assert plan.put.write_id != plan_proposal(store).put.write_id
+    assert plan.embed_requests == [("user.alice", plan.key, "text", "x")]
+    assert plan.put.reindexed == {"user.alice": [plan.key]}
+    assert (plan.limit, plan.filter, plan.index) == (10, None, None)
+
+    # Keys become strings, as put makes them
+    assert plan_proposal(store, key=7).key == "7"
+    assert plan_proposal(store, ttl=None).ttl is None
+    assert plan_proposal(store, ttl=5).put.items[0][3] == 5
+    assert plan_proposal(store, provenance=None).provenance_json is None
+    assert plan_proposal(store, limit=0).limit == 0
+    assert plan_proposal(store, filter={"source": "chat"}).filter == {"source": "chat"}
+    assert plan_proposal(store, index=False).embed_requests == []
+    other = plan_proposal(store, {"text": "x", "other": "y"}, index=["other"])
+    assert other.embed_requests == [("user.alice", "k", "other", "y")]
+    assert plan_proposal(proposal_store(None)).embed_requests == []
+
+    for kwargs, match in (
+        ({"ttl": 0}, "ttl"),
+        ({"ttl": -1}, "ttl"),
+        ({"ttl": math.inf}, "ttl"),
+        ({"ttl": "5"}, "ttl"),
+        ({"ttl": True}, "ttl"),
+        ({"provenance": ["chat"]}, "provenance"),
+        ({"provenance": {"x": object()}}, "provenance"),
+        ({"provenance": {"x": math.nan}}, "provenance"),
+        ({"limit": -1}, "limit must be non-negative"),
+        ({"limit": 1.5}, "limit"),
+        ({"limit": True}, "limit"),
+        ({"filter": {"x": {"$bad": 1}}}, "Unknown filter operator"),
+        ({"filter": ["x"]}, "filter"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            plan_proposal(store, **kwargs)
+    for bad_value in (None, ["x"], "x"):
+        with pytest.raises(ValueError, match="value"):
+            plan_proposal(store, bad_value)
+    with pytest.raises(ValueError, match="JSON"):
+        plan_proposal(store, {"x": object()})
+    with pytest.raises(InvalidNamespaceError, match="find_conflicts"):
+        plan_proposal(store, namespace=())
+    with pytest.raises(InvalidNamespaceError):
+        plan_proposal(store, namespace=("a.b",))
+
+
+def candidate_row(
+    key: str,
+    *,
+    score: float | None = None,
+    version: int = 1,
+    updated_at: datetime = T0,
+    valid_at: datetime | None = None,
+) -> dict[str, object]:
+    """A row of a candidate statement; similar rows carry a score."""
+    row: dict[str, object] = {
+        "key": key,
+        "value": {"text": key},
+        "created_at": T0,
+        "updated_at": updated_at,
+        "version": version,
+        "valid_at": updated_at if valid_at is None else valid_at,
+        "provenance": {"source": key},
+        "confirmed_at": None,
+        "confirmations": version - 1,
+        "write_id": None,
+    }
+    if score is not None:
+        row["score"] = score
+    return row
+
+
+def test_merge_candidates_orders_and_caps() -> None:
+    key_slot = [candidate_row("s2"), candidate_row("k", version=3), candidate_row("s1")]
+    # Scores of the key and slot candidates, one list per proposal vector
+    scores = [
+        [{"key": "k", "score": 0.2}, {"key": "s1", "score": 0.5}],
+        [{"key": "s1", "score": 0.7}],
+    ]
+    similar = [
+        [
+            candidate_row("a", score=0.6),
+            candidate_row("c", score=0.85),
+            candidate_row("d", score=0.8),
+        ],
+        [
+            candidate_row("a", score=0.95),
+            candidate_row("b", score=0.85),
+            candidate_row("s1", score=0.75),
+        ],
+    ]
+    found = merge_candidates(NS, "k", key_slot, scores, similar, limit=2)
+    # Key, then slot, then similar; best score first; then by key. A slot
+    # match without a vector has no score and comes after the scored ones
+    assert [(c.key, c.reason, c.score) for c in found] == [
+        ("k", "key", 0.2),
+        ("s1", "slot", 0.75),
+        ("s2", "slot", None),
+        ("a", "similar", 0.95),
+        ("b", "similar", 0.85),
+    ]
+    assert all(isinstance(c, Candidate) and c.item.namespace == NS for c in found)
+    target = found[0]
+    assert (target.version, target.provenance, target.confirmations) == (3, {"source": "k"}, 2)
+    assert (target.valid_at, target.confirmed_at, target.item.value) == (T0, None, {"text": "k"})
+
+    # The limit caps the similar candidates only: key and slot matches stay
+    assert [c.key for c in merge_candidates(NS, "k", key_slot, scores, similar, limit=0)] == [
+        "k",
+        "s1",
+        "s2",
+    ]
+    assert [c.key for c in merge_candidates(NS, "k", key_slot, scores, similar, limit=9)] == [
+        "k",
+        "s1",
+        "s2",
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    # The target comes by its key alone: a similar row under the proposal's
+    # key that the key read did not find is left out
+    late = [[candidate_row("k", score=0.99), candidate_row("a", score=0.9)]]
+    assert [c.key for c in merge_candidates(NS, "k", [], [], late, limit=5)] == ["a"]
+    # Negated distances (l2, inner product) order the same way
+    far_near = [[candidate_row("far", score=-0.9), candidate_row("near", score=-0.1)]]
+    assert [c.key for c in merge_candidates(NS, "new", [], [], far_near, limit=5)] == [
+        "near",
+        "far",
+    ]
+    assert merge_candidates(NS, "new", [], [], [], limit=5) == ()
+
+
+def test_default_valid_at_is_raised_to_a_later_candidate_update() -> None:
+    rows = [
+        candidate_row("old", updated_at=NOW - timedelta(days=1)),
+        candidate_row("ahead", updated_at=NOW + timedelta(seconds=5)),
+    ]
+    found = merge_candidates(NS, "new", rows, [], [], limit=10)
+    # A node whose clock runs ahead wrote "ahead" after the database's now():
+    # the proposal's valid time is not older than that write
+    assert default_valid_at(NOW, found) == NOW + timedelta(seconds=5)
+    assert default_valid_at(NOW, [c for c in found if c.key == "old"]) == NOW
+    assert default_valid_at(NOW, ()) == NOW
+
+
+def test_default_valid_at_never_takes_a_candidate_valid_at() -> None:
+    # A caller gave this memory a valid time a year ahead. It still counts as
+    # newer than the proposal, so the default is not raised to it
+    row = candidate_row(
+        "future", updated_at=NOW - timedelta(hours=1), valid_at=NOW + timedelta(days=365)
+    )
+    found = merge_candidates(NS, "new", [row], [], [], limit=10)
+    assert default_valid_at(NOW, found) == NOW
+    assert found[0].valid_at > default_valid_at(NOW, found)
+
+
+class CandidateReads:
+    """Answers the read groups of find_conflicts with canned rows, and logs them.
+
+    The first group gets the database's now(), ``rows`` for the key and slot
+    statement and ``vectors`` for the count when sent. In the second, score
+    statements get ``scores`` and similar statements ``similar``.
+    """
+
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, object]],
+        vectors: int = 0,
+        scores: list[dict[str, object]] | None = None,
+        similar: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.rows = rows
+        self.vectors = vectors
+        self.scores = scores or []
+        self.similar = similar or []
+        self.calls: list[tuple[str, list[tuple[str, list]], list[str] | None]] = []
+
+    def __call__(
+        self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
+    ) -> list[list[dict[str, object]]]:
+        self.calls.append((label, statements, session))
+        if label == "store find conflicts":
+            found = [[{"now": NOW}], self.rows]
+            return [*found, [{"n": self.vectors}]] if len(statements) == 3 else found
+        assert label == "store find conflicts similar"
+        return [
+            self.scores if sql.startswith("SELECT key,") else self.similar for sql, _ in statements
+        ]
+
+
+def finding_store(
+    reads: CandidateReads, *, index: dict | None = None, **settings: object
+) -> tuple[CockroachDBStore, CountingEmbeddings]:
+    """A store with an index whose reads go to ``reads``, after migration 2."""
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"], **(index or {})},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+        **settings,  # type: ignore[arg-type]
+    )
+    store._columns_ready = True  # migration 2 seen: no schema read
+    store._read_all = reads  # type: ignore[method-assign,assignment]
+    return store, embeddings
+
+
+@pytest.mark.parametrize(("vectors", "scan"), [(5, "exact"), (6, "index")])
+def test_find_conflicts_reads_twice_and_scans_by_the_count(vectors: int, scan: str) -> None:
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=vectors,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95), candidate_row("b", score=0.85)],
+    )
+    store, embeddings = finding_store(reads, index={"beam_size": 16}, reconcile_scan_limit=5)
+    conflicts = store.find_conflicts(
+        NS, "k", {"seat": "x", "text": "aisle"}, slot="seat", filter={"source": "chat"}
+    )
+    # One embedding call, of the document form a write stores
+    assert embeddings.calls == 1
+    assert embeddings.texts == ["aisle"]
+    [(first_label, first, first_session), (second_label, second, second_session)] = reads.calls
+    # First the clock, the target and slot matches, and the namespace's
+    # vectors counted up to one past the scan limit
+    assert (first_label, first_session) == ("store find conflicts", None)
+    assert first == [
+        store.sql.now(),
+        store.sql.key_slot_candidates(
+            "user.alice", "k", slot_field="seat", slot_value_json='"x"', filter={"source": "chat"}
+        ),
+        store.sql.namespace_vector_count("user.alice", 6),
+    ]
+    # Then, with the scan the count chose, the scores of the key and slot
+    # candidates and the similar ones, which leave those keys out
+    vector = [5.0, 0.0, 0.0]  # CountingEmbeddings: the length of "aisle"
+    assert second_label == "store find conflicts similar"
+    assert second == [
+        StoreSQL.bind_query_vector(store.sql.candidate_scores("user.alice", ["k", "s"]), vector),
+        StoreSQL.bind_query_vector(
+            store.sql.similar_candidates(
+                "user.alice",
+                threshold=0.8,
+                limit=10,
+                filter={"source": "chat"},
+                scan=scan,  # type: ignore[arg-type]
+                over_fetch=10 * 1 * 2 + 1,
+                exclude=["k", "s"],
+            ),
+            vector,
+        ),
+    ]
+    # Only the index scan sets the beam size, in its read's transaction
+    assert second_session == (["SET LOCAL vector_search_beam_size = 16"] if scan == "index" else [])
+
+    assert [(c.key, c.reason, c.score) for c in conflicts.candidates] == [
+        ("k", "key", 0.2),
+        ("s", "slot", 0.9),
+        ("a", "similar", 0.95),
+        ("b", "similar", 0.85),
+    ]
+    assert (conflicts.target_version, conflicts.target_updated_at) == (3, T0)
+    proposal = conflicts.proposal
+    assert (proposal.namespace, proposal.key, proposal.slot, proposal.slot_value) == (
+        NS,
+        "k",
+        "seat",
+        "x",
+    )
+    assert proposal.value == {"seat": "x", "text": "aisle"} and proposal.provenance is None
+    # No valid_at was given: the database's now(), as no candidate is newer
+    assert proposal.valid_at == NOW
+    state = conflicts._state
+    assert state is not None
+    assert state.plan.valid_at is None and state.plan.key == "k"
+    assert state.vector_rows == (("user.alice", "k", "text", vector, None),)
+    assert state.target == (3, T0)
+    assert state.tokens == {"k": (3, T0), "s": (1, T0), "a": (1, T0), "b": (1, T0)}
+
+
+def test_find_conflicts_skips_the_reads_it_does_not_need() -> None:
+    # No text to embed: no embedding call, no count and no second read
+    reads = CandidateReads(rows=[candidate_row("s")])
+    store, embeddings = finding_store(reads)
+    conflicts = store.find_conflicts(NS, None, {"seat": "x"}, slot="seat")
+    assert embeddings.calls == 0
+    [(_, first, _)] = reads.calls
+    assert first[0] == store.sql.now() and len(first) == 2
+    assert [(c.key, c.score) for c in conflicts.candidates] == [("s", None)]
+    assert conflicts.target_version is None and conflicts.target_updated_at is None
+    assert conflicts._state is not None and conflicts._state.target is None
+
+    # index=False on the call: nothing to embed either
+    reads = CandidateReads(rows=[])
+    store, embeddings = finding_store(reads)
+    store.find_conflicts(NS, "k", {"text": "t"}, index=False)
+    assert embeddings.calls == 0 and len(reads.calls) == 1
+
+    # limit=0 searches no similar candidates, so it counts nothing, but it
+    # still scores the key and slot candidates
+    reads = CandidateReads(rows=[candidate_row("s")], scores=[{"key": "s", "score": 0.5}])
+    store, _ = finding_store(reads)
+    conflicts = store.find_conflicts(NS, None, {"seat": "x", "text": "t"}, slot="seat", limit=0)
+    [(_, first, _), (_, second, _)] = reads.calls
+    assert len(first) == 2
+    assert [sql.split("\n")[0] for sql, _ in second] == [
+        "SELECT key, 1 - min(embedding <=> CAST(%s AS VECTOR)) AS score"
+    ]
+    assert [(c.key, c.score) for c in conflicts.candidates] == [("s", 0.5)]
+
+    # Nothing found and limit=0: one read
+    reads = CandidateReads(rows=[])
+    store, _ = finding_store(reads)
+    assert store.find_conflicts(NS, "k", {"text": "t"}, limit=0).candidates == ()
+    assert len(reads.calls) == 1
+
+    # A flat store has no index to choose: no count, and the exact scan
+    reads = CandidateReads(rows=[], similar=[candidate_row("a", score=0.9)])
+    store, _ = finding_store(reads, index={"flat": True})
+    conflicts = store.find_conflicts(NS, "k", {"text": "t"})
+    [(_, first, _), (_, [similar], _)] = reads.calls
+    assert len(first) == 2
+    assert "GROUP BY i.prefix, i.key" in similar[0]
+    assert [c.key for c in conflicts.candidates] == ["a"]
+
+
+def test_find_conflicts_takes_an_explicit_valid_at_as_given() -> None:
+    newer = candidate_row("s", updated_at=NOW + timedelta(minutes=1))
+    reads = CandidateReads(rows=[newer])
+    store, _ = finding_store(reads)
+    old = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    conflicts = store.find_conflicts(NS, None, {"seat": "x"}, slot="seat", valid_at=old)
+    assert conflicts.proposal.valid_at == old
+    assert conflicts._state is not None and conflicts._state.plan.valid_at == old
+    # Without one, the valid time is raised to the newer candidate's update
+    reads = CandidateReads(rows=[newer])
+    store, _ = finding_store(reads)
+    conflicts = store.find_conflicts(NS, None, {"seat": "x"}, slot="seat")
+    assert conflicts.proposal.valid_at == NOW + timedelta(minutes=1)
+
+
+def test_find_conflicts_and_record_check_everything_before_any_io() -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"], "distance_type": "l2"},
+        retry_policy=FAST,
+    )
+    for call in (
+        lambda: store.find_conflicts((), "k", TEXT, threshold=-1.0),
+        lambda: store.find_conflicts(NS, "k", TEXT),
+        lambda: store.find_conflicts(NS, "k", TEXT, threshold=-1.0, slot="seat"),
+        lambda: store.find_conflicts(NS, "k", TEXT, threshold=-1.0, limit=-1),
+        lambda: store.find_conflicts(NS, "k", TEXT, threshold=-1.0, valid_at=datetime(2026, 1, 1)),
+        lambda: store.find_conflicts(NS, "k", TEXT, threshold=-1.0, provenance="chat"),  # type: ignore[arg-type]
+        lambda: store.record((), "k"),
+        lambda: store.record(("a.b",), "k"),
+    ):
+        with pytest.raises(ValueError):
+            call()
+    assert embeddings.calls == 0
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    def no_columns(*, refresh: bool = False) -> bool:
+        assert refresh, "a method that needs migration 2 reads the schema again"
+        return False
+
+    store._reconcile_columns = no_columns  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.find_conflicts(NS, "k", TEXT, threshold=-1.0)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.record(NS, "k")
+    assert embeddings.calls == 0
+
+
+async def test_reconcile_scan_limit_is_a_positive_int_on_both_stores() -> None:
+    assert CockroachDBStore(object()).reconcile_scan_limit == 2000  # type: ignore[arg-type]
+    assert CockroachDBStore(object(), reconcile_scan_limit=1).reconcile_scan_limit == 1  # type: ignore[arg-type]
+    pool = AsyncConnectionPool("", open=False)
+    assert AsyncCockroachDBStore(pool, reconcile_scan_limit=7).reconcile_scan_limit == 7
+    for bad in (0, -1, 1.5, True, "10", None):
+        with pytest.raises(ValueError, match="reconcile_scan_limit"):
+            CockroachDBStore(object(), reconcile_scan_limit=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="reconcile_scan_limit"):
+            AsyncCockroachDBStore(pool, reconcile_scan_limit=bad)  # type: ignore[arg-type]

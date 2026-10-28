@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from langchain_cockroachdb._sql import validate_identifier, vector_literal
 from langchain_cockroachdb.indexes import DistanceStrategy
@@ -38,6 +38,12 @@ ItemRowV2 = tuple[
 VectorRow = tuple[
     str, str, str, list[float], float | None
 ]  # prefix, key, field_name, embedding, ttl_minutes
+
+# The columns of a candidate row, as the candidate statements return them
+_CANDIDATE_OUTPUT = (
+    "key, value, created_at, updated_at, version, valid_at, provenance, confirmed_at, "
+    "confirmations, write_id"
+)
 
 
 def _validate_paging(limit: int, offset: int) -> None:
@@ -923,6 +929,260 @@ LIMIT %s OFFSET %s"""
                 sql, "prefix, key, value, created_at, updated_at, score", "score DESC, prefix, key"
             )
         return (sql, params)
+
+    # How find_conflicts, and reconcile in its transaction, find the memories
+    # a new one may conflict with, in two round trips. The first sends now(),
+    # key_slot_candidates and, when the similar read must choose a scan,
+    # namespace_vector_count. The second sends, for each vector of the new
+    # memory, candidate_scores for the key and slot candidates and
+    # similar_candidates for the others. Candidates come only from the new
+    # memory's own namespace, never its descendants, so every statement
+    # matches prefix = %s. Expired memories are never candidates, whatever
+    # omit_expired says, and none of these statements pushes back an expiry.
+    #
+    # A namespace with at most reconcile_scan_limit vectors gets the exact
+    # form of similar_candidates: it ranks every vector of the namespace,
+    # read by primary key, which also lets a serializable transaction notice
+    # a concurrent insert. A larger one gets the index form: a window of the
+    # nearest vectors from the C-SPANN index, as in semantic_search_in, then
+    # the join, filter and expiry check. A candidate beyond the window, or
+    # one whose window place went to a row the filter removed, is missed.
+    # Measured with EXPLAIN on v26.3.3, with 3,000 vectors in one namespace
+    # and a C-SPANN index: the index form is a vector search on the vector
+    # index over the namespace's prefix span, under a top-k of over_fetch,
+    # with the excluded keys filtered after it; the exact form is a merge
+    # join of the items and vectors primary keys over the namespace's span;
+    # and candidate_scores reads its keys from the vectors primary key.
+
+    @staticmethod
+    def _candidate_columns(alias: str = "") -> str:
+        """The columns of a candidate row, read from the items table under ``alias``.
+
+        A row without a valid time, from 0.5.x or a plain put, reads as valid
+        from its updated_at.
+        """
+        a = f"{alias}." if alias else ""
+        return (
+            f"{a}key, {a}value, {a}created_at, {a}updated_at, {a}version, "
+            f"COALESCE({a}valid_at, {a}updated_at) AS valid_at, {a}provenance, "
+            f"{a}confirmed_at, {a}confirmations, {a}write_id"
+        )
+
+    @staticmethod
+    def now() -> tuple[str, list]:
+        """The statement that reads the database's clock, as ``now``.
+
+        In a transaction it reads the transaction's timestamp, which is also
+        the updated_at of every row the transaction writes.
+        """
+        return ("SELECT now() AS now", [])
+
+    def key_slot_candidates(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        slot_field: str | None,
+        slot_value_json: str | None,
+        filter: Mapping | None,
+    ) -> tuple[str, list]:
+        """Build the read of a new memory's target and of the memories in its slot.
+
+        The live row under ``key`` comes back whatever ``filter`` says. With a
+        slot, so do the live rows whose value holds the same value in the
+        slot field, compared as JSON, if they also match ``filter``. The slot
+        field and value are bound, never formatted into the text.
+
+        Args:
+            prefix: Namespace text. Its descendants are not read.
+            key: The new memory's key.
+            slot_field: The top-level field that holds the slot, or None.
+            slot_value_json: The slot's value serialized as JSON, or None.
+            filter: Narrows the slot matches, as in search.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has the candidate columns.
+
+        Raises:
+            ValueError: If the filter has an unknown operator.
+        """
+        params: list[Any] = [prefix, key]
+        match = "key = %s"
+        if slot_field is not None:
+            conditions, filter_params = translate_filter(filter)
+            slot = " AND ".join(["value -> %s = CAST(%s AS JSONB)", *conditions])
+            match = f"(key = %s OR ({slot}))"
+            params.extend([slot_field, slot_value_json, *filter_params])
+        sql = f"""SELECT {self._candidate_columns()}
+FROM {self.items}
+WHERE prefix = %s AND {match}
+    AND (expires_at IS NULL OR expires_at > now())"""
+        return (sql, params)
+
+    def similar_candidates(
+        self,
+        prefix: str,
+        *,
+        threshold: float,
+        limit: int,
+        filter: Mapping | None,
+        scan: Literal["exact", "index"],
+        over_fetch: int,
+        exclude: Sequence[str] = (),
+    ) -> tuple[str, list]:
+        """Build the read of the memories similar to one vector of a new memory.
+
+        Every row is live, matches ``filter`` and scores at or above
+        ``threshold`` with the store's score function. Rows come best first,
+        then by key, up to ``limit``. The ``exclude`` keys are left out: the
+        target and the slot matches, which candidate_scores scores.
+
+        Args:
+            prefix: Namespace text. Its descendants are not read.
+            threshold: The lowest score a row may have.
+            limit: Most rows.
+            filter: Narrows the rows by value, as in search.
+            scan: "exact" ranks every vector of the namespace. "index" ranks
+                the ``over_fetch`` nearest vectors the C-SPANN index returns,
+                then filters them.
+            over_fetch: The window of the index scan. The exact scan has none.
+            exclude: Keys to leave out.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has the candidate columns
+            and ``score``. Bind the query vector in place of QUERY_VECTOR.
+
+        Raises:
+            ValueError: If limit is negative, the scan is unknown, there is no
+                index, or the filter has an unknown operator.
+        """
+        _validate_paging(limit, 0)
+        if self._index is None:
+            raise ValueError("similar_candidates requires an index configuration")
+        if scan not in ("exact", "index"):
+            raise ValueError(f"scan must be 'exact' or 'index', got {scan!r}")
+        operator = self._index.distance.get_operator()
+        conditions, filter_params = self._item_conditions(filter, omit_expired=True)
+        score = self._score("distance")
+        if scan == "exact":
+            # No LIMIT in ranked: see the notes above _candidate_columns
+            where = " AND ".join(
+                ["v.prefix = %s", "NOT (v.key = ANY(CAST(%s AS STRING[])))", *conditions]
+            )
+            sql = f"""WITH ranked AS (
+    SELECT {self._candidate_columns("i")},
+        min(v.embedding {operator} CAST(%s AS VECTOR)) AS distance
+    FROM {self.vectors} AS v
+    JOIN {self.items} AS i ON v.prefix = i.prefix AND v.key = i.key
+    WHERE {where}
+    GROUP BY i.prefix, i.key
+)
+SELECT {_CANDIDATE_OUTPUT}, {score} AS score
+FROM ranked
+WHERE {score} >= CAST(%s AS FLOAT8)
+ORDER BY score DESC, key
+LIMIT %s"""
+            params: list[Any] = [
+                QUERY_VECTOR,
+                prefix,
+                list(exclude),
+                *filter_params,
+                threshold,
+                limit,
+            ]
+            return (sql, params)
+
+        # No filter in nearest, so the C-SPANN index serves it: see the notes
+        # above semantic_search
+        where = " AND ".join(["NOT (i.key = ANY(CAST(%s AS STRING[])))", *conditions])
+        sql = f"""WITH nearest AS (
+    SELECT prefix, key, embedding {operator} CAST(%s AS VECTOR) AS distance
+    FROM {self.vectors}
+    WHERE prefix = %s
+    ORDER BY embedding {operator} CAST(%s AS VECTOR)
+    LIMIT %s
+),
+best AS (
+    SELECT DISTINCT ON (i.key)
+        {self._candidate_columns("i")}, r.distance
+    FROM nearest AS r
+    JOIN {self.items} AS i ON r.prefix = i.prefix AND r.key = i.key
+    WHERE {where}
+    ORDER BY i.key, r.distance
+)
+SELECT {_CANDIDATE_OUTPUT}, {score} AS score
+FROM best
+WHERE {score} >= CAST(%s AS FLOAT8)
+ORDER BY score DESC, key
+LIMIT %s"""
+        params = [
+            QUERY_VECTOR,
+            prefix,
+            QUERY_VECTOR,
+            over_fetch,
+            list(exclude),
+            *filter_params,
+            threshold,
+            limit,
+        ]
+        return (sql, params)
+
+    def candidate_scores(self, prefix: str, keys: Sequence[str]) -> tuple[str, list]:
+        """Build the scores of some memories against one vector of a new memory.
+
+        A memory scores as its best vector, with the store's score function,
+        and one without vectors returns no row. No threshold or filter
+        applies: these are the target and the slot matches, found already.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key`` and ``score``.
+            Bind the query vector in place of QUERY_VECTOR.
+
+        Raises:
+            ValueError: If there is no index.
+        """
+        if self._index is None:
+            raise ValueError("candidate_scores requires an index configuration")
+        operator = self._index.distance.get_operator()
+        best = self._score(f"min(embedding {operator} CAST(%s AS VECTOR))")
+        sql = f"""SELECT key, {best} AS score
+FROM {self.vectors}
+WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))
+GROUP BY key"""
+        return (sql, [QUERY_VECTOR, prefix, list(keys)])
+
+    def namespace_vector_count(self, prefix: str, cap: int) -> tuple[str, list]:
+        """Build the count of one namespace's vectors, up to ``cap``.
+
+        It reads at most ``cap`` rows of the vectors primary key, so a count
+        of ``cap`` means at least that many. Expired vectors count, and the
+        namespace's descendants do not.
+
+        Returns:
+            Tuple of (SQL, parameters). The row has the count as ``n``.
+
+        Raises:
+            ValueError: If there is no index.
+        """
+        if self._index is None:
+            raise ValueError("namespace_vector_count requires an index configuration")
+        sql = f"""SELECT count(*) AS n FROM (
+    SELECT 1 FROM {self.vectors} WHERE prefix = %s LIMIT %s
+) AS c"""
+        return (sql, [prefix, cap])
+
+    def record(self, prefix: str, key: str) -> tuple[str, list]:
+        """Build the read of one live memory with its version, provenance and confirmations.
+
+        It never pushes back the expiry: reading a memory does not confirm it.
+
+        Returns:
+            Tuple of (SQL, parameters). The row, if any, has the candidate columns.
+        """
+        sql = f"""SELECT {self._candidate_columns()}
+FROM {self.items}
+WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
+        return (sql, [prefix, key])
 
     def list_namespaces(
         self,

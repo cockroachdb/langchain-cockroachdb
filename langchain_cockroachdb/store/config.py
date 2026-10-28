@@ -13,6 +13,11 @@ from langgraph.store.base.embed import ensure_embeddings, tokenize_path
 
 from langchain_cockroachdb.indexes import DistanceStrategy
 
+# The most vectors a namespace may hold for find_conflicts and reconcile to
+# rank every one of them, by primary key. A namespace with more finds its
+# similar candidates through the C-SPANN index instead.
+DEFAULT_RECONCILE_SCAN_LIMIT = 2000
+
 
 class CSPANNConfig(TypedDict, total=False):
     """C-SPANN index configuration.
@@ -381,3 +386,21 @@ def resolve_history_config(history: bool | HistoryConfig | None) -> ResolvedHist
     ):
         raise ValueError(f"history ttl_days must be a positive number of days, got {ttl_days!r}")
     return ResolvedHistory(ttl_days=float(ttl_days))
+
+
+def resolve_reconcile_scan_limit(limit: int) -> int:
+    """Validate the store's ``reconcile_scan_limit`` setting.
+
+    Args:
+        limit: The most vectors a namespace may hold for its similar
+            candidates to be ranked exactly.
+
+    Returns:
+        The limit.
+
+    Raises:
+        ValueError: If the limit is not a positive int.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError(f"reconcile_scan_limit must be a positive integer, got {limit!r}")
+    return limit

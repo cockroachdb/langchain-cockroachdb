@@ -11,6 +11,7 @@ from langgraph.store.base import SearchItem
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    Conflicts,
     Decision,
     Proposal,
     first_of,
@@ -260,3 +261,26 @@ def test_policies_do_not_mutate_candidates() -> None:
 
     # Verify candidates weren't mutated
     assert found == original_found
+
+
+def test_conflicts_keeps_its_state_out_of_repr_and_comparison() -> None:
+    import langchain_cockroachdb
+    from langchain_cockroachdb import store as store_package
+
+    proposal = make_proposal("k")
+    found = (candidate("a", score=0.9),)
+    with_state = Conflicts(
+        proposal=proposal,
+        candidates=found,
+        target_version=2,
+        target_updated_at=T0,
+        _state=object(),  # type: ignore[arg-type]
+    )
+    plain = Conflicts(proposal=proposal, candidates=found, target_version=2, target_updated_at=T0)
+    assert with_state == plain
+    assert "_state" not in repr(with_state)
+    assert plain._state is None
+    # Exported from the store package, not from the top-level package
+    assert store_package.Conflicts is Conflicts
+    assert "Conflicts" in store_package.__all__
+    assert not hasattr(langchain_cockroachdb, "Conflicts")
