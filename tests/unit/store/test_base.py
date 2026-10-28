@@ -33,9 +33,11 @@ from langchain_cockroachdb.store.base import (
     ProposalPlan,
     PutPlan,
     SchemaCheck,
+    StoreIdentity,
     _group_ops,
     default_valid_at,
     merge_candidates,
+    needs_exact_candidates,
     needs_exact_search,
 )
 from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
@@ -2144,12 +2146,40 @@ def test_default_valid_at_never_takes_a_candidate_valid_at() -> None:
     assert found[0].valid_at > default_valid_at(NOW, found)
 
 
+# A row of the index form of StoreSQL.similar_candidates when no candidate passes
+NO_HIT: dict[str, object] = dict.fromkeys(
+    [
+        "key",
+        "value",
+        "created_at",
+        "updated_at",
+        "version",
+        "valid_at",
+        "provenance",
+        "confirmed_at",
+        "confirmations",
+        "write_id",
+        "score",
+    ]
+)
+
+
+def window_rows(
+    hits: list[dict[str, object]], *, size: int = 21, lowest: float | None = 0.0
+) -> list[dict[str, object]]:
+    """The rows of an index scan: its hits, or one row without a candidate, with the window."""
+    window = {"window_size": size, "lowest_score": lowest}
+    return [{**row, **window} for row in hits] or [{**NO_HIT, **window}]
+
+
 class CandidateReads:
     """Answers the read groups of find_conflicts with canned rows, and logs them.
 
     The first group gets the database's now(), ``rows`` for the key and slot
     statement and ``vectors`` for the count when sent. In the second, score
-    statements get ``scores`` and similar statements ``similar``.
+    statements get ``scores`` and similar statements ``similar``. An index
+    scan's rows carry a window of 21 vectors whose lowest score is
+    ``lowest``. An exact scan run again gets ``exact``.
     """
 
     def __init__(
@@ -2159,11 +2189,15 @@ class CandidateReads:
         vectors: int = 0,
         scores: list[dict[str, object]] | None = None,
         similar: list[dict[str, object]] | None = None,
+        lowest: float | None = 0.0,
+        exact: list[dict[str, object]] | None = None,
     ) -> None:
         self.rows = rows
         self.vectors = vectors
         self.scores = scores or []
         self.similar = similar or []
+        self.lowest = lowest
+        self.exact = exact or []
         self.calls: list[tuple[str, list[tuple[str, list]], list[str] | None]] = []
 
     def __call__(
@@ -2173,10 +2207,18 @@ class CandidateReads:
         if label == "store find conflicts":
             found = [[{"now": NOW}], self.rows]
             return [*found, [{"n": self.vectors}]] if len(statements) == 3 else found
+        if label == "store find conflicts exact":
+            return [self.exact for _ in statements]
         assert label == "store find conflicts similar"
-        return [
-            self.scores if sql.startswith("SELECT key,") else self.similar for sql, _ in statements
-        ]
+        answers = []
+        for sql, _ in statements:
+            if sql.startswith("SELECT key,"):
+                answers.append(self.scores)
+            elif "window_stats" in sql:
+                answers.append(window_rows(self.similar, lowest=self.lowest))
+            else:
+                answers.append(self.similar)
+        return answers
 
 
 def finding_store(
@@ -2266,6 +2308,9 @@ def test_find_conflicts_reads_twice_and_scans_by_the_count(vectors: int, scan: s
     assert state.vector_rows == (("user.alice", "k", "text", vector, None),)
     assert state.target == (3, T0)
     assert state.tokens == {"k": (3, T0), "s": (1, T0), "a": (1, T0), "b": (1, T0)}
+    assert state.store == StoreIdentity(
+        items="public.store", dims=3, distance="cosine", fields=("text",)
+    )
 
 
 def test_find_conflicts_skips_the_reads_it_does_not_need() -> None:
@@ -2374,3 +2419,124 @@ async def test_reconcile_scan_limit_is_a_positive_int_on_both_stores() -> None:
             CockroachDBStore(object(), reconcile_scan_limit=bad)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="reconcile_scan_limit"):
             AsyncCockroachDBStore(pool, reconcile_scan_limit=bad)  # type: ignore[arg-type]
+
+
+def test_needs_exact_candidates() -> None:
+    hit = candidate_row("a", score=0.9)
+    # The window's lowest score is below the threshold: every vector beyond it
+    # scores lower still, up to the index's approximation, so nothing is missing
+    assert not needs_exact_candidates(window_rows([], lowest=0.5), threshold=0.8)
+    assert not needs_exact_candidates(window_rows([hit], lowest=0.79), threshold=0.8)
+    # At or above the threshold, matches may lie beyond the window: the filter,
+    # the expiry check or the excluded keys may have taken every place in it
+    assert needs_exact_candidates(window_rows([], lowest=0.8), threshold=0.8)
+    assert needs_exact_candidates(window_rows([], lowest=0.95), threshold=0.8)
+    assert needs_exact_candidates(window_rows([hit], lowest=0.85), threshold=0.8)
+    # An empty window tells nothing about the namespace
+    assert needs_exact_candidates(window_rows([], size=0, lowest=None), threshold=0.8)
+    assert needs_exact_candidates([], threshold=0.8)
+    # Negated distances (l2, inner product) compare the same way
+    assert not needs_exact_candidates(window_rows([], lowest=-0.9), threshold=-0.6)
+    assert needs_exact_candidates(window_rows([], lowest=-0.5), threshold=-0.6)
+
+
+def test_find_conflicts_runs_the_exact_scan_where_the_window_may_hide_matches() -> None:
+    # Two vectors: "aaaaa" embeds to [5, 0, 0] and "bbbbbbb" to [7, 0, 0]. The
+    # first vector's window ends above the threshold with no hit, so it may
+    # hide matches; the second's ends below it
+    def windows(statements: list[tuple[str, list]]) -> list[list[dict[str, object]]]:
+        by_vector = {
+            "[5.0,0.0,0.0]": window_rows([], lowest=0.9),
+            "[7.0,0.0,0.0]": window_rows([candidate_row("b", score=0.85)], lowest=0.3),
+        }
+        return [by_vector[params[0]] for _, params in statements]
+
+    calls: list[tuple[str, list[tuple[str, list]], list[str] | None]] = []
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: list[str] | None = None
+    ) -> list[list[dict[str, object]]]:
+        calls.append((label, statements, session))
+        if label == "store find conflicts":
+            return [[{"now": NOW}], [], [{"n": 6}]]
+        if label == "store find conflicts similar":
+            return windows(statements)
+        assert label == "store find conflicts exact"
+        return [[candidate_row("a", score=0.82)] for _ in statements]
+
+    store, _ = finding_store(
+        read_all,  # type: ignore[arg-type]
+        index={"fields": ["text", "note"]},
+        reconcile_scan_limit=5,
+    )
+    conflicts = store.find_conflicts(NS, "k", {"text": "aaaaa", "note": "bbbbbbb"})
+
+    assert [label for label, _, _ in calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+        "store find conflicts exact",
+    ]
+    # One more round trip, with the exact form of the first vector's statement only
+    exact = store.sql.similar_candidates(
+        "user.alice",
+        threshold=0.8,
+        limit=10,
+        filter=None,
+        scan="exact",
+        over_fetch=10 * 2 * 2 + 1,
+        exclude=["k"],
+    )
+    _, sent, session = calls[2]
+    assert sent == [StoreSQL.bind_query_vector(exact, [5.0, 0.0, 0.0])]
+    assert session is None
+    # The exact rows replace that window's empty result; the other window's hit stays
+    assert [(c.key, c.reason, c.score) for c in conflicts.candidates] == [
+        ("b", "similar", 0.85),
+        ("a", "similar", 0.82),
+    ]
+
+    # When every window ends below the threshold, the index result stands
+    reads = CandidateReads(rows=[], vectors=6, similar=[candidate_row("b", score=0.85)])
+    store, _ = finding_store(reads, reconcile_scan_limit=5)
+    conflicts = store.find_conflicts(NS, "k", {"text": "aisle"})
+    assert [label for label, _, _ in reads.calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
+    assert [c.key for c in conflicts.candidates] == ["b"]
+
+    # A window that ends above the threshold with nothing beyond it: the exact
+    # scan finds nothing either, and the empty row of the window is no candidate
+    reads = CandidateReads(rows=[], vectors=6, lowest=0.9)
+    store, _ = finding_store(reads, reconcile_scan_limit=5)
+    assert store.find_conflicts(NS, "k", {"text": "aisle"}).candidates == ()
+    assert [label for label, _, _ in reads.calls][-1] == "store find conflicts exact"
+
+
+def test_conflicts_record_which_store_made_them() -> None:
+    def identity(**settings: object) -> StoreIdentity:
+        store = CockroachDBStore(object(), retry_policy=FAST, **settings)  # type: ignore[arg-type]
+        return store._identity()
+
+    index = {"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]}
+    base = identity(index=index, table_name="memories")
+    assert base == StoreIdentity(
+        items="public.memories", dims=3, distance="cosine", fields=("text",)
+    )
+    # The same table and index make the same store, whatever else differs
+    assert identity(index={**index, "embed": CountingEmbeddings()}, table_name="memories") == base
+    assert identity(index=index, table_name="memories", history=True) == base
+    # Another table, schema, dims, distance or fields make another store
+    others = [
+        identity(index=index, table_name="other"),
+        identity(index=index, table_name="memories", schema="app"),
+        identity(index={**index, "dims": 4}, table_name="memories"),
+        identity(index={**index, "distance_type": "l2"}, table_name="memories"),
+        identity(index={**index, "fields": ["text", "note"]}, table_name="memories"),
+        identity(table_name="memories"),
+    ]
+    assert all(other != base for other in others)
+    assert len(set(others)) == len(others)
+    assert others[-1] == StoreIdentity(
+        items="public.memories", dims=None, distance=None, fields=None
+    )

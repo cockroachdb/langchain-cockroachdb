@@ -9,10 +9,12 @@ from the caller, the new memory is valid from the database's clock.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from langgraph.store.base import PutOp
 from psycopg import Connection
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
@@ -20,7 +22,7 @@ from langchain_cockroachdb.store import Conflicts, MemoryRecord
 from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store import reconcile as store_reconcile
 from langchain_cockroachdb.store import store as store_module
-from tests.integration.store.conftest import SEATS, seat_index
+from tests.integration.store.conftest import SEATS, FixedEmbeddings, seat_index
 from tests.integration.store.test_schema_upgrade import schema_0_5
 
 NS = ("user", "alice")
@@ -56,6 +58,15 @@ def expiries(admin: Connection[Any], store: Any) -> list[tuple[str, Any]]:
         ).fetchall()
         found.extend((f"{table}/{row['key']}", row["expires_at"]) for row in rows)
     return found
+
+
+def toward(base: list[float], cosine: float) -> list[float]:
+    """A unit vector whose cosine similarity with ``base`` is ``cosine``.
+
+    ``base`` lies in the first two dimensions; the third takes the rest.
+    """
+    norm = math.sqrt(sum(x * x for x in base))
+    return [cosine * base[0] / norm, cosine * base[1] / norm, math.sqrt(1 - cosine**2), 0.0]
 
 
 def spy_on_reads(store: CockroachDBStore, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
@@ -235,6 +246,12 @@ def test_find_conflicts_uses_the_index_above_the_scan_limit(
     [(_, [similar], session)] = [s for s in sent if s[0] == "store find conflicts similar"]
     assert "ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s" in similar
     assert session == ["SET LOCAL vector_search_beam_size = 8"]
+    # The window holds all five, down to scores below the threshold, so
+    # nothing lies beyond it and the result stands
+    assert [label for label, _, _ in sent] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
 
     # At the limit every vector of the namespace is ranked, with the same result
     exact = store_factory(mode, index=seat_index(), reconcile_scan_limit=5)
@@ -245,6 +262,41 @@ def test_find_conflicts_uses_the_index_above_the_scan_limit(
     ]
     [(_, [similar], session)] = [s for s in sent if s[0] == "store find conflicts similar"]
     assert "GROUP BY i.prefix, i.key" in similar and session == []
+
+
+def test_find_conflicts_looks_past_a_window_the_filter_emptied(
+    store_factory, mode, monkeypatch
+) -> None:
+    # Twenty-nine memories of another kind lie nearer to the new memory than
+    # the only match, all above the threshold. The index's window of 21 holds
+    # none of the match's kind and still ends above the threshold, so matches
+    # may lie beyond it, and the store ranks the namespace exactly
+    vectors = {AISLE: SEATS[AISLE], "match": toward(SEATS[AISLE], 0.85)}
+    for i in range(29):
+        vectors[f"other {i}"] = toward(SEATS[AISLE], 0.99 - 0.001 * i)
+    store = store_factory(
+        mode,
+        index={"dims": 4, "embed": FixedEmbeddings(vectors), "fields": ["text"]},
+        reconcile_scan_limit=10,
+    )
+    store.batch(
+        [PutOp(NS, f"o{i}", {"text": f"other {i}", "kind": "other"}) for i in range(29)]
+        + [PutOp(NS, "m", {"text": "match", "kind": "seat"})]
+    )
+    sent = spy_on_reads(store, monkeypatch)
+
+    conflicts = store.find_conflicts(NS, None, text(AISLE, kind="seat"), filter={"kind": "seat"})
+
+    assert reasons(conflicts) == [("m", "similar")]
+    assert conflicts.candidates[0].score == pytest.approx(0.85, abs=1e-3)
+    assert [label for label, _, _ in sent] == [
+        "store find conflicts",
+        "store find conflicts similar",
+        "store find conflicts exact",
+    ]
+    [(_, [indexed], _), (_, [exact], session)] = sent[1:]
+    assert "window_stats" in indexed
+    assert "GROUP BY i.prefix, i.key" in exact and session is None
 
 
 def test_store_without_index_finds_key_and_slot_candidates(store_factory, mode) -> None:

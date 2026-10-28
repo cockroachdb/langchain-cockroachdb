@@ -40,10 +40,19 @@ VectorRow = tuple[
 ]  # prefix, key, field_name, embedding, ttl_minutes
 
 # The columns of a candidate row, as the candidate statements return them
-_CANDIDATE_OUTPUT = (
-    "key, value, created_at, updated_at, version, valid_at, provenance, confirmed_at, "
-    "confirmations, write_id"
+_CANDIDATE_NAMES = (
+    "key",
+    "value",
+    "created_at",
+    "updated_at",
+    "version",
+    "valid_at",
+    "provenance",
+    "confirmed_at",
+    "confirmations",
+    "write_id",
 )
+_CANDIDATE_OUTPUT = ", ".join(_CANDIDATE_NAMES)
 
 
 def _validate_paging(limit: int, offset: int) -> None:
@@ -945,14 +954,25 @@ LIMIT %s OFFSET %s"""
     # read by primary key, which also lets a serializable transaction notice
     # a concurrent insert. A larger one gets the index form: a window of the
     # nearest vectors from the C-SPANN index, as in semantic_search_in, then
-    # the join, filter and expiry check. A candidate beyond the window, or
-    # one whose window place went to a row the filter removed, is missed.
+    # the join, filter and expiry check. Rows that the filter, the expiry
+    # check or the excluded keys remove still take places in the window, so
+    # a match beyond it would be missed. The index form therefore reports
+    # the window's size and lowest score, over every vector in it. When the
+    # lowest score is below the threshold, every vector beyond the window
+    # scores lower still, up to the index's approximation, and the result
+    # stands. Otherwise matches may lie beyond the window, and the store
+    # runs the exact form for that vector (needs_exact_candidates in
+    # base.py). That costs one more round trip, and only when the
+    # namespace holds at least over_fetch vectors at or above the threshold.
+    #
     # Measured with EXPLAIN on v26.3.3, with 3,000 vectors in one namespace
-    # and a C-SPANN index: the index form is a vector search on the vector
-    # index over the namespace's prefix span, under a top-k of over_fetch,
-    # with the excluded keys filtered after it; the exact form is a merge
-    # join of the items and vectors primary keys over the namespace's span;
-    # and candidate_scores reads its keys from the vectors primary key.
+    # and a C-SPANN index: the index form computes nearest once, as a buffer,
+    # with a vector search on the vector index over the namespace's prefix
+    # span under a top-k of over_fetch; the window's count and lowest score
+    # read that buffer, and so do the excluded keys' filter and the items
+    # lookup join. The exact form is a merge join of the items and vectors
+    # primary keys over the namespace's span. candidate_scores reads its
+    # keys from the vectors primary key.
 
     @staticmethod
     def _candidate_columns(alias: str = "") -> str:
@@ -1037,6 +1057,13 @@ WHERE prefix = %s AND {match}
         then by key, up to ``limit``. The ``exclude`` keys are left out: the
         target and the slot matches, which candidate_scores scores.
 
+        The index form also reports the window it ranked: ``window_size``,
+        the vectors the C-SPANN index returned, and ``lowest_score``, the
+        lowest score among them, before the filter, the expiry check and
+        the excluded keys. Every row carries both, and when no row passes,
+        one row still does, with NULL candidate columns. See
+        needs_exact_candidates in base.py.
+
         Args:
             prefix: Namespace text. Its descendants are not read.
             threshold: The lowest score a row may have.
@@ -1050,7 +1077,8 @@ WHERE prefix = %s AND {match}
 
         Returns:
             Tuple of (SQL, parameters). Each row has the candidate columns
-            and ``score``. Bind the query vector in place of QUERY_VECTOR.
+            and ``score``, and with the index scan ``window_size`` and
+            ``lowest_score``. Bind the query vector in place of QUERY_VECTOR.
 
         Raises:
             ValueError: If limit is negative, the scan is unknown, there is no
@@ -1093,14 +1121,20 @@ LIMIT %s"""
             return (sql, params)
 
         # No filter in nearest, so the C-SPANN index serves it: see the notes
-        # above semantic_search
+        # above semantic_search. window_stats reads every vector it kept, and
+        # the LEFT JOIN returns its row even when no candidate passes
         where = " AND ".join(["NOT (i.key = ANY(CAST(%s AS STRING[])))", *conditions])
+        hit_columns = ", ".join(f"h.{name}" for name in _CANDIDATE_NAMES)
         sql = f"""WITH nearest AS (
     SELECT prefix, key, embedding {operator} CAST(%s AS VECTOR) AS distance
     FROM {self.vectors}
     WHERE prefix = %s
     ORDER BY embedding {operator} CAST(%s AS VECTOR)
     LIMIT %s
+),
+window_stats AS (
+    SELECT count(*) AS window_size, min({score}) AS lowest_score
+    FROM nearest
 ),
 best AS (
     SELECT DISTINCT ON (i.key)
@@ -1109,12 +1143,18 @@ best AS (
     JOIN {self.items} AS i ON r.prefix = i.prefix AND r.key = i.key
     WHERE {where}
     ORDER BY i.key, r.distance
+),
+hits AS (
+    SELECT {_CANDIDATE_OUTPUT}, {score} AS score
+    FROM best
+    WHERE {score} >= CAST(%s AS FLOAT8)
+    ORDER BY score DESC, key
+    LIMIT %s
 )
-SELECT {_CANDIDATE_OUTPUT}, {score} AS score
-FROM best
-WHERE {score} >= CAST(%s AS FLOAT8)
-ORDER BY score DESC, key
-LIMIT %s"""
+SELECT {hit_columns}, h.score, w.window_size, w.lowest_score
+FROM window_stats AS w
+LEFT JOIN hits AS h ON TRUE
+ORDER BY h.score DESC, h.key"""
         params = [
             QUERY_VECTOR,
             prefix,

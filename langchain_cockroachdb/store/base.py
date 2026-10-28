@@ -215,6 +215,31 @@ def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fe
     return window >= over_fetch or window < held
 
 
+def needs_exact_candidates(rows: Sequence[Mapping[str, Any]], *, threshold: float) -> bool:
+    """Whether an index scan for similar candidates must run again in its exact form.
+
+    ``rows`` are what the index form of StoreSQL.similar_candidates returned
+    for one vector of a new memory. Each carries ``window_size``, the
+    vectors the C-SPANN index returned into the window, and
+    ``lowest_score``, the lowest score among them, counted before the
+    filter, the expiry check and the excluded keys removed any.
+
+    A window whose lowest score is below ``threshold`` held every vector at
+    or above it, up to the index's approximation: the vectors beyond it
+    score lower still. So its result stands, however few rows passed.
+    When the lowest score is at or above the threshold, the rows the filter,
+    the expiry check or the excluded keys removed may have taken every
+    place in the window, and matches may lie beyond it. An empty window
+    tells nothing about the namespace. Both run again. Unlike
+    needs_exact_search, a short result alone never does: short results are
+    the normal case here.
+    """
+    if not rows:
+        return True
+    lowest = rows[0]["lowest_score"]
+    return int(rows[0]["window_size"]) == 0 or lowest is None or float(lowest) >= threshold
+
+
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
     """Group ops by type, keeping each op's position in the batch.
 
@@ -529,6 +554,10 @@ class KeySlotRead:
 class SimilarRead:
     """The second candidate read, built from what the first found.
 
+    Run the session statements, then ``statements()``, as one round trip.
+    If ``exact_statements()`` of their rows returns any, run those as one
+    more round trip and pass both to ``fill_exact``.
+
     Attributes:
         scores: One StoreSQL.candidate_scores statement per vector of the
             new memory, or none without key and slot candidates.
@@ -536,15 +565,76 @@ class SimilarRead:
             new memory, or none when the limit is 0.
         session: Statements that run first, in the read's transaction: the
             beam size of an index scan, when set.
+        exact: The exact form of each statement in ``similar`` when those are
+            index scans, else none. One runs only when its index scan's
+            window may have left matches out (needs_exact_candidates).
+        threshold: The lowest score of a similar candidate, or None when
+            ``similar`` is empty.
     """
 
     scores: list[tuple[str, list]]
     similar: list[tuple[str, list]]
     session: list[str]
+    exact: list[tuple[str, list]] = field(default_factory=list)
+    threshold: float | None = None
 
     def statements(self) -> list[tuple[str, list]]:
         """The statements to send as one round trip: the scores, then the similar reads."""
         return [*self.scores, *self.similar]
+
+    def exact_statements(
+        self, found: Sequence[Sequence[Mapping[str, Any]]]
+    ) -> list[tuple[str, list]]:
+        """The exact form of each index scan whose window may have left matches out.
+
+        ``found`` are the rows of ``statements()``, in order.
+        """
+        return [self.exact[i] for i in self._reruns(found)]
+
+    def fill_exact(
+        self,
+        found: Sequence[Sequence[dict[str, Any]]],
+        exact_found: Sequence[Sequence[dict[str, Any]]],
+    ) -> list[Sequence[dict[str, Any]]]:
+        """``found`` with the rows of each index scan that ran again replaced by its exact rows.
+
+        ``exact_found`` are the rows of ``exact_statements(found)``, in order.
+        """
+        filled = list(found)
+        for i, rows in zip(self._reruns(found), exact_found, strict=True):
+            filled[len(self.scores) + i] = rows
+        return filled
+
+    def _reruns(self, found: Sequence[Sequence[Mapping[str, Any]]]) -> list[int]:
+        """The positions in ``similar`` of the index scans that must run again."""
+        if not self.exact or self.threshold is None:
+            return []
+        threshold = self.threshold
+        return [
+            i
+            for i, rows in enumerate(found[len(self.scores) :])
+            if needs_exact_candidates(rows, threshold=threshold)
+        ]
+
+
+@dataclass(frozen=True)
+class StoreIdentity:
+    """Which store made a Conflicts: the items table and the index it embeds for.
+
+    resolve() writes what find_conflicts planned, so it must run on a store
+    with the same table and index.
+
+    Attributes:
+        items: The items table, with its schema.
+        dims: The index's dims, or None without an index.
+        distance: The index's distance, as configured, or None.
+        fields: The index's fields, or None.
+    """
+
+    items: str
+    dims: int | None
+    distance: str | None
+    fields: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -552,6 +642,7 @@ class ConflictsState:
     """What Conflicts keeps from find_conflicts, for resolve().
 
     Attributes:
+        store: Which store made it.
         plan: The new memory's plan, with its write id.
         vector_rows: Its vectors, embedded once.
         target: The (version, updated_at) of the live memory under its key,
@@ -559,6 +650,7 @@ class ConflictsState:
         tokens: The (version, updated_at) of each candidate, by key.
     """
 
+    store: StoreIdentity
     plan: ProposalPlan
     vector_rows: tuple[VectorRow, ...]
     target: tuple[int, datetime] | None
@@ -676,7 +768,8 @@ def merge_candidates(
     caps the similar candidates only, never the key and slot matches.
 
     A similar row under ``key`` is left out when the key read found no
-    target: the target is found by its key alone.
+    target: the target is found by its key alone. So is the row without a
+    key that an index scan returns when no candidate passes.
     """
     scores: dict[str, float] = {}
     for rows in score_rows:
@@ -686,6 +779,8 @@ def merge_candidates(
     similar: dict[str, tuple[float, Mapping[str, Any]]] = {}
     for rows in similar_rows:
         for row in rows:
+            if row["key"] is None:
+                continue
             score = float(row["score"])
             if row["key"] not in similar or score > similar[row["key"]][0]:
                 similar[row["key"]] = (score, row)
@@ -1452,6 +1547,17 @@ class BaseCockroachDBStore:
             )
         return float(threshold)
 
+    def _identity(self) -> StoreIdentity:
+        """Which store this is, as Conflicts records it: the items table and the index."""
+        if self.index is None:
+            return StoreIdentity(items=self.sql.items, dims=None, distance=None, fields=None)
+        return StoreIdentity(
+            items=self.sql.items,
+            dims=self.index.dims,
+            distance=self.index.distance.value,
+            fields=tuple(path for path, _ in self.index.fields),
+        )
+
     def _chooses_scan(self, plan: ProposalPlan) -> bool:
         """Whether the similar read runs and must choose between the exact scan and the index.
 
@@ -1507,35 +1613,47 @@ class BaseCockroachDBStore:
         are ranked exactly when it holds at most reconcile_scan_limit of
         them, or the index is flat. Otherwise the C-SPANN index gives a
         window of the store search's over_fetch for ``limit``, with the beam
-        size set when the index configures one. Empty when the new memory
-        has no vectors. Run the session statements, then ``statements()``,
-        as one round trip, and pass the rows to _conflicts.
+        size set when the index configures one, and the exact form of each
+        statement is kept for a window that may have left matches out. Empty
+        when the new memory has no vectors. Run it as SimilarRead says, and
+        pass the rows to _conflicts.
         """
         if not vector_rows:
             return SimilarRead(scores=[], similar=[], session=[])
         keys = [row["key"] for row in read.rows]
         scores: list[tuple[str, list]] = []
-        similar: list[tuple[str, list]] = []
-        session: list[str] = []
         if keys:
             statement = self.sql.candidate_scores(plan.prefix, keys)
             scores = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
-        if self.index is not None and plan.threshold is not None and plan.limit > 0:
-            above = read.vectors is not None and read.vectors > self.reconcile_scan_limit
-            scan: Literal["exact", "index"] = "index" if above else "exact"
+        index, threshold = self.index, plan.threshold
+        if index is None or threshold is None or plan.limit == 0:
+            return SimilarRead(scores=scores, similar=[], session=[])
+        above = read.vectors is not None and read.vectors > self.reconcile_scan_limit
+        scans: list[Literal["exact", "index"]] = ["exact", "index"] if above else ["exact"]
+        built: dict[str, list[tuple[str, list]]] = {}
+        for scan in scans:
             statement = self.sql.similar_candidates(
                 plan.prefix,
-                threshold=plan.threshold,
+                threshold=threshold,
                 limit=plan.limit,
                 filter=plan.filter,
                 scan=scan,
-                over_fetch=plan.limit * self.index.estimated_vectors * 2 + 1,
+                over_fetch=plan.limit * index.estimated_vectors * 2 + 1,
                 exclude=list(dict.fromkeys([plan.key, *keys])),
             )
-            similar = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
-            if scan == "index" and self.index.beam_size:
-                session = [self.sql.beam_size_statement(self.index.beam_size)]
-        return SimilarRead(scores=scores, similar=similar, session=session)
+            built[scan] = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
+        if not above:
+            return SimilarRead(
+                scores=scores, similar=built["exact"], session=[], threshold=threshold
+            )
+        session = [self.sql.beam_size_statement(index.beam_size)] if index.beam_size else []
+        return SimilarRead(
+            scores=scores,
+            similar=built["index"],
+            session=session,
+            exact=built["exact"],
+            threshold=threshold,
+        )
 
     def _conflicts(
         self,
@@ -1547,10 +1665,11 @@ class BaseCockroachDBStore:
     ) -> Conflicts:
         """Merge what both candidate reads found into Conflicts.
 
-        ``found`` are the rows of ``similar.statements()``, in order, or
-        nothing when there were none. Without a valid_at from the caller, the
-        new memory is valid from default_valid_at. The target's and each
-        candidate's (version, updated_at) go into the state for resolve().
+        ``found`` are the rows of ``similar.statements()``, in order, after
+        ``similar.fill_exact``, or nothing when there were none. Without a
+        valid_at from the caller, the new memory is valid from
+        default_valid_at. The state for resolve() records which store made
+        it, and the target's and each candidate's (version, updated_at).
         """
         split = len(similar.scores)
         candidates = merge_candidates(
@@ -1571,6 +1690,7 @@ class BaseCockroachDBStore:
             valid_at=valid_at,
         )
         state = ConflictsState(
+            store=self._identity(),
             plan=plan,
             vector_rows=tuple(vector_rows),
             target=token,

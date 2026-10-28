@@ -1122,7 +1122,8 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
     """The exact form ranks every vector of the namespace; the index form keeps a window.
 
     Both skip the excluded keys, filter, check expiry and keep the scores at
-    or above the threshold, best first, up to the limit.
+    or above the threshold, best first, up to the limit. The index form also
+    reports the window's size and lowest score, for needs_exact_candidates.
     """
     sql = StoreSQL("public", "store", index=_make_index())
     kwargs = {"threshold": 0.8, "limit": 5, "filter": {"x": 1}, "over_fetch": 11}
@@ -1156,21 +1157,37 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
         exclude=["k", "s"],
         **kwargs,  # type: ignore[arg-type]
     )
-    window, rest = index_sql.split("\n),\nbest AS (", 1)
+    nearest, rest = index_sql.split("\n),\nwindow_stats AS (\n", 1)
     # The window orders by distance with a LIMIT, which the C-SPANN index serves,
     # and has no other filter
-    assert window.startswith("WITH nearest AS (")
-    assert "FROM public.store_vectors\n    WHERE prefix = %s\n" in window
-    assert "ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s" in window
-    assert "expires_at" not in window and "value" not in window and "ANY(" not in window
-    assert "JOIN public.store AS i ON r.prefix = i.prefix AND r.key = i.key" in rest
+    assert nearest.startswith("WITH nearest AS (")
+    assert "FROM public.store_vectors\n    WHERE prefix = %s\n" in nearest
+    assert nearest.endswith("ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s")
+    assert "expires_at" not in nearest and "value" not in nearest and "ANY(" not in nearest
+    # The window's size and lowest score, over every vector in it: before the
+    # filter, the expiry check and the excluded keys
+    stats, rest = rest.split("\n),\nbest AS (\n", 1)
+    assert stats == (
+        "    SELECT count(*) AS window_size, min(1 - distance) AS lowest_score\n    FROM nearest"
+    )
+    best, rest = rest.split("\n),\nhits AS (\n", 1)
+    assert "JOIN public.store AS i ON r.prefix = i.prefix AND r.key = i.key" in best
     assert (
         "WHERE NOT (i.key = ANY(CAST(%s AS STRING[]))) AND i.value -> %s = CAST(%s AS JSONB) "
         "AND (i.expires_at IS NULL OR i.expires_at > now())"
-    ) in rest
-    assert "SELECT DISTINCT ON (i.key)" in rest and "ORDER BY i.key, r.distance" in rest
-    assert rest.endswith(
-        "WHERE 1 - distance >= CAST(%s AS FLOAT8)\nORDER BY score DESC, key\nLIMIT %s"
+    ) in best
+    assert "SELECT DISTINCT ON (i.key)" in best and "ORDER BY i.key, r.distance" in best
+    hits, outer = rest.split("\n)\nSELECT ", 1)
+    assert hits.endswith(
+        "    FROM best\n    WHERE 1 - distance >= CAST(%s AS FLOAT8)\n"
+        "    ORDER BY score DESC, key\n    LIMIT %s"
+    )
+    # Every row carries the window's size and lowest score. Without a
+    # candidate one row still does, with NULL candidate columns
+    assert outer == (
+        "h.key, h.value, h.created_at, h.updated_at, h.version, h.valid_at, h.provenance, "
+        "h.confirmed_at, h.confirmations, h.write_id, h.score, w.window_size, w.lowest_score\n"
+        "FROM window_stats AS w\nLEFT JOIN hits AS h ON TRUE\nORDER BY h.score DESC, h.key"
     )
     assert index_params == [
         QUERY_VECTOR,
@@ -1196,6 +1213,7 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
         )
         assert "<->" in l2_sql and "<=>" not in l2_sql
         assert "-distance AS score" in l2_sql and "WHERE -distance >= CAST(%s AS FLOAT8)" in l2_sql
+        assert ("min(-distance) AS lowest_score" in l2_sql) == (scan == "index")
 
     with pytest.raises(ValueError, match="scan"):
         sql.similar_candidates("a", scan="fast", exclude=[], **kwargs)  # type: ignore[arg-type]

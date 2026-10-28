@@ -14,7 +14,7 @@ import concurrent.futures
 import logging
 import threading
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Literal
@@ -139,7 +139,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             reconcile_scan_limit: The most vectors a namespace may hold for
                 find_conflicts to rank every one of them, by primary key
                 (default 2000). A namespace with more finds its similar
-                candidates through the C-SPANN index, which may miss some.
+                candidates through the C-SPANN index, and ranks every vector
+                only when the index's window may have left matches out.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
@@ -696,8 +697,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         the database's clock, the key and slot matches and the namespace's
         vector count, then the similar memories and the scores. A namespace
         with at most ``reconcile_scan_limit`` vectors has all of them ranked.
-        A larger one takes its similar candidates from the C-SPANN index,
-        which may miss some.
+        A larger one takes its similar candidates from a window of the
+        C-SPANN index. When that window holds nothing below ``threshold``,
+        matches may lie beyond it, and one more round trip ranks every
+        vector of the namespace.
 
         Args:
             namespace: The new memory's namespace. It cannot be empty.
@@ -755,11 +758,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         )
         similar = self._similar_read(plan, vector_rows, read)
         statements = similar.statements()
-        found = (
+        found: Sequence[Sequence[dict[str, Any]]] = (
             self._read_all(statements, "store find conflicts similar", similar.session)
             if statements
             else []
         )
+        exact = similar.exact_statements(found)
+        if exact:
+            found = similar.fill_exact(found, self._read_all(exact, "store find conflicts exact"))
         return self._conflicts(plan, vector_rows, read, similar, found)
 
     def record(self, namespace: tuple[str, ...], key: str) -> MemoryRecord | None:

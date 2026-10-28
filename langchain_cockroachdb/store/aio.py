@@ -164,7 +164,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             reconcile_scan_limit: The most vectors a namespace may hold for
                 find_conflicts to rank every one of them, by primary key
                 (default 2000). A namespace with more finds its similar
-                candidates through the C-SPANN index, which may miss some.
+                candidates through the C-SPANN index, and ranks every vector
+                only when the index's window may have left matches out.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
