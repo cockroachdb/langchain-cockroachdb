@@ -56,9 +56,9 @@ def seat_index(**extra: Any) -> dict[str, Any]:
 
 
 def drop_store_tables(libpq_url: str, table_name: str, schema: str = "public") -> None:
-    """Drop the items, vectors and migrations tables of a store."""
+    """Drop the items, vectors, migrations and history tables of a store."""
     with psycopg.connect(libpq_url, autocommit=True) as conn:
-        for suffix in ("", "_vectors", "_migrations"):
+        for suffix in ("", "_vectors", "_migrations", "_history"):
             conn.execute(f"DROP TABLE IF EXISTS {schema}.{table_name}{suffix} CASCADE")
 
 

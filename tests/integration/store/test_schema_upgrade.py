@@ -1,10 +1,13 @@
 """Migration 2 on a 0.5 table, and the write id every put batch carries.
 
-A store reads the latest recorded migration once, before its first write.
-Until setup() records migration 2 it writes with the 0.5 statements, so a
-table that 0.5.x set up keeps working. After it, every write bumps the row's
-version and stores the batch's write id, and a batch retried after its
-commit changes nothing.
+A store reads the latest recorded migration before its first write, and
+trusts migration 2 for good once it has seen it. Until setup() records
+migration 2 the store writes with the 0.5 statements, so a table that 0.5.x
+set up keeps working. It reads the migration again after
+_SCHEMA_RECHECK_SECONDS, or at once for a method that needs migration 2, so
+it sees a setup() that another process ran. After migration 2, every write
+bumps the row's version and stores the batch's write id, and a batch retried
+after its commit changes nothing.
 """
 
 from __future__ import annotations

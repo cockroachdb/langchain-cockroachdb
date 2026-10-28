@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 
 from langgraph.store.base import (
     GetOp,
+    InvalidNamespaceError,
     Item,
     ListNamespacesOp,
     Op,
@@ -32,6 +33,7 @@ from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
 from langchain_cockroachdb.indexes import _find_vector_index
 from langchain_cockroachdb.store.config import (
+    ResolvedHistory,
     ResolvedIndex,
     ResolvedTTL,
     resolve_ttl_config,
@@ -43,6 +45,7 @@ from langchain_cockroachdb.store.namespaces import (
     to_text,
     validate_labels,
 )
+from langchain_cockroachdb.store.reconcile import MemoryVersion
 from langchain_cockroachdb.store.sql import (
     MAX_SEARCH_NAMESPACES,
     MIGRATION_RECONCILE,
@@ -71,6 +74,18 @@ def _check_paging(limit: int, offset: int) -> None:
         raise ValueError(f"limit must be non-negative, got {limit}")
     if offset < 0:
         raise ValueError(f"offset must be non-negative, got {offset}")
+
+
+def _memory_prefix(namespace: Sequence[str], method: str) -> str:
+    """The namespace text of one memory, for methods that take a namespace and a key.
+
+    Raises:
+        InvalidNamespaceError: If the namespace is empty or a label is invalid.
+    """
+    labels = validate_labels(namespace)
+    if not labels:
+        raise InvalidNamespaceError(f"{method} needs a non-empty namespace")
+    return to_text(labels)
 
 
 def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fetch: int) -> bool:
@@ -155,6 +170,26 @@ class PutPlan:
     embed_requests: list[tuple[str, str, str, str]] = field(default_factory=list)
     reindexed: dict[str, list[str]] = field(default_factory=dict)
     write_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SchemaCheck:
+    """What the schema check found.
+
+    Attributes:
+        columns: Whether setup() has applied migration 2, which adds the
+            columns that versions, reconciliation and history use.
+        history: Whether the history table exists. Always False on a store
+            without history, which never looks for it.
+    """
+
+    columns: bool
+    history: bool
+
+    @property
+    def history_ready(self) -> bool:
+        """Whether writes can keep history: the columns and the history table exist."""
+        return self.columns and self.history
 
 
 @dataclass
@@ -347,32 +382,57 @@ def _row_to_search_item(row: dict[str, Any]) -> SearchItem:
     )
 
 
+def _row_to_version(namespace: tuple[str, ...], key: str, row: Mapping[str, Any]) -> MemoryVersion:
+    """Build a MemoryVersion from a row of StoreSQL.history_versions."""
+    return MemoryVersion(
+        namespace=namespace,
+        key=key,
+        version=int(row["version"]),
+        value=row["value"],
+        provenance=row["provenance"],
+        valid_at=row["valid_at"],
+        invalid_at=row["invalid_at"],
+        written_at=row["written_at"],
+        ended_at=row["ended_at"],
+        reason=row["reason"],
+        superseded_by=row["superseded_by"],
+    )
+
+
 class BaseCockroachDBStore:
     """State and planning shared by CockroachDBStore and its async twin."""
 
     # Names the store in log and error messages of the psycopg machinery
     component: ClassVar[str] = "store"
     _log: ClassVar[logging.Logger] = logger
-    # Seconds a plain write trusts a schema check that found no migration 2.
-    # Another process may run setup() meanwhile, so after that the next write
-    # reads the schema again. Found columns are trusted for good.
+    # Seconds a plain write trusts a schema check that found no migration 2,
+    # or no history table. Another process may run setup() meanwhile, so
+    # after that the next write reads the schema again. What was found is
+    # trusted for good.
     _SCHEMA_RECHECK_SECONDS: ClassVar[float] = 60.0
 
     sql: StoreSQL
     index: ResolvedIndex | None
     ttl: ResolvedTTL
+    # Version history settings, or None for a store without history
+    _history: ResolvedHistory | None
     # Whether a TTL configuration was given. Without one the store never
     # refreshes an expiry and setup() leaves the table TTL settings alone.
     _ttl_given: bool
     _warned_query_without_index: bool
     # Pooled batches run concurrently; the lock makes the warning appear once
     _warning_lock: threading.Lock
-    # Whether migration 2's columns exist. None until the schema check
-    # (_reconcile_columns, or _areconcile_columns on the async store) reads
-    # the latest migration. setup() clears it after migrating.
+    # Whether migration 2's columns exist, and on a store with history whether
+    # the history table does. None until the schema check (_schema, or
+    # _aschema on the async store) reads them. setup() clears them once it
+    # has created what they describe.
     _columns_ready: bool | None
-    # When the schema check last read it, by time.monotonic()
-    _columns_read_at: float
+    _history_ready: bool | None
+    # When the schema check last read them, by time.monotonic()
+    _schema_read_at: float
+    # Pooled batches check the schema concurrently. The lock keeps a read
+    # that finishes late from replacing a True another read cached.
+    _schema_lock: threading.Lock
 
     def _configure(
         self,
@@ -381,60 +441,143 @@ class BaseCockroachDBStore:
         ttl: Any,
         table_name: str,
         schema: str,
+        history: ResolvedHistory | None = None,
     ) -> None:
         """Set the shared state from validated settings."""
         self.index = index
         self.ttl = resolve_ttl_config(ttl)
+        self._history = history
         self._ttl_given = ttl is not None
         self.sql = StoreSQL(schema, table_name, index=index)
         self._warned_query_without_index = False
         self._warning_lock = threading.Lock()
         self._columns_ready = None
-        self._columns_read_at = 0.0
+        self._history_ready = None
+        self._schema_read_at = 0.0
+        self._schema_lock = threading.Lock()
 
-    def _cached_columns(self, *, refresh: bool) -> bool | None:
-        """What the schema check can answer without a read, or None to read.
+    def _trusted(self, ready: bool | None, *, refresh: bool) -> bool | None:
+        """A cached schema answer, or None when the schema check must read it again.
 
-        True holds for good: migrations are never undone. False holds for
-        _SCHEMA_RECHECK_SECONDS after the read that found it, because another
-        process may run setup() meanwhile, and not at all with ``refresh``.
+        True holds for good: migrations are never undone, and setup() never
+        drops a table. False holds for _SCHEMA_RECHECK_SECONDS after the read
+        that found it, because another process may run setup() meanwhile,
+        and not at all with ``refresh``.
         """
-        ready = self._columns_ready
         if ready is False and (
-            refresh or time.monotonic() - self._columns_read_at >= self._SCHEMA_RECHECK_SECONDS
+            refresh or time.monotonic() - self._schema_read_at >= self._SCHEMA_RECHECK_SECONDS
         ):
             return None
         return ready
+
+    def _cached_columns(self, *, refresh: bool) -> bool | None:
+        """Whether migration 2's columns exist, if the cache can answer, else None."""
+        return self._trusted(self._columns_ready, refresh=refresh)
+
+    def _cached_history(self, *, refresh: bool) -> bool | None:
+        """Whether the history table exists, if the cache can answer, else None.
+
+        A store without history never looks for the table: always False.
+        """
+        if self._history is None:
+            return False
+        return self._trusted(self._history_ready, refresh=refresh)
 
     def _cache_columns(self, rows: Sequence[Mapping[str, Any]]) -> bool:
         """Cache and return whether migration 2's columns exist.
 
         ``rows`` are what StoreSQL.migration_version returned: the latest
-        migration recorded, or no row.
+        migration recorded, or no row. A True cached before is kept: a read
+        that started before another process ran setup() can finish late.
         """
         version = int(rows[0]["v"]) if rows else -1
-        ready = version >= MIGRATION_RECONCILE
-        self._columns_read_at = time.monotonic()
-        self._columns_ready = ready
+        with self._schema_lock:
+            ready = version >= MIGRATION_RECONCILE or self._columns_ready is True
+            self._schema_read_at = time.monotonic()
+            self._columns_ready = ready
         return ready
 
-    def _require_columns(self) -> None:
+    def _cache_history(self, rows: Sequence[Mapping[str, Any]]) -> bool:
+        """Cache and return whether the history table exists.
+
+        ``rows`` are what StoreSQL.history_exists returned. A True cached
+        before is kept, as in _cache_columns.
+        """
+        with self._schema_lock:
+            ready = bool(rows and rows[0]["ready"]) or self._history_ready is True
+            self._schema_read_at = time.monotonic()
+            self._history_ready = ready
+        return ready
+
+    def _schema_statements(self) -> list[tuple[str, list]]:
+        """The schema check's reads, sent as one round trip.
+
+        The latest migration, and on a store with history whether the
+        history table exists.
+        """
+        statements: list[tuple[str, list]] = [(self.sql.migration_version(), [])]
+        if self._history is not None:
+            statements.append(self.sql.history_exists())
+        return statements
+
+    def _cached_schema(self, *, refresh: bool) -> SchemaCheck | None:
+        """What the schema check can answer without a read, or None to read."""
+        columns = self._cached_columns(refresh=refresh)
+        history = self._cached_history(refresh=refresh)
+        if columns is None or history is None:
+            return None
+        return SchemaCheck(columns=columns, history=history)
+
+    def _cache_schema(self, found: Sequence[Sequence[Mapping[str, Any]]]) -> SchemaCheck:
+        """Cache and return what the reads of _schema_statements found."""
+        columns = self._cache_columns(found[0])
+        history = self._cache_history(found[1]) if self._history is not None else False
+        return SchemaCheck(columns=columns, history=history)
+
+    def _require_columns(self, ready: bool) -> None:
         """Raise ValueError unless setup() has applied migration 2.
 
-        Reads what the schema check cached, so run that first, with
-        refresh=True: _reconcile_columns, or _areconcile_columns on the async
-        store. A store that found no migration 2 earlier then sees a setup()
-        that another process ran since.
+        ``ready`` is what the schema check returned, run with refresh=True:
+        _reconcile_columns, or _areconcile_columns on the async store. A
+        store that found no migration 2 earlier then sees a setup() that
+        another process ran since.
 
         Raises:
             ValueError: If the items table lacks the columns that
                 reconciliation needs.
         """
-        assert self._columns_ready is not None, "the schema check has not run"
-        if not self._columns_ready:
+        if not ready:
             raise ValueError(
                 f"The table {self.sql.items} does not have the columns this method "
                 "needs yet; run setup() to add them."
+            )
+
+    def _require_history(self) -> None:
+        """Raise ValueError unless the store keeps history.
+
+        Raises:
+            ValueError: If the store was created without history.
+        """
+        if self._history is None:
+            raise ValueError(
+                "This store keeps no history. Create it with history=True, or a "
+                "HistoryConfig, and run setup() to create the history table."
+            )
+
+    def _require_history_table(self, schema: SchemaCheck) -> None:
+        """Raise ValueError unless setup() has made the store ready to keep history.
+
+        ``schema`` is what the schema check returned. Read it again with
+        refresh=True before calling this with a check that found no history
+        table, so a setup() that another process ran since is seen.
+
+        Raises:
+            ValueError: If migration 2's columns or the history table are missing.
+        """
+        if not schema.history_ready:
+            raise ValueError(
+                f"The history table {self.sql.history} does not exist yet; "
+                "run setup() to create it."
             )
 
     def _refresh(self, refresh_ttl: bool) -> bool:
@@ -778,9 +921,13 @@ class BaseCockroachDBStore:
         vector upserts, and the deletes with their vectors. ``vector_rows``
         come from ``_vector_rows``, computed once before the first attempt.
         With a write id on the plan, the item upserts store it and bump each
-        row's version. Without one they are the 0.5 statements.
+        row's version. Without one they are the 0.5 statements. On a store
+        with history, the archive statements come before all of them.
         """
+        keeps_history = self._history is not None and plan.write_id is not None
         statements: list[tuple[str, list]] = []
+        if keeps_history:
+            statements.extend(self._archive_statements(plan))
         for prefix, keys in plan.reindexed.items():
             statements.append(self.sql.delete_vectors(prefix, keys))
         rows: Sequence[ItemRow] | Sequence[ItemRowV2] = plan.items
@@ -790,7 +937,9 @@ class BaseCockroachDBStore:
         for start in range(0, len(rows), ITEMS_PER_STATEMENT):
             statements.append(
                 self.sql.upsert_items(
-                    rows[start : start + ITEMS_PER_STATEMENT], write_id=plan.write_id
+                    rows[start : start + ITEMS_PER_STATEMENT],
+                    write_id=plan.write_id,
+                    history=keeps_history,
                 )
             )
         for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT):
@@ -802,6 +951,31 @@ class BaseCockroachDBStore:
             if self.index is not None:
                 statements.append(self.sql.delete_vectors(prefix, keys))
         return statements
+
+    def _archive_statements(self, plan: PutPlan) -> list[tuple[str, list]]:
+        """The statements that keep the versions a put batch ends, on a store with history.
+
+        Each put key's live version is archived as overwritten and each
+        deleted key's as deleted, both invalid from now. Keys with no live
+        row archive nothing. One statement per namespace and reason.
+        """
+        assert self._history is not None and plan.write_id is not None
+        overwritten: dict[str, list[str]] = {}
+        for prefix, key, _, _ in plan.items:
+            overwritten.setdefault(prefix, []).append(key)
+        return [
+            self.sql.archive(
+                prefix,
+                keys,
+                reason=reason,
+                superseded_by=None,
+                invalid_at=None,
+                write_id=plan.write_id,
+                ttl_days=self._history.ttl_days,
+            )
+            for reason, by_prefix in (("overwritten", overwritten), ("deleted", plan.deletes))
+            for prefix, keys in by_prefix.items()
+        ]
 
     def _listing_statement(self, op: ListNamespacesOp) -> tuple[str, list]:
         """The statement for one list_namespaces op.

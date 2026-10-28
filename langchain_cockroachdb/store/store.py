@@ -2,8 +2,9 @@
 
 Provides the interface of langgraph-checkpoint-postgres's PostgresStore on
 CockroachDB. Every operation retries transient errors under the store's
-RetryPolicy. Every write is an UPSERT, a DELETE, or an UPDATE that pushes
-back an expiry, so a retry after an ambiguous result is safe.
+RetryPolicy. Every write is an UPSERT, a DELETE, an UPDATE that pushes back
+an expiry, or an INSERT into history that skips versions already there, so
+a retry after an ambiguous result is safe.
 """
 
 from __future__ import annotations
@@ -39,14 +40,21 @@ from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
     PutPlan,
+    SchemaCheck,
+    _check_paging,
+    _memory_prefix,
+    _row_to_version,
 )
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
+    HistoryConfig,
     PoolConfig,
+    resolve_history_config,
     resolve_index_config,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
+from langchain_cockroachdb.store.reconcile import MemoryVersion
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
     add one before the searches, to find their namespaces, and one after them
     when a search must run again exactly. A flat store adds neither. The
     long-term memory guide explains why.
+
+    With ``history``, a batch that overwrites or deletes a memory first
+    copies the version it ends into a history table, in its transaction.
+    ``delete`` then keeps the memory in history; ``purge`` removes a memory
+    with its history, and ``history`` lists the old versions.
 
     Example:
         ```python
@@ -97,6 +110,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         pipe: Pipeline | None = None,
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
+        history: bool | HistoryConfig | None = None,
         retry_policy: RetryPolicy | None = None,
         table_name: str = "store",
         schema: str = "public",
@@ -112,21 +126,32 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 configured fields of each item.
             ttl: TTL settings. When given, setup() also turns on CockroachDB
                 row-level TTL for expired rows.
+            history: Version history: True, or a HistoryConfig to give old
+                versions a TTL. setup() then creates the history table, and
+                every batch keeps the versions it overwrites or deletes there.
+                Default None, no history.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
 
         Raises:
             ValueError: If a pipeline is given with a pool, or a name or the
-                TTL or index settings are invalid
+                TTL, index or history settings are invalid
         """
         # Validated first, so a bad index fails before anything starts
         resolved_index = resolve_index_config(index)
+        resolved_history = resolve_history_config(history)
         if isinstance(conn, ConnectionPool) and pipe is not None:
             raise ValueError(
                 "Pipeline should be used only with a single Connection, not ConnectionPool."
             )
-        self._configure(index=resolved_index, ttl=ttl, table_name=table_name, schema=schema)
+        self._configure(
+            index=resolved_index,
+            ttl=ttl,
+            table_name=table_name,
+            schema=schema,
+            history=resolved_history,
+        )
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
         self.conn = conn
@@ -150,6 +175,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         pool_config: PoolConfig | None = None,
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
+        history: bool | HistoryConfig | None = None,
         retry_policy: RetryPolicy | None = None,
         connect_timeout: float | None = 10.0,
         prepare_threshold: int | None = 5,
@@ -166,6 +192,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             pool_config: Open a ConnectionPool with these settings instead of one connection
             index: Semantic search settings
             ttl: TTL settings
+            history: Version history settings (default None, no history)
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
             prepare_threshold: psycopg prepared statement threshold, None to disable
@@ -190,6 +217,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 pipe=pipe,
                 index=index,
                 ttl=ttl,
+                history=history,
                 retry_policy=policy,
                 table_name=table_name,
                 schema=schema,
@@ -232,8 +260,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         are recorded with ON CONFLICT DO NOTHING. With an index, it creates
         the vectors table and its C-SPANN index (unless ``flat``) on every
         call, then checks an existing index against the configuration. With
-        a TTL configuration, it then turns on CockroachDB row-level TTL on
-        ``expires_at``.
+        history, it creates the history table, and with ``ttl_days`` turns on
+        CockroachDB row-level TTL there. With a TTL configuration, it then
+        turns on CockroachDB row-level TTL on ``expires_at``.
 
         On CockroachDB v25.4 a TTL change fails while another setup() changes
         the same table. That error is retried under the store's retry policy,
@@ -286,6 +315,13 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             self._run_ddl(statement, "store vector setup")
         if self.index is not None:
             self._check_index()
+        if self._history is not None:
+            policy = schema_change_policy(self.retry_policy)
+            for statement in self.sql.history_statements(self._history.ttl_days):
+                self._run_ddl(statement, "store history setup", policy=policy)
+            # A write before setup() may have found no history table. The
+            # next write reads the schema again.
+            self._history_ready = None
         if self._ttl_given:
             policy = schema_change_policy(self.retry_policy)
             for statement in self.sql.ttl_statements(self.ttl.cron):
@@ -400,6 +436,22 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         self._check_vector_index(self._retry(read, label="store index check"))
 
+    def _schema(self, *, refresh: bool = False) -> SchemaCheck:
+        """What the schema check knows: migration 2's columns and the history table.
+
+        It reads the latest migration, and on a store with history whether
+        the history table exists, in one round trip. It reads them the first
+        time, and again when an answer it found missing is older than
+        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. What it found present
+        it trusts for good.
+        """
+        schema = self._cached_schema(refresh=refresh)
+        if schema is None:
+            schema = self._cache_schema(
+                self._read_all(self._schema_statements(), "store schema check")
+            )
+        return schema
+
     def _reconcile_columns(self, *, refresh: bool = False) -> bool:
         """Whether migration 2's columns exist, as the schema check last read it.
 
@@ -410,11 +462,24 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         records migration 2, puts write with the 0.5 statements and those
         methods raise ValueError.
         """
-        ready = self._cached_columns(refresh=refresh)
-        if ready is None:
-            [rows] = self._read_all([(self.sql.migration_version(), [])], "store schema check")
-            ready = self._cache_columns(rows)
-        return ready
+        return self._schema(refresh=refresh).columns
+
+    def _history_schema(self) -> SchemaCheck:
+        """The schema check for an operation that needs the history table.
+
+        Before it refuses, it reads the schema again, so a setup() that
+        another process ran since is seen.
+
+        Raises:
+            ValueError: If the store keeps no history, or setup() has not
+                created the history table yet.
+        """
+        self._require_history()
+        schema = self._schema()
+        if not schema.history_ready:
+            schema = self._schema(refresh=True)
+        self._require_history_table(schema)
+        return schema
 
     def _run_puts(self, plan: PutPlan) -> None:
         # Embed once, before the first attempt: a retry reuses the vectors
@@ -424,9 +489,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 [text for _, _, _, text in plan.embed_requests]
             )
         vector_rows = self._vector_rows(plan, embeddings)
+        # With history, a write refuses to run until setup() has created
+        # the history table, since it could not keep what it replaces
+        schema = self._history_schema() if self._history is not None else self._schema()
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
-        if self._reconcile_columns():
+        if schema.columns:
             plan.write_id = str(uuid.uuid4())
         statements = self._write_statements(plan, vector_rows)
         if not statements:
@@ -448,7 +516,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """Delete every item in a namespace and its descendants.
 
         ``("user", "a")`` deletes ``("user", "a")`` and ``("user", "a", "b")``,
-        not ``("user", "ab")``. One statement deletes the items and their vectors.
+        not ``("user", "ab")``. One statement deletes the items and their
+        vectors, and on a store with history their history too.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
@@ -459,6 +528,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Raises:
             InvalidNamespaceError: If the prefix is empty or a label is invalid
+            ValueError: If the store keeps history and setup() has not
+                created the history table
         """
         prefix = validate_labels(namespace_prefix)
         if not prefix:
@@ -467,10 +538,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 "store on purpose, delete each top-level namespace from list_namespaces("
                 "max_depth=1), or drop the store's tables."
             )
-        statement = self.sql.delete_namespace(prefix)
+        if self._history is not None:
+            self._history_schema()
+        statement = self.sql.delete_namespace(prefix, history=self._history is not None)
 
         def write() -> int:
-            # One statement, so items and vectors commit together. pipeline=True
+            # One statement, so items, vectors and history commit together. pipeline=True
             # makes a component-wide pipeline sync, which commits it
             with self._cursor(
                 pipeline=True,
@@ -481,6 +554,78 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 return len(cur.fetchall())
 
         return self._retry(write, label="store delete namespace")
+
+    def history(
+        self, namespace: tuple[str, ...], key: str, *, limit: int = 20
+    ) -> list[MemoryVersion]:
+        """The old versions of a memory, newest first.
+
+        A store with history keeps every version that a put overwrites
+        (reason "overwritten") or a delete ends ("deleted"). The live value
+        is not one of them; get() returns it.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+            limit: Most versions to return (default 20).
+
+        Returns:
+            Up to ``limit`` versions, highest version first. Versions past
+            the history's ``ttl_days`` are left out.
+
+        Raises:
+            ValueError: If the store keeps no history (create it with
+                history=True and run setup()), setup() has not created the
+                history table, or ``limit`` is negative
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+        """
+        prefix = _memory_prefix(namespace, "history")
+        _check_paging(limit, 0)
+        self._history_schema()
+        statement = self.sql.history_versions(prefix, str(key), limit=limit)
+        [rows] = self._read_all([statement], "store history")
+        return [_row_to_version(tuple(namespace), str(key), row) for row in rows]
+
+    def purge(self, namespace: tuple[str, ...], key: str) -> bool:
+        """Forget a memory: delete the item, its vectors and its history.
+
+        On a store with history, delete() keeps the version it ends, so
+        purge is how to remove a memory for good. One statement deletes all
+        of it.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+
+        Returns:
+            Whether anything was deleted: the memory, or only its history
+            after a delete. If a retry follows a commit whose result was
+            lost, the retry finds nothing and returns False.
+
+        Raises:
+            ValueError: If the store keeps no history (create it with
+                history=True and run setup(); without history, delete()
+                already removes a memory and its vectors), or setup() has
+                not created the history table
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+        """
+        prefix = _memory_prefix(namespace, "purge")
+        self._history_schema()
+        statement = self.sql.purge(prefix, str(key))
+
+        def write() -> bool:
+            # One statement, so the item, its vectors and its history commit
+            # together. pipeline=True makes a component-wide pipeline sync
+            with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="store purge",
+            ) as cur:
+                cur.execute(*statement)
+                row = cur.fetchone()
+                return row is not None and bool(row["removed"])
+
+        return self._retry(write, label="store purge")
 
     def reconcile(
         self,
@@ -506,8 +651,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Raises:
             ValueError: If setup() has not applied migration 2.
         """
-        self._reconcile_columns(refresh=True)
-        self._require_columns()
+        self._require_columns(self._reconcile_columns(refresh=True))
         raise NotImplementedError("reconcile arrives in a later task")
 
     def sweep_ttl(self) -> int:

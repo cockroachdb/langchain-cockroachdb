@@ -7,6 +7,8 @@ from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
+    ResolvedHistory,
+    resolve_history_config,
     resolve_index_config,
     resolve_ttl_config,
     ttl_job_cron_for,
@@ -175,3 +177,22 @@ def test_resolve_index_rejects_a_flat_that_is_not_a_bool():
     for flat in (True, False):
         resolved = resolve_index_config({"dims": 3, "embed": FakeEmbeddings(size=3), "flat": flat})
         assert resolved is not None and resolved.flat is flat
+
+
+def test_resolve_history_config():
+    """history is off by default, True keeps history forever, ttl_days expires it."""
+    assert resolve_history_config(None) is None
+    assert resolve_history_config(False) is None
+    assert resolve_history_config(True) == ResolvedHistory(ttl_days=None)
+    assert resolve_history_config({}) == ResolvedHistory(ttl_days=None)
+    assert resolve_history_config({"ttl_days": 30}) == ResolvedHistory(ttl_days=30)
+    resolved = resolve_history_config({"ttl_days": 0.5})
+    assert resolved is not None and resolved.ttl_days == 0.5
+
+    for bad in (0, -1, -0.5, float("nan"), float("inf"), "30", True):
+        with pytest.raises(ValueError, match="ttl_days"):
+            resolve_history_config({"ttl_days": bad})  # type: ignore[typeddict-item]
+    # Anything but a bool, None or a dict is a mistake, such as history=1
+    for bad in (1, "yes", ["ttl_days"]):
+        with pytest.raises(ValueError, match="history"):
+            resolve_history_config(bad)  # type: ignore[arg-type]

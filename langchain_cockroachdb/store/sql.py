@@ -89,6 +89,7 @@ class StoreSQL:
         self.items = f"{self._schema}.{self._table_name}"
         self.vectors = f"{self._schema}.{self._table_name}_vectors"
         self.migrations_table = f"{self._schema}.{self._table_name}_migrations"
+        self.history = f"{self._schema}.{self._table_name}_history"
 
         # Vector index name (public)
         self.vector_index_name = f"{self._table_name}_vectors_embedding_idx"
@@ -172,6 +173,48 @@ class StoreSQL:
             stmts.append(index_sql + ";")
 
         return stmts
+
+    def history_statements(self, ttl_days: float | None) -> list[str]:
+        """Return idempotent DDL statements for the history table.
+
+        setup() runs them only on a store with history, each on its own.
+
+        Args:
+            ttl_days: The history's TTL in days, or None to keep it. With a
+                TTL, CockroachDB's row-level TTL deletes a version once its
+                ``expires_at`` passes. The archive statement sets that.
+
+        Returns:
+            [history table], and the TTL setting with ``ttl_days``.
+        """
+        stmts = [
+            f"""CREATE TABLE IF NOT EXISTS {self.history} (
+    prefix TEXT NOT NULL,
+    key TEXT NOT NULL,
+    version INT8 NOT NULL,
+    value JSONB NOT NULL,
+    provenance JSONB,
+    valid_at TIMESTAMPTZ NOT NULL,
+    invalid_at TIMESTAMPTZ,
+    written_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL,
+    superseded_by TEXT,
+    write_id UUID,
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (prefix, key, version)
+);"""
+        ]
+        if ttl_days is not None:
+            stmts.append(
+                f"ALTER TABLE {self.history} SET "
+                "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');"
+            )
+        return stmts
+
+    def history_exists(self) -> tuple[str, list]:
+        """The statement that tells whether the history table exists, as ``ready``."""
+        return ("SELECT to_regclass(%s) IS NOT NULL AS ready", [self.history])
 
     def show_create_vectors(self) -> str:
         """The statement that reads the vectors table's definition.
@@ -320,7 +363,11 @@ WHERE {where}"""
         )
 
     def upsert_items(
-        self, rows: Sequence[ItemRow] | Sequence[ItemRowV2], *, write_id: str | None = None
+        self,
+        rows: Sequence[ItemRow] | Sequence[ItemRowV2],
+        *,
+        write_id: str | None = None,
+        history: bool = False,
     ) -> tuple[str, list]:
         """Build multi-row INSERT for items with ON CONFLICT.
 
@@ -336,15 +383,22 @@ WHERE {where}"""
                 provenance_json, valid_at) tuples with it. Callers must dedupe
                 (prefix, key) rows (ON CONFLICT cannot touch a row twice).
             write_id: The batch's write id, chosen before its first attempt.
+            history: For a store with history. A new row's version then
+                follows the highest version its key has in the history
+                table, so a key written again after a delete never reuses an
+                archived version. Needs ``write_id``.
 
         Returns:
             Tuple of (SQL, parameters).
 
         Raises:
-            ValueError: If rows is empty, or a row has the wrong number of fields.
+            ValueError: If rows is empty, a row has the wrong number of
+                fields, or ``history`` is set without ``write_id``.
         """
         if not rows:
             raise ValueError("rows cannot be empty")
+        if history and write_id is None:
+            raise ValueError("upsert_items with history needs a write id")
 
         columns = [
             ("prefix", "STRING"),
@@ -382,8 +436,17 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     ttl_minutes = EXCLUDED.ttl_minutes"""
             return (sql, params)
 
-        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id)
-SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID)
+        # A new row starts at version 1, the column's default, or with
+        # history after the versions its key already has there
+        version_column, version_value = "", ""
+        if history:
+            version_column = ", version"
+            version_value = (
+                f",\n    COALESCE((SELECT max(h.version) FROM {self.history} AS h "
+                "WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key), 0) + 1"
+            )
+        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{version_column})
+SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){version_value}
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key) DO UPDATE SET
     value = EXCLUDED.value,
@@ -923,14 +986,110 @@ LIMIT %s OFFSET %s"""
 
         return (sql, params)
 
-    def delete_namespace(self, namespace_prefix: Sequence[str]) -> tuple[str, list]:
+    def archive(
+        self,
+        prefix: str,
+        keys: Sequence[str],
+        *,
+        reason: str,
+        superseded_by: str | None,
+        invalid_at: datetime | None,
+        write_id: str,
+        ttl_days: float | None,
+    ) -> tuple[str, list]:
+        """Build the INSERT that copies live items into the history table.
+
+        A write runs it first, in the write's transaction, before it
+        overwrites or deletes the items. It copies each live item of ``keys``
+        with its version, value, provenance and valid time (``updated_at``
+        when the row has none), and records when the store wrote it, when
+        the version ended (now), why, and what replaced it. Rows that
+        already carry ``write_id`` were written by this batch, in an attempt
+        that committed before its result was lost, so they are not old
+        versions and are left out. A version already in history is left as
+        it is, so a retried attempt never adds a row twice.
+
+        Args:
+            prefix: Namespace text.
+            keys: Item keys whose live versions end.
+            reason: Why they end: "overwritten", "superseded" or "deleted".
+            superseded_by: The key that replaces them, or None.
+            invalid_at: When the facts stopped being true, or None for now.
+            write_id: The write id of the batch that ends them.
+            ttl_days: Days the versions stay in history, or None to keep them.
+
+        Returns:
+            Tuple of (SQL, parameters).
+        """
+        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
+SELECT prefix, key, version, value, provenance, COALESCE(valid_at, updated_at),
+    COALESCE(CAST(%s AS TIMESTAMPTZ), now()), updated_at, now(),
+    CAST(%s AS STRING), CAST(%s AS STRING), CAST(%s AS UUID),
+    now() + CAST(%s AS DECIMAL) * INTERVAL '1 day'
+FROM {self.items}
+WHERE prefix = %s AND key = ANY(%s)
+    AND (expires_at IS NULL OR expires_at > now())
+    AND write_id IS DISTINCT FROM CAST(%s AS UUID)
+ON CONFLICT (prefix, key, version) DO NOTHING"""
+        params: list[Any] = [
+            invalid_at,
+            reason,
+            superseded_by,
+            write_id,
+            ttl_days,
+            prefix,
+            list(keys),
+            write_id,
+        ]
+        return (sql, params)
+
+    def history_versions(self, prefix: str, key: str, *, limit: int) -> tuple[str, list]:
+        """Build the SELECT for the versions of one key in history, newest first.
+
+        Versions past their history TTL are left out, though CockroachDB's
+        TTL job may not have deleted them yet.
+
+        Returns:
+            Tuple of (SQL, parameters).
+        """
+        sql = f"""SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by
+FROM {self.history}
+WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())
+ORDER BY version DESC
+LIMIT %s"""
+        return (sql, [prefix, key, limit])
+
+    def purge(self, prefix: str, key: str) -> tuple[str, list]:
+        """Build one statement that deletes an item, its vectors and its history.
+
+        Each table's rows go in a data-modifying CTE of the same statement,
+        so they are deleted together.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement returns one row whose
+            ``removed`` says whether any row was deleted.
+        """
+        where = "WHERE prefix = %s AND key = %s RETURNING 1"
+        tables = [("deleted_items", self.items)]
+        if self._index is not None:
+            tables.append(("deleted_vectors", self.vectors))
+        tables.append(("deleted_history", self.history))
+        ctes = [f"{name} AS (\n    DELETE FROM {table} {where}\n)" for name, table in tables]
+        found = "\n    OR ".join(f"EXISTS (SELECT 1 FROM {name})" for name, _ in tables)
+        sql = "WITH " + ",\n".join(ctes) + f"\nSELECT {found} AS removed"
+        return (sql, [prefix, key] * len(tables))
+
+    def delete_namespace(
+        self, namespace_prefix: Sequence[str], *, history: bool = False
+    ) -> tuple[str, list]:
         """Build one DELETE for a namespace and its descendants.
 
         With an index, the vectors go in a data-modifying CTE of the same
-        statement.
+        statement, and with ``history`` so do the history rows.
 
         Args:
             namespace_prefix: Namespace prefix to delete.
+            history: Whether to delete the namespace's history rows too.
 
         Returns:
             Tuple of (SQL, parameters). The statement returns the key of
@@ -938,13 +1097,18 @@ LIMIT %s OFFSET %s"""
         """
         ns_condition, ns_params = prefix_condition("prefix", namespace_prefix)
         sql = f"DELETE FROM {self.items}\nWHERE {ns_condition}\nRETURNING key"
-        if self._index is None:
+        tables = []
+        if self._index is not None:
+            tables.append(("deleted_vectors", self.vectors))
+        if history:
+            tables.append(("deleted_history", self.history))
+        if not tables:
             return (sql, list(ns_params))
-        cte = (
-            f"WITH deleted_vectors AS (\n    DELETE FROM {self.vectors}\n"
-            f"    WHERE {ns_condition}\n    RETURNING key\n)\n"
-        )
-        return (cte + sql, list(ns_params) + list(ns_params))
+        ctes = [
+            f"{name} AS (\n    DELETE FROM {table}\n    WHERE {ns_condition}\n    RETURNING key\n)"
+            for name, table in tables
+        ]
+        return ("WITH " + ",\n".join(ctes) + "\n" + sql, list(ns_params) * (len(tables) + 1))
 
     def sweep(self) -> list[tuple[str, list]]:
         """Build DELETE statements for expired rows.

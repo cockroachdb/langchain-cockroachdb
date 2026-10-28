@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
@@ -60,6 +61,19 @@ class CockroachDBTTLConfig(TTLConfig, total=False):  # type: ignore[call-arg,unu
 
     omit_expired: bool
     ttl_job_cron: str
+
+
+class HistoryConfig(TypedDict, total=False):
+    """Version history settings, for the store's ``history`` argument.
+
+    Attributes:
+        ttl_days: Days an old version stays in history. setup() turns on
+            CockroachDB row-level TTL on the history table, which deletes it
+            after that. Without it, history is kept until purge() or
+            delete_namespace() removes it.
+    """
+
+    ttl_days: float
 
 
 class PoolConfig(TypedDict, total=False):
@@ -121,6 +135,17 @@ class ResolvedTTL:
     omit_expired: bool
     sweep_interval_minutes: float | None
     cron: str
+
+
+@dataclass(frozen=True)
+class ResolvedHistory:
+    """Validated version history settings.
+
+    Attributes:
+        ttl_days: Days an old version stays in history, or None to keep it.
+    """
+
+    ttl_days: float | None
 
 
 def _validate_cspann(cspann_config: CSPANNConfig | None) -> dict[str, int]:
@@ -321,3 +346,38 @@ def resolve_ttl_config(ttl: TTLConfig | CockroachDBTTLConfig | None) -> Resolved
         sweep_interval_minutes=sweep_interval_minutes,
         cron=cron,
     )
+
+
+def resolve_history_config(history: bool | HistoryConfig | None) -> ResolvedHistory | None:
+    """Validate and normalize the version history setting.
+
+    Args:
+        history: True to keep history, a HistoryConfig to keep it with a TTL,
+            or None or False for no history.
+
+    Returns:
+        Resolved history settings, or None without history.
+
+    Raises:
+        ValueError: If history is not a bool, None or a dict, or ttl_days is
+            not a positive, finite number.
+    """
+    if history is None or history is False:
+        return None
+    if history is True:
+        return ResolvedHistory(ttl_days=None)
+    if not isinstance(history, dict):
+        raise ValueError(
+            f"history must be True, False, None or a HistoryConfig dict, got {history!r}"
+        )
+    ttl_days = history.get("ttl_days")
+    if ttl_days is None:
+        return ResolvedHistory(ttl_days=None)
+    if (
+        isinstance(ttl_days, bool)
+        or not isinstance(ttl_days, (int, float))
+        or not math.isfinite(ttl_days)
+        or ttl_days <= 0
+    ):
+        raise ValueError(f"history ttl_days must be a positive number of days, got {ttl_days!r}")
+    return ResolvedHistory(ttl_days=float(ttl_days))

@@ -183,6 +183,26 @@ def test_no_cast_shorthand():
     )
     assert "::" not in query_sql
 
+    for stmt in sql.history_statements(30.0):
+        assert "::" not in stmt
+    for query_sql, _ in (
+        sql.archive(
+            "a",
+            ["k1"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id="w",
+            ttl_days=1.0,
+        ),
+        sql.history_versions("a", "k1", limit=1),
+        sql.history_exists(),
+        sql.purge("a", "k1"),
+        sql.delete_namespace(["a"], history=True),
+        sql.upsert_items([("a", "k1", "{}", None, None, None)], write_id="w", history=True),
+    ):
+        assert "::" not in query_sql
+
 
 def test_get():
     """get() builds SELECT with prefix and key list."""
@@ -650,6 +670,27 @@ def test_every_builder_has_one_param_per_placeholder():
     # delete_namespace
     query_sql, params = sql.delete_namespace(["a", "b", "c"])
     assert query_sql.count("%s") == len(params)
+    query_sql, params = sql.delete_namespace(["a", "b", "c"], history=True)
+    assert query_sql.count("%s") == len(params)
+
+    # history
+    query_sql, params = sql.archive(
+        "a.b.c",
+        ["k1", "k2"],
+        reason="deleted",
+        superseded_by=None,
+        invalid_at=None,
+        write_id="w",
+        ttl_days=None,
+    )
+    assert query_sql.count("%s") == len(params)
+    for query_sql, params in (
+        sql.history_versions("a.b.c", "k1", limit=3),
+        sql.history_exists(),
+        sql.purge("a.b.c", "k1"),
+        sql.upsert_items([("a.b.c", "k1", "{}", None, None, None)], write_id="w", history=True),
+    ):
+        assert query_sql.count("%s") == len(params)
 
     # sweep
     sweeps = sql.sweep()
@@ -828,3 +869,160 @@ def test_vector_index_statements():
     assert sql.show_create_vectors() == (
         "SELECT create_statement FROM [SHOW CREATE TABLE app.mem_vectors]"
     )
+
+
+# The history table's columns, in order, as setup() creates them
+HISTORY_COLUMNS = [
+    "prefix TEXT NOT NULL",
+    "key TEXT NOT NULL",
+    "version INT8 NOT NULL",
+    "value JSONB NOT NULL",
+    "provenance JSONB",
+    "valid_at TIMESTAMPTZ NOT NULL",
+    "invalid_at TIMESTAMPTZ",
+    "written_at TIMESTAMPTZ NOT NULL",
+    "ended_at TIMESTAMPTZ NOT NULL",
+    "reason TEXT NOT NULL",
+    "superseded_by TEXT",
+    "write_id UUID",
+    "expires_at TIMESTAMPTZ",
+]
+
+
+def test_history_table_statement() -> None:
+    sql = StoreSQL("app", "mem")
+    assert sql.history == "app.mem_history"
+    [create] = sql.history_statements(None)
+    lines = create.splitlines()
+    assert lines[0] == "CREATE TABLE IF NOT EXISTS app.mem_history ("
+    assert lines[-1] == ");"
+    assert [line.strip().rstrip(",") for line in lines[1:-1]] == [
+        *HISTORY_COLUMNS,
+        "PRIMARY KEY (prefix, key, version)",
+    ]
+
+
+def test_history_ttl_statement_only_with_ttl_days() -> None:
+    sql = StoreSQL("public", "store")
+    [create] = sql.history_statements(None)
+    statements = sql.history_statements(30.0)
+    assert statements == [
+        create,
+        "ALTER TABLE public.store_history SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');",
+    ]
+    # Each archived row carries its own expires_at, so the days are not in the DDL
+    assert "30" not in statements[1]
+
+
+def test_archive_statement_binds_everything() -> None:
+    sql = StoreSQL("public", "store")
+    when = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    write_id = "8d6f1c9e-0000-4000-8000-000000000001"
+    query, params = sql.archive(
+        "user.alice",
+        ["seat-key", "food-key"],
+        reason="overwritten",
+        superseded_by="newer-key",
+        invalid_at=when,
+        write_id=write_id,
+        ttl_days=30.0,
+    )
+    for value in ("user.alice", "seat-key", "food-key", "overwritten", "newer-key", write_id):
+        assert value not in query
+    assert query.startswith("INSERT INTO public.store_history (")
+    assert "\nFROM public.store\n" in query
+    assert "ON CONFLICT (prefix, key, version) DO NOTHING" in query
+    # Only live rows, and not the rows this batch already wrote
+    assert "(expires_at IS NULL OR expires_at > now())" in query
+    assert "write_id IS DISTINCT FROM CAST(%s AS UUID)" in query
+    assert "COALESCE(valid_at, updated_at)" in query
+    assert query.count("%s") == len(params)
+    assert "::" not in query
+    assert params == [
+        when,
+        "overwritten",
+        "newer-key",
+        write_id,
+        30.0,
+        "user.alice",
+        ["seat-key", "food-key"],
+        write_id,
+    ]
+
+    # No invalid time means now, and no ttl_days means no expiry: both bind NULL
+    _, params = sql.archive(
+        "user.alice",
+        ["seat-key"],
+        reason="deleted",
+        superseded_by=None,
+        invalid_at=None,
+        write_id=write_id,
+        ttl_days=None,
+    )
+    assert params == [None, "deleted", None, write_id, None, "user.alice", ["seat-key"], write_id]
+
+
+def test_history_reads_bind_the_key_and_skip_expired_versions() -> None:
+    sql = StoreSQL("public", "store")
+    query, params = sql.history_versions("user.alice", "seat-key", limit=5)
+    assert "FROM public.store_history\n" in query
+    assert "prefix = %s AND key = %s" in query
+    assert "(expires_at IS NULL OR expires_at > now())" in query
+    assert "ORDER BY version DESC\nLIMIT %s" in query
+    assert params == ["user.alice", "seat-key", 5]
+
+    # The schema check asks for the history table by its validated name
+    query, params = sql.history_exists()
+    assert query == "SELECT to_regclass(%s) IS NOT NULL AS ready"
+    assert params == ["public.store_history"]
+
+
+def test_purge_deletes_the_item_its_vectors_and_history_in_one_statement() -> None:
+    query, params = StoreSQL("public", "store", index=_make_index()).purge("user.alice", "k1")
+    assert query.startswith("WITH deleted_items AS (")
+    for table in ("public.store", "public.store_vectors", "public.store_history"):
+        assert f"DELETE FROM {table} WHERE prefix = %s AND key = %s RETURNING 1" in query
+    assert query.rstrip().endswith("AS removed")
+    assert params == ["user.alice", "k1"] * 3
+
+    # Without an index there are no vectors to delete
+    query, params = StoreSQL("public", "store").purge("user.alice", "k1")
+    assert "store_vectors" not in query
+    assert params == ["user.alice", "k1"] * 2
+
+
+def test_delete_namespace_with_history_deletes_its_history_too() -> None:
+    sql = StoreSQL("public", "store", index=_make_index())
+    without = sql.delete_namespace(["a", "b"])
+    query, params = sql.delete_namespace(["a", "b"], history=True)
+    assert "DELETE FROM public.store_history\n" in query
+    # The same prefix condition as the items, in the same statement
+    assert query.count("(prefix = %s OR (prefix >= %s AND prefix < %s))") == 3
+    assert query.endswith("RETURNING key")
+    assert params == ["a.b", "a.b.", "a.b/"] * 3
+    assert sql.delete_namespace(["a", "b"], history=False) == without
+
+    query, params = StoreSQL("public", "store").delete_namespace(["a"], history=True)
+    assert query.startswith("WITH deleted_history AS (")
+    assert "store_vectors" not in query
+    assert params == ["a", "a.", "a/"] * 2
+
+
+def test_upsert_with_history_continues_versions_after_the_history() -> None:
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True)
+    # A key written again after a delete never reuses a version it has in history
+    assert (
+        "COALESCE((SELECT max(h.version) FROM public.store_history AS h "
+        "WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key), 0) + 1"
+    ) in query
+    assert "version = public.store.version + 1" in query
+    assert "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id" in query
+    assert query.count("%s") == len(params)
+    assert params == ["w-1", *rows[0]]
+    # Without history the statement is the one Task 1 sends
+    assert "store_history" not in sql.upsert_items(rows, write_id="w-1")[0]
+    with pytest.raises(ValueError, match="write id"):
+        sql.upsert_items([("user.a", "k", "{}", None)], history=True)

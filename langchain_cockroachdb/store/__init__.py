@@ -7,6 +7,7 @@ from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
+    HistoryConfig,
     PoolConfig,
 )
 from langchain_cockroachdb.store.reconcile import (
@@ -37,6 +38,7 @@ __all__ = [
     "CockroachDBTTLConfig",
     "ConflictsChanged",
     "Decision",
+    "HistoryConfig",
     "MemoryRecord",
     "MemoryVersion",
     "Policy",

@@ -3,8 +3,9 @@
 Provides the interface of langgraph-checkpoint-postgres's AsyncPostgresStore
 on CockroachDB. It plans batches with the same code as CockroachDBStore and
 runs the same SQL. Every operation retries transient errors under the
-store's RetryPolicy. Every write is an UPSERT, a DELETE, or an UPDATE that
-pushes back an expiry, so a retry after an ambiguous result is safe.
+store's RetryPolicy. Every write is an UPSERT, a DELETE, an UPDATE that
+pushes back an expiry, or an INSERT into history that skips versions
+already there, so a retry after an ambiguous result is safe.
 """
 
 from __future__ import annotations
@@ -43,11 +44,14 @@ from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
     PutPlan,
+    SchemaCheck,
 )
 from langchain_cockroachdb.store.config import (
     CockroachDBIndexConfig,
     CockroachDBTTLConfig,
+    HistoryConfig,
     PoolConfig,
+    resolve_history_config,
     resolve_index_config,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
@@ -134,6 +138,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         pipe: AsyncPipeline | None = None,
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
+        history: bool | HistoryConfig | None = None,
         retry_policy: RetryPolicy | None = None,
         table_name: str = "store",
         schema: str = "public",
@@ -149,6 +154,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 configured fields of each item.
             ttl: TTL settings. When given, setup() also turns on CockroachDB
                 row-level TTL for expired rows.
+            history: Version history: True, or a HistoryConfig to give old
+                versions a TTL. setup() then creates the history table, and
+                every batch keeps the versions it overwrites or deletes there.
+                Default None, no history.
             retry_policy: How operations retry (default: RetryPolicy())
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
@@ -156,10 +165,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             RuntimeError: If no event loop is running
             ValueError: If a pipeline is given with a pool, or a name or the
-                TTL or index settings are invalid
+                TTL, index or history settings are invalid
         """
         # Validated first, so a bad index fails before anything starts
         resolved_index = resolve_index_config(index)
+        resolved_history = resolve_history_config(history)
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
             raise ValueError(
                 "Pipeline should be used only with a single AsyncConnection, "
@@ -173,7 +183,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 "for example in an async function. In sync code, use CockroachDBStore."
             ) from error
         super().__init__()
-        self._configure(index=resolved_index, ttl=ttl, table_name=table_name, schema=schema)
+        self._configure(
+            index=resolved_index,
+            ttl=ttl,
+            table_name=table_name,
+            schema=schema,
+            history=resolved_history,
+        )
         # BaseStore reads ttl_config for the default TTL and refresh_on_read
         self.ttl_config = ttl
         self.conn = conn
@@ -199,6 +215,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         pool_config: PoolConfig | None = None,
         index: CockroachDBIndexConfig | None = None,
         ttl: TTLConfig | CockroachDBTTLConfig | None = None,
+        history: bool | HistoryConfig | None = None,
         retry_policy: RetryPolicy | None = None,
         connect_timeout: float | None = 10.0,
         prepare_threshold: int | None = 5,
@@ -215,6 +232,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             pool_config: Open an AsyncConnectionPool with these settings instead of one connection
             index: Semantic search settings
             ttl: TTL settings
+            history: Version history settings (default None, no history)
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
             prepare_threshold: psycopg prepared statement threshold, None to disable
@@ -241,6 +259,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 pipe=pipe,
                 index=index,
                 ttl=ttl,
+                history=history,
                 retry_policy=policy,
                 table_name=table_name,
                 schema=schema,
@@ -283,8 +302,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         are recorded with ON CONFLICT DO NOTHING. With an index, it creates
         the vectors table and its C-SPANN index (unless ``flat``) on every
         call, then checks an existing index against the configuration. With
-        a TTL configuration, it then turns on CockroachDB row-level TTL on
-        ``expires_at``.
+        history, it creates the history table, and with ``ttl_days`` turns on
+        CockroachDB row-level TTL there. With a TTL configuration, it then
+        turns on CockroachDB row-level TTL on ``expires_at``.
 
         On CockroachDB v25.4 a TTL change fails while another setup() changes
         the same table. That error is retried under the store's retry policy,
@@ -337,6 +357,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             await self._run_ddl(statement, "store vector setup")
         if self.index is not None:
             await self._check_index()
+        if self._history is not None:
+            policy = schema_change_policy(self.retry_policy)
+            for statement in self.sql.history_statements(self._history.ttl_days):
+                await self._run_ddl(statement, "store history setup", policy=policy)
+            # A write before setup() may have found no history table. The
+            # next write reads the schema again.
+            self._history_ready = None
         if self._ttl_given:
             policy = schema_change_policy(self.retry_policy)
             for statement in self.sql.ttl_statements(self.ttl.cron):
@@ -563,6 +590,22 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         self._check_vector_index(await self._retry(read, label="store index check"))
 
+    async def _aschema(self, *, refresh: bool = False) -> SchemaCheck:
+        """What the schema check knows: migration 2's columns and the history table.
+
+        It reads the latest migration, and on a store with history whether
+        the history table exists, in one round trip. It reads them the first
+        time, and again when an answer it found missing is older than
+        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. What it found present
+        it trusts for good.
+        """
+        schema = self._cached_schema(refresh=refresh)
+        if schema is None:
+            schema = self._cache_schema(
+                await self._read_all(self._schema_statements(), "store schema check")
+            )
+        return schema
+
     async def _areconcile_columns(self, *, refresh: bool = False) -> bool:
         """Whether migration 2's columns exist, as the schema check last read it.
 
@@ -573,13 +616,24 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         records migration 2, puts write with the 0.5 statements and those
         methods raise ValueError.
         """
-        ready = self._cached_columns(refresh=refresh)
-        if ready is None:
-            [rows] = await self._read_all(
-                [(self.sql.migration_version(), [])], "store schema check"
-            )
-            ready = self._cache_columns(rows)
-        return ready
+        return (await self._aschema(refresh=refresh)).columns
+
+    async def _ahistory_schema(self) -> SchemaCheck:
+        """The schema check for an operation that needs the history table.
+
+        Before it refuses, it reads the schema again, so a setup() that
+        another process ran since is seen.
+
+        Raises:
+            ValueError: If the store keeps no history, or setup() has not
+                created the history table yet.
+        """
+        self._require_history()
+        schema = await self._aschema()
+        if not schema.history_ready:
+            schema = await self._aschema(refresh=True)
+        self._require_history_table(schema)
+        return schema
 
     async def _run_puts(self, plan: PutPlan) -> None:
         # Embed once, before the first attempt: a retry reuses the vectors
@@ -589,9 +643,15 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 [text for _, _, _, text in plan.embed_requests]
             )
         vector_rows = self._vector_rows(plan, embeddings)
+        # With history, a write refuses to run until setup() has created
+        # the history table, since it could not keep what it replaces
+        if self._history is not None:
+            schema = await self._ahistory_schema()
+        else:
+            schema = await self._aschema()
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
-        if await self._areconcile_columns():
+        if schema.columns:
             plan.write_id = str(uuid.uuid4())
         statements = self._write_statements(plan, vector_rows)
         if not statements:
@@ -613,7 +673,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         """Delete every item in a namespace and its descendants.
 
         ``("user", "a")`` deletes ``("user", "a")`` and ``("user", "a", "b")``,
-        not ``("user", "ab")``. One statement deletes the items and their vectors.
+        not ``("user", "ab")``. One statement deletes the items and their
+        vectors, and on a store with history their history too.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
@@ -624,6 +685,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         Raises:
             InvalidNamespaceError: If the prefix is empty or a label is invalid
+            ValueError: If the store keeps history and setup() has not
+                created the history table
         """
         prefix = validate_labels(namespace_prefix)
         if not prefix:
@@ -632,10 +695,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 "store on purpose, delete each top-level namespace from alist_namespaces("
                 "max_depth=1), or drop the store's tables."
             )
-        statement = self.sql.delete_namespace(prefix)
+        if self._history is not None:
+            await self._ahistory_schema()
+        statement = self.sql.delete_namespace(prefix, history=self._history is not None)
 
         async def write() -> int:
-            # One statement, so items and vectors commit together. pipeline=True
+            # One statement, so items, vectors and history commit together. pipeline=True
             # makes a component-wide pipeline sync, which commits it
             async with self._cursor(
                 pipeline=True,

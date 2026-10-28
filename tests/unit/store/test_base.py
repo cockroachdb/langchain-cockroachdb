@@ -28,10 +28,11 @@ from langchain_cockroachdb.store.base import (
     MAX_SEARCH_NAMESPACES,
     BaseCockroachDBStore,
     PutPlan,
+    SchemaCheck,
     _group_ops,
     needs_exact_search,
 )
-from langchain_cockroachdb.store.config import resolve_index_config
+from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
 from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE
 from langchain_cockroachdb.store.store import CockroachDBStore
 
@@ -69,13 +70,19 @@ class CountingEmbeddings(Embeddings):
         return [1.0, 0.0, 0.0]
 
 
-def make_base(*, fields: list[str] | None = None, ttl=None) -> BaseCockroachDBStore:
+def make_base(*, fields: list[str] | None = None, ttl=None, history=None) -> BaseCockroachDBStore:
     """BaseCockroachDBStore state built directly, without a connection."""
     store = BaseCockroachDBStore()
     index = None
     if fields is not None:
         index = resolve_index_config({"dims": 3, "embed": CountingEmbeddings(), "fields": fields})
-    store._configure(index=index, ttl=ttl, table_name="store", schema="public")
+    store._configure(
+        index=index,
+        ttl=ttl,
+        table_name="store",
+        schema="public",
+        history=resolve_history_config(history),
+    )
     return store
 
 
@@ -1253,16 +1260,21 @@ def test_cache_columns_compares_the_latest_migration() -> None:
 class SchemaReads:
     """A stand-in for a store's _read_all that answers the schema check.
 
-    It returns ``latest`` as the latest migration and records every call.
+    It returns ``latest`` as the latest migration and, when asked,
+    ``history`` as whether the history table exists. It records every call.
     """
 
-    def __init__(self, latest: int) -> None:
+    def __init__(self, latest: int, history: bool = False) -> None:
         self.latest = latest
+        self.history = history
         self.calls: list[tuple[list[tuple[str, list]], str]] = []
 
     def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
         self.calls.append((statements, label))
-        return [[{"v": self.latest}]]
+        found = [[{"v": self.latest}]]
+        if len(statements) > 1:
+            found.append([{"ready": self.history}])
+        return found
 
 
 class FakeClock:
@@ -1315,7 +1327,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
     assert store._reconcile_columns() is False
     assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
     with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
-        store._require_columns()
+        store._require_columns(store._reconcile_columns())
     # A method that needs migration 2 reads again rather than trust the cached False
     assert store._reconcile_columns(refresh=True) is False
     assert len(reads.calls) == 2
@@ -1341,7 +1353,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
     assert store._reconcile_columns() is True
     assert store._reconcile_columns(refresh=True) is True
     assert len(reads.calls) == 4
-    store._require_columns()
+    store._require_columns(store._reconcile_columns(refresh=True))
 
 
 async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
@@ -1358,7 +1370,7 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
     assert await store._areconcile_columns() is False
     assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
     with pytest.raises(ValueError, match=r"run setup\(\)"):
-        store._require_columns()
+        store._require_columns(await store._areconcile_columns())
     assert await store._areconcile_columns(refresh=True) is False
     assert len(reads.calls) == 2
     monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
@@ -1379,7 +1391,222 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
     assert await store._areconcile_columns() is True
     assert await store._areconcile_columns(refresh=True) is True
     assert len(reads.calls) == 4
-    store._require_columns()
+    store._require_columns(await store._areconcile_columns(refresh=True))
+
+
+def test_cache_columns_keeps_true_once_seen() -> None:
+    store = make_base()
+    assert store._cache_columns([{"v": MIGRATION_RECONCILE}]) is True
+    # A read that started before another process ran setup() can finish
+    # after one that saw migration 2. It must not take the answer back
+    assert store._cache_columns([{"v": MIGRATION_RECONCILE - 1}]) is True
+    assert store._cache_columns([]) is True
+    assert store._columns_ready is True
+
+
+def test_require_columns_acts_on_the_check_it_is_given() -> None:
+    store = make_base()
+    # setup() in another thread can clear the cache between the check and this call
+    assert store._columns_ready is None
+    store._require_columns(True)
+    store._cache_columns([{"v": MIGRATION_RECONCILE}])
+    with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
+        store._require_columns(False)
+
+
+def test_reconcile_uses_the_schema_check_it_ran(monkeypatch) -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+
+    def check(*, refresh: bool = False) -> bool:
+        # As if setup() in another thread cleared the cache right after the read
+        store._columns_ready = None
+        return True
+
+    monkeypatch.setattr(store, "_reconcile_columns", check)
+    with pytest.raises(NotImplementedError):
+        store.reconcile(("a",), "k", {"text": "x"}, policy=lambda proposal, candidates: None)
+
+
+def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_base(history=True)
+    assert store._cached_history(refresh=False) is None
+    assert store._cache_history([{"ready": False}]) is False
+    assert store._cached_history(refresh=False) is False
+    # An operation about to refuse for a missing table does not trust False
+    assert store._cached_history(refresh=True) is None
+    clock.now += store._SCHEMA_RECHECK_SECONDS
+    assert store._cached_history(refresh=False) is None
+    assert store._cache_history([{"ready": True}]) is True
+    # setup() never drops the table, so True holds for good, even against a late read
+    assert store._cache_history([{"ready": False}]) is True
+    clock.now += 365 * 86400.0
+    assert store._cached_history(refresh=True) is True
+    # A store without history never looks for the table
+    assert make_base()._cached_history(refresh=True) is False
+
+
+def test_history_check_reads_with_the_schema_and_again_before_refusing() -> None:
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"public\.store_history .* run setup\(\)"):
+        store._history_schema()
+    # One round trip reads both, and the refusal reads again first
+    statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
+    assert reads.calls == [(statements, "store schema check")] * 2
+    # A plain read of the columns trusts the answer for a while
+    assert store._reconcile_columns() is True
+    assert len(reads.calls) == 2
+
+    # Another process runs setup(): the next operation that needs history sees it
+    reads.history = True
+    assert store._history_schema() == SchemaCheck(columns=True, history=True)
+    assert len(reads.calls) == 3
+    store._history_schema()
+    assert len(reads.calls) == 3
+
+    # Without migration 2 there is no history either
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(latest=MIGRATION_RECONCILE - 1, history=True)
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"run setup\(\)"):
+        store._history_schema()
+
+
+async def test_async_history_check_reads_with_the_schema_and_again_before_refusing() -> None:
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False), history=True, retry_policy=FAST
+    )
+    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"public\.store_history .* run setup\(\)"):
+        await store._ahistory_schema()
+    statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
+    assert reads.calls == [(statements, "store schema check")] * 2
+    reads.history = True
+    assert await store._ahistory_schema() == SchemaCheck(columns=True, history=True)
+    await store._ahistory_schema()
+    assert len(reads.calls) == 3
+
+
+def test_a_store_without_history_refuses_history_without_any_io() -> None:
+    # A connection the store must never touch: using it would raise
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="history=True"):
+        store.history(("a",), "k")
+    with pytest.raises(ValueError, match="history=True"):
+        store.purge(("a",), "k")
+
+
+def test_history_and_purge_validate_before_any_io() -> None:
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    for call in (
+        lambda: store.history((), "k"),
+        lambda: store.history(("a.b",), "k"),
+        lambda: store.purge((), "k"),
+        lambda: store.purge(("a", ""), "k"),
+    ):
+        with pytest.raises(InvalidNamespaceError):
+            call()
+    with pytest.raises(ValueError, match="limit must be non-negative"):
+        store.history(("a",), "k", limit=-1)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_setup_creates_the_history_table_and_clears_its_check(make: str) -> None:
+    if make == "sync":
+        store: CockroachDBStore | AsyncCockroachDBStore = CockroachDBStore(
+            object(),  # type: ignore[arg-type]
+            history={"ttl_days": 30},
+            retry_policy=FAST,
+        )
+        cursor: BusyOnceCursor = BusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+        @contextlib.contextmanager
+        def fake_cursor(**kwargs: object) -> Iterator[BusyOnceCursor]:
+            yield cursor
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    else:
+        store = AsyncCockroachDBStore(
+            AsyncConnectionPool("", open=False), history={"ttl_days": 30}, retry_policy=FAST
+        )
+        cursor = AsyncBusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+        @contextlib.asynccontextmanager
+        async def afake_cursor(**kwargs: object) -> AsyncIterator[BusyOnceCursor]:
+            yield cursor
+
+        store._cursor = afake_cursor  # type: ignore[method-assign,assignment]
+    store._cache_history([{"ready": False}])
+
+    result = store.setup()
+    if make == "async":
+        await result  # type: ignore[misc]
+    create, ttl = store.sql.history_statements(30.0)
+    # The TTL change met another schema change once and ran again, as the
+    # items' TTL does
+    assert [s for s in cursor.statements if store.sql.history in s] == [create, ttl, ttl]
+    assert store._history_ready is None
+
+
+def test_put_batch_with_history_archives_what_it_ends_first() -> None:
+    store = make_base(fields=["text"], history={"ttl_days": 7})
+    plan = store._plan_puts(
+        [
+            PutOp(("a",), "k1", {"text": "one"}),
+            PutOp(("b",), "k2", {"text": "two"}),
+            PutOp(("a",), "k3", None),
+        ]
+    )
+    plan.write_id = "w-1"
+    rows = store._vector_rows(plan, [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    statements = store._write_statements(plan, rows)
+    history, items, vectors = store.sql.history, store.sql.items, store.sql.vectors
+    assert statement_kinds(statements) == [
+        f"INSERT {history}",
+        f"INSERT {history}",
+        f"INSERT {history}",
+        f"DELETE {vectors}",
+        f"DELETE {vectors}",
+        f"INSERT {items}",
+        f"INSERT {vectors}",
+        f"DELETE {items}",
+        f"DELETE {vectors}",
+    ]
+    # (invalid_at, reason, superseded_by, write_id, ttl_days, prefix, keys, write_id)
+    archives = [params for _, params in statements[:3]]
+    assert [(p[1], p[5], p[6]) for p in archives] == [
+        ("overwritten", "a", ["k1"]),
+        ("overwritten", "b", ["k2"]),
+        ("deleted", "a", ["k3"]),
+    ]
+    assert all(p[0] is None and p[2] is None and p[4] == 7.0 for p in archives)
+    assert all(p[3] == p[7] == "w-1" for p in archives)
+    # The upsert numbers a new row after its versions in history
+    assert f"FROM {history} AS h" in statements[5][0]
+
+    # Without a write id the table has no migration 2 yet: nothing to archive
+    plan.write_id = None
+    assert history not in " ".join(sql for sql, _ in store._write_statements(plan, rows))
+    # And without history the batch is the one it was
+    plain = make_base(fields=["text"])
+    plan.write_id = "w-1"
+    assert history not in " ".join(sql for sql, _ in plain._write_statements(plan, rows))
 
 
 def test_cancelling_the_sweeper_future_stops_it_without_a_traceback(monkeypatch) -> None:
