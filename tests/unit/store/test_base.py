@@ -468,6 +468,9 @@ def test_nan_embedding_fails_before_any_statement() -> None:
         object(),  # type: ignore[arg-type]
         index={"dims": 3, "embed": NaNEmbeddings(), "fields": ["text"]},
     )
+    # The schema check runs before embedding, and the fake cursor cannot
+    # answer it: say it found migration 2
+    store._cache_columns([{"v": MIGRATION_RECONCILE}])
     opened: list[object] = []
 
     @contextlib.contextmanager
@@ -1447,7 +1450,7 @@ def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) ->
     assert make_base()._cached_history(refresh=True) is False
 
 
-def test_history_check_reads_with_the_schema_and_again_before_refusing() -> None:
+def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
     store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
     reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
 
@@ -1457,31 +1460,43 @@ def test_history_check_reads_with_the_schema_and_again_before_refusing() -> None
         return reads.answer(statements, label)
 
     store._read_all = read_all  # type: ignore[method-assign,assignment]
-    with pytest.raises(ValueError, match=r"public\.store_history .* run setup\(\)"):
+    missing_table = r"The history table public\.store_history does not exist yet; run setup\(\)"
+    with pytest.raises(ValueError, match=missing_table):
         store._history_schema()
-    # One round trip reads both, and the refusal reads again first
+    # One round trip reads both, once
     statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
-    assert reads.calls == [(statements, "store schema check")] * 2
-    # A plain read of the columns trusts the answer for a while
+    assert reads.calls == [(statements, "store schema check")]
+    # A plain read of the columns trusts the answers for a while
     assert store._reconcile_columns() is True
+    assert len(reads.calls) == 1
+    # An operation that needs the table does not trust its absence: it reads once
+    with pytest.raises(ValueError, match=missing_table):
+        store._history_schema()
     assert len(reads.calls) == 2
 
     # Another process runs setup(): the next operation that needs history sees it
     reads.history = True
     assert store._history_schema() == SchemaCheck(columns=True, history=True)
     assert len(reads.calls) == 3
+    # and trusts it for good
     store._history_schema()
     assert len(reads.calls) == 3
 
-    # Without migration 2 there is no history either
+    # Without migration 2 there is no history either, and the message says
+    # what is missing
     store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
     reads = SchemaReads(latest=MIGRATION_RECONCILE - 1, history=True)
     store._read_all = read_all  # type: ignore[method-assign,assignment]
-    with pytest.raises(ValueError, match=r"run setup\(\)"):
+    with pytest.raises(
+        ValueError,
+        match=r"The table public\.store does not have the columns that history needs yet; "
+        r"run setup\(\) to add them and to create the history table public\.store_history\.",
+    ):
         store._history_schema()
+    assert len(reads.calls) == 1
 
 
-async def test_async_history_check_reads_with_the_schema_and_again_before_refusing() -> None:
+async def test_async_history_check_reads_once_with_the_schema_before_refusing() -> None:
     store = AsyncCockroachDBStore(
         AsyncConnectionPool("", open=False), history=True, retry_policy=FAST
     )
@@ -1493,14 +1508,16 @@ async def test_async_history_check_reads_with_the_schema_and_again_before_refusi
         return reads.answer(statements, label)
 
     store._read_all = read_all  # type: ignore[method-assign,assignment]
-    with pytest.raises(ValueError, match=r"public\.store_history .* run setup\(\)"):
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
         await store._ahistory_schema()
     statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
-    assert reads.calls == [(statements, "store schema check")] * 2
+    assert reads.calls == [(statements, "store schema check")]
     reads.history = True
     assert await store._ahistory_schema() == SchemaCheck(columns=True, history=True)
     await store._ahistory_schema()
-    assert len(reads.calls) == 3
+    assert len(reads.calls) == 2
 
 
 def test_a_store_without_history_refuses_history_without_any_io() -> None:
@@ -1607,6 +1624,170 @@ def test_put_batch_with_history_archives_what_it_ends_first() -> None:
     plain = make_base(fields=["text"])
     plan.write_id = "w-1"
     assert history not in " ".join(sql for sql, _ in plain._write_statements(plan, rows))
+
+
+# What delete_namespace(("user", "a")) sent in 0.5.1 on a store without an index
+ZERO_FIVE_DELETE_NAMESPACE = (
+    "DELETE FROM public.store\nWHERE (prefix = %s OR (prefix >= %s AND prefix < %s))\n"
+    "RETURNING key",
+    ["user.a", "user.a.", "user.a/"],
+)
+
+
+class HistoryTableReads:
+    """A stand-in for a store's _read_all that says whether the history table exists."""
+
+    def __init__(self, exists: bool) -> None:
+        self.exists = exists
+        self.calls: list[tuple[list[tuple[str, list]], str]] = []
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        self.calls.append((statements, label))
+        return [[{"ready": self.exists}]]
+
+
+class DeleteLog:
+    """A cursor for delete_namespace that records its statement and deletes nothing."""
+
+    def __init__(self, sent: list[tuple[str, list]]) -> None:
+        self.sent = sent
+
+    def execute(self, query: str, params: list) -> None:
+        self.sent.append((query, params))
+
+    def fetchall(self) -> list:
+        return []
+
+
+class AsyncDeleteLog(DeleteLog):
+    async def execute(self, query: str, params: list) -> None:  # type: ignore[override]
+        self.sent.append((query, params))
+
+    async def fetchall(self) -> list:  # type: ignore[override]
+        return []
+
+
+def deleting_store_without_history(
+    exists: bool,
+) -> tuple[CockroachDBStore, HistoryTableReads, list[tuple[str, list]]]:
+    """A store without history whose reads and delete statements are faked."""
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    reads = HistoryTableReads(exists)
+    sent: list[tuple[str, list]] = []
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[DeleteLog]:
+        yield DeleteLog(sent)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    return store, reads, sent
+
+
+def test_delete_namespace_without_history_looks_for_a_history_table_each_time() -> None:
+    store, reads, sent = deleting_store_without_history(exists=False)
+    assert store.delete_namespace(("user", "a")) == 0
+    assert store.delete_namespace(("user", "a")) == 0
+    # One read per call while there is no history table, and the 0.5.x statement
+    assert reads.calls == [([store.sql.history_exists()], "store history check")] * 2
+    assert sent == [ZERO_FIVE_DELETE_NAMESPACE] * 2
+    # The read leaves the schema check alone: its clock did not move, and
+    # plain writes never look for the table
+    assert store._schema_read_at == 0.0
+    assert store._schema_statements() == [(store.sql.migration_version(), [])]
+
+
+def test_delete_namespace_without_history_stops_looking_once_it_found_the_table() -> None:
+    store, reads, sent = deleting_store_without_history(exists=True)
+    store.delete_namespace(("user", "a"))
+    reads.exists = False
+    store.delete_namespace(("user", "a"))
+    # The table was seen, so the second call trusts it and deletes history too
+    assert len(reads.calls) == 1
+    assert sent == [store.sql.delete_namespace(("user", "a"), history=True)] * 2
+    # Plain writes still never look for it
+    assert store._cached_history(refresh=True) is False
+
+
+async def test_async_delete_namespace_without_history_looks_for_a_history_table() -> None:
+    store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
+    reads = HistoryTableReads(exists=False)
+    sent: list[tuple[str, list]] = []
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncDeleteLog]:
+        yield AsyncDeleteLog(sent)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    assert await store.adelete_namespace(("user", "a")) == 0
+    assert sent == [ZERO_FIVE_DELETE_NAMESPACE]
+    # Once it finds the table it deletes history too, and stops looking
+    reads.exists = True
+    await store.adelete_namespace(("user", "a"))
+    await store.adelete_namespace(("user", "a"))
+    assert reads.calls == [([store.sql.history_exists()], "store history check")] * 2
+    assert sent[1:] == [store.sql.delete_namespace(("user", "a"), history=True)] * 2
+    assert store._schema_read_at == 0.0
+
+
+def test_a_put_refused_for_a_missing_history_table_costs_no_embedding_call() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        history=True,
+        retry_policy=FAST,
+    )
+    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
+        store.put(("a",), "k", {"text": "x"})
+    assert embeddings.calls == 0
+    assert len(reads.calls) == 1
+
+
+async def test_async_put_refused_for_a_missing_history_table_costs_no_embedding_call() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        history=True,
+        retry_policy=FAST,
+    )
+    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
+        await store.aput(("a",), "k", {"text": "x"})
+    assert embeddings.async_calls == 0
+    assert embeddings.calls == 0
+    assert len(reads.calls) == 1
 
 
 def test_cancelling_the_sweeper_future_stops_it_without_a_traceback(monkeypatch) -> None:

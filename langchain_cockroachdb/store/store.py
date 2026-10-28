@@ -467,21 +467,35 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
     def _history_schema(self) -> SchemaCheck:
         """The schema check for an operation that needs the history table.
 
-        Before it refuses, it reads the schema again, so a setup() that
-        another process ran since is seen.
+        It runs with ``refresh``: what it found present it trusts for good,
+        and what it found missing it reads again, once, so it sees a setup()
+        that another process ran since before it refuses.
 
         Raises:
             ValueError: If the store keeps no history, or setup() has not
                 created the history table yet.
         """
         self._require_history()
-        schema = self._schema()
-        if not schema.history_ready:
-            schema = self._schema(refresh=True)
+        schema = self._schema(refresh=True)
         self._require_history_table(schema)
         return schema
 
+    def _history_table_exists(self) -> bool:
+        """Whether the history table exists, for delete_namespace on a store without history.
+
+        True is trusted for good. Until then every call reads. Only
+        delete_namespace asks, and it is a rare call: plain writes never do.
+        """
+        if self._history_ready is True:
+            return True
+        [rows] = self._read_all([self.sql.history_exists()], "store history check")
+        return self._cache_history(rows)
+
     def _run_puts(self, plan: PutPlan) -> None:
+        # The schema check comes first. With history, a write refuses to run
+        # until setup() has created the history table, since it could not
+        # keep what it replaces, and a refused batch costs no embedding call
+        schema = self._history_schema() if self._history is not None else self._schema()
         # Embed once, before the first attempt: a retry reuses the vectors
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
@@ -489,9 +503,6 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 [text for _, _, _, text in plan.embed_requests]
             )
         vector_rows = self._vector_rows(plan, embeddings)
-        # With history, a write refuses to run until setup() has created
-        # the history table, since it could not keep what it replaces
-        schema = self._history_schema() if self._history is not None else self._schema()
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
         if schema.columns:
@@ -516,8 +527,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """Delete every item in a namespace and its descendants.
 
         ``("user", "a")`` deletes ``("user", "a")`` and ``("user", "a", "b")``,
-        not ``("user", "ab")``. One statement deletes the items and their
-        vectors, and on a store with history their history too.
+        not ``("user", "ab")``. One statement deletes the items, their
+        vectors and their history. A store without history deletes history
+        too when the history table exists, as when the store kept history
+        before, so nothing of the namespace is left.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
@@ -540,7 +553,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             )
         if self._history is not None:
             self._history_schema()
-        statement = self.sql.delete_namespace(prefix, history=self._history is not None)
+            history = True
+        else:
+            history = self._history_table_exists()
+        statement = self.sql.delete_namespace(prefix, history=history)
 
         def write() -> int:
             # One statement, so items, vectors and history commit together. pipeline=True

@@ -170,6 +170,26 @@ def test_delete_namespace_removes_history_under_the_prefix(store_factory, admin,
     assert store.get(("user", "ab"), "k") is not None
 
 
+def test_a_store_without_history_deletes_the_history_left_under_a_namespace(
+    store_factory, admin, mode
+) -> None:
+    keeper = store_factory(mode, history=True, index=seat_index())
+    for ns in [("user", "a"), ("user", "ab")]:
+        keeper.put(ns, "k", WINDOW)
+        keeper.put(ns, "k", AISLE)
+
+    # Later the application turns history off, on the same tables. Forgetting
+    # a namespace still forgets its history
+    store = store_factory(mode, index=seat_index())
+    assert store.delete_namespace(("user", "a")) == 1
+    assert count(admin, store.sql.history, "user.a") == 0
+    assert count(admin, store.sql.history, "user.ab") == 1
+    assert store.get(("user", "ab"), "k") is not None
+    # purge still needs a store with history
+    with pytest.raises(ValueError, match="history=True"):
+        store.purge(("user", "ab"), "k")
+
+
 def test_history_lists_versions_newest_first_up_to_limit(store_factory, mode) -> None:
     store = store_factory(mode, history=True, index=seat_index())
     values = [WINDOW, AISLE, VEGETARIAN, PEANUTS]
@@ -203,6 +223,23 @@ def test_history_ttl_sets_row_level_ttl_on_the_history_table(store_factory, admi
     ).fetchone()
     assert row is not None
     assert 30 * 86400 - 600 < float(row["left_seconds"]) <= 30 * 86400
+
+
+def test_history_leaves_out_versions_past_their_ttl(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history={"ttl_days": 30}, index=seat_index())
+    store.put(NS, "k", WINDOW)
+    store.put(NS, "k", AISLE)
+    store.put(NS, "k", VEGETARIAN)
+    admin.execute(
+        f"UPDATE {store.sql.history} SET expires_at = now() - INTERVAL '1 hour' "
+        "WHERE prefix = %s AND key = %s AND version = 1",
+        (PREFIX, "k"),
+    )
+
+    assert [v.version for v in store.history(NS, "k")] == [2]
+    # The expired version is still in the table after history() ran: it was
+    # left out, not yet deleted by the TTL job
+    assert count(admin, store.sql.history, PREFIX, "k") == 2
 
 
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
@@ -397,6 +434,22 @@ async def test_async_store_archives_overwrites_and_deletes(astore_factory, aadmi
     cur = await aadmin.execute(f"SELECT count(*) AS n FROM {store.sql.history}")
     row = await cur.fetchone()
     assert row is not None and row["n"] == 0
+
+
+async def test_async_store_without_history_deletes_the_history_left_under_a_namespace(
+    astore_factory, aadmin, mode
+) -> None:
+    keeper = await astore_factory(mode, history=True, index=seat_index())
+    for ns in [("user", "a"), ("user", "ab")]:
+        await keeper.aput(ns, "k", WINDOW)
+        await keeper.aput(ns, "k", AISLE)
+
+    store = await astore_factory(mode, index=seat_index())
+    assert await store.adelete_namespace(("user", "a")) == 1
+    cur = await aadmin.execute(
+        f"SELECT prefix, count(*) AS n FROM {store.sql.history} GROUP BY prefix"
+    )
+    assert {row["prefix"]: row["n"] for row in await cur.fetchall()} == {"user.ab": 1}
 
 
 async def test_async_store_history_needs_setup(astore_factory, aadmin, mode) -> None:

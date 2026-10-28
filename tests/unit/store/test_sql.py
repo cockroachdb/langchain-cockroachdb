@@ -1026,3 +1026,21 @@ def test_upsert_with_history_continues_versions_after_the_history() -> None:
     assert "store_history" not in sql.upsert_items(rows, write_id="w-1")[0]
     with pytest.raises(ValueError, match="write id"):
         sql.upsert_items([("user.a", "k", "{}", None)], history=True)
+
+
+def test_delete_namespace_without_history_keeps_the_0_5_1_text() -> None:
+    """With no history table to clear, delete_namespace sends the 0.5.1 statement."""
+    condition = "(prefix = %s OR (prefix >= %s AND prefix < %s))"
+    assert StoreSQL("public", "store").delete_namespace(["user", "a"]) == (
+        f"DELETE FROM public.store\nWHERE {condition}\nRETURNING key",
+        ["user.a", "user.a.", "user.a/"],
+    )
+    assert StoreSQL("public", "store", index=_make_index()).delete_namespace(["user", "a"]) == (
+        "WITH deleted_vectors AS (\n"
+        "    DELETE FROM public.store_vectors\n"
+        f"    WHERE {condition}\n"
+        "    RETURNING key\n"
+        ")\n"
+        f"DELETE FROM public.store\nWHERE {condition}\nRETURNING key",
+        ["user.a", "user.a.", "user.a/"] * 2,
+    )

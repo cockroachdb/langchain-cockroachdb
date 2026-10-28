@@ -186,11 +186,6 @@ class SchemaCheck:
     columns: bool
     history: bool
 
-    @property
-    def history_ready(self) -> bool:
-        """Whether writes can keep history: the columns and the history table exist."""
-        return self.columns and self.history
-
 
 @dataclass
 class NamespaceLookup:
@@ -422,10 +417,11 @@ class BaseCockroachDBStore:
     _warned_query_without_index: bool
     # Pooled batches run concurrently; the lock makes the warning appear once
     _warning_lock: threading.Lock
-    # Whether migration 2's columns exist, and on a store with history whether
-    # the history table does. None until the schema check (_schema, or
-    # _aschema on the async store) reads them. setup() clears them once it
-    # has created what they describe.
+    # Whether migration 2's columns exist, and whether the history table
+    # does. None until read. On a store with history the schema check
+    # (_schema, or _aschema on the async store) reads both; a store without
+    # history reads the table only for delete_namespace. setup() clears them
+    # once it has created what they describe.
     _columns_ready: bool | None
     _history_ready: bool | None
     # When the schema check last read them, by time.monotonic()
@@ -501,11 +497,15 @@ class BaseCockroachDBStore:
         """Cache and return whether the history table exists.
 
         ``rows`` are what StoreSQL.history_exists returned. A True cached
-        before is kept, as in _cache_columns.
+        before is kept, as in _cache_columns. On a store with history the
+        answer is part of the schema check. A store without history reads it
+        only for delete_namespace, so that read leaves the schema check's
+        clock alone: a missing migration 2 is not trusted any longer for it.
         """
         with self._schema_lock:
             ready = bool(rows and rows[0]["ready"]) or self._history_ready is True
-            self._schema_read_at = time.monotonic()
+            if self._history is not None:
+                self._schema_read_at = time.monotonic()
             self._history_ready = ready
         return ready
 
@@ -567,14 +567,19 @@ class BaseCockroachDBStore:
     def _require_history_table(self, schema: SchemaCheck) -> None:
         """Raise ValueError unless setup() has made the store ready to keep history.
 
-        ``schema`` is what the schema check returned. Read it again with
-        refresh=True before calling this with a check that found no history
-        table, so a setup() that another process ran since is seen.
+        ``schema`` is what the schema check returned, read with refresh=True,
+        so a setup() that another process ran since is seen.
 
         Raises:
             ValueError: If migration 2's columns or the history table are missing.
         """
-        if not schema.history_ready:
+        if not schema.columns:
+            raise ValueError(
+                f"The table {self.sql.items} does not have the columns that history "
+                "needs yet; run setup() to add them and to create the history table "
+                f"{self.sql.history}."
+            )
+        if not schema.history:
             raise ValueError(
                 f"The history table {self.sql.history} does not exist yet; "
                 "run setup() to create it."
@@ -926,8 +931,12 @@ class BaseCockroachDBStore:
         """
         keeps_history = self._history is not None and plan.write_id is not None
         statements: list[tuple[str, list]] = []
-        if keeps_history:
-            statements.extend(self._archive_statements(plan))
+        if self._history is not None and plan.write_id is not None:
+            statements.extend(
+                self._archive_statements(
+                    plan, write_id=plan.write_id, ttl_days=self._history.ttl_days
+                )
+            )
         for prefix, keys in plan.reindexed.items():
             statements.append(self.sql.delete_vectors(prefix, keys))
         rows: Sequence[ItemRow] | Sequence[ItemRowV2] = plan.items
@@ -952,14 +961,20 @@ class BaseCockroachDBStore:
                 statements.append(self.sql.delete_vectors(prefix, keys))
         return statements
 
-    def _archive_statements(self, plan: PutPlan) -> list[tuple[str, list]]:
+    def _archive_statements(
+        self, plan: PutPlan, *, write_id: str, ttl_days: float | None
+    ) -> list[tuple[str, list]]:
         """The statements that keep the versions a put batch ends, on a store with history.
 
         Each put key's live version is archived as overwritten and each
         deleted key's as deleted, both invalid from now. Keys with no live
         row archive nothing. One statement per namespace and reason.
+
+        Args:
+            plan: The put plan.
+            write_id: The plan's write id.
+            ttl_days: The history's TTL in days, or None.
         """
-        assert self._history is not None and plan.write_id is not None
         overwritten: dict[str, list[str]] = {}
         for prefix, key, _, _ in plan.items:
             overwritten.setdefault(prefix, []).append(key)
@@ -970,8 +985,8 @@ class BaseCockroachDBStore:
                 reason=reason,
                 superseded_by=None,
                 invalid_at=None,
-                write_id=plan.write_id,
-                ttl_days=self._history.ttl_days,
+                write_id=write_id,
+                ttl_days=ttl_days,
             )
             for reason, by_prefix in (("overwritten", overwritten), ("deleted", plan.deletes))
             for prefix, keys in by_prefix.items()

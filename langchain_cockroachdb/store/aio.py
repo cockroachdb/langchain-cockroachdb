@@ -621,21 +621,38 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     async def _ahistory_schema(self) -> SchemaCheck:
         """The schema check for an operation that needs the history table.
 
-        Before it refuses, it reads the schema again, so a setup() that
-        another process ran since is seen.
+        It runs with ``refresh``: what it found present it trusts for good,
+        and what it found missing it reads again, once, so it sees a setup()
+        that another process ran since before it refuses.
 
         Raises:
             ValueError: If the store keeps no history, or setup() has not
                 created the history table yet.
         """
         self._require_history()
-        schema = await self._aschema()
-        if not schema.history_ready:
-            schema = await self._aschema(refresh=True)
+        schema = await self._aschema(refresh=True)
         self._require_history_table(schema)
         return schema
 
+    async def _ahistory_table_exists(self) -> bool:
+        """Whether the history table exists, for adelete_namespace on a store without history.
+
+        True is trusted for good. Until then every call reads. Only
+        adelete_namespace asks, and it is a rare call: plain writes never do.
+        """
+        if self._history_ready is True:
+            return True
+        [rows] = await self._read_all([self.sql.history_exists()], "store history check")
+        return self._cache_history(rows)
+
     async def _run_puts(self, plan: PutPlan) -> None:
+        # The schema check comes first. With history, a write refuses to run
+        # until setup() has created the history table, since it could not
+        # keep what it replaces, and a refused batch costs no embedding call
+        if self._history is not None:
+            schema = await self._ahistory_schema()
+        else:
+            schema = await self._aschema()
         # Embed once, before the first attempt: a retry reuses the vectors
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
@@ -643,12 +660,6 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 [text for _, _, _, text in plan.embed_requests]
             )
         vector_rows = self._vector_rows(plan, embeddings)
-        # With history, a write refuses to run until setup() has created
-        # the history table, since it could not keep what it replaces
-        if self._history is not None:
-            schema = await self._ahistory_schema()
-        else:
-            schema = await self._aschema()
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
         if schema.columns:
@@ -673,8 +684,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         """Delete every item in a namespace and its descendants.
 
         ``("user", "a")`` deletes ``("user", "a")`` and ``("user", "a", "b")``,
-        not ``("user", "ab")``. One statement deletes the items and their
-        vectors, and on a store with history their history too.
+        not ``("user", "ab")``. One statement deletes the items, their
+        vectors and their history. A store without history deletes history
+        too when the history table exists, as when the store kept history
+        before, so nothing of the namespace is left.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
@@ -697,7 +710,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             )
         if self._history is not None:
             await self._ahistory_schema()
-        statement = self.sql.delete_namespace(prefix, history=self._history is not None)
+            history = True
+        else:
+            history = await self._ahistory_table_exists()
+        statement = self.sql.delete_namespace(prefix, history=history)
 
         async def write() -> int:
             # One statement, so items, vectors and history commit together. pipeline=True
