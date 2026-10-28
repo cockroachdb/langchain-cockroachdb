@@ -1,6 +1,7 @@
 """Run every example against the test database, the way a user would."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,3 +23,6 @@ def test_example_runs_cleanly(example: Path, connection_string: str) -> None:
         f"STDOUT:\n{result.stdout[-4000:]}\nSTDERR:\n{result.stderr[-4000:]}"
     )
     assert "Traceback" not in result.stderr, result.stderr[-4000:]
+    # Python's warnings, as "file:line: Category: message"; the retry log is not one
+    warnings = re.findall(r"^\S+:\d+: \w*Warning: .*$", result.stderr, re.MULTILINE)
+    assert not warnings, "\n".join(warnings)

@@ -3,9 +3,10 @@
 The LangGraph checkpointers and the store open psycopg connections
 themselves, not through SQLAlchemy. They share the code here: retries under
 a RetryPolicy, the hang guard, one operation at a time on a single
-connection, and writes with several statements sent as one
-``BEGIN ... COMMIT`` batch. A host class names itself in ``component``
-(``"checkpointer"`` or ``"store"``), which log and error messages use.
+connection, writes with several statements sent as one ``BEGIN ... COMMIT``
+batch, and no prepared statements in a pipeline. A host class names itself
+in ``component`` (``"checkpointer"`` or ``"store"``), which log and error
+messages use.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, ClassVar, TypeVar
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Connection, Cursor, Pipeline
-from psycopg.pq import TransactionStatus
+from psycopg.pq import PipelineStatus, TransactionStatus
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
@@ -47,6 +48,29 @@ def _operation_label(component: str) -> str:
     """The default hang-guard label: "checkpoint operation" keeps the 0.4.1 text."""
     noun = "checkpoint" if component == "checkpointer" else component
     return f"{noun} operation"
+
+
+@contextmanager
+def _unprepared(conn: Connection[DictRow] | AsyncConnection[DictRow]) -> Iterator[None]:
+    """Run the block's statements on ``conn`` without psycopg's prepared statements.
+
+    The components send every statement in a pipeline this way. psycopg
+    prepares a statement once a connection has run it prepare_threshold
+    times, and in pipeline mode it records the statement as prepared as soon
+    as it sends it. When an earlier statement in the same batch fails, the
+    server skips the rest of the batch and never prepares it, yet psycopg runs
+    it by name from then on. Each run fails with "prepared statement ... does
+    not exist" (SQLSTATE 26000) until a rollback clears psycopg's record, and
+    a batch that failed before BEGIN, or a read in an implicit transaction,
+    has nothing to roll back. Outside a pipeline psycopg reads the server's
+    answer before it records anything, so statements there stay prepared.
+    """
+    threshold = conn.prepare_threshold
+    conn.prepare_threshold = None
+    try:
+        yield
+    finally:
+        conn.prepare_threshold = threshold
 
 
 class PsycopgOps:
@@ -325,34 +349,44 @@ class PsycopgOps:
                     not self._batch_open
                     and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
+                # Every branch but the last sends the block in a pipeline (a batch needs
+                # one), and so does the last on a connection already in pipeline mode.
+                # psycopg's executemany opens a pipeline of its own: give it a block
+                # with pipeline=True
+                in_pipeline = (
+                    bool(self.pipe)
+                    or (pipeline and self.supports_pipeline)
+                    or conn.pgconn.pipeline_status != PipelineStatus.OFF
+                )
                 try:
-                    if self.pipe:
-                        with self._on_component_pipeline(
-                            conn,
-                            self.pipe,
-                            pipeline=pipeline,
-                            transaction=transaction,
-                            batched=batched,
-                        ) as cur:
-                            yield cur
-                    elif batched:
-                        with self._in_one_batch(conn) as cur:
-                            yield cur
-                    elif pipeline and self.supports_pipeline:
-                        # psycopg's transaction goes around the pipeline, which saves a
-                        # round trip
-                        with (
-                            self._transaction(conn, transaction),
-                            conn.pipeline(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                    else:
-                        with (
-                            self._transaction(conn, transaction),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
+                    with _unprepared(conn) if in_pipeline else contextlib.nullcontext():
+                        if self.pipe:
+                            with self._on_component_pipeline(
+                                conn,
+                                self.pipe,
+                                pipeline=pipeline,
+                                transaction=transaction,
+                                batched=batched,
+                            ) as cur:
+                                yield cur
+                        elif batched:
+                            with self._in_one_batch(conn) as cur:
+                                yield cur
+                        elif pipeline and self.supports_pipeline:
+                            # psycopg's transaction goes around the pipeline, which saves a
+                            # round trip
+                            with (
+                                self._transaction(conn, transaction),
+                                conn.pipeline(),
+                                conn.cursor(binary=True, row_factory=dict_row) as cur,
+                            ):
+                                yield cur
+                        else:
+                            with (
+                                self._transaction(conn, transaction),
+                                conn.cursor(binary=True, row_factory=dict_row) as cur,
+                            ):
+                                yield cur
                 except Exception as error:
                     if in_callers_transaction:
                         _psycopg_conn.mark_in_caller_transaction(error)
@@ -662,34 +696,44 @@ class AsyncPsycopgOps:
                     not self._batch_open
                     and conn.info.transaction_status in _psycopg_conn.OPEN_TRANSACTION
                 )
+                # Every branch but the last sends the block in a pipeline (a batch needs
+                # one), and so does the last on a connection already in pipeline mode.
+                # psycopg's executemany opens a pipeline of its own: give it a block
+                # with pipeline=True
+                in_pipeline = (
+                    bool(self.pipe)
+                    or (pipeline and self.supports_pipeline)
+                    or conn.pgconn.pipeline_status != PipelineStatus.OFF
+                )
                 try:
-                    if self.pipe:
-                        async with self._on_component_pipeline(
-                            conn,
-                            self.pipe,
-                            pipeline=pipeline,
-                            transaction=transaction,
-                            batched=batched,
-                        ) as cur:
-                            yield cur
-                    elif batched:
-                        async with self._in_one_batch(conn) as cur:
-                            yield cur
-                    elif pipeline and self.supports_pipeline:
-                        # psycopg's transaction goes around the pipeline, which saves a
-                        # round trip
-                        async with (
-                            self._transaction(conn, transaction),
-                            conn.pipeline(),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
-                    else:
-                        async with (
-                            self._transaction(conn, transaction),
-                            conn.cursor(binary=True, row_factory=dict_row) as cur,
-                        ):
-                            yield cur
+                    with _unprepared(conn) if in_pipeline else contextlib.nullcontext():
+                        if self.pipe:
+                            async with self._on_component_pipeline(
+                                conn,
+                                self.pipe,
+                                pipeline=pipeline,
+                                transaction=transaction,
+                                batched=batched,
+                            ) as cur:
+                                yield cur
+                        elif batched:
+                            async with self._in_one_batch(conn) as cur:
+                                yield cur
+                        elif pipeline and self.supports_pipeline:
+                            # psycopg's transaction goes around the pipeline, which saves a
+                            # round trip
+                            async with (
+                                self._transaction(conn, transaction),
+                                conn.pipeline(),
+                                conn.cursor(binary=True, row_factory=dict_row) as cur,
+                            ):
+                                yield cur
+                        else:
+                            async with (
+                                self._transaction(conn, transaction),
+                                conn.cursor(binary=True, row_factory=dict_row) as cur,
+                            ):
+                                yield cur
                 except Exception as error:
                     if in_callers_transaction:
                         _psycopg_conn.mark_in_caller_transaction(error)

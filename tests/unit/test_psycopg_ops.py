@@ -13,7 +13,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from psycopg.pq import TransactionStatus
+from psycopg.pq import PipelineStatus, TransactionStatus
 from psycopg.waiting import Wait
 
 from tests.unit.checkpointer_fakes import (
@@ -360,3 +360,90 @@ async def test_a_write_in_its_own_pipeline_block_is_not_drained(kind: str) -> No
     await _maybe_await((_run_sync_path if kind == "sync" else _run_async_path)(host, "write"))
     assert ("pipeline", "open") in conn.events
     assert conn.pgconn.io == []
+
+
+# A connection's own prepare_threshold in the tests below; psycopg's default is 5
+CALLERS_THRESHOLD = 7
+
+
+def _record_thresholds(kind: str, conn: Any) -> list[int | None]:
+    """The prepare_threshold the connection has as each of its statements runs."""
+    seen: list[int | None] = []
+
+    def record(query: str) -> None:
+        seen.append(conn.prepare_threshold)
+
+    async def arecord(query: str) -> None:
+        record(query)
+
+    conn.on_statement = record if kind == "sync" else arecord
+    return seen
+
+
+async def _run_select(host: Any, kind: str, **block: bool) -> None:
+    if kind == "sync":
+        with host._cursor(**block) as cur:
+            cur.execute("SELECT 1")
+    else:
+        async with host._cursor(**block) as cur:
+            await cur.execute("SELECT 1")
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("block", "pipelined"),
+    [
+        pytest.param({"pipeline": True, "transaction": True}, True, id="batch"),
+        pytest.param({"pipeline": True}, True, id="pipeline"),
+        pytest.param({}, False, id="statement"),
+    ],
+)
+async def test_only_statements_outside_a_pipeline_are_prepared(
+    kind: str, block: dict[str, bool], pipelined: bool
+) -> None:
+    # In pipeline mode psycopg can record a statement as prepared that the
+    # server never prepared, so statements there run unprepared. A statement
+    # on its own keeps the caller's threshold, and so stays prepared
+    conn = _single(kind)
+    conn.prepare_threshold = CALLERS_THRESHOLD
+    seen = _record_thresholds(kind, conn)
+    await _run_select(_host(kind, "store", conn), kind, **block)
+    assert seen
+    assert set(seen) == {None if pipelined else CALLERS_THRESHOLD}
+    assert conn.prepare_threshold == CALLERS_THRESHOLD
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("opened_by", ["component", "caller"])
+async def test_statements_on_a_connection_in_pipeline_mode_run_unprepared(
+    kind: str, opened_by: str
+) -> None:
+    # The pipeline is the component's own (pipe=), or one the caller opened
+    # on the connection without passing it as pipe=
+    conn = _single(kind)
+    conn.prepare_threshold = CALLERS_THRESHOLD
+    conn.pgconn.pipeline_status = PipelineStatus.ON
+    host = _host(kind, "store", conn)
+    if opened_by == "component":
+        conn.in_pipeline_mode = True
+        host.pipe = FakePipe(conn.pgconn.io) if kind == "sync" else FakeAsyncPipe(conn.pgconn.io)
+    seen = _record_thresholds(kind, conn)
+    await _run_select(host, kind)
+    assert seen == [None]
+    assert conn.prepare_threshold == CALLERS_THRESHOLD
+
+
+@pytest.mark.usefixtures("_sockets")
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_a_failed_pipeline_block_gives_the_threshold_back(kind: str) -> None:
+    # BEGIN runs, then the statement fails and the batch is rolled back
+    error = psycopg.errors.SerializationFailure("restart transaction")
+    conn = _single(kind, error, fail_at=2)
+    conn.prepare_threshold = CALLERS_THRESHOLD
+    host = _host(kind, "store", conn)
+    with pytest.raises(psycopg.errors.SerializationFailure):
+        await _run_select(host, kind, pipeline=True, transaction=True)
+    assert ("rollback",) in conn.events
+    assert conn.prepare_threshold == CALLERS_THRESHOLD

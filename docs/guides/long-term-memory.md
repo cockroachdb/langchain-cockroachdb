@@ -89,7 +89,7 @@ All `from_conn_string` options:
 | `ttl` | `None` | Expiry settings, see [TTL](#ttl) |
 | `retry_policy` | `RetryPolicy()` | How operations retry |
 | `connect_timeout` | `10.0` | Seconds to wait when connecting, or `None` |
-| `prepare_threshold` | `5` | psycopg prepared statement threshold, or `None` to disable |
+| `prepare_threshold` | `5` | psycopg prepared statement threshold, or `None` to disable. Statements sent in a pipeline, which are nearly all of the store's, are never prepared |
 | `connect_kwargs` | `None` | Extra psycopg connection options, for example `{"application_name": "my-service"}` |
 | `table_name` | `"store"` | Name of the items table |
 | `schema` | `"public"` | Schema of the store's tables |
@@ -360,7 +360,7 @@ The store creates plain tables, with no multi-region locality such as `REGIONAL 
 
 ### With create_agent
 
-The tools annotate their runtime as plain `ToolRuntime`. On Python 3.10, pydantic cannot build the tool schema for `ToolRuntime[Context]`, so the subscripted form fails there.
+The tools annotate their runtime as `ToolRuntime[Context, dict]`, which names both the context type and the agent state type. Python 3.10 cannot fill in the default of the second, so `ToolRuntime[Context]` fails there. A plain `ToolRuntime` expects no context, and pydantic warns about the `Context` it gets.
 
 Tools reach the store through `ToolRuntime`, and the user id comes from the run's context:
 
@@ -383,7 +383,7 @@ class Context:
 
 
 @tool
-def save_memory(text: str, runtime: ToolRuntime) -> str:
+def save_memory(text: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     namespace = ("user", runtime.context.user_id, "memories")
@@ -392,7 +392,7 @@ def save_memory(text: str, runtime: ToolRuntime) -> str:
 
 
 @tool
-def recall(query: str, runtime: ToolRuntime) -> str:
+def recall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     namespace = ("user", runtime.context.user_id, "memories")

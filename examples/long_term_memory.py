@@ -103,15 +103,16 @@ class ScriptedModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-# The tools take a plain ToolRuntime. On Python 3.10, pydantic cannot build
-# the tool schema for ToolRuntime[Context], so the context type stays unnamed.
-def memories(runtime: ToolRuntime) -> tuple[str, ...]:
+# ToolRuntime has two type arguments, the context and the agent state. Give
+# both: Python 3.10 cannot fill in the default of the second, and a plain
+# ToolRuntime expects no context, so pydantic warns about the Context it gets.
+def memories(runtime: ToolRuntime[Context, dict]) -> tuple[str, ...]:
     """The namespace of the current user's memories."""
     return ("user", runtime.context.user_id, "memories")
 
 
 @tool
-def save_memory(text: str, runtime: ToolRuntime) -> str:
+def save_memory(text: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     runtime.store.put(memories(runtime), str(uuid.uuid4()), {"text": text})
@@ -119,7 +120,7 @@ def save_memory(text: str, runtime: ToolRuntime) -> str:
 
 
 @tool
-def recall(query: str, runtime: ToolRuntime) -> str:
+def recall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     found = runtime.store.search(memories(runtime), query=query, limit=1)
@@ -128,7 +129,7 @@ def recall(query: str, runtime: ToolRuntime) -> str:
 
 # The async agent awaits async tools, which call the store's a-prefixed methods
 @tool("save_memory")
-async def asave_memory(text: str, runtime: ToolRuntime) -> str:
+async def asave_memory(text: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Save a fact about the user for later conversations."""
     assert runtime.store is not None
     await runtime.store.aput(memories(runtime), str(uuid.uuid4()), {"text": text})
@@ -136,7 +137,7 @@ async def asave_memory(text: str, runtime: ToolRuntime) -> str:
 
 
 @tool("recall")
-async def arecall(query: str, runtime: ToolRuntime) -> str:
+async def arecall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
     """Search the user's memories."""
     assert runtime.store is not None
     found = await runtime.store.asearch(memories(runtime), query=query, limit=1)

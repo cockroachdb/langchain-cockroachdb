@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator, Callable, Generator, Iterator, Sequen
 from typing import Any, TypeVar
 
 import psycopg
-from psycopg.pq import TransactionStatus
+from psycopg.pq import PipelineStatus, TransactionStatus
 from psycopg.waiting import Ready
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
@@ -72,7 +72,11 @@ class FakePGconn:
     flush() returns the next of ``flushes``, then 0: nothing is left to send.
     ``io`` records each flush() and each wait for the socket, in order. Pass
     a connection's ``events`` as ``io`` to see them among its statements.
+    ``pipeline_status`` is what libpq reports; set ON for a connection that
+    is already in pipeline mode.
     """
+
+    pipeline_status = PipelineStatus.OFF
 
     def __init__(
         self, flushes: Sequence[int] = (), io: list[tuple[Any, ...]] | None = None
@@ -113,6 +117,9 @@ class FakeConnection:
     """
 
     autocommit = True
+    # psycopg's default. Set as a class attribute, it also hides psycopg's own
+    # property in the subclasses below, which never run psycopg's __init__
+    prepare_threshold: int | None = 5
 
     def __init__(
         self,

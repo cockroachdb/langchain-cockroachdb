@@ -216,7 +216,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             ttl: TTL settings
             retry_policy: How operations retry (default: RetryPolicy())
             connect_timeout: Seconds to wait when connecting, or None (default: 10)
-            prepare_threshold: psycopg prepared statement threshold, None to disable (default: 5)
+            prepare_threshold: psycopg prepared statement threshold, None to disable
+                (default: 5). Statements sent in a pipeline are never prepared
             connect_kwargs: Extra psycopg connection options, e.g. application_name
             table_name: Name of the items table (default "store")
             schema: Schema of the store's tables (default "public")
