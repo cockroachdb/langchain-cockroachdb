@@ -2590,7 +2590,7 @@
 <tr>
 <td><code>prepare_threshold</code></td>
 <td><code>5</code></td>
-<td>psycopg prepared statement threshold, or <code>None</code> to disable</td>
+<td>psycopg prepared statement threshold, or <code>None</code> to disable. Statements sent in a pipeline, which are nearly all of the store's, are never prepared</td>
 </tr>
 <tr>
 <td><code>connect_kwargs</code></td>
@@ -2919,7 +2919,7 @@
 <p>The store creates plain tables, with no multi-region locality such as <code>REGIONAL BY ROW</code> or <code>GLOBAL</code>. You can set one yourself with <code>ALTER TABLE</code>; <code>setup()</code> leaves it as you set it.</p>
 <h2 id="use-with-langgraph">Use with LangGraph<a class="headerlink" href="#use-with-langgraph" title="Permanent link">&para;</a></h2>
 <h3 id="with-create_agent">With create_agent<a class="headerlink" href="#with-create_agent" title="Permanent link">&para;</a></h3>
-<p>The tools annotate their runtime as plain <code>ToolRuntime</code>. On Python 3.10, pydantic cannot build the tool schema for <code>ToolRuntime[Context]</code>, so the subscripted form fails there.</p>
+<p>The tools annotate their runtime as <code>ToolRuntime[Context, dict]</code>, which names both the context type and the agent state type. Python 3.10 cannot fill in the default of the second, so <code>ToolRuntime[Context]</code> fails there. A plain <code>ToolRuntime</code> expects no context, and pydantic warns about the <code>Context</code> it gets.</p>
 <p>Tools reach the store through <code>ToolRuntime</code>, and the user id comes from the run's context:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">uuid</span>
 <a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
@@ -2939,7 +2939,7 @@
 <a id="__codelineno-16-16" name="__codelineno-16-16" href="#__codelineno-16-16"></a>
 <a id="__codelineno-16-17" name="__codelineno-16-17" href="#__codelineno-16-17"></a>
 <a id="__codelineno-16-18" name="__codelineno-16-18" href="#__codelineno-16-18"></a><span class="nd">@tool</span>
-<a id="__codelineno-16-19" name="__codelineno-16-19" href="#__codelineno-16-19"></a><span class="k">def</span><span class="w"> </span><span class="nf">save_memory</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-16-19" name="__codelineno-16-19" href="#__codelineno-16-19"></a><span class="k">def</span><span class="w"> </span><span class="nf">save_memory</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">[</span><span class="n">Context</span><span class="p">,</span> <span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <a id="__codelineno-16-20" name="__codelineno-16-20" href="#__codelineno-16-20"></a><span class="w">    </span><span class="sd">"""Save a fact about the user for later conversations."""</span>
 <a id="__codelineno-16-21" name="__codelineno-16-21" href="#__codelineno-16-21"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 <a id="__codelineno-16-22" name="__codelineno-16-22" href="#__codelineno-16-22"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
@@ -2948,7 +2948,7 @@
 <a id="__codelineno-16-25" name="__codelineno-16-25" href="#__codelineno-16-25"></a>
 <a id="__codelineno-16-26" name="__codelineno-16-26" href="#__codelineno-16-26"></a>
 <a id="__codelineno-16-27" name="__codelineno-16-27" href="#__codelineno-16-27"></a><span class="nd">@tool</span>
-<a id="__codelineno-16-28" name="__codelineno-16-28" href="#__codelineno-16-28"></a><span class="k">def</span><span class="w"> </span><span class="nf">recall</span><span class="p">(</span><span class="n">query</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-16-28" name="__codelineno-16-28" href="#__codelineno-16-28"></a><span class="k">def</span><span class="w"> </span><span class="nf">recall</span><span class="p">(</span><span class="n">query</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">[</span><span class="n">Context</span><span class="p">,</span> <span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <a id="__codelineno-16-29" name="__codelineno-16-29" href="#__codelineno-16-29"></a><span class="w">    </span><span class="sd">"""Search the user's memories."""</span>
 <a id="__codelineno-16-30" name="__codelineno-16-30" href="#__codelineno-16-30"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 <a id="__codelineno-16-31" name="__codelineno-16-31" href="#__codelineno-16-31"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>

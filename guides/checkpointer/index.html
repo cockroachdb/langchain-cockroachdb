@@ -2976,7 +2976,8 @@
 <h3 id="raw-bytea-deserialization">Raw BYTEA Deserialization<a class="headerlink" href="#raw-bytea-deserialization" title="Permanent link">&para;</a></h3>
 <p>Blob data is read as raw BYTEA via psycopg3's binary cursor protocol, eliminating the overhead of hex-encoding in SQL and decoding in Python.</p>
 <h3 id="prepared-statement-caching">Prepared Statement Caching<a class="headerlink" href="#prepared-statement-caching" title="Permanent link">&para;</a></h3>
-<p>The <code>from_conn_string()</code> factory sets <code>prepare_threshold=5</code> by default, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths. <code>prepare_threshold</code> is configurable via <code>from_conn_string(prepare_threshold=...)</code>.</p>
+<p>The <code>from_conn_string()</code> factory sets <code>prepare_threshold=5</code> by default, enabling server-side prepared statement caching after 5 executions of the same query. This eliminates repeated query parsing and planning overhead for hot paths. <code>prepare_threshold</code> is configurable via <code>from_conn_string(prepare_threshold=...)</code>, and <code>None</code> turns prepared statements off.</p>
+<p>Statements sent in a pipeline are never prepared: the writes (<code>put</code>, <code>put_writes</code>, <code>delete_thread</code>) and, with <code>pipeline=True</code>, every statement. In pipeline mode psycopg records a statement as prepared before the server confirms it. If an earlier statement in the same batch fails, the server never prepares it, and later runs on that connection could fail with "prepared statement ... does not exist".</p>
 <h2 id="cockroachdb-specific-adaptations">CockroachDB-Specific Adaptations<a class="headerlink" href="#cockroachdb-specific-adaptations" title="Permanent link">&para;</a></h2>
 <p>This checkpointer is modeled on <code>langgraph-checkpoint-postgres</code> (PostgresSaver) with the following adaptations for CockroachDB compatibility:</p>
 <h3 id="separate-queries-instead-of-multidimensional-arrays">Separate Queries Instead of Multidimensional Arrays<a class="headerlink" href="#separate-queries-instead-of-multidimensional-arrays" title="Permanent link">&para;</a></h3>
@@ -3033,8 +3034,8 @@
 </tr>
 <tr>
 <td>Prepared statements</td>
-<td><code>prepare_threshold=0</code> (disabled)</td>
-<td><code>prepare_threshold=5</code> (enabled)</td>
+<td><code>prepare_threshold=0</code> (each query from its first run)</td>
+<td><code>prepare_threshold=5</code> (after five runs, outside pipelines)</td>
 </tr>
 <tr>
 <td>Row-level TTL</td>
