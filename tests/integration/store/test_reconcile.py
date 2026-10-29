@@ -882,6 +882,35 @@ def test_first_of_writes_an_update_of_a_live_slot_key_next_to_a_near_duplicate(
     assert other is not None and (other.version, other.confirmations) == (1, 0)
 
 
+def test_a_near_duplicate_outside_the_slot_does_not_keep_an_older_slot_memory_live(
+    store_factory, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "old", in_slot(AISLE))  # 0.94 against LONG_FLIGHTS, in the slot
+    store.put(NS, "other", text(WINDOW))  # 0.98 against LONG_FLIGHTS, in no slot
+
+    # A new memory in the slot. skip_duplicates counts only repeats in the
+    # slot, so the near duplicate outside it does not skip the new memory,
+    # and supersede_same_slot ends the older, contradicting memory
+    policy = first_of(skip_duplicates(), supersede_same_slot())
+    result = store.reconcile(NS, "new", in_slot(LONG_FLIGHTS), slot="seat", policy=policy)
+
+    assert result == ReconcileResult(
+        key="new",
+        new="written",
+        version=1,
+        superseded=("old",),
+        deleted=(),
+        confirmed=(),
+        kept=("other",),
+    )
+    assert sorted(item.key for item in store.search(NS)) == ["new", "other"]
+    [old] = store.history(NS, "old")
+    assert (old.reason, old.superseded_by, old.value) == ("superseded", "new", in_slot(AISLE))
+    other = store.record(NS, "other")
+    assert other is not None and (other.version, other.confirmations) == (1, 0)
+
+
 def test_reconcile_records_a_late_fact_as_superseded(store_factory, admin, mode) -> None:
     store = store_factory(mode, history=True, index=seat_index())
     live = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")

@@ -623,10 +623,10 @@ A policy is a function of the `Proposal` and the candidates that returns a `Deci
 | Policy | What it decides |
 |---|---|
 | `supersede_same_slot()` | Skips the new memory if the memory under its key has a later valid time. Otherwise, if a slot candidate's valid time is later than the new memory's, records the new memory as superseded by the latest such candidate and keeps the rest. If none is later, supersedes every slot candidate |
-| `skip_duplicates(threshold=0.97)` | Skips a new memory, one whose key holds no live memory, if a candidate has an equal value or scores at or above `threshold`, and confirms the best such candidate. Saving a live memory's value again under its key skips it and confirms that memory. Any other value under a live key is an update, which it never skips: it writes the new memory and keeps everything, so `first_of` tries the next policy |
-| `supersede_similar(threshold=0.9)` | Works like `supersede_same_slot`, for the slot candidates and the candidates that score at or above `threshold`. It is blunt: similar is not contradictory |
+| `skip_duplicates(threshold=0.97)` | Skips a new memory, one whose key holds no live memory, if a candidate has an equal value or scores at or above `threshold`, and confirms the best such candidate. With a `slot`, only candidates in the same slot count: a repeat outside the slot states another fact, so it lets the next policy supersede an older memory in the slot. Saving a live memory's value again under its key skips it and confirms that memory. Any other value under a live key is an update, which it never skips: it writes the new memory and keeps everything, so `first_of` tries the next policy |
+| `supersede_similar(threshold=0.9)` | Works like `supersede_same_slot`, for the slot candidates and the candidates that score at or above `threshold`. Like it, it skips the new memory if the memory under its key has a later valid time, whatever that memory scores. It is blunt: similar is not contradictory |
 | `keep_all()` | Writes the new memory and keeps every candidate |
-| `first_of(*policies)` | Tries the policies in order and uses the first decision that does more than write the new memory and keep everything |
+| `first_of(*policies)` | Tries the policies in order and uses the first decision that does more than write the new memory and keep everything. A decision whose actions only `KEEP` candidates keeps everything too |
 
 Confirming a duplicate instead of writing it again is how repeated observations reinforce a fact instead of piling up.
 
@@ -893,6 +893,8 @@ print(late.new)  # superseded
 ```
 
 With history on, the late fact goes straight into history, superseded by the aisle preference. Its version there is true from May 2024 until the aisle preference became true. Without history it is skipped, and `new` is `"skipped"`.
+
+Only these two policies compare valid times. A late fact under a key whose live memory is newer is skipped, not recorded, since a memory cannot be superseded by the memory under its own key.
 
 ### Confirmation-Aware Expiry
 

@@ -127,9 +127,46 @@ def test_supersede_same_slot_writes_over_an_older_target_in_the_slot() -> None:
 
 def test_skip_duplicates_confirms_the_closest_near_duplicate() -> None:
     found = [candidate("a", score=0.98), candidate("b", score=0.99), candidate("c", score=0.5)]
-    assert skip_duplicates()(make_proposal("new"), found) == Decision(
+    assert skip_duplicates()(make_proposal("new", slot=None), found) == Decision(
         new="skip", actions={"b": Action.CONFIRM}
     )
+
+
+def test_skip_duplicates_with_a_slot_counts_only_duplicates_in_the_slot() -> None:
+    # A near duplicate or an equal value outside the new memory's slot states
+    # another fact, so it does not make the new memory a repeat
+    proposal = make_proposal("new", value={"text": "aisle seats", "slot": "seat_preference"})
+    outside = [
+        candidate("near", score=0.99),
+        candidate("equal", value={"text": "aisle seats", "slot": "seat_preference"}),
+    ]
+    assert skip_duplicates()(proposal, outside) == Decision()
+    # One in the slot still does, and the best of those is confirmed
+    found = [*outside, candidate("s1", reason="slot", score=0.98)]
+    found.append(candidate("s2", reason="slot", score=0.99))
+    assert skip_duplicates()(proposal, found) == Decision(
+        new="skip", actions={"s2": Action.CONFIRM}
+    )
+    # Without a slot, a duplicate anywhere counts
+    without_slot = dataclasses.replace(proposal, slot=None, slot_value=None)
+    assert skip_duplicates()(without_slot, outside) == Decision(
+        new="skip", actions={"equal": Action.CONFIRM}
+    )
+
+
+def test_first_of_supersedes_an_older_slot_memory_next_to_a_duplicate_outside_the_slot() -> None:
+    # Skipping the new memory for a repeat outside its slot would leave the
+    # older memory in the slot live, contradicting it
+    proposal = make_proposal("new", value={"text": "aisle seats on long flights"}, valid_at=T1)
+    found = [
+        candidate("old", reason="slot", score=0.9, value={"text": "window seats"}, valid_at=T0),
+        candidate("dup", score=0.99, value={"text": "aisle seats on long flights!"}),
+    ]
+
+    decision = first_of(skip_duplicates(), supersede_same_slot())(proposal, found)
+
+    assert decision == Decision(actions={"old": Action.SUPERSEDE})
+    validate_decision(proposal, found, decision)
 
 
 def test_skip_duplicates_treats_an_equal_value_as_a_duplicate() -> None:
@@ -228,6 +265,26 @@ def test_supersede_similar_does_not_supersede_the_target() -> None:
     validate_decision(proposal, candidates, decision)
 
 
+@pytest.mark.parametrize("score", [0.85, None], ids=["below-threshold", "no-score"])
+def test_supersede_similar_skips_a_late_fact_under_a_newer_target(score: float | None) -> None:
+    # The memory under the new key is newer. Whatever it scores, or without a
+    # score on a store without an index, a late fact must not overwrite it
+    proposal = make_proposal("k", value={"text": "window seats"}, valid_at=T0)
+    found = [
+        candidate("k", reason="key", score=score, value={"text": "aisle seats"}, valid_at=T1),
+        candidate("other", score=0.95, valid_at=T0),
+    ]
+
+    decision = supersede_similar(threshold=0.9)(proposal, found)
+
+    assert decision == Decision(new="skip")
+    validate_decision(proposal, found, decision)
+    # Behind skip_duplicates too, which leaves an update of a live key to the next policy
+    assert first_of(skip_duplicates(), supersede_similar())(proposal, found) == Decision(new="skip")
+    # With no other candidate at all
+    assert supersede_similar(threshold=0.9)(proposal, found[:1]) == Decision(new="skip")
+
+
 def test_keep_all_writes_and_keeps() -> None:
     found = [candidate("a"), candidate("b")]
     assert keep_all()(make_proposal("new"), found) == Decision()
@@ -246,6 +303,25 @@ def test_first_of_writes_when_no_policy_acts() -> None:
     found = [candidate("a", score=0.5)]  # Not a duplicate, not in slot
     policy = first_of(skip_duplicates(), keep_all())
     assert policy(proposal, found) == Decision()
+
+
+def test_an_explicit_keep_does_not_act() -> None:
+    # Keeping a candidate by name is what leaving it out does
+    assert not Decision(actions={"a": Action.KEEP}).acts()
+    assert not Decision(actions={"a": "keep", "b": Action.KEEP}).acts()
+    assert not Decision().acts()
+    assert Decision(actions={"a": Action.KEEP, "b": Action.CONFIRM}).acts()
+    assert Decision(actions={"a": Action.SUPERSEDE}).acts()
+    assert Decision(new="skip").acts() and Decision(new="skip", actions={"a": "keep"}).acts()
+    # So first_of moves past a policy that only names what it keeps
+    proposal = make_proposal("new")
+    found = [candidate("a", reason="slot", valid_at=T0)]
+
+    def keep_by_name(proposal: Proposal, candidates: object) -> Decision:
+        return Decision(actions={"a": Action.KEEP})
+
+    policy = first_of(keep_by_name, supersede_same_slot())
+    assert policy(proposal, found) == Decision(actions={"a": Action.SUPERSEDE})
 
 
 def test_validate_decision_rejects_unknown_candidate_key() -> None:

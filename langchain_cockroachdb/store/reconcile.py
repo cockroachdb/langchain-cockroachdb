@@ -127,8 +127,12 @@ class Decision:
         return self.actions.get(key, Action.KEEP)
 
     def acts(self) -> bool:
-        """Return True if this decision does more than just write and keep all."""
-        return self.new != "write" or len(self.actions) > 0
+        """Return True if this decision does more than just write and keep all.
+
+        An action of KEEP keeps the candidate, as leaving it out does, so it
+        does not count.
+        """
+        return self.new != "write" or any(a != Action.KEEP for a in self.actions.values())
 
 
 @dataclass(frozen=True)
@@ -387,11 +391,13 @@ def _validate_threshold(threshold: float, name: str) -> None:
 def supersede_same_slot() -> Policy:
     """Return a policy that supersedes older facts in the same slot.
 
-    When slot candidates exist (reason "slot"):
-    1. If the target exists and has a later valid_at, skip the proposal.
-    2. If any slot candidate has a later valid_at, record the proposal as
+    1. If the memory under the proposal's key (the target) has a later
+       valid_at, skip the proposal, whatever reason the target has.
+    2. Otherwise, if no candidate is in the same slot (reason "slot"),
+       write the proposal and keep every candidate.
+    3. If a slot candidate has a later valid_at, record the proposal as
        superseded by the latest such candidate.
-    3. Otherwise, supersede all slot candidates.
+    4. Otherwise, supersede all slot candidates.
 
     Returns:
         Policy that supersedes same-slot candidates.
@@ -431,13 +437,16 @@ def skip_duplicates(threshold: float = 0.97) -> Policy:
     A new memory, one with no live memory under its key, is skipped when a
     candidate has an equal value or scores at or above threshold, and the
     highest-scoring such candidate is confirmed (an equal value counts as
-    score 1.0). A memory whose key holds a live memory is skipped only when
-    it saves that memory's value again, which confirms it. Any other value
-    there is an update, which this policy never skips, whatever repeats it
-    under another key: skipping it would leave the key with its old value,
-    which may contradict the new one. Then it returns the decision that
-    writes the new memory and keeps every candidate, so first_of moves on to
-    the next policy.
+    score 1.0). When the proposal has a slot, only candidates in the same
+    slot count: a repeat outside the slot states another fact, and skipping
+    the new memory for it would leave an older memory in the slot live,
+    which may contradict the new one. A memory whose key holds a live
+    memory is skipped only when it saves that memory's value again, which
+    confirms it. Any other value there is an update, which this policy
+    never skips, whatever repeats it under another key: skipping it would
+    leave the key with its old value, which may contradict the new one.
+    Then it returns the decision that writes the new memory and keeps every
+    candidate, so first_of moves on to the next policy.
 
     Args:
         threshold: Similarity threshold (default 0.97).
@@ -459,9 +468,11 @@ def skip_duplicates(threshold: float = 0.97) -> Policy:
                 return Decision(new="skip", actions={target.key: Action.CONFIRM})
             return Decision()
 
-        # A new memory: an equal value or a near duplicate elsewhere repeats it
+        # A new memory: an equal value or a near duplicate elsewhere repeats
+        # it. With a slot, only a memory in the same slot can
+        same_fact = [c for c in candidates if proposal.slot is None or c.reason == "slot"]
         duplicates = []
-        for c in candidates:
+        for c in same_fact:
             if c.item.value == proposal.value:
                 # Equal value counts as score 1.0
                 duplicates.append((c, 1.0))
@@ -481,8 +492,10 @@ def skip_duplicates(threshold: float = 0.97) -> Policy:
 def supersede_similar(threshold: float = 0.9) -> Policy:
     """Return a policy that supersedes similar memories.
 
-    Works like supersede_same_slot, but matches candidates scoring at or
-    above threshold instead of slot candidates.
+    Works like supersede_same_slot, but matches the slot candidates and the
+    candidates scoring at or above threshold. As there, a target with a
+    later valid_at skips the proposal whatever it scores, and so does a
+    target without a score, as on a store without an index.
 
     Args:
         threshold: Similarity threshold (default 0.9).
@@ -496,6 +509,11 @@ def supersede_similar(threshold: float = 0.9) -> Policy:
     _validate_threshold(threshold, "threshold")
 
     def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        # Check if target (same key) is newer, whether it matches or not
+        target = next((c for c in candidates if c.key == proposal.key), None)
+        if target and target.valid_at > proposal.valid_at:
+            return Decision(new="skip")
+
         # Find matches: slot candidates or scored >= threshold
         matches = [
             c
@@ -504,11 +522,6 @@ def supersede_similar(threshold: float = 0.9) -> Policy:
         ]
         if not matches:
             return Decision()
-
-        # Check if target (same key) is newer
-        target = next((c for c in matches if c.key == proposal.key), None)
-        if target and target.valid_at > proposal.valid_at:
-            return Decision(new="skip")
 
         # Check if any match is newer (excluding target)
         newer = [c for c in matches if c.valid_at > proposal.valid_at and c.key != proposal.key]
@@ -540,8 +553,9 @@ def first_of(*policies: Policy) -> Policy:
     """Return a policy that uses the first decision that acts.
 
     Tries each policy in order and returns the first decision that does
-    more than just write and keep all candidates. If no policy acts,
-    returns a plain write decision.
+    more than just write and keep all candidates (Decision.acts). A
+    decision whose actions only KEEP candidates keeps them all, so it does
+    not act. If no policy acts, returns a plain write decision.
 
     Args:
         *policies: Policies to try in order.
