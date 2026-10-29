@@ -3,8 +3,9 @@
 Everything here runs without a database: grouping and validating ops,
 planning the rows a put batch writes, building search, candidate and
 decision statements, checking a decision that resolve applies and what
-changed since find_conflicts, and turning result rows into items,
-candidates and reconcile results. The store classes run the statements.
+changed since find_conflicts or since the record a conditional write
+expects, and turning result rows into items, candidates and results. The
+store classes run the statements.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from langchain_cockroachdb.store.namespaces import (
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    ConditionalWrite,
     Conflicts,
     ConflictsChanged,
     Decision,
@@ -820,6 +822,72 @@ class ResolvePlan:
     writes: list[tuple[str, list]]
 
 
+@dataclass(frozen=True)
+class ConditionalPlan:
+    """What put_if or delete_if sends, built before any I/O.
+
+    Each attempt sends ``reads(retry=...)`` as one round trip and passes
+    their rows to BaseCockroachDBStore._check_conditional. Unless that
+    returns a result, the attempt sends the statements of
+    _conditional_writes and commits, and passes the rows they return to
+    _conditional_result.
+
+    Attributes:
+        namespace: The memory's namespace.
+        prefix: The namespace as text.
+        key: The memory's key.
+        expected: The (version, updated_at) of the record the caller read,
+            or None when no live memory may have the key.
+        put: The write as put and delete plan it, with the write id: one
+            item and the texts to embed for put_if, the key's delete for
+            delete_if.
+        provenance_json: The provenance put_if writes, serialized, or None.
+        valid_at: The valid time put_if writes, or None.
+        read: The read of the live memory under the key (StoreSQL.record).
+            Its version and updated_at are compared with ``expected``, and
+            a conflict returns it as the current memory.
+        checks: The reads a retry adds, of the rows that carry the write id:
+            the item under the key for put_if, live or expired, and the
+            key's history rows for delete_if on a store with history.
+            Without history nothing proves which attempt deleted a memory.
+    """
+
+    namespace: tuple[str, ...]
+    prefix: str
+    key: str
+    expected: tuple[int, datetime] | None
+    put: PutPlan
+    provenance_json: str | None
+    valid_at: datetime | None
+    read: tuple[str, list]
+    checks: list[tuple[str, list]]
+
+    @property
+    def deletes(self) -> bool:
+        """Whether this is the plan of delete_if."""
+        return bool(self.put.deletes)
+
+    @property
+    def write_id(self) -> str:
+        """The write id, chosen with the plan, so every attempt reuses it.
+
+        Raises:
+            ValueError: If the plan has none, as only a plan built by hand can.
+        """
+        if self.put.write_id is None:
+            raise ValueError("The plan of the conditional write has no write id")
+        return self.put.write_id
+
+    def reads(self, *, retry: bool) -> list[tuple[str, list]]:
+        """The statements an attempt sends first, as one round trip.
+
+        The first attempt has a write id no row can carry yet, so it reads
+        only the live memory. A retry follows an attempt whose commit may
+        have been lost, so it also reads the rows that carry the write id.
+        """
+        return [self.read, *self.checks] if retry else [self.read]
+
+
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
     """Build an Item from a get row."""
     return Item(
@@ -1011,6 +1079,34 @@ def changed_keys(
         if not (key in may_be_gone and key not in live)
         and live.get(key) != (None if token is None else tuple(token))
     )
+
+
+def _expected_token(
+    namespace: tuple[str, ...], key: str, expected: object, method: str
+) -> tuple[int, datetime] | None:
+    """The (version, updated_at) a conditional write expects, as changed_keys compares them.
+
+    ``expected`` is the MemoryRecord the caller read with record(), or None
+    when no live memory may have the key.
+
+    Raises:
+        ValueError: If ``expected`` is neither, or is the record of another
+            namespace or key.
+    """
+    if expected is None:
+        return None
+    if not isinstance(expected, MemoryRecord):
+        raise ValueError(
+            f"{method} needs expected as the MemoryRecord that record() returned, or None "
+            f"to require that no live memory has the key, got {type(expected).__name__}"
+        )
+    found = (tuple(expected.item.namespace), expected.item.key)
+    if found != (namespace, key):
+        raise ValueError(
+            f"{method} was given the record of {found[0]} key {found[1]!r}, not of "
+            f"{namespace} key {key!r}. Pass the record that record() returns for that memory."
+        )
+    return (expected.version, expected.item.updated_at)
 
 
 def _matches_json(value: object, text: str | None) -> bool:
@@ -1675,6 +1771,34 @@ class BaseCockroachDBStore:
             statements.extend(self._delete_statements(prefix, keys))
         return statements
 
+    def _write_one_statements(
+        self,
+        put: PutPlan,
+        vector_rows: Sequence[VectorRow],
+        *,
+        provenance_json: str | None,
+        valid_at: datetime | None,
+    ) -> list[tuple[str, list]]:
+        """The statements that write the one memory of ``put`` as put writes it, returning its version.
+
+        The old vectors go, then the item is upserted with the put's write
+        id, ``provenance_json`` and ``valid_at``, its version numbered across
+        history on a store with history, and then ``vector_rows`` are
+        written. Only the upsert returns rows: the version it wrote.
+        reconcile, resolve and put_if write a memory with these.
+        """
+        [(prefix, key, value_json, ttl)] = put.items
+        return [
+            *self._reindex_deletes(put),
+            self.sql.upsert_items(
+                [(prefix, key, value_json, ttl, provenance_json, valid_at)],
+                write_id=put.write_id,
+                history=self._history is not None,
+                return_version=True,
+            ),
+            *self._vector_upserts(vector_rows),
+        ]
+
     def _reindex_deletes(self, plan: PutPlan) -> list[tuple[str, list]]:
         """The deletes of the old vectors of every item a put plan re-indexes."""
         return [self.sql.delete_vectors(prefix, keys) for prefix, keys in plan.reindexed.items()]
@@ -1783,11 +1907,7 @@ class BaseCockroachDBStore:
         _check_limit(limit)
         resolved_threshold = self._proposal_threshold(threshold, index, method)
         _check_filter(filter)
-        if isinstance(ttl, NotProvided):
-            minutes = self.ttl.default_ttl
-        else:
-            _check_ttl(ttl)
-            minutes = ttl
+        minutes = self._memory_ttl(ttl)
         provenance_value, provenance_json = _serialized_provenance(provenance)
         _check_valid_at(valid_at)
 
@@ -1817,6 +1937,17 @@ class BaseCockroachDBStore:
             valid_at=valid_at,
             put=put,
         )
+
+    def _memory_ttl(self, ttl: float | None | NotProvided) -> float | None:
+        """The minutes a memory written with ``ttl`` lives: the store's default TTL when not provided.
+
+        Raises:
+            ValueError: If ``ttl`` is not None or a positive, finite number.
+        """
+        if isinstance(ttl, NotProvided):
+            return self.ttl.default_ttl
+        _check_ttl(ttl)
+        return ttl
 
     def _proposal_threshold(
         self, threshold: float | None, index: Literal[False] | list[str] | None, method: str
@@ -2260,18 +2391,14 @@ class BaseCockroachDBStore:
                 for reason, keys, superseded_by, invalid_at in ended
             )
         if writes:
-            # As put writes it: the old vectors go, then the item and the new vectors
-            statements.extend(self._reindex_deletes(plan.put))
-            row = (plan.prefix, plan.key, plan.value_json, plan.ttl, plan.provenance_json)
-            statements.append(
-                self.sql.upsert_items(
-                    [(*row, plan.valid_at)],
-                    write_id=write_id,
-                    history=self._history is not None,
-                    return_version=True,
+            statements.extend(
+                self._write_one_statements(
+                    plan.put,
+                    vector_rows,
+                    provenance_json=plan.provenance_json,
+                    valid_at=plan.valid_at,
                 )
             )
-            statements.extend(self._vector_upserts(vector_rows))
         removed = superseded + deleted
         if removed:
             statements.extend(self._delete_statements(plan.prefix, removed))
@@ -2471,3 +2598,188 @@ class BaseCockroachDBStore:
             memory has the key.
         """
         return rowcount > 0 or bool(check_rows)
+
+    def _plan_put_if(
+        self,
+        namespace: Sequence[str],
+        key: str,
+        value: dict[str, Any],
+        *,
+        expected: MemoryRecord | None,
+        index: Literal[False] | list[str] | None,
+        ttl: float | None | NotProvided,
+        provenance: dict[str, Any] | None,
+        valid_at: datetime | None,
+    ) -> ConditionalPlan:
+        """Check a put_if and plan it, before anything is embedded or sent.
+
+        The value, its TTL (the store's default when not provided), the
+        provenance and the valid time are checked as reconcile checks them,
+        and the write is planned as put plans it. The write id is chosen
+        here, once, so every attempt reuses it.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid.
+            ValueError: If ``value`` is not a dict that serializes as JSON,
+                ``expected`` is not None or the record of this namespace and
+                key, or ``ttl``, ``provenance`` or ``valid_at`` is invalid.
+        """
+        prefix = _memory_prefix(namespace, "put_if")
+        if not isinstance(value, dict):
+            raise ValueError(f"put_if needs the value as a dict, got {type(value).__name__}")
+        labels, memory_key = tuple(namespace), str(key)
+        token = _expected_token(labels, memory_key, expected, "put_if")
+        minutes = self._memory_ttl(ttl)
+        _, provenance_json = _serialized_provenance(provenance)
+        _check_valid_at(valid_at)
+        put = self._plan_puts([PutOp(labels, memory_key, value, index=index, ttl=minutes)])
+        write_id = str(uuid.uuid4())
+        put.write_id = write_id
+        return ConditionalPlan(
+            namespace=labels,
+            prefix=prefix,
+            key=memory_key,
+            expected=token,
+            put=put,
+            provenance_json=provenance_json,
+            valid_at=valid_at,
+            read=self.sql.record(prefix, memory_key),
+            checks=[self.sql.applied_items(prefix, [memory_key], write_id=write_id)],
+        )
+
+    def _plan_delete_if(
+        self, namespace: Sequence[str], key: str, *, expected: MemoryRecord | None
+    ) -> ConditionalPlan:
+        """Check a delete_if and plan it as delete plans it, before anything is sent.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid.
+            ValueError: If ``expected`` is not None or the record of this
+                namespace and key.
+        """
+        prefix = _memory_prefix(namespace, "delete_if")
+        labels, memory_key = tuple(namespace), str(key)
+        token = _expected_token(labels, memory_key, expected, "delete_if")
+        put = self._plan_puts([PutOp(labels, memory_key, None)])
+        write_id = str(uuid.uuid4())
+        put.write_id = write_id
+        checks: list[tuple[str, list]] = []
+        if self._history is not None:
+            checks.append(self.sql.applied_history(prefix, [memory_key], write_id=write_id))
+        return ConditionalPlan(
+            namespace=labels,
+            prefix=prefix,
+            key=memory_key,
+            expected=token,
+            put=put,
+            provenance_json=None,
+            valid_at=None,
+            read=self.sql.record(prefix, memory_key),
+            checks=checks,
+        )
+
+    def _conditional_writes(
+        self, plan: ConditionalPlan, vector_rows: Sequence[VectorRow] = ()
+    ) -> list[tuple[str, list]]:
+        """The statements of a conditional write that applies, in the order they run.
+
+        delete_if sends what delete sends: on a store with history the live
+        version is archived as deleted, then the item and its vectors go.
+        put_if writes as put does, with its provenance and valid time: on a
+        store with history the live version is archived as overwritten
+        first, ending at the valid time given or at the write, as reconcile
+        ends it, then the old vectors go, and the item and ``vector_rows``,
+        embedded once before the first attempt, are written. Every write
+        carries the write id. Only the item upsert returns rows: the
+        version it wrote.
+        """
+        if plan.deletes:
+            return self._write_statements(plan.put)
+        statements: list[tuple[str, list]] = []
+        if self._history is not None:
+            statements.append(
+                self.sql.archive(
+                    plan.prefix,
+                    [plan.key],
+                    reason="overwritten",
+                    superseded_by=None,
+                    invalid_at=plan.valid_at,
+                    write_id=plan.write_id,
+                    ttl_days=self._history.ttl_days,
+                )
+            )
+        statements.extend(
+            self._write_one_statements(
+                plan.put, vector_rows, provenance_json=plan.provenance_json, valid_at=plan.valid_at
+            )
+        )
+        return statements
+
+    def _check_conditional(
+        self,
+        plan: ConditionalPlan,
+        found: Sequence[Sequence[dict[str, Any]]],
+        *,
+        retry: bool,
+    ) -> ConditionalWrite | None:
+        """What the first round trip of a conditional write's attempt found, before anything is written.
+
+        ``found`` are the rows of ``plan.reads(retry=retry)``, in order. None
+        means the live memory is the one ``plan.expected`` names, compared as
+        resolve compares (changed_keys), and the attempt writes. A memory
+        written since moves the version, or only updated_at when a 0.5.x
+        store wrote it. Otherwise the result is a conflict, with the live
+        memory as ``current``, or None if there is none: the attempt writes
+        nothing, and the result is returned, not retried.
+
+        On a retry, the commit of an earlier attempt may have been lost. The
+        item that carries put_if's write id proves that it wrote, and moved
+        the version itself, so the result is applied with that item's
+        version and ``already_applied``. delete_if asked for the memory to
+        be gone, so a retry that finds it gone applies, as resolve lets a
+        memory its decision deletes be gone (``may_be_gone``). On a store
+        with history its own history row proves the delete, and the result
+        has ``already_applied``. Without history the attempt deletes again,
+        which changes nothing. A live memory that differs is a conflict on
+        every attempt, also when another writer put the key after a lost
+        commit: that memory is the current state.
+        """
+        rows, proof = found[0], found[1] if len(found) > 1 else []
+        if proof and not plan.deletes:
+            version = int(proof[0]["version"])
+            return ConditionalWrite(
+                applied=True, key=plan.key, version=version, current=None, already_applied=True
+            )
+        if proof and not rows:
+            return ConditionalWrite(
+                applied=True, key=plan.key, version=None, current=None, already_applied=True
+            )
+        gone = {plan.key} if retry and plan.deletes else set()
+        if changed_keys({plan.key: plan.expected}, rows, may_be_gone=gone):
+            current = _row_to_record(plan.namespace, rows[0]) if rows else None
+            return ConditionalWrite(applied=False, key=plan.key, version=None, current=current)
+        return None
+
+    @staticmethod
+    def _conditional_result(
+        plan: ConditionalPlan, returned: Sequence[Sequence[Mapping[str, Any]]]
+    ) -> ConditionalWrite:
+        """What a conditional write that applied did, as put_if and delete_if return it.
+
+        ``returned`` are the rows of the statements of _conditional_writes
+        that return rows: only put_if's item upsert does, with the version
+        it wrote.
+
+        Raises:
+            RuntimeError: If put_if's upsert returned no version. Its write
+                id is new, so the upsert always writes its row; this can
+                only be a broken invariant, and the write has committed.
+        """
+        if plan.deletes:
+            return ConditionalWrite(applied=True, key=plan.key, version=None, current=None)
+        if not returned or not returned[0]:
+            raise RuntimeError(
+                f"The upsert of {plan.prefix}/{plan.key} committed but returned no version"
+            )
+        version = int(returned[0][0]["version"])
+        return ConditionalWrite(applied=True, key=plan.key, version=version, current=None)

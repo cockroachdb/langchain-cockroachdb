@@ -50,6 +50,7 @@ from langchain_cockroachdb.store.config import resolve_history_config, resolve_i
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    ConditionalWrite,
     Conflicts,
     ConflictsChanged,
     Decision,
@@ -4456,13 +4457,6 @@ def test_confirm_with_invalid_callable_return_raises_and_sends_no_update() -> No
         assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
 
 
-def test_confirm_on_retry_with_write_id_returns_without_calling_callable() -> None:
-    """On a retry, if the record has this write_id, return True without calling the callable."""
-    # The integration tests cover the full retry scenario. This unit test verifies
-    # the key check: rows[0].get("write_id") == write_id causes early return.
-    # Tested via integration: test_confirm_retried_after_a_lost_commit_counts_once
-
-
 def test_confirm_on_retry_skips_callable_when_record_has_write_id() -> None:
     """On a retry, if the record has this write_id, return True without calling the callable."""
     called = []
@@ -4540,3 +4534,509 @@ def test_confirm_on_retry_skips_callable_when_record_has_write_id() -> None:
     second = reads.attempts[1]
     assert any("SELECT key, value" in stmt[0] for stmt in second)
     assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in second)
+
+
+# put_if and delete_if: the checks before any I/O, the plan, the check and the attempt
+
+LATER = T0 + timedelta(seconds=1)
+
+
+def record_of(namespace: tuple[str, ...] = NS, key: str = "k", **row: object) -> MemoryRecord:
+    """The MemoryRecord that record() returns for the live row candidate_row(key, **row)."""
+    return store_base._row_to_record(namespace, candidate_row(key, **row))  # type: ignore[arg-type]
+
+
+def conditional_store(*, history: bool = False, ttl: object = None) -> CockroachDBStore:
+    """A store with a 3-dimension index, on a connection it must never touch."""
+    return CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        history=history,
+        ttl=ttl,  # type: ignore[arg-type]
+        retry_policy=FAST,
+    )
+
+
+def plan_put_if(store: BaseCockroachDBStore, value: object = TEXT, **kwargs: object):  # type: ignore[no-untyped-def]
+    """_plan_put_if with put_if's defaults, under NS and key "k" unless given."""
+    arguments: dict = {
+        "expected": None,
+        "index": None,
+        "ttl": NOT_PROVIDED,
+        "provenance": None,
+        "valid_at": None,
+    }
+    arguments.update(kwargs)
+    namespace = arguments.pop("namespace", NS)
+    key = arguments.pop("key", "k")
+    return store._plan_put_if(namespace, key, value, **arguments)  # type: ignore[arg-type]
+
+
+def test_put_if_rejects_a_record_for_another_key_before_any_io() -> None:
+    store = conditional_store()
+    embeddings = store.index.embeddings  # type: ignore[union-attr]
+    record = record_of()
+    for call, match in (
+        # The record of another namespace or key
+        (lambda: store.put_if(NS, "k", TEXT, expected=record_of(("user", "bob"))), "record of"),
+        (lambda: store.put_if(NS, "other", TEXT, expected=record), "record of"),
+        (lambda: store.delete_if(NS, "other", expected=record), "record of"),
+        (lambda: store.delete_if(("user", "bob"), "k", expected=record), "record of"),
+        # Something other than a record
+        (lambda: store.put_if(NS, "k", TEXT, expected={"version": 1}), "MemoryRecord"),  # type: ignore[arg-type]
+        (lambda: store.delete_if(NS, "k", expected=1), "MemoryRecord"),  # type: ignore[arg-type]
+        # The other arguments, checked as put and reconcile check them
+        (lambda: store.put_if((), "k", TEXT, expected=None), "put_if needs a non-empty namespace"),
+        (lambda: store.delete_if((), "k", expected=None), "delete_if needs a non-empty namespace"),
+        (lambda: store.put_if(("a.b",), "k", TEXT, expected=None), "a.b"),
+        (lambda: store.put_if(NS, "k", None, expected=None), "put_if needs the value as a dict"),  # type: ignore[arg-type]
+        (lambda: store.put_if(NS, "k", ["x"], expected=None), "put_if needs the value as a dict"),  # type: ignore[arg-type]
+        (lambda: store.put_if(NS, "k", {"x": object()}, expected=None), "not JSON serializable"),
+        (lambda: store.put_if(NS, "k", {"x": math.nan}, expected=None), "not JSON serializable"),
+        (lambda: store.put_if(NS, "k", TEXT, expected=None, ttl=0), "ttl"),
+        (lambda: store.put_if(NS, "k", TEXT, expected=None, ttl=True), "ttl"),  # type: ignore[arg-type]
+        (lambda: store.put_if(NS, "k", TEXT, expected=None, provenance="chat"), "provenance"),  # type: ignore[arg-type]
+        (
+            lambda: store.put_if(NS, "k", TEXT, expected=None, provenance={"x": object()}),
+            "provenance",
+        ),
+        (
+            lambda: store.put_if(NS, "k", TEXT, expected=None, valid_at=datetime(2026, 1, 1)),
+            "valid_at",
+        ),
+    ):
+        with pytest.raises(ValueError, match=match):
+            call()
+    assert embeddings.calls == 0
+
+    # A namespace given as a list names the record's namespace, and a record
+    # that came back from a checkpoint is the record it was
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    serde = JsonPlusSerializer()
+    saved = serde.loads_typed(serde.dumps_typed(record))
+    assert plan_put_if(store, namespace=list(NS), expected=saved).expected == (1, T0)
+    assert store._plan_delete_if(list(NS), "k", expected=saved).expected == (1, T0)  # type: ignore[arg-type]
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    def no_columns(*, refresh: bool = False) -> bool:
+        assert refresh, "a method that needs migration 2 reads the schema again"
+        return False
+
+    store._reconcile_columns = no_columns  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.put_if(NS, "k", TEXT, expected=record)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.delete_if(NS, "k", expected=record)
+    assert embeddings.calls == 0
+
+    # A store with history refuses until setup() has created the history table
+    keeping = conditional_store(history=True)
+    schema = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return schema.answer(statements, label)
+
+    keeping._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        keeping.put_if(NS, "k", TEXT, expected=record)
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        keeping.delete_if(NS, "k", expected=record)
+    assert keeping.index.embeddings.calls == 0  # type: ignore[union-attr]
+
+
+def test_plan_put_if_reads_the_live_memory_and_writes_as_put_does() -> None:
+    store = conditional_store(history=True)
+    plan = plan_put_if(
+        store,
+        {"text": "aisle"},
+        expected=record_of(version=2),
+        ttl=30.0,
+        provenance={"source": "chat"},
+        valid_at=VALID,
+    )
+
+    assert (plan.namespace, plan.prefix, plan.key) == (NS, "user.alice", "k")
+    # The token resolve compares: the record's version and updated_at
+    assert plan.expected == (2, T0)
+    assert not plan.deletes
+    write_id = plan.write_id
+    uuid.UUID(write_id)
+    # Every attempt reads the live memory, whose token it compares and which
+    # a conflict returns. A retry also looks for the item that carries the
+    # write id, live or expired, by primary key
+    read = store.sql.record("user.alice", "k")
+    assert plan.reads(retry=False) == [read]
+    assert plan.reads(retry=True) == [
+        read,
+        store.sql.applied_items("user.alice", ["k"], write_id=write_id),
+    ]
+    # It writes as put does, with the write id, the provenance and the valid
+    # time, after keeping the version it replaces, which ends at the valid time
+    vector_rows = store._vector_rows(plan.put, [[1.0, 0.0, 0.0]])
+    assert store._conditional_writes(plan, vector_rows) == [
+        store.sql.archive(
+            "user.alice",
+            ["k"],
+            reason="overwritten",
+            superseded_by=None,
+            invalid_at=VALID,
+            write_id=write_id,
+            ttl_days=None,
+        ),
+        store.sql.delete_vectors("user.alice", ["k"]),
+        store.sql.upsert_items(
+            [("user.alice", "k", '{"text": "aisle"}', 30.0, '{"source": "chat"}', VALID)],
+            write_id=write_id,
+            history=True,
+            return_version=True,
+        ),
+        store.sql.upsert_vectors([("user.alice", "k", "text", [1.0, 0.0, 0.0], 30.0)]),
+    ]
+    # Each call has a write id of its own
+    assert plan_put_if(store).write_id != write_id
+
+    # Create only, on a store without history and with a default TTL: no
+    # archive, no valid time and no provenance, and the default TTL
+    plain = conditional_store(ttl={"default_ttl": 5.0})
+    created = plan_put_if(plain, {"text": "aisle"})
+    assert created.expected is None
+    assert plain._conditional_writes(created, []) == [
+        plain.sql.delete_vectors("user.alice", ["k"]),
+        plain.sql.upsert_items(
+            [("user.alice", "k", '{"text": "aisle"}', 5.0, None, None)],
+            write_id=created.write_id,
+            history=False,
+            return_version=True,
+        ),
+    ]
+
+
+def test_plan_delete_if_deletes_as_delete_does() -> None:
+    for history in (False, True):
+        store = conditional_store(history=history)
+        plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+
+        assert (plan.namespace, plan.prefix, plan.key, plan.expected) == (
+            NS,
+            "user.alice",
+            "k",
+            (2, T0),
+        )
+        assert plan.deletes
+        write_id = plan.write_id
+        read = store.sql.record("user.alice", "k")
+        assert plan.reads(retry=False) == [read]
+        # A retry on a store with history looks for its own history row.
+        # Without history no row can prove which attempt deleted the memory
+        proof = [store.sql.applied_history("user.alice", ["k"], write_id=write_id)]
+        assert plan.reads(retry=True) == [read, *(proof if history else [])]
+        # The statements delete sends, with the write id on the archived version
+        deleting = store._plan_puts([PutOp(NS, "k", None)])
+        deleting.write_id = write_id
+        writes = store._conditional_writes(plan)
+        assert writes == store._write_statements(deleting)
+        archive = store.sql.archive(
+            "user.alice",
+            ["k"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=write_id,
+            ttl_days=None,
+        )
+        assert writes == [
+            *([archive] if history else []),
+            store.sql.delete_items("user.alice", ["k"]),
+            store.sql.delete_vectors("user.alice", ["k"]),
+        ]
+
+
+def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
+    store = conditional_store()
+    live = candidate_row("k", version=2)
+    put = plan_put_if(store, expected=record_of(version=2))
+
+    # Unchanged: the attempt writes
+    assert store._check_conditional(put, [[live]], retry=False) is None
+    # Written since, written by a 0.5.x store, which leaves the version, or
+    # gone: a conflict, with the live memory as current
+    for rows in (
+        [candidate_row("k", version=3, updated_at=LATER)],
+        [candidate_row("k", version=2, updated_at=LATER)],
+        [],
+    ):
+        assert store._check_conditional(put, [rows], retry=False) == ConditionalWrite(
+            applied=False,
+            key="k",
+            version=None,
+            current=store_base._row_to_record(NS, rows[0]) if rows else None,
+        )
+    # Create only: no live memory may have the key
+    create = plan_put_if(store)
+    assert store._check_conditional(create, [[]], retry=False) is None
+    assert store._check_conditional(create, [[live]], retry=False) == ConditionalWrite(
+        applied=False, key="k", version=None, current=record_of(version=2)
+    )
+    # On a retry, the item that carries the write id proves that an earlier
+    # attempt wrote it, which moved the token itself
+    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    written = [candidate_row("k", version=3, updated_at=LATER)]
+    for plan in (put, create):
+        assert store._check_conditional(plan, [written, proof], retry=True) == ConditionalWrite(
+            applied=True, key="k", version=3, current=None, already_applied=True
+        )
+    # Without it a retry is as strict as the first attempt
+    assert store._check_conditional(put, [[], []], retry=True) == ConditionalWrite(
+        applied=False, key="k", version=None, current=None
+    )
+    assert store._check_conditional(put, [[live], []], retry=True) is None
+
+
+def test_check_conditional_lets_a_retried_delete_if_find_the_memory_gone() -> None:
+    put_again = candidate_row("k", version=3, updated_at=LATER)
+    for history in (False, True):
+        store = conditional_store(history=history)
+        plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+        no_proof: list = [[]] if history else []
+
+        assert (
+            store._check_conditional(plan, [[candidate_row("k", version=2)]], retry=False) is None
+        )
+        # The first attempt is strict: a memory gone since is a conflict
+        assert store._check_conditional(plan, [[]], retry=False) == ConditionalWrite(
+            applied=False, key="k", version=None, current=None
+        )
+        # A retry that finds it gone has the state delete_if asked for. It
+        # deletes again, which changes nothing, as no row proves the earlier commit
+        assert store._check_conditional(plan, [[], *no_proof], retry=True) is None
+        # A live memory written since still counts
+        assert store._check_conditional(plan, [[put_again], *no_proof], retry=True) == (
+            ConditionalWrite(
+                applied=False,
+                key="k",
+                version=None,
+                current=store_base._row_to_record(NS, put_again),
+            )
+        )
+    # With history, its own history row proves that an earlier attempt deleted it
+    store = conditional_store(history=True)
+    plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+    deleted = [{"key": "k", "reason": "deleted"}]
+    assert store._check_conditional(plan, [[], deleted], retry=True) == ConditionalWrite(
+        applied=True, key="k", version=None, current=None, already_applied=True
+    )
+    # unless another writer put the key again since: that memory is the current state
+    assert store._check_conditional(plan, [[put_again], deleted], retry=True) == ConditionalWrite(
+        applied=False, key="k", version=None, current=store_base._row_to_record(NS, put_again)
+    )
+
+
+def test_conditional_result_reports_the_version_written() -> None:
+    store = conditional_store()
+    put = plan_put_if(store)
+    assert store._conditional_result(put, [[{"version": 4}]]) == ConditionalWrite(
+        applied=True, key="k", version=4, current=None
+    )
+    # The write id is new, so the upsert always writes its row: no version is a broken invariant
+    for returned in ([], [[]]):
+        with pytest.raises(RuntimeError, match="committed but returned no version"):
+            store._conditional_result(put, returned)
+    deleting = store._plan_delete_if(NS, "k", expected=None)
+    assert store._conditional_result(deleting, []) == ConditionalWrite(
+        applied=True, key="k", version=None, current=None
+    )
+
+
+class ConditionalReads:
+    """Stands in for a store's _cursor in put_if and delete_if, and answers their statements.
+
+    Every attempt logs its statements and the arguments of its _cursor. The
+    record read returns ``row`` on the first attempt and ``retry_row`` on
+    the others, or no row for None. The reads of the rows that carry the
+    write id return ``proof``. The item upsert returns version 2. With
+    ``fail`` the first attempt fails with a 40003 as its block ends, after
+    its writes went out, as when the result of its commit is lost. Like
+    psycopg, a cursor keeps its result from execute, and an execute after
+    the block raises.
+    """
+
+    def __init__(
+        self,
+        row: dict[str, object] | None,
+        *,
+        retry_row: dict[str, object] | None = None,
+        proof: list[dict[str, object]] | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.row = row
+        self.retry_row = retry_row
+        self.proof = proof or []
+        self.fail = fail
+        self.attempts: list[list[tuple[str, list]]] = []
+        self.arguments: list[dict[str, object]] = []
+        self.closed = False
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ConditionalCursor"]:
+        self.attempts.append([])
+        self.arguments.append(kwargs)
+        self.closed = False
+        yield ConditionalCursor(self)
+        self.closed = True
+        if self.fail and len(self.attempts) == 1:
+            raise psycopg.errors.StatementCompletionUnknown("injected 40003 after COMMIT")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if sql.startswith("SELECT key, value, created_at"):
+            row = self.row if len(self.attempts) == 1 else self.retry_row
+            return [] if row is None else [row]
+        if sql.startswith(APPLIED_READS):
+            return self.proof
+        if sql.endswith("RETURNING version"):
+            return [{"version": 2}]
+        return []
+
+
+class ConditionalCursor:
+    """A cursor of ConditionalReads."""
+
+    def __init__(self, reads: ConditionalReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.description: list[str] | None = None
+        self._result: list[dict[str, object]] = []
+
+    def cursor(self, **kwargs: object) -> "ConditionalCursor":
+        return ConditionalCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        if self.reads.closed:
+            raise RuntimeError("A statement was sent after the _cursor block ended")
+        self.reads.attempts[-1].append((sql, params or []))
+        self._result = self.reads.answer(sql)
+        self.description = ["version"] if sql.endswith("RETURNING version") else None
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self._result
+
+    def close(self) -> None:
+        pass
+
+
+def conditional_attempts(
+    reads: ConditionalReads, *, history: bool = False
+) -> tuple[CockroachDBStore, list]:
+    """A store without an index whose attempts go to ``reads``, and the plans it makes."""
+    store = CockroachDBStore(object(), history=history, retry_policy=FAST)  # type: ignore[arg-type]
+    # Migration 2 and the history table were seen: no schema read
+    store._columns_ready = True
+    store._history_ready = True
+    store._cursor = reads.cursor  # type: ignore[method-assign,assignment]
+    plans: list = []
+    for name in ("_plan_put_if", "_plan_delete_if"):
+        planner = getattr(store, name)
+
+        def keep(*args: object, planner=planner, **kwargs: object) -> object:  # type: ignore[no-untyped-def]
+            plans.append(planner(*args, **kwargs))
+            return plans[-1]
+
+        setattr(store, name, keep)
+    return store, plans
+
+
+def test_put_if_checks_then_writes_in_one_attempt() -> None:
+    reads = ConditionalReads(candidate_row("k", version=2))
+    store, plans = conditional_attempts(reads, history=True)
+
+    result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    # The read goes out first, as one round trip, then the writes, in one
+    # transaction: nothing is sent after the block
+    assert reads.attempts == [[*plan.reads(retry=False), *store._conditional_writes(plan)]]
+    assert reads.arguments == [
+        {
+            "pipeline": True,
+            "transaction": True,
+            "timeout": store.retry_policy.attempt_timeout,
+            "label": "store put_if",
+        }
+    ]
+    assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+def test_put_if_returns_the_current_record_and_writes_nothing() -> None:
+    newer = candidate_row("k", version=3, updated_at=LATER)
+    reads = ConditionalReads(newer)
+    store, plans = conditional_attempts(reads)
+
+    result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    # One attempt, which sent only the read: a conflict is returned, not retried
+    [plan] = plans
+    assert reads.attempts == [plan.reads(retry=False)]
+    assert result == ConditionalWrite(
+        applied=False, key="k", version=None, current=store_base._row_to_record(NS, newer)
+    )
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+def test_a_retried_put_if_looks_for_its_write_id(committed: bool) -> None:
+    # The first attempt fails with a 40003 as its block ends, after its writes went out
+    row = candidate_row("k", version=2)
+    written = candidate_row("k", version=3, updated_at=LATER)
+    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    reads = ConditionalReads(
+        row,
+        retry_row=written if committed else row,
+        proof=proof if committed else [],
+        fail=True,
+    )
+    store, plans = conditional_attempts(reads)
+
+    result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    first, second = reads.attempts
+    assert first == [*plan.reads(retry=False), *writes]
+    if committed:
+        # Its write id on the row proves the first attempt committed: nothing more is sent
+        assert second == plan.reads(retry=True)
+        assert result == ConditionalWrite(
+            applied=True, key="k", version=3, current=None, already_applied=True
+        )
+    else:
+        # Nothing carries the write id, the record still matches, and the retry writes again
+        assert second == [*plan.reads(retry=True), *writes]
+        assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+@pytest.mark.parametrize("history", [False, True], ids=["no-history", "history"])
+def test_a_retried_delete_if_reports_a_memory_it_finds_gone_as_deleted(history: bool) -> None:
+    # The first attempt deleted the memory and committed, and its result was lost
+    proof = [{"key": "k", "reason": "deleted"}] if history else []
+    reads = ConditionalReads(candidate_row("k", version=2), retry_row=None, proof=proof, fail=True)
+    store, plans = conditional_attempts(reads, history=history)
+
+    result = store.delete_if(NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    first, second = reads.attempts
+    assert first == [*plan.reads(retry=False), *writes]
+    assert [arguments["label"] for arguments in reads.arguments] == ["store delete_if"] * 2
+    if history:
+        # Its own history row proves the delete: nothing more is sent
+        assert second == plan.reads(retry=True)
+        assert result == ConditionalWrite(
+            applied=True, key="k", version=None, current=None, already_applied=True
+        )
+    else:
+        # Gone is the state it asked for. It deletes again, which changes
+        # nothing, and no row proves which attempt deleted the memory
+        assert second == [*plan.reads(retry=True), *writes]
+        assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)

@@ -14,6 +14,7 @@ from langgraph.store.base import Item, SearchItem
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    ConditionalWrite,
     Conflicts,
     ConflictsChanged,
     Decision,
@@ -325,6 +326,7 @@ def test_the_reconcile_types_resolve_their_type_hints() -> None:
         ReconcileResult,
         MemoryRecord,
         MemoryVersion,
+        ConditionalWrite,
     ):
         assert typing.get_type_hints(kind)
     assert "_state" in typing.get_type_hints(Conflicts)
@@ -526,3 +528,40 @@ def test_a_decision_with_null_actions_has_none() -> None:
     for bad in ("delete", ["old"], [("old", "delete")], 3):
         with pytest.raises(ValueError, match="actions"):
             Decision(actions=bad)  # type: ignore[arg-type]
+
+
+# A conditional write's result, as an agent keeps it in graph state
+CONDITIONAL_WRITES = {
+    "applied": ConditionalWrite(applied=True, key="k", version=3, current=None),
+    "conflict": ConditionalWrite(
+        applied=False,
+        key="k",
+        version=None,
+        current=ROUND_TRIPS["record"],  # type: ignore[arg-type]
+    ),
+    "conflict with no live memory": ConditionalWrite(
+        applied=False, key="k", version=None, current=None
+    ),
+    "already applied": ConditionalWrite(
+        applied=True, key="k", version=None, current=None, already_applied=True
+    ),
+}
+
+
+@pytest.mark.parametrize("value", list(CONDITIONAL_WRITES.values()), ids=list(CONDITIONAL_WRITES))
+def test_conditional_write_survives_a_checkpoint_round_trip(value: ConditionalWrite) -> None:
+    back = checkpoint_round_trip(value)
+
+    assert back == value
+    assert_same_types(value, back)
+
+
+def test_conditional_write_is_exported_from_the_store_package_only() -> None:
+    import langchain_cockroachdb
+    from langchain_cockroachdb import store as store_package
+
+    assert store_package.ConditionalWrite is ConditionalWrite
+    assert "ConditionalWrite" in store_package.__all__
+    assert not hasattr(langchain_cockroachdb, "ConditionalWrite")
+    # A write that applied is not already applied unless a retry says so
+    assert ConditionalWrite(applied=True, key="k", version=1, current=None).already_applied is False

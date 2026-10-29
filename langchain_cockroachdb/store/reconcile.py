@@ -238,6 +238,37 @@ class MemoryRecord:
 
 
 @dataclass(frozen=True)
+class ConditionalWrite:
+    """What put_if or delete_if did.
+
+    A conflict is an expected outcome of a conditional write, so it is
+    returned, not raised: ``applied`` is False and ``current`` holds the
+    live memory, for the application to merge, write again with, reject,
+    or show to the user.
+
+    Attributes:
+        applied: Whether the write applied: the live memory was the one
+            expected, or there was none when None was expected. A retried
+            delete_if that finds the memory gone also counts as applied.
+        key: The memory's key.
+        version: The version put_if wrote, or None after a delete or a
+            conflict.
+        current: On a conflict, the live memory as the write's transaction
+            read it, or None if no live memory has the key. None when the
+            write applied.
+        already_applied: Whether an earlier attempt of the same call had
+            already committed the write, whose result was lost, as the row
+            or history row that carries its write id proves.
+    """
+
+    applied: bool
+    key: str
+    version: int | None
+    current: MemoryRecord | None
+    already_applied: bool = False
+
+
+@dataclass(frozen=True)
 class Conflicts:
     """What find_conflicts found: a new memory and the memories it may conflict with.
 

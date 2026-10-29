@@ -41,6 +41,7 @@ from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
+    ConditionalPlan,
     PutPlan,
     SchemaCheck,
     _check_paging,
@@ -63,6 +64,7 @@ from langchain_cockroachdb.store.config import (
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.reconcile import (
+    ConditionalWrite,
     Conflicts,
     Decision,
     MemoryRecord,
@@ -1300,6 +1302,198 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     statement_cursor.close()
 
         return self._retry(attempt, label="store resolve")
+
+    def put_if(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        *,
+        expected: MemoryRecord | None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> ConditionalWrite:
+        """Write a memory only if it is still the one the caller read, in one transaction.
+
+        Two threads that read the same memory with record() and both write
+        it back with put would lose one update without a word. put_if
+        writes only if the live memory under ``key`` still has the version
+        and updated_at of ``expected``, the check resolve makes: a put
+        moves the version, and a 0.5.x store, which does not, still moves
+        updated_at. With ``expected=None`` it writes only if no live memory
+        has the key, so a memory is created once. An expired memory counts
+        as absent.
+
+        On a match it writes as put does, in the transaction that checked:
+        the write id goes on the row, the version it replaces is kept in
+        history on a store with history, ending at ``valid_at`` when given
+        or else at the write, and the memory's vectors are replaced. The
+        result has ``applied`` set and the version written.
+
+        On a mismatch it writes nothing and returns ``applied=False`` with
+        ``current``, the live memory as the same transaction read it, or
+        None if there is none. A conflict is an expected outcome here, so it
+        is returned, not raised: merge and call put_if again with
+        ``current``, keep the stored memory, or ask the user.
+
+        The index fields of ``value`` are embedded once, before the first
+        attempt. If an attempt commits and its result is lost, as when the
+        connection drops while the COMMIT's answer travels, the retry finds
+        the write id on the row and returns ``applied=True`` with
+        ``already_applied``. If another writer replaced the memory before the
+        retry, the retry reports a conflict with that writer's memory, which
+        is the current state.
+
+        Args:
+            namespace: The memory's namespace. It cannot be empty.
+            key: The memory's key.
+            value: The new value.
+            expected: The MemoryRecord that record() returned for this
+                namespace and key, or None to write only if no live memory
+                has the key.
+            index: Which fields of ``value`` to embed, as in put. False
+                embeds nothing.
+            ttl: Minutes the memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the memory comes from, as a JSON object. It is
+                stored in its own column and kept in history.
+            valid_at: When the fact became true, as a timezone-aware
+                datetime. Without one the memory stores no valid time and is
+                valid from its updated_at.
+
+        Returns:
+            Whether the write applied, the version written, and on a
+            conflict the current memory.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: Before any I/O: if ``value`` is not a dict that
+                serializes as JSON; if ``expected`` is not None or the record
+                of this namespace and key; or if ``ttl``, ``provenance`` or
+                ``valid_at`` is invalid. After a schema read: if setup() has
+                not added the columns this method needs or, on a store with
+                history, created the history table.
+        """
+        plan = self._plan_put_if(
+            namespace,
+            key,
+            value,
+            expected=expected,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+        )
+        # The schema check comes first, so a store that cannot write costs no
+        # embedding call. With history, the write also needs the history table
+        if self._history is not None:
+            self._history_schema()
+        else:
+            self._require_columns(self._reconcile_columns(refresh=True))
+        vector_rows = self._embed_put(plan.put)
+        return self._run_conditional(
+            plan, self._conditional_writes(plan, vector_rows), label="store put_if"
+        )
+
+    def delete_if(
+        self, namespace: tuple[str, ...], key: str, *, expected: MemoryRecord | None
+    ) -> ConditionalWrite:
+        """Delete a memory only if it is still the one the caller read, in one transaction.
+
+        delete_if deletes only if the live memory under ``key`` still has
+        the version and updated_at of ``expected``, as put_if checks them.
+        On a match it deletes as delete does: on a store with history the
+        memory is kept in history as deleted, and its vectors go. With
+        ``expected=None`` it applies only while no live memory has the key,
+        so it deletes nothing live.
+
+        On a mismatch it deletes nothing and returns ``applied=False`` with
+        ``current``, the live memory as the same transaction read it, or
+        None if there is none, as when another writer deleted it or it
+        expired since. A conflict is returned, not raised.
+
+        If an attempt commits and its result is lost, the retry finds the
+        memory gone. That is the state delete_if asked for, whoever removed
+        the memory, so the result is applied. On a store with history the
+        retry also finds its own history row, which proves the earlier
+        attempt deleted the memory, and the result has ``already_applied``.
+        A store without history keeps no row that proves which attempt
+        deleted it, so ``already_applied`` stays False. If another writer
+        put the key again before the retry, the retry reports a conflict
+        with that memory.
+
+        Args:
+            namespace: The memory's namespace. It cannot be empty.
+            key: The memory's key.
+            expected: The MemoryRecord that record() returned for this
+                namespace and key, or None.
+
+        Returns:
+            Whether the delete applied, and on a conflict the current memory.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: Before any I/O: if ``expected`` is not None or the
+                record of this namespace and key. After a schema read: if
+                setup() has not added the columns this method needs or, on a
+                store with history, created the history table.
+        """
+        plan = self._plan_delete_if(namespace, key, expected=expected)
+        # As in put_if: with history, the delete also needs the history table
+        if self._history is not None:
+            self._history_schema()
+        else:
+            self._require_columns(self._reconcile_columns(refresh=True))
+        return self._run_conditional(plan, self._conditional_writes(plan), label="store delete_if")
+
+    def _run_conditional(
+        self, plan: ConditionalPlan, writes: Sequence[tuple[str, list]], *, label: str
+    ) -> ConditionalWrite:
+        """Run the attempts of put_if or delete_if: read and check, then write and commit.
+
+        Each attempt sends the reads of ``plan`` as one round trip and checks
+        their rows while the transaction stays open. A conflict, or a write
+        an earlier attempt already committed, returns at once and writes
+        nothing. Otherwise ``writes`` go out with the COMMIT.
+        """
+        # Attempts of this call so far. A retry may follow a commit that was lost
+        attempts = 0
+
+        def attempt() -> ConditionalWrite:
+            nonlocal attempts
+            attempts += 1
+            retry = attempts > 1
+            cursors: list[Cursor[DictRow]] = []
+            try:
+                with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label=label,
+                ) as cur:
+                    conn = cur.connection
+                    # In a pipeline the fetch flushes without a sync, so the
+                    # transaction stays open
+                    reads = self._send(conn, plan.reads(retry=retry), cursors)
+                    found = [statement_cursor.fetchall() for statement_cursor in reads]
+                    decided = self._check_conditional(plan, found, retry=retry)
+                    if decided is not None:
+                        return decided
+                    sent = self._send(conn, writes, cursors)
+                # Committed. Only put_if's item upsert returns rows: the version written
+                returned = [
+                    statement_cursor.fetchall()
+                    for statement_cursor in sent
+                    if statement_cursor.description is not None
+                ]
+                return self._conditional_result(plan, returned)
+            finally:
+                for statement_cursor in cursors:
+                    statement_cursor.close()
+
+        return self._retry(attempt, label=label)
 
     def sweep_ttl(self) -> int:
         """Delete expired items now, without waiting for CockroachDB's TTL job.

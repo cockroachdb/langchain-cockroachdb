@@ -13,6 +13,7 @@ from langchain_cockroachdb.store.config import (
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    ConditionalWrite,
     Conflicts,
     ConflictsChanged,
     Decision,
@@ -37,6 +38,7 @@ __all__ = [
     "CockroachDBIndexConfig",
     "CockroachDBStore",
     "CockroachDBTTLConfig",
+    "ConditionalWrite",
     "Conflicts",
     "ConflictsChanged",
     "Decision",
