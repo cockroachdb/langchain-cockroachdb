@@ -481,7 +481,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         return self._run_sync(self.abatch(ops))
 
@@ -497,7 +499,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         return self._run_sync(self.aget(namespace, key, refresh_ttl=refresh_ttl))
 
@@ -517,7 +521,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         return self._run_sync(
             self.asearch(
@@ -544,7 +550,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         self._run_sync(self.aput(namespace, key, value, index, ttl=ttl))
 
@@ -554,7 +562,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         self._run_sync(self.adelete(namespace, key))
 
@@ -572,7 +582,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             asyncio.InvalidStateError: If called from the store's loop
             RuntimeError: If that loop is closed, is not running or stops
-                before the work finishes, or in a forked child
+                before the work finishes, or in a forked child; or, before
+                any of these checks, if called from inside a reconcile policy
+                or a confirm TTL function of the store
         """
         return self._run_sync(
             self.alist_namespaces(
@@ -913,7 +925,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 history table, or ``limit`` is negative
             InvalidNamespaceError: If the namespace is empty or a label is invalid
         """
-        prefix = _memory_prefix(namespace, "history")
+        prefix = _memory_prefix(namespace, "ahistory")
         _check_paging(limit, 0)
         await self._ahistory_schema()
         statement = self.sql.history_versions(prefix, str(key), limit=limit)
@@ -943,7 +955,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 not created the history table
             InvalidNamespaceError: If the namespace is empty or a label is invalid
         """
-        prefix = _memory_prefix(namespace, "purge")
+        prefix = _memory_prefix(namespace, "apurge")
         await self._ahistory_schema()
         statement = self.sql.purge(prefix, str(key))
 
@@ -1038,7 +1050,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             ttl=ttl,
             provenance=provenance,
             valid_at=valid_at,
-            method="find_conflicts",
+            method="afind_conflicts",
         )
         self._require_columns(await self._areconcile_columns(refresh=True))
         vector_rows = await self._embed_put(plan.put)
@@ -1076,7 +1088,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             InvalidNamespaceError: If the namespace is empty or a label is invalid
             ValueError: If setup() has not added the columns this method needs
         """
-        prefix = _memory_prefix(namespace, "record")
+        prefix = _memory_prefix(namespace, "arecord")
         self._require_columns(await self._areconcile_columns(refresh=True))
         [rows] = await self._read_all([self.sql.record(prefix, str(key))], "store record")
         return _row_to_record(tuple(namespace), rows[0]) if rows else None
@@ -1105,7 +1117,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 the same transaction and returns a number of minutes or None.
                 It is a plain function that runs on the event loop: keep it
                 fast and deterministic, since it runs again on each retry,
-                and it must not call the store.
+                and it must not call the store. An async function is
+                refused before any I/O.
 
         Returns:
             True if a live memory was confirmed, False if no live memory has
@@ -1114,11 +1127,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid
             ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
-                number of minutes, or a callable; if setup() has not added the
-                columns this method needs; or if the callable returns an
-                invalid value (not None or a positive finite number)
+                number of minutes, or a plain callable; if setup() has not
+                added the columns this method needs; or if the callable
+                returns an invalid value (not None or a positive finite
+                number, a coroutine included)
         """
-        prefix = _memory_prefix(namespace, "confirm")
+        prefix = _memory_prefix(namespace, "aconfirm")
         _validate_confirm_ttl(ttl)
         self._require_columns(await self._areconcile_columns(refresh=True))
 
@@ -1204,16 +1218,16 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         other's write. Two agents that reconcile contradicting memories for
         one user cannot both win.
 
-        ``policy`` is a plain function, not a coroutine. It runs on the event
-        loop, inside the transaction, and runs again on every retry, so it
-        must be fast and deterministic: the loop runs nothing else while it
-        runs. An LLM judge, or a person, belongs in afind_conflicts and
-        aresolve, which hold no transaction while the decision is made. A
-        policy must not call the store either: the store holds its
-        connection while the policy runs, so such a call raises RuntimeError
-        at once. A policy that raises rolls the transaction back, and its
-        exception propagates unchanged, without a retry. So does the
-        ValueError for an invalid decision.
+        ``policy`` is a plain function, not an async one, which is refused
+        before any I/O. It runs on the event loop, inside the transaction,
+        and runs again on every retry, so it must be fast and deterministic:
+        the loop runs nothing else while it runs. An LLM judge, or a person,
+        belongs in afind_conflicts and aresolve, which hold no transaction
+        while the decision is made. A policy must not call the store either:
+        the store holds its connection while the policy runs, so such a call
+        raises RuntimeError at once. A policy that raises rolls the
+        transaction back, and its exception propagates unchanged, without a
+        retry. So does the ValueError for an invalid decision.
 
         The index fields of ``value`` are embedded once, with
         aembed_documents, before the first attempt. If an attempt commits
@@ -1258,9 +1272,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid
             ValueError: If another argument is invalid, as in afind_conflicts;
-                if the policy returns an invalid decision; or if setup() has
-                not added the columns this method needs or, on a store with
-                history, created the history table
+                if the policy is async or returns an invalid decision; or if
+                setup() has not added the columns this method needs or, on a
+                store with history, created the history table
         """
         plan = self._plan_proposal(
             namespace,
@@ -1274,7 +1288,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             ttl=ttl,
             provenance=provenance,
             valid_at=valid_at,
-            method="reconcile",
+            method="areconcile",
         )
         _check_policy(policy)
         # The schema check comes first, so a store that cannot write costs no
@@ -1404,7 +1418,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 this method needs or, on a store with history, created the
                 history table.
         """
-        resolving = self._plan_resolve(conflicts, decision)
+        resolving = self._plan_resolve(conflicts, decision, method="aresolve")
         # As in areconcile: with history, the write also needs the history table
         if self._history is not None:
             await self._ahistory_schema()
@@ -1527,6 +1541,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             ttl=ttl,
             provenance=provenance,
             valid_at=valid_at,
+            method="aput_if",
         )
         # The schema check comes first, so a store that cannot write costs no
         # embedding call. With history, the write also needs the history table
@@ -1575,7 +1590,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 setup() has not added the columns this method needs or, on a
                 store with history, created the history table.
         """
-        plan = self._plan_delete_if(namespace, key, expected=expected)
+        plan = self._plan_delete_if(namespace, key, expected=expected, method="adelete_if")
         # As in aput_if: with history, the delete also needs the history table
         if self._history is not None:
             await self._ahistory_schema()

@@ -10,6 +10,7 @@ store classes run the statements.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -144,6 +145,59 @@ def _check_ttl(ttl: object) -> None:
         raise ValueError(f"ttl must be a positive number of minutes, or None, got {ttl!r}")
 
 
+# What to do instead of making a reconcile policy or a confirm TTL function
+# async, by the argument's name
+_ASYNC_ADVICE = {
+    "policy": (
+        "A decision that needs async work, such as an LLM call, belongs in afind_conflicts "
+        "and aresolve, or find_conflicts and resolve on the sync store, which hold no "
+        "transaction while it is made."
+    ),
+    "ttl": (
+        "Work out a TTL that needs async work before the call, for example from the memory "
+        "that arecord or record returns, and pass the minutes."
+    ),
+}
+
+
+def _not_async(argument: str) -> str:
+    """Why ``argument``, a reconcile policy or a confirm TTL function, cannot be async."""
+    return (
+        f"{argument} must be a plain function that returns its answer, not an async "
+        "function: the store calls it inside its transaction and does not await what it "
+        f"returns. {_ASYNC_ADVICE[argument]}"
+    )
+
+
+def _refuse_async(fn: object, argument: str) -> None:
+    """Raise ValueError if calling ``fn`` returns a coroutine, before it is ever called.
+
+    A reconcile policy and a confirm TTL function run inside the store's
+    transaction, which cannot wait for them, and the store never awaits
+    what they return. inspect.iscoroutinefunction does not look at the
+    __call__ of an object, so that is checked too.
+
+    Raises:
+        ValueError: If ``fn`` is an async function, a functools.partial of
+            one, or an object whose __call__ is one.
+    """
+    if inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(type(fn).__call__):
+        raise ValueError(_not_async(argument))
+
+
+def _refuse_awaitable(answer: object, argument: str) -> None:
+    """Raise ValueError if a policy or TTL function gave an awaitable, closing a coroutine.
+
+    A plain function can still return a coroutine, as a lambda that calls an
+    async function does. Closing it keeps Python from warning that it was
+    never awaited.
+    """
+    if inspect.isawaitable(answer):
+        if inspect.iscoroutine(answer):
+            answer.close()
+        raise ValueError(_not_async(argument))
+
+
 def _validate_confirm_ttl(
     ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None],
 ) -> None:
@@ -151,9 +205,12 @@ def _validate_confirm_ttl(
 
     Raises:
         ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
-            number of minutes, or a callable.
+            number of minutes, or a callable; or if it is an async callable.
     """
-    if isinstance(ttl, (NotProvided, type(None))) or callable(ttl):
+    if isinstance(ttl, (NotProvided, type(None))):
+        return
+    if callable(ttl):
+        _refuse_async(ttl, "ttl")
         return
     _check_ttl(ttl)
 
@@ -173,11 +230,12 @@ def _resolve_confirm_ttl(
 
     Raises:
         ValueError: If the callable returns a value that is not None or a
-            positive finite number of minutes.
+            positive finite number of minutes, an awaitable included.
     """
     if not callable(ttl):
         return ttl
     resolved = ttl(record)
+    _refuse_awaitable(resolved, "ttl")
     if resolved is None:
         return None
     _check_ttl(resolved)
@@ -203,12 +261,13 @@ def _check_valid_at(valid_at: object) -> None:
 
 
 def _check_policy(policy: object) -> None:
-    """Raise ValueError unless ``policy`` can be called to decide."""
+    """Raise ValueError unless ``policy`` is a plain function that can be called to decide."""
     if not callable(policy):
         raise ValueError(
             "policy must be a function of the proposal and its candidates that returns "
             f"a Decision, got {type(policy).__name__}"
         )
+    _refuse_async(policy, "policy")
 
 
 def _serialized_provenance(provenance: object) -> tuple[dict[str, Any] | None, str | None]:
@@ -1098,8 +1157,9 @@ def _expected_token(
 ) -> tuple[int, datetime] | None:
     """The (version, updated_at) a conditional write expects, as changed_keys compares them.
 
-    ``expected`` is the MemoryRecord the caller read with record(), or None
-    when no live memory may have the key.
+    ``expected`` is the MemoryRecord the caller read with record() or
+    arecord(), or None when no live memory may have the key. ``method``
+    names the calling method in errors.
 
     Raises:
         ValueError: If ``expected`` is neither, or is the record of another
@@ -1109,14 +1169,16 @@ def _expected_token(
         return None
     if not isinstance(expected, MemoryRecord):
         raise ValueError(
-            f"{method} needs expected as the MemoryRecord that record() returned, or None "
-            f"to require that no live memory has the key, got {type(expected).__name__}"
+            f"{method} needs expected as the MemoryRecord that record() or arecord() "
+            "returned, or None to require that no live memory has the key, got "
+            f"{type(expected).__name__}"
         )
     found = (tuple(expected.item.namespace), expected.item.key)
     if found != (namespace, key):
         raise ValueError(
             f"{method} was given the record of {found[0]} key {found[1]!r}, not of "
-            f"{namespace} key {key!r}. Pass the record that record() returns for that memory."
+            f"{namespace} key {key!r}. Pass the record that record() or arecord() returns "
+            "for that memory."
         )
     return (expected.version, expected.item.updated_at)
 
@@ -2171,9 +2233,11 @@ class BaseCockroachDBStore:
         """The policy's decision, once it is a valid Decision for ``proposal`` and ``candidates``.
 
         Raises:
-            ValueError: If the policy returned something other than a
-                Decision, or a decision that validate_decision rejects.
+            ValueError: If the policy returned an awaitable, as a plain
+                function that calls an async one does, something else other
+                than a Decision, or a decision that validate_decision rejects.
         """
+        _refuse_awaitable(decision, "policy")
         if not isinstance(decision, Decision):
             raise ValueError(f"The policy returned {type(decision).__name__}, not a Decision")
         validate_decision(proposal, candidates, decision)
@@ -2226,7 +2290,8 @@ class BaseCockroachDBStore:
             raise RuntimeError(
                 "A reconcile policy or a confirm TTL function must not call the store: it "
                 "runs inside the transaction, while the store holds its connection. For a "
-                "decision that needs more data, use find_conflicts, decide, then call resolve."
+                "decision that needs more data, use find_conflicts, decide, then call "
+                "resolve, or afind_conflicts and aresolve on the async store."
             )
 
     @staticmethod
@@ -2465,7 +2530,9 @@ class BaseCockroachDBStore:
             kept=tuple(key for key in kept if not (writes and key == plan.key)),
         )
 
-    def _plan_resolve(self, conflicts: Conflicts, decision: Decision) -> ResolvePlan:
+    def _plan_resolve(
+        self, conflicts: Conflicts, decision: Decision, *, method: str = "resolve"
+    ) -> ResolvePlan:
         """Check a decision about a Conflicts and build what resolve() sends, before any I/O.
 
         The Conflicts must be one that find_conflicts returned, as it
@@ -2486,23 +2553,28 @@ class BaseCockroachDBStore:
         decision names: an earlier resolve of the same Conflicts may have
         decided otherwise.
 
+        Args:
+            method: The calling method, named in errors: resolve, or aresolve
+                on the async store. A Conflicts from find_conflicts or
+                afind_conflicts works with either, so errors name both.
+
         Raises:
             ValueError: If ``conflicts`` holds no plan from find_conflicts,
                 as when it was built by hand; if a store with another items
                 table or index made it; if its proposal's namespace, key,
                 value, slot, slot value, provenance or valid time differ from
                 the memory find_conflicts planned (_edited_fields); if its
-                candidates'
-                keys, versions or updated_at differ from what find_conflicts
-                read; or if ``decision`` is not a valid Decision for its
-                proposal and candidates.
+                candidates' keys, versions or updated_at differ from what
+                find_conflicts read; or if ``decision`` is not a valid
+                Decision for its proposal and candidates.
         """
         state = conflicts._state if isinstance(conflicts, Conflicts) else None
         if not isinstance(state, ConflictsState):
             raise ValueError(
-                "resolve needs the Conflicts that find_conflicts returned. This one holds "
-                "no plan for the write, as when it is built by hand, or read back by a "
-                "checkpoint serializer that does not allow the store's types."
+                f"{method} needs the Conflicts that find_conflicts or afind_conflicts "
+                "returned. This one holds no plan for the write, as when it is built by "
+                "hand, or read back by a checkpoint serializer that does not allow the "
+                "store's types."
             )
         identity = self._identity()
         if state.store != identity:
@@ -2513,19 +2585,19 @@ class BaseCockroachDBStore:
         edited = _edited_fields(conflicts.proposal, state)
         if edited:
             raise ValueError(
-                "The proposal changed after find_conflicts returned it, in these fields: "
-                f"{', '.join(edited)}. resolve writes the memory find_conflicts planned and "
-                "reuses its embedding, so call find_conflicts again with the edited memory."
+                "The proposal changed after find_conflicts or afind_conflicts returned it, in "
+                f"these fields: {', '.join(edited)}. {method} writes the memory planned then "
+                "and reuses its embedding, so find the conflicts again with the edited memory."
             )
         tokens = {c.key: (c.version, c.item.updated_at) for c in conflicts.candidates}
         if tokens != state.tokens:
             raise ValueError(
-                "The candidates changed after find_conflicts returned them: their keys, "
-                "versions or updated_at are not the ones find_conflicts read. Resolve the "
-                "Conflicts as find_conflicts returned it."
+                "The candidates changed after find_conflicts or afind_conflicts returned "
+                "them: their keys, versions or updated_at are not the ones it read. Resolve "
+                "the Conflicts as it was returned."
             )
         if not isinstance(decision, Decision):
-            raise ValueError(f"resolve needs a Decision, got {type(decision).__name__}")
+            raise ValueError(f"{method} needs a Decision, got {type(decision).__name__}")
         validate_decision(conflicts.proposal, conflicts.candidates, decision)
 
         plan, candidates = state.plan, conflicts.candidates
@@ -2628,6 +2700,7 @@ class BaseCockroachDBStore:
         ttl: float | None | NotProvided,
         provenance: dict[str, Any] | None,
         valid_at: datetime | None,
+        method: str = "put_if",
     ) -> ConditionalPlan:
         """Check a put_if and plan it, before anything is embedded or sent.
 
@@ -2636,17 +2709,21 @@ class BaseCockroachDBStore:
         and the write is planned as put plans it. The write id is chosen
         here, once, so every attempt reuses it.
 
+        Args:
+            method: The calling method, named in errors: put_if, or aput_if
+                on the async store.
+
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid.
             ValueError: If ``value`` is not a dict that serializes as JSON,
                 ``expected`` is not None or the record of this namespace and
                 key, or ``ttl``, ``provenance`` or ``valid_at`` is invalid.
         """
-        prefix = _memory_prefix(namespace, "put_if")
+        prefix = _memory_prefix(namespace, method)
         if not isinstance(value, dict):
-            raise ValueError(f"put_if needs the value as a dict, got {type(value).__name__}")
+            raise ValueError(f"{method} needs the value as a dict, got {type(value).__name__}")
         labels, memory_key = tuple(namespace), str(key)
-        token = _expected_token(labels, memory_key, expected, "put_if")
+        token = _expected_token(labels, memory_key, expected, method)
         minutes = self._memory_ttl(ttl)
         _, provenance_json = _serialized_provenance(provenance)
         _check_valid_at(valid_at)
@@ -2666,18 +2743,27 @@ class BaseCockroachDBStore:
         )
 
     def _plan_delete_if(
-        self, namespace: Sequence[str], key: str, *, expected: MemoryRecord | None
+        self,
+        namespace: Sequence[str],
+        key: str,
+        *,
+        expected: MemoryRecord | None,
+        method: str = "delete_if",
     ) -> ConditionalPlan:
         """Check a delete_if and plan it as delete plans it, before anything is sent.
+
+        Args:
+            method: The calling method, named in errors: delete_if, or
+                adelete_if on the async store.
 
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid.
             ValueError: If ``expected`` is not None or the record of this
                 namespace and key.
         """
-        prefix = _memory_prefix(namespace, "delete_if")
+        prefix = _memory_prefix(namespace, method)
         labels, memory_key = tuple(namespace), str(key)
-        token = _expected_token(labels, memory_key, expected, "delete_if")
+        token = _expected_token(labels, memory_key, expected, method)
         put = self._plan_puts([PutOp(labels, memory_key, None)])
         write_id = str(uuid.uuid4())
         put.write_id = write_id

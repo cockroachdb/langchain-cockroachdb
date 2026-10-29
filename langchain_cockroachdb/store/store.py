@@ -919,7 +919,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 number is minutes. A callable takes the MemoryRecord read in
                 the same transaction and returns a number of minutes or None.
                 Keep it fast and deterministic: it runs again on each retry,
-                and must not call the store.
+                and must not call the store. It must be a plain function:
+                an async one is refused before any I/O.
 
         Returns:
             True if a live memory was confirmed, False if no live memory has
@@ -928,9 +929,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid
             ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
-                number of minutes, or a callable; if setup() has not added the
-                columns this method needs; or if the callable returns an
-                invalid value (not None or a positive finite number)
+                number of minutes, or a plain callable; if setup() has not
+                added the columns this method needs; or if the callable
+                returns an invalid value (not None or a positive finite
+                number, a coroutine included)
         """
         prefix = _memory_prefix(namespace, "confirm")
         _validate_confirm_ttl(ttl)
@@ -1018,7 +1020,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         both win.
 
         ``policy`` runs inside the transaction, and runs again on every
-        retry, so it must be fast and deterministic. A slow policy holds the
+        retry, so it must be a plain function, fast and deterministic: an
+        async function is refused before any I/O. A slow policy holds the
         transaction open and can run past the attempt timeout. An LLM judge,
         or a person, belongs in find_conflicts and resolve, which hold no
         transaction while the decision is made. A policy must not call the
@@ -1091,9 +1094,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid
             ValueError: If another argument is invalid, as in find_conflicts;
-                if the policy returns an invalid decision; or if setup() has
-                not added the columns this method needs or, on a store with
-                history, created the history table
+                if the policy is async or returns an invalid decision; or if
+                setup() has not added the columns this method needs or, on a
+                store with history, created the history table
         """
         plan = self._plan_proposal(
             namespace,
@@ -1266,7 +1269,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 read: if setup() has not added the columns this method needs
                 or, on a store with history, created the history table.
         """
-        resolving = self._plan_resolve(conflicts, decision)
+        resolving = self._plan_resolve(conflicts, decision, method="resolve")
         # As in reconcile: with history, the write also needs the history table
         if self._history is not None:
             self._history_schema()
@@ -1399,6 +1402,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             ttl=ttl,
             provenance=provenance,
             valid_at=valid_at,
+            method="put_if",
         )
         # The schema check comes first, so a store that cannot write costs no
         # embedding call. With history, the write also needs the history table
@@ -1462,7 +1466,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 setup() has not added the columns this method needs or, on a
                 store with history, created the history table.
         """
-        plan = self._plan_delete_if(namespace, key, expected=expected)
+        plan = self._plan_delete_if(namespace, key, expected=expected, method="delete_if")
         # As in put_if: with history, the delete also needs the history table
         if self._history is not None:
             self._history_schema()

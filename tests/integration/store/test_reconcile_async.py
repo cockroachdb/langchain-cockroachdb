@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -44,6 +45,7 @@ from tests.integration.store.test_reconcile import (
     AISLE,
     LONG_FLIGHTS,
     NS,
+    OLD,
     PEANUTS,
     PREFIX,
     RETRY_LOGGER,
@@ -157,8 +159,8 @@ def gate_writes(store: AsyncCockroachDBStore, monkeypatch: pytest.MonkeyPatch) -
     Each task's first attempt then reads in its transaction before either
     task writes, as the sync tests arrange with a barrier in the policy, a
     plain function that cannot wait without blocking the event loop. A
-    retry writes at once. The writes of areconcile and aput_if start with
-    INSERT or DELETE, and the reads before them with SELECT or WITH.
+    retry writes at once. The writes of areconcile, aput_if and adelete_if
+    start with INSERT or DELETE, and the reads before them with SELECT or WITH.
     """
     send = store._send
     waited: set[asyncio.Task[Any] | None] = set()
@@ -251,6 +253,31 @@ async def test_afind_conflicts_returns_key_slot_and_similar_in_that_order(
     )
     # Nothing was written
     assert await item_rows(aadmin, store) == before
+
+
+async def test_afind_conflicts_ignores_expired_memories(astore_factory, aadmin, mode) -> None:
+    store = await astore_factory(mode, index=seat_index())
+    await store.aput(NS, "k", text(WINDOW), ttl=60)
+    await store.aput(NS, "s", text(VEGETARIAN, seat="x"), ttl=60)
+    await store.aput(NS, "w", text(WINDOW), ttl=60)
+    await store.aput(NS, "live", text(LONG_FLIGHTS))
+    await aadmin.execute(
+        f"UPDATE {store.sql.items} SET expires_at = now() - INTERVAL '1 minute' "
+        "WHERE prefix = %s AND key <> 'live'",
+        (PREFIX,),
+    )
+
+    conflicts = await store.afind_conflicts(NS, "k", text(AISLE, seat="x"), slot="seat")
+
+    assert reasons(conflicts) == [("live", "similar")]
+    # The expired target counts as absent, the same as no row
+    assert conflicts.target_version is None and conflicts.target_updated_at is None
+    assert conflicts._state is not None and conflicts._state.target is None
+    assert await store.arecord(NS, "k") is None
+    assert await store.arecord(NS, "live") is not None
+    # Nor does areconcile's transaction see them: the live memory is the only candidate
+    result = await store.areconcile(NS, None, text(AISLE, seat="x"), policy=keep_all(), slot="seat")
+    assert (result.new, result.kept) == ("written", ("live",))
 
 
 async def test_afind_conflicts_and_areconcile_look_past_a_window_the_filter_emptied(
@@ -373,6 +400,46 @@ async def test_areconcile_skips_and_confirms_a_duplicate(astore_factory, aadmin,
     assert await store.arecord(NS, result.key) is None
     # The memory's expiry and its vector's were renewed from its own TTL
     assert await renewed(aadmin, store, window.key) == [True, True]
+
+
+async def test_areconcile_records_a_late_fact_as_superseded(astore_factory, mode) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())
+    live = await store.areconcile(
+        NS, None, in_slot(WINDOW), policy=supersede_same_slot(), slot="seat"
+    )
+
+    late = await store.areconcile(
+        NS,
+        None,
+        in_slot(AISLE),
+        policy=supersede_same_slot(),
+        slot="seat",
+        provenance={"source": "old chat"},
+        valid_at=OLD,
+    )
+
+    assert late == ReconcileResult(
+        key=late.key,
+        new="superseded",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=(),
+        kept=(live.key,),
+    )
+    # The live fact is unchanged, and the late one never became live
+    assert [item.key for item in await store.asearch(NS)] == [live.key]
+    assert await store.arecord(NS, late.key) is None
+    current = await store.arecord(NS, live.key)
+    assert current is not None and current.version == 1
+    assert await store.ahistory(NS, live.key) == []
+    [row] = await store.ahistory(NS, late.key)
+    assert (row.version, row.reason, row.superseded_by) == (1, "superseded", live.key)
+    assert (row.value, row.provenance) == (in_slot(AISLE), {"source": "old chat"})
+    # True from its own valid time until the newer fact became true. The store
+    # held it for no time
+    assert (row.valid_at, row.invalid_at) == (OLD, current.valid_at)
+    assert row.written_at == row.ended_at
 
 
 @pytest.mark.parametrize("failure", ["raises", "invalid decision"])
@@ -537,6 +604,27 @@ async def test_aresolve_raises_conflicts_changed(astore_factory, aadmin, caplog,
         (2, "superseded"),
         (1, "overwritten"),
     ]
+
+
+async def test_aresolve_detects_a_0_5_style_write_through_updated_at(
+    astore_factory, aadmin, mode
+) -> None:
+    store = await astore_factory(mode, index=seat_index())
+    await store.aput(NS, "old", in_slot(WINDOW))
+    conflicts = await store.afind_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    # A 0.5.x store writes with the 0.5 statement during a rolling upgrade: it
+    # sets updated_at and leaves the version as it was
+    value = json.dumps(in_slot(LONG_FLIGHTS))
+    await aadmin.execute(*store.sql.upsert_items([(PREFIX, "old", value, None)]))
+    record = await store.arecord(NS, "old")
+    assert record is not None and (record.version, record.item.value) == (1, in_slot(LONG_FLIGHTS))
+    before = await snapshot(aadmin, store)
+
+    with pytest.raises(ConflictsChanged) as error:
+        await store.aresolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    assert error.value.keys == ("old",)
+    assert await snapshot(aadmin, store) == before
 
 
 async def test_aresolve_accepts_a_conflicts_and_a_decision_from_a_checkpoint(
@@ -865,6 +953,29 @@ async def test_aput_if_applies_and_returns_the_current_record_on_a_conflict(
 
 
 @HISTORY
+async def test_aput_if_detects_a_0_5_style_write_through_updated_at(
+    astore_factory, aadmin, mode, history
+) -> None:
+    store = await astore_factory(mode, history=history, index=seat_index())
+    await store.aput(NS, "k", text(WINDOW))
+    record = await store.arecord(NS, "k")
+    # A 0.5.x store writes with the 0.5 statement during a rolling upgrade: it
+    # sets updated_at and leaves the version as it was
+    await aadmin.execute(
+        *store.sql.upsert_items([(PREFIX, "k", json.dumps(text(LONG_FLIGHTS)), None)])
+    )
+    current = await store.arecord(NS, "k")
+    assert record is not None and current is not None
+    assert (current.version, current.item.value) == (1, text(LONG_FLIGHTS))
+    before = await snapshot(aadmin, store)
+
+    result = await store.aput_if(NS, "k", text(AISLE), expected=record)
+
+    assert result == ConditionalWrite(applied=False, key="k", version=None, current=current)
+    assert await snapshot(aadmin, store) == before
+
+
+@HISTORY
 async def test_adelete_if(astore_factory, aadmin, mode, history) -> None:
     store = await astore_factory(mode, history=history, index=seat_index())
     await store.aput(NS, "k", text(WINDOW))
@@ -937,6 +1048,32 @@ async def test_two_aput_ifs_from_the_same_record_one_wins(
         assert [(v.version, v.reason, v.value) for v in await store.ahistory(NS, "k")] == [
             (1, "overwritten", text(WINDOW))
         ]
+
+
+@HISTORY
+async def test_two_adelete_ifs_from_the_same_record_one_wins(
+    astore_factory, aadmin, caplog, monkeypatch, history
+) -> None:
+    # Both read the memory before either deletes it. Serializable isolation
+    # rolls one of them back with a 40001, so its retry checks as strictly
+    # as its first attempt and finds the memory gone: the other removed it
+    store = await astore_factory("pool", history=history, index=seat_index())
+    await store.aput(NS, "k", text(WINDOW))
+    record = await store.arecord(NS, "k")
+    gate_writes(store, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        results = await asyncio.gather(
+            *(store.adelete_if(NS, "k", expected=record) for _ in range(2))
+        )
+
+    found = retries(caplog, "store delete_if")
+    assert found and all("SQLSTATE 40001" in message for message in found)
+    assert sorted(result.applied for result in results) == [False, True]
+    assert ConditionalWrite(applied=False, key="k", version=None, current=None) in results
+    assert await store.aget(NS, "k") is None and await vector_keys(aadmin, store) == []
+    if history:
+        assert [(v.version, v.reason) for v in await store.ahistory(NS, "k")] == [(1, "deleted")]
 
 
 @LOST_COMMIT_MODES

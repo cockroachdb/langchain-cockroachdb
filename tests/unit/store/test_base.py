@@ -3,11 +3,14 @@
 import asyncio
 import contextlib
 import dataclasses
+import functools
+import gc
 import json
 import logging
 import math
 import threading
 import uuid
+import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Sequence
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -2130,8 +2133,11 @@ async def raised(
 ) -> BaseException | None:
     """What ``call(store, name, ...)`` raised, or None if it returned.
 
-    A sync call runs in another thread (raised_within) and an async one under
-    a timeout, so a call that hangs fails the test instead of hanging it.
+    A sync call runs in another thread (raised_within), so a call that hangs
+    fails the test instead of hanging it. An async call runs under
+    asyncio.wait_for, which stops one that waits, as for a lock, but cannot
+    stop one that blocks the event loop without awaiting: only pytest's
+    timeout ends that.
     """
     if isinstance(store, AsyncCockroachDBStore):
         try:
@@ -2140,6 +2146,16 @@ async def raised(
             return error
         return None
     return raised_within(lambda: getattr(store, name)(*args, **kwargs), timeout)
+
+
+@contextlib.contextmanager
+def no_unawaited_coroutines() -> Iterator[None]:
+    """Fail if the block leaves a coroutine behind that was never awaited."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]
 
 
 def embedded(embeddings: CountingEmbeddings, make: str) -> int:
@@ -3981,7 +3997,8 @@ async def test_a_policy_that_calls_the_async_store_fails_at_once() -> None:
             with pytest.raises(RuntimeError) as error:
                 store._decide(policy, make_proposal(), [])
             assert str(error.value).startswith(REFUSED)
-            assert "find_conflicts" in str(error.value) and "resolve" in str(error.value)
+            # The advice names the async methods too
+            assert "afind_conflicts" in str(error.value) and "aresolve" in str(error.value)
     finally:
         store.lock.release()
     # Refused before the embedding model was called, too
@@ -4040,6 +4057,141 @@ async def test_areconcile_and_aconfirm_run_their_callables_under_the_mark() -> N
         await confirming.aconfirm(NS, "k", ttl=ttl)
     [attempt] = confirms.attempts
     assert [sql.split(" ", 2)[:2] for sql, _ in attempt] == [["SELECT", "key,"]]
+
+
+async def judge(proposal: Proposal, candidates: object) -> Decision:
+    """An async policy, as an LLM judge would be written."""
+    return Decision()
+
+
+class AsyncJudge:
+    """A policy object whose __call__ is async."""
+
+    async def __call__(self, proposal: Proposal, candidates: object) -> Decision:
+        return Decision()
+
+
+async def async_ttl(record: MemoryRecord) -> float:
+    """An async confirm TTL function."""
+    return 10.0
+
+
+class AsyncTTL:
+    """A confirm TTL object whose __call__ is async."""
+
+    async def __call__(self, record: MemoryRecord) -> float:
+        return 10.0
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_an_async_policy_or_ttl_function_is_refused_before_any_io(make: str) -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise TypeError
+    store = make_store(make, index={"dims": 3, "embed": embeddings, "fields": ["text"]})
+    # Refused before it is called, so no coroutine is left unawaited
+    with no_unawaited_coroutines():
+        for policy in (judge, AsyncJudge(), functools.partial(judge)):
+            with pytest.raises(
+                ValueError,
+                match="^policy must be a plain function that returns its answer, not an async",
+            ) as error:
+                await call(store, "reconcile", NS, "k", TEXT, policy=policy)
+            # A decision that needs async work belongs in the two-step flow
+            assert "afind_conflicts" in str(error.value) and "aresolve" in str(error.value)
+        for ttl in (async_ttl, AsyncTTL()):
+            with pytest.raises(
+                ValueError,
+                match="^ttl must be a plain function that returns its answer, not an async",
+            ):
+                await call(store, "confirm", NS, "k", ttl=ttl)
+    assert embedded(embeddings, make) == 0
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_policy_or_ttl_function_that_returns_a_coroutine_fails_without_a_warning(
+    make: str,
+) -> None:
+    # A plain function that returns a coroutine passes the check before any
+    # I/O. The store closes what it returns, so nothing warns that it was
+    # never awaited, and the error says what a policy must be
+    reads = ReconcileReads([candidate_row("k")], fail="none")
+    store = reconciling_store(reads, make=make)
+    with (
+        no_unawaited_coroutines(),
+        pytest.raises(
+            ValueError,
+            match="^policy must be a plain function that returns its answer, not an async",
+        ),
+    ):
+        await call(store, "reconcile", NS, "k", TEXT, policy=lambda p, c: judge(p, c))
+    # One attempt, which sent its reads and nothing more
+    [attempt] = reads.attempts
+    assert all(sql.startswith("SELECT") for sql, _ in attempt)
+
+    record_row = {**candidate_row("k"), "value": {"text": "x"}}
+    confirms = ConfirmReads(record_row=record_row, updated=1)
+    confirming = confirming_store(confirms, make)
+    with (
+        no_unawaited_coroutines(),
+        pytest.raises(
+            ValueError, match="^ttl must be a plain function that returns its answer, not an async"
+        ),
+    ):
+        await call(confirming, "confirm", NS, "k", ttl=lambda record: async_ttl(record))
+    [attempt] = confirms.attempts
+    assert [sql.split(" ", 2)[:2] for sql, _ in attempt] == [["SELECT", "key,"]]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_errors_name_the_method_that_was_called(make: str) -> None:
+    # Each store names its own method in its errors: the async store's
+    # methods are the sync store's with an "a" in front
+    a = "a" if make == "async" else ""
+    store = make_store(
+        make,
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"], "distance_type": "l2"},
+        history=True,
+    )
+    for name, args, kwargs, message in (
+        ("history", ((), "k"), {}, "history needs a non-empty namespace"),
+        ("purge", ((), "k"), {}, "purge needs a non-empty namespace"),
+        ("record", ((), "k"), {}, "record needs a non-empty namespace"),
+        ("confirm", ((), "k"), {}, "confirm needs a non-empty namespace"),
+        (
+            "find_conflicts",
+            ((), "k", TEXT),
+            {"threshold": -1.0},
+            "find_conflicts needs a non-empty",
+        ),
+        ("find_conflicts", (NS, "k", TEXT), {}, "find_conflicts needs a threshold"),
+        ("reconcile", ((), "k", TEXT), {"policy": keep_all()}, "reconcile needs a non-empty"),
+        ("reconcile", (NS, "k", ["x"]), {"policy": keep_all()}, "reconcile needs the value as a"),
+        ("put_if", ((), "k", TEXT), {"expected": None}, "put_if needs a non-empty namespace"),
+        ("put_if", (NS, "k", ["x"]), {"expected": None}, "put_if needs the value as a dict"),
+        ("put_if", (NS, "k", TEXT), {"expected": 1}, "put_if needs expected as the MemoryRecord"),
+        ("delete_if", ((), "k"), {"expected": None}, "delete_if needs a non-empty namespace"),
+        ("delete_if", (NS, "other"), {"expected": record_of()}, "delete_if was given the record"),
+    ):
+        with pytest.raises(ValueError, match=rf"^{a}{message}"):
+            await call(store, name, *args, **kwargs)
+
+    # resolve names itself, and the method a Conflicts comes from in both forms
+    conflicts = found_conflicts(make_store("sync"), [candidate_row("k")])
+    resolver = make_store(make)
+    edited = dataclasses.replace(
+        conflicts, proposal=dataclasses.replace(conflicts.proposal, key="other")
+    )
+    for given, decision, message in (
+        (
+            object(),
+            Decision(),
+            f"^{a}resolve needs the Conflicts that find_conflicts or afind_conflicts returned",
+        ),
+        (conflicts, None, f"^{a}resolve needs a Decision, got NoneType"),
+        (edited, Decision(), rf"in these fields: key\. {a}resolve writes the memory planned"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            await call(resolver, "resolve", given, decision)
 
 
 # resolve: the change check, the checks before any I/O, and the attempt
@@ -4114,7 +4266,9 @@ async def test_resolve_checks_the_conflicts_and_the_decision_before_any_io(make:
         target_updated_at=T0,
     )
     for given in (by_hand, object()):
-        with pytest.raises(ValueError, match="the Conflicts that find_conflicts returned"):
+        with pytest.raises(
+            ValueError, match="the Conflicts that find_conflicts or afind_conflicts returned"
+        ):
             await call(store, "resolve", given, decision)
     # Another table, schema, dims, distance or fields, or no index, is another store
     for settings in (
@@ -4508,8 +4662,8 @@ async def test_resolve_refuses_an_edited_proposal_before_any_io(make: str) -> No
     ):
         with pytest.raises(
             ValueError,
-            match=rf"The proposal changed after find_conflicts returned it, in these fields: "
-            rf"{named}\. .*call find_conflicts again with the edited memory",
+            match=rf"The proposal changed after find_conflicts or afind_conflicts returned it, in "
+            rf"these fields: {named}\. .*find the conflicts again with the edited memory",
         ):
             await call(store, "resolve", edited(**fields), decision)
     # A slot value of 1 made True is another JSON value, though Python finds them equal
