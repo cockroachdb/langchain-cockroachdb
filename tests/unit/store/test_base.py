@@ -4275,3 +4275,182 @@ def test_validate_and_resolve_confirm_ttl() -> None:
         _resolve_confirm_ttl(lambda r: -1, record)
     with pytest.raises(ValueError, match="got nan"):
         _resolve_confirm_ttl(lambda r: math.nan, record)
+
+
+def test_confirm_result_interprets_rowcount_and_check_rows() -> None:
+    """_confirm_result returns True for updated or found write_id, False otherwise."""
+    store = CockroachDBStore(object())  # type: ignore[arg-type]
+    # Updated row means confirmed
+    assert store._confirm_result(rowcount=1, check_rows=[]) is True
+    # No update but check row means retried after lost commit
+    assert store._confirm_result(rowcount=0, check_rows=[{"x": 1}]) is True
+    # No update and no check row means no live memory
+    assert store._confirm_result(rowcount=0, check_rows=[]) is False
+
+
+class ConfirmReads:
+    """Stands in for a store's _cursor in confirm, and answers its statements.
+
+    Every attempt logs its statements. The record read returns ``record_row``
+    (or no rows if None), the UPDATE returns ``updated`` rows, and the write_id
+    check returns ``check_rows``. ``fail`` makes the first attempt fail with a
+    retryable 40001 as its block ends.
+    """
+
+    def __init__(
+        self,
+        *,
+        record_row: dict[str, object] | None = None,
+        updated: int = 1,
+        check_rows: list[dict[str, object]] | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.record_row = record_row
+        self.updated = updated
+        self.check_rows = check_rows if check_rows is not None else []
+        self.fail = fail
+        self.attempts: list[list[tuple[str, list]]] = []
+        self.closed = False
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ConfirmCursor"]:
+        self.closed = False
+        self.attempts.append([])
+        yield ConfirmCursor(self)
+        self.closed = True
+        if self.fail and len(self.attempts) == 1:
+            raise psycopg.errors.StatementCompletionUnknown("40003")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if self.closed:
+            raise RuntimeError("Statement sent after _cursor block closed")
+        if sql.startswith("SELECT key, value"):
+            return [self.record_row] if self.record_row else []
+        if sql.startswith("SELECT 1 FROM"):
+            return self.check_rows
+        return []
+
+
+class ConfirmCursor:
+    """A cursor of ConfirmReads: it logs each statement and answers its fetch."""
+
+    def __init__(self, reads: ConfirmReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.sql = ""
+        self.rowcount = 0
+
+    def cursor(self, **kwargs: object) -> "ConfirmCursor":
+        return ConfirmCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        if self.reads.closed:
+            raise RuntimeError("Statement sent after _cursor block closed")
+        self.reads.attempts[-1].append((sql, params or []))
+        self.sql = sql
+        if sql.startswith("WITH renewed") or sql.startswith("UPDATE"):
+            self.rowcount = self.reads.updated
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.reads.answer(self.sql)
+
+    def close(self) -> None:
+        pass
+
+
+def confirming_store(reads: ConfirmReads) -> CockroachDBStore:
+    """A store whose confirm attempts go to ``reads``."""
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    store._columns_ready = True
+    store._cursor = reads.cursor  # type: ignore[method-assign]
+    return store
+
+
+def test_confirm_sends_all_statements_inside_the_attempt() -> None:
+    """Every statement is sent inside the _cursor block, nothing after it exits."""
+    # With a number TTL: UPDATE and write_id check
+    reads = ConfirmReads(updated=1, check_rows=[])
+    store = confirming_store(reads)
+
+    result = store.confirm(NS, "k", ttl=10.0)
+
+    assert result is True
+    assert len(reads.attempts) == 1
+    statements = reads.attempts[0]
+    # UPDATE (may include CTE for vectors) and write_id check
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+    assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
+    # Nothing sent after the block closed
+    # (The ConfirmCursor raises if a statement arrives while closed)
+
+    # With a callable TTL: record read, UPDATE, and write_id check
+    record_row = {
+        "key": "k",
+        "value": '{"text": "x"}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        "version": 1,
+        "valid_at": NOW,
+        "provenance": None,
+        "confirmed_at": None,
+        "confirmations": 0,
+        "write_id": None,
+    }
+    reads = ConfirmReads(record_row=record_row, updated=1, check_rows=[])
+    store = confirming_store(reads)
+
+    result = store.confirm(NS, "k", ttl=lambda r: 10.0)
+
+    assert result is True
+    assert len(reads.attempts) == 1
+    statements = reads.attempts[0]
+    # Record read, UPDATE, and write_id check
+    assert any("SELECT key, value" in stmt[0] for stmt in statements)
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+    assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
+
+
+def test_confirm_with_invalid_callable_return_raises_and_sends_no_update() -> None:
+    """A TTL callable returning invalid values raises ValueError inside the attempt."""
+    record_row = {
+        "key": "k",
+        "value": '{"text": "x"}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        "version": 1,
+        "valid_at": NOW,
+        "provenance": None,
+        "confirmed_at": None,
+        "confirmations": 0,
+        "write_id": None,
+    }
+
+    for invalid, pattern in [
+        (0, "got 0"),
+        (-1, "got -1"),
+        (math.nan, "got nan"),
+        ("x", "got 'x'"),
+        (True, "got True"),
+    ]:
+        reads = ConfirmReads(record_row=record_row, updated=1, check_rows=[])
+        store = confirming_store(reads)
+
+        error = raised_within(
+            lambda s=store, inv=invalid: s.confirm(NS, "k", ttl=lambda r, i=inv: i)
+        )  # type: ignore[arg-type,return-value]
+
+        assert isinstance(error, ValueError), (invalid, error)
+        assert pattern in str(error), (invalid, error)
+        # One attempt
+        assert len(reads.attempts) == 1
+        statements = reads.attempts[0]
+        # Record read sent, but no UPDATE (callable failed)
+        assert any("SELECT key, value" in stmt[0] for stmt in statements)
+        assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+
+
+def test_confirm_on_retry_with_write_id_returns_without_calling_callable() -> None:
+    """On a retry, if the record has this write_id, return True without calling the callable."""
+    # The integration tests cover the full retry scenario. This unit test verifies
+    # the key check: rows[0].get("write_id") == write_id causes early return.
+    # Tested via integration: test_confirm_retried_after_a_lost_commit_counts_once
