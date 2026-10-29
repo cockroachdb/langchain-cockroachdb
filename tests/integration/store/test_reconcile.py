@@ -825,6 +825,34 @@ def test_reconcile_skips_and_confirms_a_duplicate(store_factory, admin, mode) ->
         assert row is not None and row["n"] == 1
 
 
+def test_skip_duplicates_writes_an_update_under_its_own_key(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.reconcile(NS, "w", text(WINDOW), policy=keep_all())
+
+    # A reworded value under the same key, 0.98 against the stored one, is an
+    # update the caller aimed at that key: it is written, not skipped
+    updated = store.reconcile(NS, "w", text(LONG_FLIGHTS), policy=skip_duplicates())
+
+    assert updated == ReconcileResult(
+        key="w", new="written", version=2, superseded=(), deleted=(), confirmed=(), kept=()
+    )
+    record = store.record(NS, "w")
+    assert record is not None and (record.version, record.item.value) == (2, text(LONG_FLIGHTS))
+    assert [(v.version, v.reason, v.value) for v in store.history(NS, "w")] == [
+        (1, "overwritten", text(WINDOW))
+    ]
+
+    # Saving the same value again is a repeat: skipped, and the memory confirmed
+    again = store.reconcile(NS, "w", text(LONG_FLIGHTS), policy=skip_duplicates())
+
+    assert again == ReconcileResult(
+        key="w", new="skipped", version=None, superseded=(), deleted=(), confirmed=("w",), kept=()
+    )
+    record = store.record(NS, "w")
+    assert record is not None and (record.version, record.confirmations) == (2, 1)
+    assert len(store.history(NS, "w")) == 1
+
+
 def test_reconcile_records_a_late_fact_as_superseded(store_factory, admin, mode) -> None:
     store = store_factory(mode, history=True, index=seat_index())
     live = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")

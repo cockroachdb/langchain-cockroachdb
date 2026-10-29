@@ -159,6 +159,15 @@ What `put_if` or `delete_if` did.
       show_root_heading: true
       show_source: false
 
+## RECONCILE_SERDE_TYPES
+
+The classes a checkpoint serializer must allow, so reconcile values can wait in graph state.
+
+::: langchain_cockroachdb.store.reconcile.RECONCILE_SERDE_TYPES
+    options:
+      show_root_heading: true
+      show_source: false
+
 ## Policies
 
 A policy is a function of the `Proposal` and the sequence of candidates that returns a `Decision`, typed as `Policy` (`Callable[[Proposal, Sequence[Candidate]], Decision]`). It runs inside the reconcile's transaction, and again on every retry, so it must be a plain function, fast and deterministic, and must not call the store. These are the built-in ones, and `validate_decision`, which checks a decision as `reconcile` and `resolve` do.
@@ -213,6 +222,7 @@ A policy is a function of the `Proposal` and the sequence of candidates that ret
 | `MemoryRecord` | Yes | No |
 | `MemoryVersion` | Yes | No |
 | `ConditionalWrite` | Yes | No |
+| `RECONCILE_SERDE_TYPES` | Yes | No |
 | `Policy` | Yes | No |
 | `supersede_same_slot` | Yes | No |
 | `skip_duplicates` | Yes | No |

@@ -417,6 +417,8 @@ def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int
     return grouped, total
 
 
+# Named in reconcile.RECONCILE_SERDE_TYPES: keep this class's module and name,
+# which saved checkpoints refer to.
 @dataclass
 class PutPlan:
     """What a batch of puts writes, worked out before the first attempt.
@@ -630,6 +632,8 @@ class BatchPlan:
             self.results[i] = [from_text(row["ns"]) for row in rows]
 
 
+# Named in reconcile.RECONCILE_SERDE_TYPES: keep this class's module and name,
+# which saved checkpoints refer to.
 @dataclass(frozen=True)
 class ProposalPlan:
     """A new memory for find_conflicts or reconcile, checked before any I/O.
@@ -792,6 +796,8 @@ class SimilarRead:
         ]
 
 
+# Named in reconcile.RECONCILE_SERDE_TYPES: keep this class's module and name,
+# which saved checkpoints refer to.
 @dataclass(frozen=True)
 class StoreIdentity:
     """Which store made a Conflicts: the items table and the index it embeds for.
@@ -817,6 +823,8 @@ class StoreIdentity:
             object.__setattr__(self, "fields", tuple(self.fields))
 
 
+# Named in reconcile.RECONCILE_SERDE_TYPES: keep this class's module and name,
+# which saved checkpoints refer to.
 @dataclass(frozen=True)
 class ConflictsState:
     """What Conflicts keeps from find_conflicts, for resolve().
@@ -1591,6 +1599,9 @@ class BaseCockroachDBStore:
         """Pair the embeddings of ``plan.embed_requests`` with their rows.
 
         Each vector row gets the TTL of its item, so vectors expire with it.
+        Its values are plain floats, whatever number type the model returned,
+        such as numpy's float64: a Conflicts keeps these rows for resolve(),
+        and LangGraph's checkpoint serializer refuses numpy numbers.
 
         Args:
             plan: The put plan whose texts were embedded.
@@ -1614,7 +1625,8 @@ class BaseCockroachDBStore:
         for i, (prefix, key, field_name, _) in enumerate(plan.embed_requests):
             embedding = embeddings[i]
             self._check_embedding(embedding, f"{prefix}/{key}, field {field_name}")
-            rows.append((prefix, key, field_name, list(embedding), ttls[(prefix, key)]))
+            vector = [float(value) for value in embedding]
+            rows.append((prefix, key, field_name, vector, ttls[(prefix, key)]))
         return rows
 
     def _check_embedding(self, embedding: Sequence[float], what: str) -> None:

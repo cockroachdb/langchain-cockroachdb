@@ -627,7 +627,7 @@ A policy is a function of the `Proposal` and the candidates that returns a `Deci
 | Policy | What it decides |
 |---|---|
 | `supersede_same_slot()` | Supersedes the slot candidates whose valid time is not later than the new memory's. If one is later, records the new memory as superseded by the latest of them. If the memory under the new key is later, skips the new memory |
-| `skip_duplicates(threshold=0.97)` | If a candidate scores at or above `threshold`, or has an equal value, skips the new memory and confirms the best such candidate. That includes the memory under the new key, so a reworded value that scores that high is not written |
+| `skip_duplicates(threshold=0.97)` | If a candidate has an equal value, or a candidate under another key scores at or above `threshold`, skips the new memory and confirms the best such candidate. Under the new memory's own key only an equal value counts, so a reworded update to that key is written |
 | `supersede_similar(threshold=0.9)` | Works like `supersede_same_slot`, for the slot candidates and the candidates that score at or above `threshold`. It is blunt: similar is not contradictory |
 | `keep_all()` | Writes the new memory and keeps every candidate |
 | `first_of(*policies)` | Tries the policies in order and uses the first decision that does more than write the new memory and keep everything |
@@ -771,7 +771,7 @@ If a resolve of the same `Conflicts` already committed, as when an error left it
 
 ### Waiting for a Person
 
-A `Conflicts` and a `Decision` can wait in graph state while a person decides, for example across a LangGraph `interrupt()`. The checkpointer's serializer must then rebuild the store's types. Recent releases of langgraph-checkpoint log a warning for each type that is not on their msgpack allowlist, and refuse it when `LANGGRAPH_STRICT_MSGPACK=true` is set. A refused type comes back as a plain dict, so a `Conflicts` loses the plan that `resolve` needs, and `resolve` refuses it. Give the checkpointer a serializer that allows the store's types. Besides the public ones, a `Conflicts` keeps four types from `langchain_cockroachdb.store.base` for `resolve`, and each candidate holds a `SearchItem`:
+A `Conflicts` and a `Decision` can wait in graph state while a person decides, for example across a LangGraph `interrupt()`. The checkpointer's serializer must then rebuild the store's types. From langgraph-checkpoint 4.0.1, the serializer logs a warning for each type that is not on its msgpack allowlist, and refuses it when `LANGGRAPH_STRICT_MSGPACK=true` is set. A refused type comes back as a plain dict, so a `Conflicts` loses the plan that `resolve` needs, and `resolve` refuses it. `RECONCILE_SERDE_TYPES`, from `langchain_cockroachdb.store`, lists every class a reconcile value holds, in the form `allowed_msgpack_modules` takes. Give the checkpointer a serializer that allows them:
 
 ```python
 from typing import TypedDict
@@ -781,19 +781,12 @@ from langgraph.graph import START, StateGraph
 from langgraph.types import Command, interrupt
 
 from langchain_cockroachdb import CockroachDBSaver
-from langchain_cockroachdb.store import Conflicts, Decision, ReconcileResult
-
-RECONCILE_TYPES = [
-    *(
-        ("langchain_cockroachdb.store.reconcile", name)
-        for name in ("Action", "Candidate", "Conflicts", "Decision", "Proposal", "ReconcileResult")
-    ),
-    *(
-        ("langchain_cockroachdb.store.base", name)
-        for name in ("ConflictsState", "ProposalPlan", "PutPlan", "StoreIdentity")
-    ),
-    ("langgraph.store.base", "SearchItem"),
-]
+from langchain_cockroachdb.store import (
+    RECONCILE_SERDE_TYPES,
+    Conflicts,
+    Decision,
+    ReconcileResult,
+)
 
 
 class Review(TypedDict, total=False):
@@ -818,7 +811,7 @@ builder.add_node("decide", decide)
 builder.add_edge(START, "find")
 builder.add_edge("find", "decide")
 
-serde = JsonPlusSerializer(allowed_msgpack_modules=RECONCILE_TYPES)
+serde = JsonPlusSerializer(allowed_msgpack_modules=RECONCILE_SERDE_TYPES)
 with CockroachDBSaver.from_conn_string(DB_URI, serde=serde) as checkpointer:
     checkpointer.setup()
     graph = builder.compile(checkpointer=checkpointer)
@@ -831,7 +824,7 @@ with CockroachDBSaver.from_conn_string(DB_URI, serde=serde) as checkpointer:
     print(graph.invoke(Command(resume=decision), config)["result"])
 ```
 
-With a list of types, the serializer refuses every other type that is not built in, so add your own state types to the list. Add `MemoryRecord`, `MemoryVersion` and `ConditionalWrite` from `langchain_cockroachdb.store.reconcile` the same way if you keep them in state. langgraph-checkpoint 2.1.2, the oldest release this package supports, has no allowlist and rebuilds every type.
+The constant covers `Conflicts` with what it keeps for `resolve`, `Decision`, `ReconcileResult`, `ConditionalWrite`, `MemoryRecord` and `MemoryVersion`. With a list of types, the serializer refuses every other type that is not built in, so add your own state types to it, as in `[*RECONCILE_SERDE_TYPES, ("my_app.state", "Ticket")]`. Releases of langgraph-checkpoint before 4.0.1, back to 2.1.2, the oldest this package supports, take no `allowed_msgpack_modules` and rebuild every type, so they need no list.
 
 ### History
 

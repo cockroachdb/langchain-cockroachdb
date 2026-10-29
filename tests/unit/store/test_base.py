@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Sequen
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+import numpy
 import psycopg
 import pytest
 from langchain_core.embeddings import Embeddings
@@ -26,6 +27,7 @@ from langgraph.store.base import (
     ListNamespacesOp,
     MatchCondition,
     PutOp,
+    SearchItem,
     SearchOp,
 )
 from psycopg_pool import AsyncConnectionPool
@@ -37,6 +39,7 @@ from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.base import (
     MAX_SEARCH_NAMESPACES,
     BaseCockroachDBStore,
+    ConflictsState,
     ProposalPlan,
     PutPlan,
     SchemaCheck,
@@ -53,6 +56,7 @@ from langchain_cockroachdb.store.base import (
 )
 from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
 from langchain_cockroachdb.store.reconcile import (
+    RECONCILE_SERDE_TYPES,
     Action,
     Candidate,
     ConditionalWrite,
@@ -66,6 +70,7 @@ from langchain_cockroachdb.store.reconcile import (
 )
 from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, StoreSQL
 from langchain_cockroachdb.store.store import CockroachDBStore
+from tests.unit.store.test_reconcile import strict_serializer
 
 FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
 
@@ -2630,10 +2635,18 @@ class CandidateReads:
 
 
 def finding_store(
-    reads: CandidateReads, *, index: dict | None = None, make: str = "sync", **settings: object
+    reads: CandidateReads,
+    *,
+    index: dict | None = None,
+    make: str = "sync",
+    embeddings: CountingEmbeddings | None = None,
+    **settings: object,
 ) -> tuple[Any, CountingEmbeddings]:
-    """A sync or async store with an index whose reads go to ``reads``, after migration 2."""
-    embeddings = CountingEmbeddings()
+    """A sync or async store with an index whose reads go to ``reads``, after migration 2.
+
+    It embeds with ``embeddings``, a new CountingEmbeddings by default.
+    """
+    embeddings = embeddings or CountingEmbeddings()
     store = make_store(
         make,
         index={"dims": 3, "embed": embeddings, "fields": ["text"], **(index or {})},
@@ -3059,6 +3072,89 @@ def test_conflicts_survive_a_checkpoint_round_trip() -> None:
     )
     assert isinstance(plan.ttl, float) and plan.ttl == 30.0
     assert back.candidates[0].item.score == 0.2
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_conflicts_survives_a_strict_serializer_only_with_the_allowlist(make: str) -> None:
+    # LangGraph's strict mode rebuilds only the types it is given. A person
+    # deciding across an interrupt needs the Conflicts back whole, plan included
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=6,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95)],
+    )
+    finder, _ = finding_store(reads, reconcile_scan_limit=5)
+    conflicts = finder.find_conflicts(NS, "k", {"seat": "x", "text": "aisle"}, slot="seat")
+    decision = Decision(actions={"s": Action.SUPERSEDE, "a": Action.CONFIRM})
+    # A connection the store must never touch: using it would raise TypeError
+    store = make_store(make, index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]})
+
+    allowed = strict_serializer(RECONCILE_SERDE_TYPES)
+    back = allowed.loads_typed(allowed.dumps_typed(conflicts))
+    decided = allowed.loads_typed(allowed.dumps_typed(decision))
+
+    assert (back, back._state, decided) == (conflicts, conflicts._state, decision)
+    state = back._state
+    assert type(state) is ConflictsState and type(state.store) is StoreIdentity
+    assert type(state.plan) is ProposalPlan and type(state.plan.put) is PutPlan
+    assert [type(c.item) for c in back.candidates] == [SearchItem, SearchItem, SearchItem]
+    assert all(type(action) is Action for action in decided.actions.values())
+    # resolve takes them: its plan is built before any I/O
+    assert store._plan_resolve(back, decided).plan == conflicts._state.plan
+
+    # Strict mode also allows the types that a graph's state schema names,
+    # such as Conflicts, Proposal and Candidate. What a Conflicts keeps inside,
+    # its plan and its candidates' items, still comes back raw, and resolve
+    # refuses a Conflicts without its plan
+    schema_only = strict_serializer(
+        [
+            ("langchain_cockroachdb.store.reconcile", name)
+            for name in ("Conflicts", "Proposal", "Candidate")
+        ]
+    )
+    stripped = schema_only.loads_typed(schema_only.dumps_typed(conflicts))
+    assert type(stripped) is Conflicts and type(stripped._state) is dict
+    assert type(stripped.candidates[0].item) is dict
+    with pytest.raises(ValueError, match="holds no plan for the write"):
+        await call(store, "resolve", stripped, decision)
+
+
+class NumpyEmbeddings(CountingEmbeddings):
+    """CountingEmbeddings whose vectors hold numpy float64 values, as some models return."""
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [
+            [numpy.float64(value) for value in vector] for vector in super().embed_documents(texts)
+        ]
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        vectors = await super().aembed_documents(texts)
+        return [[numpy.float64(value) for value in vector] for vector in vectors]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_vector_rows_hold_plain_floats_when_the_model_returns_numpy(make: str) -> None:
+    # A Conflicts keeps its vector rows for resolve. Numpy floats in them would
+    # make LangGraph's serializer refuse the Conflicts when an interrupt
+    # checkpoints it while a person decides
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(rows=[candidate_row("k", version=3)], vectors=1)
+    store, _ = finding_store(reads, make=make, embeddings=NumpyEmbeddings())
+
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "aisle"})
+
+    [row] = conflicts._state.vector_rows
+    assert row[3] == [5.0, 0.0, 0.0]
+    assert [type(value) for value in row[3]] == [float, float, float]
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+    assert back == conflicts and back._state == conflicts._state
+    # A plain put pairs its vectors the same way
+    plan = store._plan_puts([PutOp(NS, "p", {"text": "abc"})])
+    [(_, _, _, vector, _)] = store._vector_rows(plan, [[numpy.float64(3.0), 0.0, 0.0]])
+    assert [type(value) for value in vector] == [float, float, float]
 
 
 @pytest.mark.parametrize(

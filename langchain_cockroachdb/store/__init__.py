@@ -11,6 +11,7 @@ from langchain_cockroachdb.store.config import (
     PoolConfig,
 )
 from langchain_cockroachdb.store.reconcile import (
+    RECONCILE_SERDE_TYPES,
     Action,
     Candidate,
     ConditionalWrite,
@@ -32,6 +33,7 @@ from langchain_cockroachdb.store.reconcile import (
 from langchain_cockroachdb.store.store import CockroachDBStore
 
 __all__ = [
+    "RECONCILE_SERDE_TYPES",
     "Action",
     "AsyncCockroachDBStore",
     "Candidate",

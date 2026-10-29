@@ -324,6 +324,45 @@ class ConflictsChanged(Exception):
         return (type(self), (self.keys,), self.__dict__)
 
 
+# These class paths are kept stable. A LangGraph checkpoint stores each object
+# under its class's module and name, so moving or renaming one of the classes
+# below would make checkpoints saved before the change give that object back
+# as a plain dict, and resolve() refuses a Conflicts whose plan comes back so.
+# A test checks that every entry names its class's own module and name.
+RECONCILE_SERDE_TYPES: tuple[tuple[str, str], ...] = (
+    ("langchain_cockroachdb.store.reconcile", "Action"),
+    ("langchain_cockroachdb.store.reconcile", "Candidate"),
+    ("langchain_cockroachdb.store.reconcile", "ConditionalWrite"),
+    ("langchain_cockroachdb.store.reconcile", "Conflicts"),
+    ("langchain_cockroachdb.store.reconcile", "Decision"),
+    ("langchain_cockroachdb.store.reconcile", "MemoryRecord"),
+    ("langchain_cockroachdb.store.reconcile", "MemoryVersion"),
+    ("langchain_cockroachdb.store.reconcile", "Proposal"),
+    ("langchain_cockroachdb.store.reconcile", "ReconcileResult"),
+    # What a Conflicts keeps for resolve()
+    ("langchain_cockroachdb.store.base", "ConflictsState"),
+    ("langchain_cockroachdb.store.base", "ProposalPlan"),
+    ("langchain_cockroachdb.store.base", "PutPlan"),
+    ("langchain_cockroachdb.store.base", "StoreIdentity"),
+    # The items that a MemoryRecord and a Candidate hold. langgraph-checkpoint
+    # already counts Item among its safe types, but not SearchItem
+    ("langgraph.store.base", "Item"),
+    ("langgraph.store.base", "SearchItem"),
+)
+"""Every class a reconcile value can hold, as ``(module, class name)`` pairs.
+
+A strict checkpoint serializer rebuilds only the classes it is given and
+gives any other back raw, as LangGraph's does with
+``LANGGRAPH_STRICT_MSGPACK=true``. To keep a Conflicts, a Decision, a
+ReconcileResult, a ConditionalWrite, a MemoryRecord or a MemoryVersion in
+graph state, give the checkpointer a serializer that allows these:
+``JsonPlusSerializer(allowed_msgpack_modules=RECONCILE_SERDE_TYPES)``, with
+your own state's types added if they are not built in. The pairs are the form
+that ``allowed_msgpack_modules`` takes, from langgraph-checkpoint 4.0.1.
+Earlier releases have no allowlist and rebuild every class.
+"""
+
+
 # Policy type
 Policy = Callable[[Proposal, Sequence[Candidate]], Decision]
 
@@ -388,9 +427,12 @@ def supersede_same_slot() -> Policy:
 def skip_duplicates(threshold: float = 0.97) -> Policy:
     """Return a policy that skips near-duplicate memories.
 
-    If a candidate scores at or above threshold, or has an equal value,
-    skip the proposal and confirm the highest-scoring duplicate (equal
-    values count as score 1.0).
+    If a candidate has a value equal to the proposal's, or a candidate under
+    another key scores at or above threshold, skip the proposal and confirm
+    the highest-scoring duplicate (equal values count as score 1.0). The
+    memory under the proposal's own key counts only with an equal value: a
+    near duplicate there is an update the caller aimed at that key, so this
+    policy leaves it to be written.
 
     Args:
         threshold: Similarity threshold (default 0.97).
@@ -404,13 +446,14 @@ def skip_duplicates(threshold: float = 0.97) -> Policy:
     _validate_threshold(threshold, "threshold")
 
     def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
-        # Find duplicates: scored >= threshold or equal value
+        # Find duplicates: an equal value, or a near duplicate under another
+        # key. Under the proposal's own key a near duplicate is an update
         duplicates = []
         for c in candidates:
             if c.item.value == proposal.value:
                 # Equal value counts as score 1.0
                 duplicates.append((c, 1.0))
-            elif c.score is not None and c.score >= threshold:
+            elif c.key != proposal.key and c.score is not None and c.score >= threshold:
                 duplicates.append((c, c.score))
 
         if not duplicates:

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
+import inspect
 import math
 import pickle
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.base import Item, SearchItem
 
+from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store.reconcile import (
+    RECONCILE_SERDE_TYPES,
     Action,
     Candidate,
     ConditionalWrite,
@@ -137,6 +142,45 @@ def test_skip_duplicates_treats_an_equal_value_as_a_duplicate() -> None:
 def test_skip_duplicates_writes_when_nothing_is_close() -> None:
     found = [candidate("a", score=0.5), candidate("b", score=0.6)]
     assert skip_duplicates()(make_proposal("new"), found) == Decision()
+
+
+def test_skip_duplicates_writes_a_near_duplicate_under_its_own_key() -> None:
+    # A reworded value under the key it updates is the update the caller asked for
+    proposal = make_proposal("k", value={"text": "aisle seats, please"})
+    found = [candidate("k", reason="key", score=0.99, value={"text": "aisle seats"})]
+
+    decision = skip_duplicates()(proposal, found)
+
+    assert decision == Decision()
+    validate_decision(proposal, found, decision)
+    # So first_of moves on to the next policy
+    assert first_of(skip_duplicates(), keep_all())(proposal, found) == Decision()
+
+
+def test_skip_duplicates_confirms_an_equal_value_under_its_own_key() -> None:
+    # Saving the same value again under its key is a repeat: confirm it
+    proposal = make_proposal("k", value={"text": "aisle seats"})
+    found = [candidate("k", reason="key", score=1.0, value={"text": "aisle seats"})]
+
+    decision = skip_duplicates()(proposal, found)
+
+    assert decision == Decision(new="skip", actions={"k": Action.CONFIRM})
+    validate_decision(proposal, found, decision)
+
+
+def test_skip_duplicates_confirms_a_near_duplicate_under_another_key() -> None:
+    # The memory under the new key does not count as a near duplicate, but
+    # one under another key still does, and the new value is skipped
+    proposal = make_proposal("k", value={"text": "aisle seats, please"})
+    found = [
+        candidate("k", reason="key", score=0.995, value={"text": "aisle seats"}),
+        candidate("other", score=0.98, value={"text": "aisle seats!"}),
+    ]
+
+    decision = skip_duplicates()(proposal, found)
+
+    assert decision == Decision(new="skip", actions={"other": Action.CONFIRM})
+    validate_decision(proposal, found, decision)
 
 
 def test_supersede_similar_uses_its_threshold() -> None:
@@ -565,3 +609,110 @@ def test_conditional_write_is_exported_from_the_store_package_only() -> None:
     assert not hasattr(langchain_cockroachdb, "ConditionalWrite")
     # A write that applied is not already applied unless a retry says so
     assert ConditionalWrite(applied=True, key="k", version=1, current=None).already_applied is False
+
+
+# LangGraph's strict mode (LANGGRAPH_STRICT_MSGPACK=true) rebuilds only the
+# types it is given, and gives any other back raw. RECONCILE_SERDE_TYPES is
+# what the reconcile values need
+
+
+def strict_serializer(allowed: Iterable[tuple[str, ...]] = ()) -> JsonPlusSerializer:
+    """A JsonPlusSerializer that rebuilds its built-in safe types and ``allowed``, and no other.
+
+    LangGraph's strict mode runs this: the serializer allows nothing beyond
+    its safe types (``allowed_msgpack_modules=None``), and a graph adds what
+    its state schema names with ``with_msgpack_allowlist``. langgraph-checkpoint
+    has the allowlist from 4.0.1. Older releases rebuild every type, so tests
+    that need a strict serializer skip there.
+    """
+    if "allowed_msgpack_modules" not in inspect.signature(JsonPlusSerializer).parameters:
+        pytest.skip("langgraph-checkpoint before 4.0.1 has no msgpack allowlist")
+    return JsonPlusSerializer(allowed_msgpack_modules=None).with_msgpack_allowlist(allowed)
+
+
+def test_the_serde_allowlist_names_every_class_a_reconcile_value_holds() -> None:
+    import langchain_cockroachdb
+    from langchain_cockroachdb import store as store_package
+
+    assert store_package.RECONCILE_SERDE_TYPES is RECONCILE_SERDE_TYPES
+    assert "RECONCILE_SERDE_TYPES" in store_package.__all__
+    assert not hasattr(langchain_cockroachdb, "RECONCILE_SERDE_TYPES")
+    # (module, class name) pairs of strings: the form that
+    # allowed_msgpack_modules and a checkpointer's with_allowlist both take
+    assert all(
+        isinstance(entry, tuple)
+        and len(entry) == 2
+        and all(isinstance(part, str) for part in entry)
+        for entry in RECONCILE_SERDE_TYPES
+    )
+    assert len(set(RECONCILE_SERDE_TYPES)) == len(RECONCILE_SERDE_TYPES)
+    classes = [
+        getattr(importlib.import_module(module), name) for module, name in RECONCILE_SERDE_TYPES
+    ]
+    assert set(classes) == {
+        Action,
+        Candidate,
+        ConditionalWrite,
+        Conflicts,
+        Decision,
+        MemoryRecord,
+        MemoryVersion,
+        Proposal,
+        ReconcileResult,
+        store_base.ConflictsState,
+        store_base.ProposalPlan,
+        store_base.PutPlan,
+        store_base.StoreIdentity,
+        Item,
+        SearchItem,
+    }
+    # A checkpoint stores each object under its class's own module and name,
+    # so every entry must be exactly that
+    assert [(cls.__module__, cls.__name__) for cls in classes] == list(RECONCILE_SERDE_TYPES)
+
+
+# Every reconcile value, as an agent or an interrupt keeps it in graph state
+STRICT_VALUES = {
+    **ROUND_TRIPS,
+    **{f"conditional write, {name}": value for name, value in CONDITIONAL_WRITES.items()},
+}
+
+
+@pytest.mark.parametrize("value", list(STRICT_VALUES.values()), ids=list(STRICT_VALUES))
+def test_a_strict_serializer_with_the_allowlist_rebuilds_every_reconcile_type(
+    value: object,
+) -> None:
+    serde = strict_serializer(RECONCILE_SERDE_TYPES)
+
+    back = serde.loads_typed(serde.dumps_typed(value))
+
+    assert back == value
+    assert_same_types(value, back)
+
+
+def test_a_strict_serializer_without_the_allowlist_gives_the_reconcile_types_back_raw() -> None:
+    serde = strict_serializer()
+
+    def round_trip(value: object) -> object:
+        return serde.loads_typed(serde.dumps_typed(value))
+
+    # A dataclass it may not rebuild comes back as the dict of its fields, an
+    # enum as its value, and an item as the dict of its fields
+    proposal = round_trip(ROUND_TRIPS["proposal"])
+    assert type(proposal) is dict and proposal["key"] == "k"
+    confirm = round_trip(Action.CONFIRM)
+    assert type(confirm) is str and confirm == "confirm"
+    candidate_back = round_trip(ROUND_TRIPS["candidate"])
+    assert type(candidate_back) is dict and type(candidate_back["item"]) is dict
+    result = round_trip(ROUND_TRIPS["result"])
+    assert type(result) is dict and result["new"] == "written"
+    # Item is one of the serializer's own safe types, so it comes back whole,
+    # inside a record that does not
+    record = round_trip(ROUND_TRIPS["record"])
+    assert type(record) is dict and type(record["item"]) is Item
+    # A Decision rebuilt from its own entry turns the actions it gets back as
+    # values into Actions again
+    decision_only = strict_serializer([("langchain_cockroachdb.store.reconcile", "Decision")])
+    decision = ROUND_TRIPS["decision"]
+    back = decision_only.loads_typed(decision_only.dumps_typed(decision))
+    assert back == decision and all(type(action) is Action for action in back.actions.values())

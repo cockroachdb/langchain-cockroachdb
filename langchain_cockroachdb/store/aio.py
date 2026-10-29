@@ -906,9 +906,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     ) -> list[MemoryVersion]:
         """The old versions of a memory, newest first.
 
-        A store with history keeps every version that a put overwrites
-        (reason "overwritten") or a delete ends ("deleted"). The live value
-        is not one of them; aget() returns it.
+        A store with history keeps every version that a write ends: one a
+        put overwrites (reason "overwritten"), one a delete ends
+        ("deleted"), and one that reconcile or resolve supersedes
+        ("superseded", with ``superseded_by`` naming the memory that
+        replaced it). A new memory that reconcile or resolve records as
+        already superseded by a newer fact is kept there too, as
+        "superseded". The live value is not one of them; aget() returns it.
 
         Args:
             namespace: The memory's namespace.
