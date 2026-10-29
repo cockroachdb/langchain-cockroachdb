@@ -212,7 +212,9 @@ class FailAfterCommit:
     crdb_internal.force_error with 40003 in the same pipeline. The batch
     commits, and the error reaches the store as the batch's result: an
     ambiguous result after the write applied, as when a connection drops
-    while the COMMIT's answer is on its way.
+    while the COMMIT's answer is on its way. Pass ``cursor_class()``, or
+    ``async_cursor_class()`` for an async connection or pool, as the
+    ``cursor_factory``.
     """
 
     def __init__(self, unsafe_internals: bool) -> None:
@@ -220,15 +222,21 @@ class FailAfterCommit:
         self.armed = False
         self.fired = 0
 
+    def _due(self, query: Any) -> bool:
+        """Whether ``query``, just sent, is the COMMIT to fail after; disarms if so."""
+        if self.armed and str(query).strip().upper() == "COMMIT":
+            self.armed = False
+            self.fired += 1
+            return True
+        return False
+
     def cursor_class(self) -> type[psycopg.Cursor[Any]]:
         fault = self
 
         class FailAfterCommitCursor(psycopg.Cursor):  # type: ignore[type-arg]
             def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
                 result = super().execute(query, params, **kwargs)
-                if fault.armed and str(query).strip().upper() == "COMMIT":
-                    fault.armed = False
-                    fault.fired += 1
+                if fault._due(query):
                     if fault.unsafe_internals:
                         super().execute("SET allow_unsafe_internals = true")
                     super().execute(
@@ -238,6 +246,23 @@ class FailAfterCommit:
                 return result
 
         return FailAfterCommitCursor
+
+    def async_cursor_class(self) -> type[psycopg.AsyncCursor[Any]]:
+        fault = self
+
+        class FailAfterCommitAsyncCursor(psycopg.AsyncCursor):  # type: ignore[type-arg]
+            async def execute(self, query, params=None, **kwargs):  # type: ignore[no-untyped-def,override]
+                result = await super().execute(query, params, **kwargs)
+                if fault._due(query):
+                    if fault.unsafe_internals:
+                        await super().execute("SET allow_unsafe_internals = true")
+                    await super().execute(
+                        FORCE_ERROR,
+                        {"fault_code": "40003", "fault_message": "injected 40003 after COMMIT"},
+                    )
+                return result
+
+        return FailAfterCommitAsyncCursor
 
 
 class Interruption:

@@ -22,6 +22,7 @@ import psycopg
 import pytest
 from psycopg import Connection, sql
 
+from langchain_cockroachdb.store import keep_all
 from tests.integration.store.conftest import seat_index
 
 NS = ("user", "alice")
@@ -108,6 +109,14 @@ def test_a_role_granted_only_the_store_tables_uses_migration_2(
     assert [(c.key, c.reason) for c in conflicts.candidates] == [("seat", "key")]
     assert conflicts.target_version == 2
 
+    # reconcile reads, decides and writes in one transaction as the role
+    result = store.reconcile(NS, "seat", LONG_FLIGHTS, policy=keep_all())
+    assert (result.key, result.new, result.version) == ("seat", "written", 3)
+    assert [(v.version, v.reason) for v in store.history(NS, "seat")] == [
+        (2, "overwritten"),
+        (1, "overwritten"),
+    ]
+
     # With history, a delete keeps the version it ends
     store.delete(NS, "food")
     assert store.get(NS, "food") is None
@@ -149,6 +158,21 @@ async def test_async_role_granted_only_the_store_tables_uses_migration_2(
     assert [(r["key"], r["version"], r["reason"], r["value"]) for r in await cur.fetchall()] == [
         ("food", 1, "deleted", VEGETARIAN),
         ("seat", 1, "overwritten", WINDOW),
+    ]
+
+    # The methods that need migration 2 work for the role too
+    record = await store.arecord(NS, "seat")
+    assert record is not None and record.version == 2
+    [old] = await store.ahistory(NS, "seat")
+    assert (old.version, old.value, old.reason) == (1, WINDOW, "overwritten")
+    conflicts = await store.afind_conflicts(NS, "seat", LONG_FLIGHTS)
+    assert [(c.key, c.reason) for c in conflicts.candidates] == [("seat", "key")]
+    assert conflicts.target_version == 2
+    result = await store.areconcile(NS, "seat", LONG_FLIGHTS, policy=keep_all())
+    assert (result.key, result.new, result.version) == ("seat", "written", 3)
+    assert [(v.version, v.reason) for v in await store.ahistory(NS, "seat")] == [
+        (2, "overwritten"),
+        (1, "overwritten"),
     ]
 
 

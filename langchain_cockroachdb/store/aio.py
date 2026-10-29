@@ -1,11 +1,13 @@
 """Asynchronous CockroachDB store for LangGraph long-term memory.
 
 Provides the interface of langgraph-checkpoint-postgres's AsyncPostgresStore
-on CockroachDB. It plans batches with the same code as CockroachDBStore and
-runs the same SQL. Every operation retries transient errors under the
-store's RetryPolicy. Every write is an UPSERT, a DELETE, an UPDATE that
-pushes back an expiry, or an INSERT into history that skips versions
-already there, so a retry after an ambiguous result is safe.
+on CockroachDB. It plans batches, reconciliations and conditional writes
+with the same code as CockroachDBStore and runs the same SQL. Every
+operation retries transient errors under the store's RetryPolicy. Every
+write is an UPSERT, a DELETE, an UPDATE that pushes back an expiry or
+confirms a memory once per write id, or an INSERT into history that skips
+versions and write ids already there, so a retry after an ambiguous result
+is safe.
 """
 
 from __future__ import annotations
@@ -14,10 +16,11 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import datetime
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import psycopg
 from langgraph.store.base import (
@@ -40,12 +43,21 @@ from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
-from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
+from langchain_cockroachdb.retry import RetryPolicy, may_have_committed, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
+    ConditionalPlan,
     PutPlan,
     SchemaCheck,
+    _carries_write_id,
+    _check_paging,
+    _check_policy,
+    _memory_prefix,
+    _resolve_confirm_ttl,
+    _row_to_record,
+    _row_to_version,
+    _validate_confirm_ttl,
 )
 from langchain_cockroachdb.store.config import (
     DEFAULT_RECONCILE_SCAN_LIMIT,
@@ -58,10 +70,21 @@ from langchain_cockroachdb.store.config import (
     resolve_reconcile_scan_limit,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
+from langchain_cockroachdb.store.reconcile import (
+    ConditionalWrite,
+    Conflicts,
+    Decision,
+    MemoryRecord,
+    MemoryVersion,
+    Policy,
+    ReconcileResult,
+)
 from langchain_cockroachdb.store.sql import VectorRow
 from langchain_cockroachdb.store.store import DEFAULT_SWEEP_INTERVAL_MINUTES
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 _OWN_LOOP = (
     "Synchronous calls to AsyncCockroachDBStore are only allowed from a "
@@ -116,6 +139,18 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     add one before the searches, to find their namespaces, and one after them
     when a search must run again exactly. A flat store adds neither. The
     long-term memory guide explains why.
+
+    With ``history``, a batch that overwrites or deletes a memory first
+    copies the version it ends into a history table, in its transaction.
+    ``adelete`` then keeps the memory in history; ``apurge`` removes a memory
+    with its history, and ``ahistory`` lists the old versions.
+
+    ``afind_conflicts``, ``aresolve``, ``areconcile``, ``aconfirm``,
+    ``arecord``, ``aput_if`` and ``adelete_if`` are CockroachDBStore's
+    methods of the same names without the prefix, as coroutines. They run on
+    the caller's event loop, not through the queue, so on a pool they run
+    concurrently. A reconcile policy and a confirm TTL function are plain
+    functions that run on the event loop inside the transaction.
 
     Example:
         ```python
@@ -545,6 +580,64 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             )
         )
 
+    def _run_sync(self, coro: Coroutine[Any, Any, T]) -> T:
+        """AsyncPsycopgOps._run_sync, refused while this thread runs a reconcile policy of the store.
+
+        A policy and a confirm TTL function are plain functions, so the sync
+        methods are the store calls they can make. They run on the store's
+        event loop, inside a transaction of the store, so such a call fails
+        at once, with the RuntimeError that CockroachDBStore raises, before
+        the check for the store's own loop would raise InvalidStateError.
+        """
+        try:
+            self._refuse_inside_user_callable()
+        except RuntimeError:
+            coro.close()
+            raise
+        return super()._run_sync(coro)
+
+    @asynccontextmanager
+    async def _cursor(
+        self,
+        *,
+        pipeline: bool = False,
+        transaction: bool = False,
+        timeout: float | None = None,
+        label: str | None = None,
+    ) -> AsyncIterator[AsyncCursor[DictRow]]:
+        """AsyncPsycopgOps._cursor, refused while this thread runs a reconcile policy of the store.
+
+        Every connection checkout of the store comes through here. Inside a
+        policy the store holds its connection, so a coroutine of the store
+        that a nested event loop runs from the policy fails here, instead of
+        waiting forever for that connection or reading outside the
+        transaction on a pool: see _refuse_inside_user_callable.
+        """
+        self._refuse_inside_user_callable()
+        async with super()._cursor(
+            pipeline=pipeline, transaction=transaction, timeout=timeout, label=label
+        ) as cur:
+            yield cur
+
+    @staticmethod
+    async def _send(
+        conn: AsyncConnection[DictRow],
+        statements: Sequence[tuple[str, list]],
+        cursors: list[AsyncCursor[DictRow]],
+    ) -> list[AsyncCursor[DictRow]]:
+        """Execute each statement on a cursor of its own, without fetching, and return the cursors.
+
+        They are added to ``cursors`` as well, for the caller to close. In a
+        pipeline, statements sent together take one round trip, and fetching
+        their rows flushes without a sync, so an open transaction stays open.
+        """
+        sent: list[AsyncCursor[DictRow]] = []
+        for statement in statements:
+            sent.append(conn.cursor(binary=True, row_factory=dict_row))
+            cursors.append(sent[-1])
+            await sent[-1].execute(*statement)
+        return sent
+
     async def _read_all(
         self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
     ) -> list[list[DictRow]]:
@@ -591,9 +684,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         Runs before the first attempt of any read, so a retry reuses the
         vectors. aembed_query, not aembed_documents: models that embed
-        queries and documents differently get the query form.
+        queries and documents differently get the query form. Inside a
+        reconcile policy it refuses before calling the model.
         """
         assert self.index is not None
+        self._refuse_inside_user_callable()
         texts = plan.query_texts()
         tasks = [asyncio.ensure_future(self.index.embeddings.aembed_query(text)) for text in texts]
         try:
@@ -704,10 +799,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     async def _embed_put(self, plan: PutPlan) -> list[VectorRow]:
         """Embed the texts a put plan writes, once, and pair the vectors with their rows.
 
-        Puts call it before their first attempt, so a retry reuses the
-        vectors. It embeds documents, with aembed_documents: the vectors are
-        the ones the write stores.
+        Puts, afind_conflicts, areconcile and aput_if call it before their
+        first attempt, so a retry reuses the vectors. All embed documents,
+        with aembed_documents: the vectors are the ones the write stores.
+        Inside a reconcile policy it refuses before calling the model.
         """
+        self._refuse_inside_user_callable()
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
             embeddings = await self.index.embeddings.aembed_documents(
@@ -791,6 +888,757 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                 return len(await cur.fetchall())
 
         return await self._retry(write, label="store delete namespace")
+
+    async def ahistory(
+        self, namespace: tuple[str, ...], key: str, *, limit: int = 20
+    ) -> list[MemoryVersion]:
+        """The old versions of a memory, newest first.
+
+        A store with history keeps every version that a put overwrites
+        (reason "overwritten") or a delete ends ("deleted"). The live value
+        is not one of them; aget() returns it.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+            limit: Most versions to return (default 20).
+
+        Returns:
+            Up to ``limit`` versions, highest version first. Versions past
+            the history's ``ttl_days`` are left out.
+
+        Raises:
+            ValueError: If the store keeps no history (create it with
+                history=True and run setup()), setup() has not created the
+                history table, or ``limit`` is negative
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+        """
+        prefix = _memory_prefix(namespace, "history")
+        _check_paging(limit, 0)
+        await self._ahistory_schema()
+        statement = self.sql.history_versions(prefix, str(key), limit=limit)
+        [rows] = await self._read_all([statement], "store history")
+        return [_row_to_version(tuple(namespace), str(key), row) for row in rows]
+
+    async def apurge(self, namespace: tuple[str, ...], key: str) -> bool:
+        """Forget a memory: delete the item, its vectors and its history.
+
+        On a store with history, adelete() keeps the version it ends, so
+        apurge is how to remove a memory for good. One statement deletes all
+        of it.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+
+        Returns:
+            Whether anything was deleted: the memory, or only its history
+            after a delete. If a retry follows a commit whose result was
+            lost, the retry finds nothing and returns False.
+
+        Raises:
+            ValueError: If the store keeps no history (create it with
+                history=True and run setup(); without history, adelete()
+                already removes a memory and its vectors), or setup() has
+                not created the history table
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+        """
+        prefix = _memory_prefix(namespace, "purge")
+        await self._ahistory_schema()
+        statement = self.sql.purge(prefix, str(key))
+
+        async def write() -> bool:
+            # One statement, so the item, its vectors and its history commit
+            # together. pipeline=True makes a component-wide pipeline sync
+            async with self._cursor(
+                pipeline=True,
+                timeout=self.retry_policy.attempt_timeout,
+                label="store purge",
+            ) as cur:
+                await cur.execute(*statement)
+                row = await cur.fetchone()
+                return row is not None and bool(row["removed"])
+
+        return await self._retry(write, label="store purge")
+
+    async def afind_conflicts(
+        self,
+        namespace: tuple[str, ...],
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        slot: str | None = None,
+        threshold: float | None = None,
+        limit: int = 10,
+        filter: dict[str, Any] | None = None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> Conflicts:
+        """Find the memories a new one may conflict with, without writing anything.
+
+        The async form of CockroachDBStore.find_conflicts, which describes
+        the candidates in full. They are live memories in ``namespace``
+        itself, for one of three reasons, strongest first: the memory under
+        ``key``; with ``slot``, the memories whose value holds the same value
+        in that field; and on a store with an index, the memories whose
+        vectors score at or above ``threshold`` against the new memory's,
+        with the store's score function. Candidates come strongest reason
+        first, then best score, then key. Expired memories are never
+        candidates, and no read pushes back an expiry.
+
+        The index fields of ``value`` are embedded once, with
+        aembed_documents, and the embedding is kept for aresolve. Then two
+        round trips read the candidates, or three when the C-SPANN index's
+        window may have left matches out.
+
+        Args:
+            namespace: The new memory's namespace. It cannot be empty.
+            key: The new memory's key, or None for a new uuid4.
+            value: The new memory's value.
+            slot: A top-level field of ``value`` naming the fact it states,
+                holding a string, number or boolean, or None.
+            threshold: The lowest score of a similar candidate. On a cosine
+                store it defaults to 0.8 and must lie between -1 and 1. On an
+                l2 or inner_product store, where scores are negated distances,
+                it must be given. Ignored without an index or with
+                ``index=False``.
+            limit: Most similar candidates (default 10). The key and slot
+                matches come on top of them; 0 keeps only those.
+            filter: Narrows the slot and similar candidates by value, as in
+                search. The memory under ``key`` is a candidate whatever it says.
+            index: Which fields of ``value`` to embed, as in put. False embeds
+                nothing and finds no similar candidates.
+            ttl: Minutes the new memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the new memory comes from, as a JSON object.
+            valid_at: When the fact became true, as a timezone-aware datetime.
+                By default the database's current time, raised to the latest
+                candidate's updated_at if that is later.
+
+        Returns:
+            The new memory as a Proposal, its candidates, and the version
+            and updated_at of the live memory under ``key``. Nothing was written.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If another argument is invalid (above), or setup() has
+                not added the columns this method needs
+        """
+        plan = self._plan_proposal(
+            namespace,
+            key,
+            value,
+            slot=slot,
+            threshold=threshold,
+            limit=limit,
+            filter=filter,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+            method="find_conflicts",
+        )
+        self._require_columns(await self._areconcile_columns(refresh=True))
+        vector_rows = await self._embed_put(plan.put)
+        read = self._key_slot_read(
+            plan, await self._read_all(self._key_slot_statements(plan), "store find conflicts")
+        )
+        similar = self._similar_read(plan, vector_rows, read)
+        statements = similar.statements()
+        found: Sequence[Sequence[dict[str, Any]]] = (
+            await self._read_all(statements, "store find conflicts similar", similar.session)
+            if statements
+            else []
+        )
+        exact = similar.exact_statements(found)
+        if exact:
+            found = similar.fill_exact(
+                found, await self._read_all(exact, "store find conflicts exact")
+            )
+        return self._conflicts(plan, vector_rows, read, similar, found)
+
+    async def arecord(self, namespace: tuple[str, ...], key: str) -> MemoryRecord | None:
+        """Read a live memory with its version, provenance, valid time and confirmations.
+
+        Reading a memory does not confirm it, so its expiry is never pushed back.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+
+        Returns:
+            The memory, or None if no live memory has that key: there is
+            none, or it expired.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If setup() has not added the columns this method needs
+        """
+        prefix = _memory_prefix(namespace, "record")
+        self._require_columns(await self._areconcile_columns(refresh=True))
+        [rows] = await self._read_all([self.sql.record(prefix, str(key))], "store record")
+        return _row_to_record(tuple(namespace), rows[0]) if rows else None
+
+    async def aconfirm(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        *,
+        ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None] = NOT_PROVIDED,
+    ) -> bool:
+        """Mark a live memory as confirmed, renewing its expiry and counting confirmations.
+
+        The async form of CockroachDBStore.confirm. This counts the
+        confirmation and renews the expiry. That way expiry can follow how
+        often a fact is confirmed, not how often it is read. Confirming does
+        not change the version or updated_at, so it never invalidates a
+        pending afind_conflicts.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+            ttl: How long the memory stays after confirmation. NOT_PROVIDED
+                renews from the row's own TTL. None removes the expiry. A
+                number is minutes. A callable takes the MemoryRecord read in
+                the same transaction and returns a number of minutes or None.
+                It is a plain function that runs on the event loop: keep it
+                fast and deterministic, since it runs again on each retry,
+                and it must not call the store.
+
+        Returns:
+            True if a live memory was confirmed, False if no live memory has
+            that key: there is none, or it expired.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
+                number of minutes, or a callable; if setup() has not added the
+                columns this method needs; or if the callable returns an
+                invalid value (not None or a positive finite number)
+        """
+        prefix = _memory_prefix(namespace, "confirm")
+        _validate_confirm_ttl(ttl)
+        self._require_columns(await self._areconcile_columns(refresh=True))
+
+        # Choose the write id before the first attempt
+        write_id = str(uuid.uuid4())
+        key_str = str(key)
+
+        async def attempt() -> bool:
+            cursors: list[AsyncCursor[DictRow]] = []
+            try:
+                async with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store confirm",
+                ) as cur:
+                    conn = cur.connection
+
+                    # If ttl is a callable, read the record first
+                    resolved_ttl: float | None | NotProvided
+                    if callable(ttl):
+                        read_sent = await self._send(
+                            conn, [self.sql.record(prefix, key_str)], cursors
+                        )
+                        rows = await read_sent[0].fetchall()
+                        if not rows:
+                            # No live memory to confirm
+                            return False
+                        record = _row_to_record(tuple(namespace), rows[0])
+                        # If the record already has this write_id, an earlier attempt
+                        # committed. Return True without calling the callable again
+                        if _carries_write_id(rows[0], write_id):
+                            return True
+                        resolved_ttl = self._run_user_callable(_resolve_confirm_ttl, ttl, record)  # type: ignore[assignment]
+                    else:
+                        resolved_ttl = ttl
+
+                    # Execute the confirm and the write_id check in the same transaction
+                    sent = await self._send(
+                        conn,
+                        [
+                            self.sql.confirm(prefix, key_str, write_id=write_id, ttl=resolved_ttl),
+                            self.sql.confirm_write_id_check(prefix, key_str, write_id=write_id),
+                        ],
+                        cursors,
+                    )
+
+                # Transaction committed. Interpret the result
+                rowcount = sent[0].rowcount
+                check_rows = await sent[1].fetchall()
+                return self._confirm_result(rowcount, check_rows)
+            finally:
+                for cursor in cursors:
+                    await cursor.close()
+
+        return await self._retry(attempt, label="store confirm")
+
+    async def areconcile(
+        self,
+        namespace: tuple[str, ...],
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        policy: Policy,
+        slot: str | None = None,
+        threshold: float | None = None,
+        limit: int = 10,
+        filter: dict[str, Any] | None = None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> ReconcileResult:
+        """Write a memory and settle the memories it may conflict with, in one transaction.
+
+        The async form of CockroachDBStore.reconcile, which describes the
+        decisions and the result in full. The candidates are the ones
+        afind_conflicts finds. They are read in the transaction, ``policy``
+        decides what to do with the new memory and with each candidate, and
+        the decision is applied before the transaction commits. Serializable
+        isolation covers all of it: if another writer changes what the policy
+        saw, one of the two transactions retries, and its policy sees the
+        other's write. Two agents that reconcile contradicting memories for
+        one user cannot both win.
+
+        ``policy`` is a plain function, not a coroutine. It runs on the event
+        loop, inside the transaction, and runs again on every retry, so it
+        must be fast and deterministic: the loop runs nothing else while it
+        runs. An LLM judge, or a person, belongs in afind_conflicts and
+        aresolve, which hold no transaction while the decision is made. A
+        policy must not call the store either: the store holds its
+        connection while the policy runs, so such a call raises RuntimeError
+        at once. A policy that raises rolls the transaction back, and its
+        exception propagates unchanged, without a retry. So does the
+        ValueError for an invalid decision.
+
+        The index fields of ``value`` are embedded once, with
+        aembed_documents, before the first attempt. If an attempt commits
+        and its result is lost, as when the connection drops while the
+        COMMIT's answer travels, the retry finds the rows that carry its
+        write id and writes nothing. It returns the result rebuilt from
+        those rows, with ``already_applied`` set, listing only what the rows
+        prove: ``kept`` is empty, and on a store without history so are
+        ``superseded`` and ``deleted``.
+
+        Args:
+            namespace: The new memory's namespace. It cannot be empty.
+            key: The new memory's key, or None for a new uuid4.
+            value: The new memory's value.
+            policy: Decides, from the new memory as a Proposal and its
+                candidates, what to do with each: a function that returns a
+                Decision. langchain_cockroachdb.store has built-in ones.
+            slot: A top-level field of ``value`` naming the fact it states,
+                as in afind_conflicts.
+            threshold: The lowest score of a similar candidate, as in
+                afind_conflicts: 0.8 by default on a cosine store, required on
+                an l2 or inner_product store, ignored without an index.
+            limit: Most similar candidates (default 10), on top of the key
+                and slot matches.
+            filter: Narrows the slot and similar candidates by value, as in
+                search.
+            index: Which fields of ``value`` to embed, as in put.
+            ttl: Minutes the new memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the new memory comes from, as a JSON object.
+                It is stored in its own column and kept in history.
+            valid_at: When the fact became true, as a timezone-aware datetime.
+                By default the database's current time, raised to the latest
+                candidate's updated_at if that is later. The memory then
+                stores no valid time and is valid from its updated_at.
+
+        Returns:
+            What happened: the new memory's key, whether it was written,
+            skipped or superseded, the version written, and the keys of the
+            candidates superseded, deleted, confirmed and kept.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If another argument is invalid, as in afind_conflicts;
+                if the policy returns an invalid decision; or if setup() has
+                not added the columns this method needs or, on a store with
+                history, created the history table
+        """
+        plan = self._plan_proposal(
+            namespace,
+            key,
+            value,
+            slot=slot,
+            threshold=threshold,
+            limit=limit,
+            filter=filter,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+            method="reconcile",
+        )
+        _check_policy(policy)
+        # The schema check comes first, so a store that cannot write costs no
+        # embedding call. With history, the write also needs the history table
+        if self._history is not None:
+            await self._ahistory_schema()
+        else:
+            self._require_columns(await self._areconcile_columns(refresh=True))
+        vector_rows = await self._embed_put(plan.put)
+        # The keys that the decisions of earlier attempts named. A retry
+        # looks for its write id under them only: an attempt that committed
+        # wrote nowhere else, and one that reached no decision wrote nothing
+        named: set[str] = set()
+
+        async def attempt() -> ReconcileResult:
+            cursors: list[AsyncCursor[DictRow]] = []
+            try:
+                async with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store reconcile",
+                ) as cur:
+                    conn = cur.connection
+
+                    async def fetch(statements: Sequence[tuple[str, list]]) -> list[list[DictRow]]:
+                        # In a pipeline the fetch flushes without a sync, so the
+                        # transaction stays open
+                        return [
+                            await statement_cursor.fetchall()
+                            for statement_cursor in await self._send(conn, statements, cursors)
+                        ]
+
+                    # A retry first looks for the rows its write id is on, in
+                    # the same round trip as the first candidate read. If an
+                    # earlier attempt committed, it returns that result
+                    reads = self._key_slot_statements(plan)
+                    checks = self._applied_statements(plan, named)
+                    found = await fetch([*reads, *checks])
+                    applied = self._applied_result(plan, found[len(reads) :]) if checks else None
+                    if applied is not None:
+                        return applied
+                    read = self._key_slot_read(plan, found[: len(reads)])
+                    similar = self._similar_read(plan, vector_rows, read)
+                    for setting in similar.session:
+                        await cur.execute(setting, prepare=False)
+                    scored: Sequence[Sequence[dict[str, Any]]] = await fetch(similar.statements())
+                    exact = similar.exact_statements(scored)
+                    if exact:
+                        scored = similar.fill_exact(scored, await fetch(exact))
+                    conflicts = self._conflicts(plan, vector_rows, read, similar, scored)
+                    proposal, candidates = conflicts.proposal, conflicts.candidates
+                    decision = self._checked_decision(
+                        proposal, candidates, self._decide(policy, proposal, candidates)
+                    )
+                    named.update(self._decision_keys(plan, decision))
+                    statements = self._decision_statements(
+                        plan,
+                        candidates,
+                        decision,
+                        vector_rows=vector_rows,
+                        valid_at=proposal.valid_at,
+                    )
+                    writes = await self._send(conn, statements, cursors)
+                # Committed. Only the item upsert returns rows: the version written
+                returned = [
+                    await statement_cursor.fetchall()
+                    for statement_cursor in writes
+                    if statement_cursor.description is not None
+                ]
+                return self._reconcile_result(plan, candidates, decision, returned)
+            finally:
+                for statement_cursor in cursors:
+                    await statement_cursor.close()
+
+        return await self._retry(attempt, label="store reconcile")
+
+    async def aresolve(self, conflicts: Conflicts, decision: Decision) -> ReconcileResult:
+        """Apply a decision about what afind_conflicts found, in one transaction.
+
+        The async form of CockroachDBStore.resolve, which describes the
+        checks and the retries in full. This is the second step of the
+        two-step flow: afind_conflicts reads the candidates, an LLM or a
+        person decides while no transaction is open, and aresolve applies
+        the decision as areconcile applies a policy's. It writes the new
+        memory that afind_conflicts planned, with its provenance, valid time
+        and write id, and the vectors it embedded then, so nothing is
+        embedded again. For the same reason it refuses a proposal edited
+        after afind_conflicts.
+
+        In the same transaction, before it writes, aresolve checks that the
+        memory under the new memory's key, and every candidate the decision
+        supersedes, deletes or confirms, or names as superseding the new
+        memory, still has the version and updated_at that afind_conflicts
+        read. If one changed, it raises ConflictsChanged with those keys,
+        writes nothing and does not retry: find the conflicts again and
+        decide again. Candidates the decision keeps are not checked, and a
+        confirmation in between never counts.
+
+        If a resolve of the same Conflicts already committed, aresolve
+        writes nothing and returns that write's result, rebuilt from its
+        rows, with ``already_applied`` set. Once an attempt of the call may
+        have committed (it sent its COMMIT and failed with an error other
+        than a serialization failure or a deadlock), a memory the decision
+        supersedes or deletes counts as unchanged when it is gone, for the
+        rest of the call. A Conflicts and a Decision can wait in a LangGraph
+        checkpoint while a person decides: aresolve takes them as the
+        checkpoint gives them back.
+
+        Args:
+            conflicts: What afind_conflicts returned, on a store with the
+                same table and index, sync or async.
+            decision: What to do with the new memory and each candidate.
+
+        Returns:
+            What happened, as areconcile reports it.
+
+        Raises:
+            ConflictsChanged: If a memory the decision depends on changed
+                since afind_conflicts. The attempt that found it wrote nothing.
+            ValueError: Before any I/O: if ``conflicts`` holds no plan from
+                afind_conflicts, as when it was built by hand; if a store
+                with another table or index made it; if its proposal or its
+                candidates changed since afind_conflicts; or if ``decision``
+                is not a valid Decision for its proposal and candidates.
+                After a schema read: if setup() has not added the columns
+                this method needs or, on a store with history, created the
+                history table.
+        """
+        resolving = self._plan_resolve(conflicts, decision)
+        # As in areconcile: with history, the write also needs the history table
+        if self._history is not None:
+            await self._ahistory_schema()
+        else:
+            self._require_columns(await self._areconcile_columns(refresh=True))
+        # Whether an earlier attempt of this call may have committed: it sent
+        # its COMMIT and failed with an error that is not a definite abort
+        committed = False
+
+        async def attempt() -> ReconcileResult:
+            nonlocal committed
+            committing = False
+            cursors: list[AsyncCursor[DictRow]] = []
+            try:
+                async with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store resolve",
+                ) as cur:
+                    conn = cur.connection
+                    # The check and the reads of an earlier commit go out as one
+                    # round trip. In a pipeline the fetch flushes without a sync,
+                    # so the transaction stays open
+                    reads = await self._send(conn, resolving.reads, cursors)
+                    found = [await statement_cursor.fetchall() for statement_cursor in reads]
+                    applied = self._check_resolve(resolving, found, may_have_committed=committed)
+                    if applied is not None:
+                        return applied
+                    writes = await self._send(conn, resolving.writes, cursors)
+                    # The COMMIT goes out as the block ends
+                    committing = True
+                # Committed. Only the item upsert returns rows: the version written
+                returned = [
+                    await statement_cursor.fetchall()
+                    for statement_cursor in writes
+                    if statement_cursor.description is not None
+                ]
+                return self._reconcile_result(
+                    resolving.plan, resolving.candidates, resolving.decision, returned
+                )
+            except Exception as error:
+                committed = committed or (committing and may_have_committed(error))
+                raise
+            finally:
+                for statement_cursor in cursors:
+                    await statement_cursor.close()
+
+        return await self._retry(attempt, label="store resolve")
+
+    async def aput_if(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        *,
+        expected: MemoryRecord | None,
+        index: Literal[False] | list[str] | None = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+        provenance: dict[str, Any] | None = None,
+        valid_at: datetime | None = None,
+    ) -> ConditionalWrite:
+        """Write a memory only if it is still the one the caller read, in one transaction.
+
+        The async form of CockroachDBStore.put_if. Two tasks that read the
+        same memory with arecord() and both write it back with aput would
+        lose one update without a word. aput_if writes only if the live
+        memory under ``key`` still has the version and updated_at of
+        ``expected``: a put moves the version, and a 0.5.x store, which does
+        not, still moves updated_at. With ``expected=None`` it writes only if
+        no live memory has the key, so a memory is created once. An expired
+        memory counts as absent.
+
+        On a match it writes as aput does, in the transaction that checked,
+        keeping the version it replaces in history on a store with history.
+        On a mismatch it writes nothing and returns ``applied=False`` with
+        ``current``, the live memory as the same transaction read it, or
+        None. A conflict is an expected outcome here, so it is returned, not
+        raised. If an attempt commits and its result is lost, the retry finds
+        the write id on the row and returns ``applied=True`` with
+        ``already_applied``. If another writer replaced the memory before the
+        retry, the retry reports a conflict with that writer's memory.
+
+        Args:
+            namespace: The memory's namespace. It cannot be empty.
+            key: The memory's key.
+            value: The new value.
+            expected: The MemoryRecord that arecord() returned for this
+                namespace and key, or None to write only if no live memory
+                has the key.
+            index: Which fields of ``value`` to embed, as in put. False
+                embeds nothing.
+            ttl: Minutes the memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the memory comes from, as a JSON object. It is
+                stored in its own column and kept in history.
+            valid_at: When the fact became true, as a timezone-aware
+                datetime. Without one the memory stores no valid time and is
+                valid from its updated_at.
+
+        Returns:
+            Whether the write applied, the version written, and on a
+            conflict the current memory.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: Before any I/O: if ``value`` is not a dict that
+                serializes as JSON; if ``expected`` is not None or the record
+                of this namespace and key; or if ``ttl``, ``provenance`` or
+                ``valid_at`` is invalid. After a schema read: if setup() has
+                not added the columns this method needs or, on a store with
+                history, created the history table.
+        """
+        plan = self._plan_put_if(
+            namespace,
+            key,
+            value,
+            expected=expected,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+        )
+        # The schema check comes first, so a store that cannot write costs no
+        # embedding call. With history, the write also needs the history table
+        if self._history is not None:
+            await self._ahistory_schema()
+        else:
+            self._require_columns(await self._areconcile_columns(refresh=True))
+        vector_rows = await self._embed_put(plan.put)
+        return await self._arun_conditional(
+            plan, self._conditional_writes(plan, vector_rows), label="store put_if"
+        )
+
+    async def adelete_if(
+        self, namespace: tuple[str, ...], key: str, *, expected: MemoryRecord | None
+    ) -> ConditionalWrite:
+        """Delete a memory only if it is still the one the caller read, in one transaction.
+
+        The async form of CockroachDBStore.delete_if, which describes the
+        retries in full. adelete_if deletes only if the live memory under
+        ``key`` still has the version and updated_at of ``expected``, as
+        aput_if checks them. On a match it deletes as adelete does: on a
+        store with history the memory is kept in history as deleted, and its
+        vectors go. With ``expected=None`` it applies only while no live
+        memory has the key, so it deletes nothing live.
+
+        ``applied=True`` means the memory matched ``expected`` and this call
+        deleted it, or, after an earlier attempt of the call that may have
+        committed, that the memory is gone and was this call's to delete. On
+        a mismatch it deletes nothing and returns ``applied=False`` with
+        ``current``, the live memory as the same transaction read it, or
+        None if there is none. A conflict is returned, not raised.
+
+        Args:
+            namespace: The memory's namespace. It cannot be empty.
+            key: The memory's key.
+            expected: The MemoryRecord that arecord() returned for this
+                namespace and key, or None.
+
+        Returns:
+            Whether the delete applied, and on a conflict the current memory.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: Before any I/O: if ``expected`` is not None or the
+                record of this namespace and key. After a schema read: if
+                setup() has not added the columns this method needs or, on a
+                store with history, created the history table.
+        """
+        plan = self._plan_delete_if(namespace, key, expected=expected)
+        # As in aput_if: with history, the delete also needs the history table
+        if self._history is not None:
+            await self._ahistory_schema()
+        else:
+            self._require_columns(await self._areconcile_columns(refresh=True))
+        return await self._arun_conditional(
+            plan, self._conditional_writes(plan), label="store delete_if"
+        )
+
+    async def _arun_conditional(
+        self, plan: ConditionalPlan, writes: Sequence[tuple[str, list]], *, label: str
+    ) -> ConditionalWrite:
+        """Run the attempts of aput_if or adelete_if: read and check, then write and commit.
+
+        Each attempt sends the reads of ``plan`` as one round trip and checks
+        their rows while the transaction stays open. A conflict, or a write
+        an earlier attempt already committed, returns at once and writes
+        nothing. Otherwise ``writes`` go out with the COMMIT.
+        """
+        # Whether an earlier attempt of this call may have committed: it sent
+        # its COMMIT and failed with an error that is not a definite abort.
+        # Until one may have, every attempt checks as strictly as the first
+        committed = False
+
+        async def attempt() -> ConditionalWrite:
+            nonlocal committed
+            committing = False
+            cursors: list[AsyncCursor[DictRow]] = []
+            try:
+                async with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label=label,
+                ) as cur:
+                    conn = cur.connection
+                    # In a pipeline the fetch flushes without a sync, so the
+                    # transaction stays open
+                    reads = await self._send(
+                        conn, plan.reads(may_have_committed=committed), cursors
+                    )
+                    found = [await statement_cursor.fetchall() for statement_cursor in reads]
+                    decided = self._check_conditional(plan, found, may_have_committed=committed)
+                    if decided is not None:
+                        return decided
+                    sent = await self._send(conn, writes, cursors)
+                    # The COMMIT goes out as the block ends
+                    committing = True
+                # Committed. Only aput_if's item upsert returns rows: the version written
+                returned = [
+                    await statement_cursor.fetchall()
+                    for statement_cursor in sent
+                    if statement_cursor.description is not None
+                ]
+                return self._conditional_result(plan, returned)
+            except Exception as error:
+                committed = committed or (committing and may_have_committed(error))
+                raise
+            finally:
+                for statement_cursor in cursors:
+                    await statement_cursor.close()
+
+        return await self._retry(attempt, label=label)
 
     async def sweep_ttl(self) -> int:
         """Delete expired items now, without waiting for CockroachDB's TTL job.
