@@ -1097,7 +1097,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         open, and resolve applies the decision as reconcile applies a
         policy's. It writes the new memory that find_conflicts planned, with
         its provenance, valid time and write id, and the vectors it embedded
-        then, so nothing is embedded again.
+        then, so nothing is embedded again. For the same reason it refuses a
+        proposal edited after find_conflicts, rather than drop the edit: to
+        change the memory, call find_conflicts again with the edited one.
 
         In the same transaction, before it writes, resolve checks that
         nothing the decision depends on has changed. The memory under the
@@ -1123,10 +1125,15 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         ``deleted``. Such a store keeps no row of a decision that only
         supersedes or deletes. When the commit of such a resolve is lost, its
         retry finds those memories gone, as the decision asked. So on a retry
-        within the same call, a candidate the decision supersedes or deletes
-        counts as unchanged when it is gone. The retry applies the decision
-        again, which changes nothing there, and returns its result without
-        ``already_applied``, since no row proves the earlier commit.
+        within the same call, a memory the decision supersedes or deletes,
+        the one under the new key included, counts as unchanged when it is
+        gone. The retry applies the decision again, which changes nothing
+        there, and returns its result without ``already_applied``, since no
+        row proves the earlier commit. A new call checks strictly again: if
+        an error escaped an earlier call, as when its retries ran out or the
+        hang guard stopped it, and the caller calls resolve again, such a
+        decision raises ConflictsChanged naming the keys that the earlier
+        call removed. find_conflicts then shows the current state.
 
         Without a ``valid_at`` given to find_conflicts, the new memory
         stores no valid time, so it is valid from its write, and the
@@ -1145,13 +1152,16 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Raises:
             ConflictsChanged: If a memory the decision depends on changed
                 since find_conflicts. The attempt that found it wrote nothing.
-            ValueError: Before any I/O, if ``conflicts`` is not what
-                find_conflicts returned, as when it was built by hand or
-                changed since, or a store with another table or index made
-                it, or if ``decision`` is not a valid Decision for its
-                proposal and candidates. After a schema read, if setup() has
-                not added the columns this method needs or, on a store with
-                history, created the history table.
+            ValueError: Before any I/O: if ``conflicts`` holds no plan from
+                find_conflicts, as when it was built by hand; if a store
+                with another table or index made it; if its proposal's
+                namespace, key, value, slot, slot value or provenance, or its
+                valid time when find_conflicts was given one, changed since
+                find_conflicts; if its candidates' keys, versions or
+                updated_at changed; or if ``decision`` is not a valid
+                Decision for its proposal and candidates. After a schema
+                read: if setup() has not added the columns this method needs
+                or, on a store with history, created the history table.
         """
         resolving = self._plan_resolve(conflicts, decision)
         # As in reconcile: with history, the write also needs the history table

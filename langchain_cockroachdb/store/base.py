@@ -754,11 +754,12 @@ class ResolvePlan:
             key: first the new memory's key, with None when no live memory
             had it, then each candidate the decision does more than keep or
             names as superseding the new memory, in candidate order.
-        removed: The candidates the decision deletes or supersedes, other
-            than the one under the new memory's key. On a retry within the
-            same call, one of them that is gone counts as unchanged: the
-            earlier attempt may have removed it, and removing it again
-            changes nothing.
+        removed: The candidates the decision deletes or supersedes, the
+            memory under the new key among them when the decision deletes
+            it. On a retry within the same call, one of them that is gone
+            counts as unchanged: the earlier attempt may have removed it,
+            and removing it again changes nothing. One that is live with
+            another version or updated_at still counts.
         reads: The read of the live (version, updated_at) of the keys in
             ``expected`` (StoreSQL.tokens), then the reads of the rows that
             carry the write id under the new key and under every
@@ -966,6 +967,49 @@ def changed_keys(
         if not (key in may_be_gone and key not in live)
         and live.get(key) != (None if token is None else tuple(token))
     )
+
+
+def _matches_json(value: object, text: str | None) -> bool:
+    """Whether ``value`` is the JSON in ``text``, or None when ``text`` is None.
+
+    Keys in another order, or a tuple in place of a list, give the same
+    JSON. Any other difference counts, true against 1 included, and a value
+    that does not serialize as JSON matches nothing.
+    """
+    if text is None:
+        return value is None
+    try:
+        return json.dumps(value, sort_keys=True) == json.dumps(json.loads(text), sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+
+
+def _edited_fields(proposal: Proposal, plan: ProposalPlan) -> list[str]:
+    """The fields of ``proposal`` that no longer describe the memory ``plan`` writes.
+
+    These are the proposal's namespace, key, value, slot, slot value and
+    provenance, and its valid time when find_conflicts was given one.
+    Without one, the proposal holds the default that find_conflicts worked
+    out and the write stores none, so there is nothing to compare. The
+    value, slot value and provenance are compared with the JSON the plan
+    writes, so an edit made in place, to a dict that the proposal shares
+    with the plan, counts too.
+    """
+    edited = [
+        name
+        for name, same in (
+            ("namespace", proposal.namespace == plan.namespace),
+            ("key", proposal.key == plan.key),
+            ("value", _matches_json(proposal.value, plan.value_json)),
+            ("slot", proposal.slot == plan.slot),
+            ("slot_value", _matches_json(proposal.slot_value, plan.slot_value_json)),
+            ("provenance", _matches_json(proposal.provenance, plan.provenance_json)),
+        )
+        if not same
+    ]
+    if plan.valid_at is not None and proposal.valid_at != plan.valid_at:
+        edited.append("valid_at")
+    return edited
 
 
 class BaseCockroachDBStore:
@@ -2228,8 +2272,11 @@ class BaseCockroachDBStore:
         The Conflicts must be one that find_conflicts returned, as it
         returned it or as a LangGraph checkpoint gives it back, from a store
         with this store's items table and index, since resolve writes the
-        plan find_conflicts made. The decision must be valid for its
-        proposal and candidates.
+        plan find_conflicts made and reuses its embedding. For the same
+        reason its proposal must still describe that memory, and its
+        candidates must be the ones find_conflicts read: an edit would be
+        lost without a word. The decision must be valid for its proposal and
+        candidates.
 
         The check before the write covers the new memory's key, whose memory
         the write replaces, and every candidate the decision supersedes,
@@ -2241,11 +2288,15 @@ class BaseCockroachDBStore:
         decided otherwise.
 
         Raises:
-            ValueError: If ``conflicts`` is not what find_conflicts
-                returned, as when it was built by hand or changed since, or
-                a store with another items table or index made it; or if
-                ``decision`` is not a valid Decision for its proposal and
-                candidates.
+            ValueError: If ``conflicts`` holds no plan from find_conflicts,
+                as when it was built by hand; if a store with another items
+                table or index made it; if its proposal's namespace, key,
+                value, slot, slot value or provenance, or its valid time when
+                find_conflicts was given one, differ from the memory
+                find_conflicts planned (_edited_fields); if its candidates'
+                keys, versions or updated_at differ from what find_conflicts
+                read; or if ``decision`` is not a valid Decision for its
+                proposal and candidates.
         """
         state = conflicts._state if isinstance(conflicts, Conflicts) else None
         if not isinstance(state, ConflictsState):
@@ -2260,11 +2311,19 @@ class BaseCockroachDBStore:
                 f"This Conflicts was found by another store, {state.store}, while this store "
                 f"is {identity}. Resolve it on a store with the same table and index."
             )
-        tokens = {c.key: (c.version, c.item.updated_at) for c in conflicts.candidates}
-        if conflicts.proposal.key != state.plan.key or tokens != state.tokens:
+        edited = _edited_fields(conflicts.proposal, state.plan)
+        if edited:
             raise ValueError(
-                "This Conflicts was changed after find_conflicts returned it: its proposal "
-                "or candidates are not the ones find_conflicts found."
+                "The proposal changed after find_conflicts returned it, in these fields: "
+                f"{', '.join(edited)}. resolve writes the memory find_conflicts planned and "
+                "reuses its embedding, so call find_conflicts again with the edited memory."
+            )
+        tokens = {c.key: (c.version, c.item.updated_at) for c in conflicts.candidates}
+        if tokens != state.tokens:
+            raise ValueError(
+                "The candidates changed after find_conflicts returned them: their keys, "
+                "versions or updated_at are not the ones find_conflicts read. Resolve the "
+                "Conflicts as find_conflicts returned it."
             )
         if not isinstance(decision, Decision):
             raise ValueError(f"resolve needs a Decision, got {type(decision).__name__}")
@@ -2294,7 +2353,7 @@ class BaseCockroachDBStore:
             candidates=candidates,
             decision=decision,
             expected=expected,
-            removed=frozenset(removing) - {plan.key},
+            removed=frozenset(removing),
             reads=reads,
             writes=writes,
         )

@@ -30,13 +30,14 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import psycopg
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.base import PutOp
 from psycopg import Connection
 
-from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
+from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore, RetryPolicy
 from langchain_cockroachdb._sql import parse_vector
 from langchain_cockroachdb.store import (
     Action,
@@ -2006,3 +2007,66 @@ def test_a_resolve_that_only_deletes_finishes_after_a_lost_commit_without_histor
     )
     assert store.get(NS, "gone") is None and store.get(NS, "also") is None
     assert vector_keys(admin, store) == ["kept"]
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_a_resolve_that_deletes_its_target_finishes_after_a_lost_commit_without_history(
+    store_factory, admin, unsafe_internals, caplog, mode
+) -> None:
+    # The decision skips the new memory and deletes the one under its key
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode, index=seat_index(), connect_kwargs={"cursor_factory": fault.cursor_class()}
+    )
+    store.put(NS, "k", in_slot(WINDOW))
+    store.put(NS, "kept", text(LONG_FLIGHTS))
+    conflicts = store.find_conflicts(NS, "k", in_slot(AISLE), slot="seat")
+    assert reasons(conflicts) == [("k", "key"), ("kept", "similar")]
+    fault.armed = True
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        result = store.resolve(conflicts, Decision(new="skip", actions={"k": Action.DELETE}))
+
+    # The retry finds the memory under the key gone, as the decision asked
+    assert fault.fired == 1
+    found = retries(caplog, "store resolve")
+    assert len(found) == 1 and "SQLSTATE 40003" in found[0]
+    assert result == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("k",),
+        confirmed=(),
+        kept=("kept",),
+    )
+    assert store.get(NS, "k") is None
+    assert vector_keys(admin, store) == ["kept"]
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_resolve_called_again_after_an_error_escaped_checks_strictly(
+    store_factory, unsafe_internals, mode
+) -> None:
+    # With one attempt, the error of a lost commit escapes the call. Calling
+    # resolve again starts a new call, whose first attempt is strict
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        index=seat_index(),
+        retry_policy=RetryPolicy(max_attempts=1),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    store.put(NS, "gone", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    decision = Decision(new="skip", actions={"gone": Action.DELETE})
+    fault.armed = True
+    with pytest.raises(psycopg.errors.StatementCompletionUnknown):
+        store.resolve(conflicts, decision)
+
+    # Without history nothing tells this call that the earlier one deleted
+    # the memory, so it names the key, and find_conflicts shows it gone
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, decision)
+    assert error.value.keys == ("gone",)
+    assert reasons(store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")) == []

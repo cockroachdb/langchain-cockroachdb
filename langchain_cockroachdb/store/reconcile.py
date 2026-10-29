@@ -94,7 +94,7 @@ class Decision:
         new: What to do with the new memory (write, skip, or superseded).
         superseded_by: Key that superseded the proposal, or None.
         actions: Mapping from candidate key to an Action, or its value such
-            as "delete" (missing means KEEP).
+            as "delete" (missing means KEEP). None means no actions.
     """
 
     new: Literal["write", "skip", "superseded"] = "write"
@@ -108,11 +108,18 @@ class Decision:
             raise ValueError(
                 f"Decision new must be 'write', 'skip' or 'superseded', got {self.new!r}"
             )
+        # Null actions, common in an LLM judge's JSON, are no actions
+        actions: object = {} if self.actions is None else self.actions
+        if not isinstance(actions, Mapping):
+            raise ValueError(
+                "Decision actions must map candidate keys to actions, or be None, "
+                f"got {type(actions).__name__}"
+            )
         # Keep a copy whose values are Actions, also when they are given as
         # their values, as in an LLM judge's JSON or from a checkpoint
         # serializer that does not allow Action. Anything else raises ValueError
         object.__setattr__(
-            self, "actions", {key: Action(action) for key, action in self.actions.items()}
+            self, "actions", {key: Action(action) for key, action in actions.items()}
         )
 
     def action(self, key: str) -> Action:

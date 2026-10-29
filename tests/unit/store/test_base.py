@@ -4030,29 +4030,38 @@ def test_a_retry_lets_only_the_candidates_the_decision_removes_be_gone() -> None
         },
     )
     resolving = store._plan_resolve(conflicts, decision)
-    assert resolving.removed == {"old", "gone"}
+    # The memory under the new key is removed too, since the decision deletes it
+    assert resolving.removed == {"k", "old", "gone"}
     nothing: list = [[], [], []]
 
     # The first attempt is strict: every key it checks must still be live
     with pytest.raises(ConflictsChanged) as first:
         store._check_resolve(resolving, nothing, retry=False)
     assert first.value.keys == ("k", "dup", "gone", "newer", "old")
-    # A retry lets the deleted and superseded candidates be gone, but not the
-    # memory under the new key, the confirmed one or the newer fact
+    # A retry lets the deleted and superseded memories be gone, but not the
+    # confirmed one or the newer fact
     with pytest.raises(ConflictsChanged) as again:
         store._check_resolve(resolving, nothing, retry=True)
-    assert again.value.keys == ("k", "dup", "newer")
+    assert again.value.keys == ("dup", "newer")
     # Gone as the decision asked, the rest unchanged: the retry applies it
-    live = [{"key": key, "version": 1, "updated_at": T0} for key in ("k", "dup", "newer")]
+    live = [{"key": key, "version": 1, "updated_at": T0} for key in ("dup", "newer")]
     assert store._check_resolve(resolving, [live, [], []], retry=True) is None
     with pytest.raises(ConflictsChanged) as strict:
         store._check_resolve(resolving, [live, [], []], retry=False)
-    assert strict.value.keys == ("gone", "old")
-    # A removed candidate that is live but was written since still counts
-    rewritten = [*live, {"key": "old", "version": 2, "updated_at": T0}]
-    with pytest.raises(ConflictsChanged) as written:
-        store._check_resolve(resolving, [rewritten, [], []], retry=True)
-    assert written.value.keys == ("old",)
+    assert strict.value.keys == ("k", "gone", "old")
+    # A removed memory that is live but was written since still counts, and so
+    # does a memory under the new key that another writer put again
+    later = T0 + timedelta(seconds=1)
+    for key, version in (("old", 2), ("k", 1)):
+        rewritten = [*live, {"key": key, "version": version, "updated_at": later}]
+        with pytest.raises(ConflictsChanged) as written:
+            store._check_resolve(resolving, [rewritten, [], []], retry=True)
+        assert written.value.keys == (key,)
+    # A decision that keeps the memory under the new key, or writes over it,
+    # leaves it strict
+    assert store._plan_resolve(conflicts, Decision(actions={"old": Action.DELETE})).removed == {
+        "old"
+    }
 
 
 class GoneOnRetry(ReconcileReads):
@@ -4097,3 +4106,75 @@ def test_a_retried_resolve_finishes_the_deletes_a_lost_commit_made() -> None:
         confirmed=(),
         kept=("k",),
     )
+
+
+def test_resolve_refuses_an_edited_proposal_before_any_io() -> None:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(rows=[candidate_row("k", version=3), candidate_row("s")], vectors=1)
+    finder, _ = finding_store(reads)
+    value = {"seat": "x", "text": "aisle", "tags": ["a", "b"]}
+    conflicts = finder.find_conflicts(
+        NS, "k", value, slot="seat", provenance={"source": "chat"}, valid_at=VALID
+    )
+    # A connection the store must never touch: using it would raise TypeError
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    decision = Decision(actions={"s": Action.SUPERSEDE})
+    proposal = conflicts.proposal
+
+    def edited(**fields: object) -> Conflicts:
+        return dataclasses.replace(conflicts, proposal=dataclasses.replace(proposal, **fields))
+
+    # resolve writes the memory find_conflicts planned, with its embedding, so
+    # a person who edited the proposal would lose the edit without a word
+    for fields, named in (
+        ({"namespace": ("user", "bob")}, "namespace"),
+        ({"key": "other"}, "key"),
+        ({"value": {**value, "text": "window"}}, "value"),
+        ({"slot": "tags"}, "slot"),
+        ({"slot_value": "y"}, "slot_value"),
+        ({"provenance": {"source": "person"}}, "provenance"),
+        ({"provenance": None}, "provenance"),
+        ({"valid_at": VALID + timedelta(days=1)}, "valid_at"),
+        ({"value": {**value, "seat": 1}, "provenance": None}, "value, provenance"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match=rf"The proposal changed after find_conflicts returned it, in these fields: "
+            rf"{named}\. .*call find_conflicts again with the edited memory",
+        ):
+            store.resolve(edited(**fields), decision)
+    # A slot value of 1 made True is another JSON value, though Python finds them equal
+    numbered = finder.find_conflicts(NS, "k", {"seat": 1, "text": "aisle"}, slot="seat")
+    made_true = dataclasses.replace(numbered.proposal, slot_value=True)
+    with pytest.raises(ValueError, match=r"in these fields: slot_value\."):
+        store.resolve(dataclasses.replace(numbered, proposal=made_true), decision)
+
+    # Equal values after a checkpoint's normalization are no edit, and neither
+    # is the same JSON with its keys in another order or a tuple for a list
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+    assert store._plan_resolve(back, decision).plan == back._state.plan
+    same = edited(
+        namespace=["user", "alice"], value={"tags": ("a", "b"), "text": "aisle", "seat": "x"}
+    )
+    store._plan_resolve(same, decision)
+    # Without a valid time given to find_conflicts, the proposal holds the
+    # default it worked out, and the write stores none: nothing to compare
+    found = finder.find_conflicts(NS, "k", value, slot="seat")
+    later = found.proposal.valid_at + timedelta(hours=1)
+    store._plan_resolve(
+        dataclasses.replace(found, proposal=dataclasses.replace(found.proposal, valid_at=later)),
+        decision,
+    )
+    # An edit in place counts too: the proposal and the plan share the value
+    # dict, but the plan writes the JSON find_conflicts serialized
+    back.proposal.value["text"] = "window"
+    proposal.value["text"] = "window"
+    for changed in (back, conflicts):
+        with pytest.raises(ValueError, match="in these fields: value\\."):
+            store.resolve(changed, decision)

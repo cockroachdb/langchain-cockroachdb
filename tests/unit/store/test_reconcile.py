@@ -514,3 +514,15 @@ def test_conflicts_changed_survives_pickle_with_its_keys_and_message() -> None:
     assert back.in_caller_transaction is True
     # Keys given as a list are kept as the tuple they stand for
     assert ConflictsChanged(["k"]).keys == ("k",)  # type: ignore[arg-type]
+
+
+def test_a_decision_with_null_actions_has_none() -> None:
+    # An LLM judge's JSON often says "actions": null for a decision that acts on no candidate
+    assert Decision(actions=None).actions == {}  # type: ignore[arg-type]
+    assert Decision(**{"new": "skip", "superseded_by": None, "actions": None}) == Decision(
+        new="skip"
+    )
+    # Anything else that is not a mapping fails, and says what was wrong
+    for bad in ("delete", ["old"], [("old", "delete")], 3):
+        with pytest.raises(ValueError, match="actions"):
+            Decision(actions=bad)  # type: ignore[arg-type]
