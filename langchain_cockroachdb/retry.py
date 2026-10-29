@@ -48,6 +48,12 @@ RETRYABLE_SQLSTATES: frozenset[str] = frozenset(
 # 08 is connection_exception, including CockroachDB sqlproxy's 08C00
 RETRYABLE_SQLSTATE_CLASSES: frozenset[str] = frozenset({"08"})
 
+# Errors that roll a transaction back, so it did not commit:
+# serialization_failure and deadlock_detected. After any other error, such
+# as 40003 or a lost connection, a transaction that sent its COMMIT may have
+# committed (may_have_committed).
+DEFINITE_ABORT_SQLSTATES: frozenset[str] = frozenset({"40001", "40P01"})
+
 # Codes too generic to decide on; message phrases decide for these
 UNCATEGORIZED_SQLSTATES: frozenset[str] = frozenset({"XXUUU", "XX000"})
 
@@ -160,6 +166,23 @@ def get_sqlstate(error: BaseException) -> str | None:
             if isinstance(code, str) and len(code) == 5:
                 return code.upper()
     return None
+
+
+def may_have_committed(error: BaseException) -> bool:
+    """Whether a transaction that sent its COMMIT, then failed with ``error``, may have committed.
+
+    Only a definite abort, an error whose SQLSTATE is in
+    DEFINITE_ABORT_SQLSTATES, proves that it did not. A 40003, a lost
+    connection, an attempt the hang guard abandoned and every other error
+    leave the outcome unknown, so they count as may have committed.
+
+    Args:
+        error: The exception that ended the transaction's attempt
+
+    Returns:
+        False only for a definite abort
+    """
+    return get_sqlstate(error) not in DEFINITE_ABORT_SQLSTATES
 
 
 @functools.cache

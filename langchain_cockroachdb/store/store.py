@@ -37,7 +37,7 @@ from psycopg_pool import ConnectionPool
 from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import connection_options, to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
-from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
+from langchain_cockroachdb.retry import RetryPolicy, may_have_committed, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
@@ -1220,16 +1220,21 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         is empty, and on a store without history so are ``superseded`` and
         ``deleted``. Such a store keeps no row of a decision that only
         supersedes or deletes. When the commit of such a resolve is lost, its
-        retry finds those memories gone, as the decision asked. So on a retry
-        within the same call, a memory the decision supersedes or deletes,
+        retry finds those memories gone, as the decision asked. So once an
+        attempt of the call may have committed (it sent its COMMIT and failed
+        with an error other than a serialization failure or a deadlock, which
+        roll the attempt back), a memory the decision supersedes or deletes,
         the one under the new key included, counts as unchanged when it is
         gone. The retry applies the decision again, which changes nothing
         there, and returns its result without ``already_applied``, since no
-        row proves the earlier commit. A new call checks strictly again: if
-        an error escaped an earlier call, as when its retries ran out or the
-        hang guard stopped it, and the caller calls resolve again, such a
-        decision raises ConflictsChanged naming the keys that the earlier
-        call removed. find_conflicts then shows the current state.
+        row proves the earlier commit. After a serialization failure the
+        retry checks as strictly as the first attempt: a memory gone since
+        was removed by another writer, and is a change. A new call checks
+        strictly again too: if an error escaped an earlier call, as when its
+        retries ran out or the hang guard stopped it, and the caller calls
+        resolve again, such a decision raises ConflictsChanged naming the
+        keys that the earlier call removed. find_conflicts then shows the
+        current state.
 
         Without a ``valid_at`` given to find_conflicts, the new memory
         stores no valid time, so it is valid from its write, and the
@@ -1265,12 +1270,13 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             self._history_schema()
         else:
             self._require_columns(self._reconcile_columns(refresh=True))
-        # Attempts of this call so far. A retry may follow a commit that was lost
-        attempts = 0
+        # Whether an earlier attempt of this call may have committed: it sent
+        # its COMMIT and failed with an error that is not a definite abort
+        committed = False
 
         def attempt() -> ReconcileResult:
-            nonlocal attempts
-            attempts += 1
+            nonlocal committed
+            committing = False
             cursors: list[Cursor[DictRow]] = []
             try:
                 with self._cursor(
@@ -1285,10 +1291,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     # so the transaction stays open
                     reads = self._send(conn, resolving.reads, cursors)
                     found = [statement_cursor.fetchall() for statement_cursor in reads]
-                    applied = self._check_resolve(resolving, found, retry=attempts > 1)
+                    applied = self._check_resolve(resolving, found, may_have_committed=committed)
                     if applied is not None:
                         return applied
                     writes = self._send(conn, resolving.writes, cursors)
+                    # The COMMIT goes out as the block ends
+                    committing = True
                 # Committed. Only the item upsert returns rows: the version written
                 returned = [
                     statement_cursor.fetchall()
@@ -1298,6 +1306,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 return self._reconcile_result(
                     resolving.plan, resolving.candidates, resolving.decision, returned
                 )
+            except Exception as error:
+                committed = committed or (committing and may_have_committed(error))
+                raise
             finally:
                 for statement_cursor in cursors:
                     statement_cursor.close()
@@ -1344,8 +1355,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         connection drops while the COMMIT's answer travels, the retry finds
         the write id on the row and returns ``applied=True`` with
         ``already_applied``. If another writer replaced the memory before the
-        retry, the retry reports a conflict with that writer's memory, which
-        is the current state.
+        retry, a 0.5.x store included, the retry reports a conflict with that
+        writer's memory, which is the current state.
 
         Args:
             namespace: The memory's namespace. It cannot be empty.
@@ -1410,20 +1421,26 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         ``expected=None`` it applies only while no live memory has the key,
         so it deletes nothing live.
 
-        On a mismatch it deletes nothing and returns ``applied=False`` with
-        ``current``, the live memory as the same transaction read it, or
-        None if there is none, as when another writer deleted it or it
-        expired since. A conflict is returned, not raised.
+        ``applied=True`` means the memory matched ``expected`` and this call
+        deleted it, or, after an earlier attempt of the call that may have
+        committed, that the memory is gone and was this call's to delete: it
+        matched ``expected`` when that attempt checked it. On a mismatch it
+        deletes nothing and returns ``applied=False`` with ``current``, the
+        live memory as the same transaction read it, or None if there is
+        none, as when another writer deleted it or it expired since. A
+        conflict is returned, not raised.
 
-        If an attempt commits and its result is lost, the retry finds the
-        memory gone. That is the state delete_if asked for, whoever removed
-        the memory, so the result is applied. On a store with history the
-        retry also finds its own history row, which proves the earlier
-        attempt deleted the memory, and the result has ``already_applied``.
-        A store without history keeps no row that proves which attempt
-        deleted it, so ``already_applied`` stays False. If another writer
-        put the key again before the retry, the retry reports a conflict
-        with that memory.
+        If an attempt sends its COMMIT and the result is lost, as when the
+        connection drops while the COMMIT's answer travels, that attempt may
+        have deleted the memory, so a retry that finds it gone reports it
+        applied. On a store with history the retry also finds its own history
+        row, which proves the earlier attempt deleted the memory, and the
+        result has ``already_applied``. A store without history keeps no row
+        that proves which attempt deleted it, so ``already_applied`` stays
+        False. A serialization failure rolls an attempt back, so after one a
+        memory gone since is a conflict: another writer removed it. If another
+        writer put the key again before the retry, the retry reports a
+        conflict with that memory.
 
         Args:
             namespace: The memory's namespace. It cannot be empty.
@@ -1459,13 +1476,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         an earlier attempt already committed, returns at once and writes
         nothing. Otherwise ``writes`` go out with the COMMIT.
         """
-        # Attempts of this call so far. A retry may follow a commit that was lost
-        attempts = 0
+        # Whether an earlier attempt of this call may have committed: it sent
+        # its COMMIT and failed with an error that is not a definite abort.
+        # Until one may have, every attempt checks as strictly as the first
+        committed = False
 
         def attempt() -> ConditionalWrite:
-            nonlocal attempts
-            attempts += 1
-            retry = attempts > 1
+            nonlocal committed
+            committing = False
             cursors: list[Cursor[DictRow]] = []
             try:
                 with self._cursor(
@@ -1477,12 +1495,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     conn = cur.connection
                     # In a pipeline the fetch flushes without a sync, so the
                     # transaction stays open
-                    reads = self._send(conn, plan.reads(retry=retry), cursors)
+                    reads = self._send(conn, plan.reads(may_have_committed=committed), cursors)
                     found = [statement_cursor.fetchall() for statement_cursor in reads]
-                    decided = self._check_conditional(plan, found, retry=retry)
+                    decided = self._check_conditional(plan, found, may_have_committed=committed)
                     if decided is not None:
                         return decided
                     sent = self._send(conn, writes, cursors)
+                    # The COMMIT goes out as the block ends
+                    committing = True
                 # Committed. Only put_if's item upsert returns rows: the version written
                 returned = [
                     statement_cursor.fetchall()
@@ -1490,6 +1510,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     if statement_cursor.description is not None
                 ]
                 return self._conditional_result(plan, returned)
+            except Exception as error:
+                committed = committed or (committing and may_have_committed(error))
+                raise
             finally:
                 for statement_cursor in cursors:
                     statement_cursor.close()

@@ -812,10 +812,10 @@ class ResolvePlan:
             names as superseding the new memory, in candidate order.
         removed: The candidates the decision deletes or supersedes, the
             memory under the new key among them when the decision deletes
-            it. On a retry within the same call, one of them that is gone
-            counts as unchanged: the earlier attempt may have removed it,
-            and removing it again changes nothing. One that is live with
-            another version or updated_at still counts.
+            it. Once an earlier attempt of the same call may have committed,
+            one of them that is gone counts as unchanged: that attempt may
+            have removed it, and removing it again changes nothing. One that
+            is live with another version or updated_at still counts.
         reads: The read of the live (version, updated_at) of the keys in
             ``expected`` (StoreSQL.tokens), then the reads of the rows that
             carry the write id under the new key and under every
@@ -836,9 +836,9 @@ class ResolvePlan:
 class ConditionalPlan:
     """What put_if or delete_if sends, built before any I/O.
 
-    Each attempt sends ``reads(retry=...)`` as one round trip and passes
-    their rows to BaseCockroachDBStore._check_conditional. Unless that
-    returns a result, the attempt sends the statements of
+    Each attempt sends ``reads(may_have_committed=...)`` as one round trip
+    and passes their rows to BaseCockroachDBStore._check_conditional.
+    Unless that returns a result, the attempt sends the statements of
     _conditional_writes and commits, and passes the rows they return to
     _conditional_result.
 
@@ -856,7 +856,8 @@ class ConditionalPlan:
         read: The read of the live memory under the key (StoreSQL.record).
             Its version and updated_at are compared with ``expected``, and
             a conflict returns it as the current memory.
-        checks: The reads a retry adds, of the rows that carry the write id:
+        checks: The reads an attempt adds once an earlier attempt of the
+            call may have committed, of the rows that carry the write id:
             the item under the key for put_if, live or expired, and the
             key's history rows for delete_if on a store with history.
             Without history nothing proves which attempt deleted a memory.
@@ -888,14 +889,15 @@ class ConditionalPlan:
             raise ValueError("The plan of the conditional write has no write id")
         return self.put.write_id
 
-    def reads(self, *, retry: bool) -> list[tuple[str, list]]:
+    def reads(self, *, may_have_committed: bool) -> list[tuple[str, list]]:
         """The statements an attempt sends first, as one round trip.
 
-        The first attempt has a write id no row can carry yet, so it reads
-        only the live memory. A retry follows an attempt whose commit may
-        have been lost, so it also reads the rows that carry the write id.
+        Until an attempt of the call may have committed, no row can carry
+        its write id, so an attempt reads only the live memory. Once one may
+        have, as when the result of its COMMIT was lost, an attempt also
+        reads the rows that carry the write id.
         """
-        return [self.read, *self.checks] if retry else [self.read]
+        return [self.read, *self.checks] if may_have_committed else [self.read]
 
 
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
@@ -2560,7 +2562,7 @@ class BaseCockroachDBStore:
         resolving: ResolvePlan,
         found: Sequence[Sequence[Mapping[str, Any]]],
         *,
-        retry: bool,
+        may_have_committed: bool,
     ) -> ReconcileResult | None:
         """What the first round trip of a resolve attempt found, before anything is written.
 
@@ -2572,12 +2574,15 @@ class BaseCockroachDBStore:
         Otherwise None means that nothing the decision depends on changed,
         and the attempt applies it.
 
-        ``retry`` says whether an earlier attempt of the same call ran. Its
-        commit may have been lost, and on a store without history a decision
-        that only deletes or supersedes leaves no row with the write id.
-        So on a retry the candidates in ``resolving.removed`` may be gone:
-        the state the decision asked for. On the first attempt they must
-        still be live, as every key the check covers must.
+        ``may_have_committed`` says whether an earlier attempt of the same
+        call may have committed: it sent its COMMIT and failed with an error
+        that is not a definite abort (retry.may_have_committed). On a store
+        without history a decision that only deletes or supersedes leaves no
+        row with the write id, so after such an attempt the candidates in
+        ``resolving.removed`` may be gone: the state the decision asked for.
+        Otherwise they must still be live, as every key the check covers
+        must. After a serialization failure, which rolled the attempt back,
+        a memory gone since was removed by another writer.
 
         Raises:
             ConflictsChanged: If a key of ``resolving.expected`` changed
@@ -2588,7 +2593,7 @@ class BaseCockroachDBStore:
         applied = self._applied_result(resolving.plan, found[1:])
         if applied is not None:
             return applied
-        gone = resolving.removed if retry else frozenset()
+        gone = resolving.removed if may_have_committed else frozenset()
         changed = changed_keys(resolving.expected, found[0], may_be_gone=gone)
         if changed:
             raise ConflictsChanged(changed)
@@ -2730,32 +2735,42 @@ class BaseCockroachDBStore:
         plan: ConditionalPlan,
         found: Sequence[Sequence[dict[str, Any]]],
         *,
-        retry: bool,
+        may_have_committed: bool,
     ) -> ConditionalWrite | None:
         """What the first round trip of a conditional write's attempt found, before anything is written.
 
-        ``found`` are the rows of ``plan.reads(retry=retry)``, in order. None
-        means the live memory is the one ``plan.expected`` names, compared as
-        resolve compares (changed_keys), and the attempt writes. A memory
-        written since moves the version, or only updated_at when a 0.5.x
-        store wrote it. Otherwise the result is a conflict, with the live
-        memory as ``current``, or None if there is none: the attempt writes
-        nothing, and the result is returned, not retried.
+        ``found`` are the rows of ``plan.reads(may_have_committed=...)``, in
+        order. None means the live memory is the one ``plan.expected``
+        names, compared as resolve compares (changed_keys), and the attempt
+        writes. A memory written since moves the version, or only updated_at
+        when a 0.5.x store wrote it. Otherwise the result is a conflict, with
+        the live memory as ``current``, or None if there is none: the attempt
+        writes nothing, and the result is returned, not retried.
 
-        On a retry, the commit of an earlier attempt may have been lost. The
+        ``may_have_committed`` says whether an earlier attempt of the same
+        call may have committed: it sent its COMMIT and failed with an error
+        that is not a definite abort (retry.may_have_committed). Then the
         item that carries put_if's write id proves that it wrote, and moved
         the version itself, so the result is applied with that item's
-        version and ``already_applied``. delete_if asked for the memory to
-        be gone, so a retry that finds it gone applies, as resolve lets a
-        memory its decision deletes be gone (``may_be_gone``). On a store
-        with history its own history row proves the delete, and the result
-        has ``already_applied``. Without history the attempt deletes again,
-        which changes nothing. A live memory that differs is a conflict on
-        every attempt, also when another writer put the key after a lost
-        commit: that memory is the current state.
+        version and ``already_applied``. A 0.5.x store leaves the write id
+        alone when it writes, so a live item whose value is not put_if's
+        was replaced since, and is a conflict. delete_if asked for the
+        memory to be gone, so after such an attempt finding it gone applies,
+        as resolve lets a memory its decision deletes be gone
+        (``may_be_gone``). On a store with history its own history row
+        proves the delete, and the result has ``already_applied``. Without
+        history the attempt deletes again, which changes nothing. After a
+        serialization failure, which rolled the attempt back, a memory gone
+        since is a conflict: another writer removed it. A live memory that
+        differs is a conflict on every attempt, also when another writer put
+        the key after a lost commit: that memory is the current state.
         """
         rows, proof = found[0], found[1] if len(found) > 1 else []
+        current = _row_to_record(plan.namespace, rows[0]) if rows else None
+        conflict = ConditionalWrite(applied=False, key=plan.key, version=None, current=current)
         if proof and not plan.deletes:
+            if rows and not _matches_json(rows[0]["value"], plan.put.items[0][2]):
+                return conflict
             version = int(proof[0]["version"])
             return ConditionalWrite(
                 applied=True, key=plan.key, version=version, current=None, already_applied=True
@@ -2764,10 +2779,9 @@ class BaseCockroachDBStore:
             return ConditionalWrite(
                 applied=True, key=plan.key, version=None, current=None, already_applied=True
             )
-        gone = {plan.key} if retry and plan.deletes else set()
+        gone = {plan.key} if may_have_committed and plan.deletes else set()
         if changed_keys({plan.key: plan.expected}, rows, may_be_gone=gone):
-            current = _row_to_record(plan.namespace, rows[0]) if rows else None
-            return ConditionalWrite(applied=False, key=plan.key, version=None, current=current)
+            return conflict
         return None
 
     @staticmethod

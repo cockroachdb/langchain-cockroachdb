@@ -53,6 +53,28 @@ def snapshot(admin: Connection[Any], store: Any) -> tuple[Any, ...]:
     return (item_rows(admin, store), vector_keys(admin, store), archived)
 
 
+def wait_for_both_reads(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first check of each of two threads wait for the other's.
+
+    Each thread's first attempt then reads the memory in its transaction
+    before either thread writes. A retry checks at once.
+    """
+    both_read = threading.Barrier(2, timeout=10)
+    check = store._check_conditional
+    lock = threading.Lock()
+    checked: set[int] = set()
+
+    def check_once_both_read(plan: Any, found: Any, **kwargs: Any) -> Any:
+        with lock:
+            first = threading.get_ident() not in checked
+            checked.add(threading.get_ident())
+        if first:
+            both_read.wait()
+        return check(plan, found, **kwargs)
+
+    monkeypatch.setattr(store, "_check_conditional", check_once_both_read)
+
+
 def stored_vector(admin: Connection[Any], store: Any, key: str) -> list[float]:
     row = admin.execute(
         f"SELECT embedding FROM {store.sql.vectors} WHERE prefix = %s AND key = %s",
@@ -68,6 +90,9 @@ def test_put_if_applies_when_unchanged(store_factory, admin, mode, history) -> N
     store.put(NS, "k", text(WINDOW))
     record = store.record(NS, "k")
     assert record is not None and record.version == 1
+    write_id_sql = f"SELECT write_id FROM {store.sql.items} WHERE prefix = %s AND key = 'k'"
+    before = admin.execute(write_id_sql, (PREFIX,)).fetchone()
+    assert before is not None and before["write_id"] is not None
 
     result = store.put_if(NS, "k", text(AISLE), expected=record, provenance={"source": "chat"})
 
@@ -75,11 +100,9 @@ def test_put_if_applies_when_unchanged(store_factory, admin, mode, history) -> N
     now = store.record(NS, "k")
     assert now is not None
     assert (now.version, now.item.value, now.provenance) == (2, text(AISLE), {"source": "chat"})
-    # The write id is on the row, and the vectors are the new value's
-    row = admin.execute(
-        f"SELECT write_id FROM {store.sql.items} WHERE prefix = %s AND key = 'k'", (PREFIX,)
-    ).fetchone()
-    assert row is not None and row["write_id"] is not None
+    # put_if's own write id replaced the put's on the row, and the vectors are the new value's
+    row = admin.execute(write_id_sql, (PREFIX,)).fetchone()
+    assert row is not None and row["write_id"] not in (None, before["write_id"])
     assert vector_keys(admin, store) == ["k"]
     assert stored_vector(admin, store, "k") == pytest.approx(SEATS[AISLE], abs=1e-6)
     if history:
@@ -200,21 +223,7 @@ def test_two_threads_put_if_from_the_same_record_one_wins(
     store = store_factory("pool", history=history, index=seat_index())
     store.put(NS, "k", text(WINDOW))
     record = store.record(NS, "k")
-    both_read = threading.Barrier(2, timeout=10)
-    check = store._check_conditional
-    lock = threading.Lock()
-    checked: set[int] = set()
-
-    def check_once_both_read(plan: Any, found: Any, **kwargs: Any) -> Any:
-        # The first check of each thread waits for the other's. A retry checks at once
-        with lock:
-            first = threading.get_ident() not in checked
-            checked.add(threading.get_ident())
-        if first:
-            both_read.wait()
-        return check(plan, found, **kwargs)
-
-    monkeypatch.setattr(store, "_check_conditional", check_once_both_read)
+    wait_for_both_reads(store, monkeypatch)
     values = [text(AISLE), text(LONG_FLIGHTS)]
 
     with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
@@ -247,14 +256,16 @@ def test_put_if_retried_after_a_lost_commit_is_already_applied(
     # The put_if commits, then the store sees 40003 and runs it again. The
     # retry finds its write id on the row and writes nothing
     fault = FailAfterCommit(unsafe_internals)
+    index = seat_index()
     store = store_factory(
         mode,
         history=history,
-        index=seat_index(),
+        index=index,
         connect_kwargs={"cursor_factory": fault.cursor_class()},
     )
     store.put(NS, "k", text(WINDOW))
     record = store.record(NS, "k")
+    embedded = index["embed"].calls
     fault.armed = True
 
     with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
@@ -266,6 +277,8 @@ def test_put_if_retried_after_a_lost_commit_is_already_applied(
     assert result == ConditionalWrite(
         applied=True, key="k", version=2, current=None, already_applied=True
     )
+    # Embedded once, before the first attempt: the retry reused the vectors
+    assert index["embed"].calls == embedded + 1
     # One version bump and, with history, one archived version
     now = store.record(NS, "k")
     assert now is not None and (now.version, now.item.value) == (2, text(AISLE))
@@ -321,6 +334,32 @@ def test_delete_if_applies_and_conflicts(store_factory, admin, mode, history) ->
     assert store.get(NS, "k") is not None
 
 
+@HISTORY
+def test_two_threads_delete_if_from_the_same_record_one_wins(
+    store_factory, admin, caplog, monkeypatch, history
+) -> None:
+    # Both read the memory before either deletes it. Serializable isolation
+    # rolls one of them back with a 40001, so its retry checks as strictly
+    # as its first attempt and finds the memory gone: the other removed it
+    store = store_factory("pool", history=history, index=seat_index())
+    store.put(NS, "k", text(WINDOW))
+    record = store.record(NS, "k")
+    wait_for_both_reads(store, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        results = run_together(
+            *(lambda: store.delete_if(NS, "k", expected=record) for _ in range(2))
+        )
+
+    found = retries(caplog, "store delete_if")
+    assert found and all("SQLSTATE 40001" in message for message in found)
+    assert sorted(result.applied for result in results) == [False, True]
+    assert ConditionalWrite(applied=False, key="k", version=None, current=None) in results
+    assert store.get(NS, "k") is None and vector_keys(admin, store) == []
+    if history:
+        assert [(v.version, v.reason) for v in store.history(NS, "k")] == [(1, "deleted")]
+
+
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
 @HISTORY
 def test_delete_if_retried_after_a_lost_commit_is_applied(
@@ -355,9 +394,13 @@ def test_delete_if_retried_after_a_lost_commit_is_applied(
 
 
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
-@pytest.mark.parametrize("method", ["put_if", "delete_if"])
+@pytest.mark.parametrize(
+    ("method", "writer"),
+    [("put_if", "store"), ("delete_if", "store"), ("put_if", "0.5.x store")],
+    ids=["put_if", "delete_if", "put_if-0.5.x"],
+)
 def test_a_retry_after_another_writer_reports_the_current_memory(
-    store_factory, unsafe_internals, monkeypatch, mode, method
+    store_factory, admin, unsafe_internals, monkeypatch, mode, method, writer
 ) -> None:
     # The write commits and its result is lost. Before the retry another
     # writer writes the key, so the retry reports a conflict with that
@@ -372,8 +415,19 @@ def test_a_retry_after_another_writer_reports_the_current_memory(
     other = store_factory("pool", history=True, index=seat_index())
     store.put(NS, "k", text(WINDOW))
     record = store.record(NS, "k")
+    write_id_sql = f"SELECT write_id FROM {store.sql.items} WHERE prefix = %s AND key = 'k'"
+    put_by = admin.execute(write_id_sql, (PREFIX,)).fetchone()
     real = store._cursor
     attempts = 0
+
+    def write_over() -> None:
+        if writer == "store":
+            other.put(NS, "k", text(LONG_FLIGHTS))
+        else:
+            # The 0.5 statement sets updated_at, and leaves the version and
+            # the write id as they were
+            value = json.dumps(text(LONG_FLIGHTS))
+            admin.execute(*store.sql.upsert_items([(PREFIX, "k", value, None)]))
 
     @contextlib.contextmanager
     def cursor(**kwargs: Any) -> Iterator[Any]:
@@ -381,7 +435,7 @@ def test_a_retry_after_another_writer_reports_the_current_memory(
         if kwargs.get("label") == f"store {method}":
             attempts += 1
             if attempts == 2:
-                other.put(NS, "k", text(LONG_FLIGHTS))
+                write_over()
         with real(**kwargs) as cur:
             yield cur
 
@@ -397,6 +451,13 @@ def test_a_retry_after_another_writer_reports_the_current_memory(
     current = store.record(NS, "k")
     assert current is not None and current.item.value == text(LONG_FLIGHTS)
     assert result == ConditionalWrite(applied=False, key="k", version=None, current=current)
+    if writer == "0.5.x store":
+        # The row still carries put_if's write id, which proves its commit,
+        # but the value is the 0.5.x store's, at put_if's version
+        row = admin.execute(write_id_sql, (PREFIX,)).fetchone()
+        assert put_by is not None and row is not None
+        assert row["write_id"] not in (None, put_by["write_id"])
+        assert current.version == 2
 
 
 @HISTORY

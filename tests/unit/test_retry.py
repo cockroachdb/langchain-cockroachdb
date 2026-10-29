@@ -12,6 +12,7 @@ from sqlalchemy.exc import TimeoutError as SAPoolTimeout
 
 from langchain_cockroachdb.retry import (
     DEFAULT_RETRY_POLICY,
+    DEFINITE_ABORT_SQLSTATES,
     RETRYABLE_SQLSTATES,
     SCHEMA_CHANGE_BUSY_SQLSTATE,
     RetryPolicy,
@@ -19,6 +20,7 @@ from langchain_cockroachdb.retry import (
     get_sqlstate,
     is_retryable_error,
     is_schema_change_busy,
+    may_have_committed,
     resolve_retry_policy,
     schema_change_policy,
     sync_retry_with_backoff,
@@ -275,6 +277,42 @@ class TestGetSqlstate:
         a, b = RuntimeError("a"), RuntimeError("b")
         a.__cause__, b.__cause__ = b, a
         assert get_sqlstate(a) is None
+
+
+class TestMayHaveCommitted:
+    def test_the_definite_aborts_are_serialization_failures_and_deadlocks(self) -> None:
+        assert frozenset({"40001", "40P01"}) == DEFINITE_ABORT_SQLSTATES
+
+    @pytest.mark.parametrize("code", sorted(DEFINITE_ABORT_SQLSTATES))
+    @pytest.mark.parametrize("shape", list(SHAPES))
+    def test_a_definite_abort_did_not_commit(self, code: str, shape: str) -> None:
+        assert may_have_committed(SHAPES[shape](server_error(code))) is False
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            server_error("40003", "result is ambiguous"),
+            server_error("57P01"),
+            server_error("08006"),
+            wrapped(server_error("40003")),
+            # A lost connection, as when the hang guard shuts the socket down
+            psycopg.OperationalError("server closed the connection unexpectedly"),
+            RuntimeError("anything else"),
+        ],
+        ids=["40003", "57P01", "08006", "wrapped 40003", "lost connection", "other"],
+    )
+    def test_any_other_error_may_have_committed(self, error: BaseException) -> None:
+        assert may_have_committed(error) is True
+
+    def test_a_definite_abort_seen_only_as_context_does_not_count(self) -> None:
+        # As get_sqlstate, the classifier follows causes, not unrelated context
+        try:
+            try:
+                raise server_error("40001")
+            except psycopg.Error:
+                raise ValueError("unrelated")  # noqa: B904
+        except ValueError as error:
+            assert may_have_committed(error) is True
 
 
 class TestRetryPolicy:

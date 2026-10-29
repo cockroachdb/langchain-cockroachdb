@@ -3448,9 +3448,10 @@ class ReconcileReads:
     Every attempt logs its statements. The candidate read returns ``rows``,
     the already-applied reads ``applied`` (the items, then the history), the
     token read ``tokens``, and the item upsert version 2. ``fail`` makes the
-    first attempt fail with a retryable 40001: "read" at its first fetch,
-    before any decision, and "commit" as its block ends, after its writes
-    went out.
+    first attempt fail: "read" with a 40001 at its first fetch, before any
+    decision; "commit" with a 40001 as its block ends, after its writes went
+    out, so the attempt rolled back; and "lost commit" with a 40003 there,
+    as when the result of its COMMIT is lost and it may have committed.
     """
 
     def __init__(
@@ -3473,6 +3474,8 @@ class ReconcileReads:
         yield ReconcileCursor(self)
         if self.fail == "commit" and len(self.attempts) == 1:
             raise psycopg.errors.SerializationFailure("restart transaction")
+        if self.fail == "lost commit" and len(self.attempts) == 1:
+            raise psycopg.errors.StatementCompletionUnknown("result is ambiguous")
 
     def answer(self, sql: str) -> list[dict[str, object]]:
         if self.fail == "read" and len(self.attempts) == 1:
@@ -4038,7 +4041,7 @@ def test_changed_keys_lets_a_key_that_may_be_gone_be_gone() -> None:
     assert changed_keys(expected, rows) == ("gone", "rewritten", "strict")
 
 
-def test_a_retry_lets_only_the_candidates_the_decision_removes_be_gone() -> None:
+def test_after_a_possible_commit_only_the_candidates_the_decision_removes_may_be_gone() -> None:
     store = reconciling_store(ReconcileReads([], fail="none"))
     rows = [candidate_row(key) for key in ("k", "old", "gone", "dup", "newer", "kept")]
     conflicts = found_conflicts(store, rows)
@@ -4059,20 +4062,21 @@ def test_a_retry_lets_only_the_candidates_the_decision_removes_be_gone() -> None
     assert resolving.removed == {"k", "old", "gone"}
     nothing: list = [[], [], []]
 
-    # The first attempt is strict: every key it checks must still be live
+    # Until an attempt may have committed, the check is strict: every key
+    # it checks must still be live. So is a retry after a serialization failure
     with pytest.raises(ConflictsChanged) as first:
-        store._check_resolve(resolving, nothing, retry=False)
+        store._check_resolve(resolving, nothing, may_have_committed=False)
     assert first.value.keys == ("k", "dup", "gone", "newer", "old")
-    # A retry lets the deleted and superseded memories be gone, but not the
-    # confirmed one or the newer fact
+    # After an attempt that may have committed, the deleted and superseded
+    # memories may be gone, but not the confirmed one or the newer fact
     with pytest.raises(ConflictsChanged) as again:
-        store._check_resolve(resolving, nothing, retry=True)
+        store._check_resolve(resolving, nothing, may_have_committed=True)
     assert again.value.keys == ("dup", "newer")
     # Gone as the decision asked, the rest unchanged: the retry applies it
     live = [{"key": key, "version": 1, "updated_at": T0} for key in ("dup", "newer")]
-    assert store._check_resolve(resolving, [live, [], []], retry=True) is None
+    assert store._check_resolve(resolving, [live, [], []], may_have_committed=True) is None
     with pytest.raises(ConflictsChanged) as strict:
-        store._check_resolve(resolving, [live, [], []], retry=False)
+        store._check_resolve(resolving, [live, [], []], may_have_committed=False)
     assert strict.value.keys == ("k", "gone", "old")
     # A removed memory that is live but was written since still counts, and so
     # does a memory under the new key that another writer put again
@@ -4080,7 +4084,7 @@ def test_a_retry_lets_only_the_candidates_the_decision_removes_be_gone() -> None
     for key, version in (("old", 2), ("k", 1)):
         rewritten = [*live, {"key": key, "version": version, "updated_at": later}]
         with pytest.raises(ConflictsChanged) as written:
-            store._check_resolve(resolving, [rewritten, [], []], retry=True)
+            store._check_resolve(resolving, [rewritten, [], []], may_have_committed=True)
         assert written.value.keys == (key,)
     # A decision that keeps the memory under the new key, or writes over it,
     # leaves it strict
@@ -4109,7 +4113,8 @@ class GoneOnRetry(ReconcileReads):
 
 def test_a_retried_resolve_finishes_the_deletes_a_lost_commit_made() -> None:
     rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
-    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="commit", tokens=TOKENS)
+    # The first attempt sent its COMMIT, and its result was lost (40003)
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="lost commit", tokens=TOKENS)
     store = reconciling_store(reads, history=False)
     conflicts = found_conflicts(store, rows)
     decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
@@ -4131,6 +4136,25 @@ def test_a_retried_resolve_finishes_the_deletes_a_lost_commit_made() -> None:
         confirmed=(),
         kept=("k",),
     )
+
+
+def test_a_resolve_retried_after_a_serialization_failure_counts_a_gone_memory_as_changed() -> None:
+    # The first attempt failed with a 40001 as its COMMIT went out, so it
+    # rolled back. Memories gone before the retry were removed by another
+    # writer, and the decision depended on them
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="commit", tokens=TOKENS)
+    store = reconciling_store(reads, history=False)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, decision)
+
+    assert error.value.keys == ("dup", "old")
+    # The retry wrote nothing
+    resolving = store._plan_resolve(conflicts, decision)
+    assert reads.attempts == [[*resolving.reads, *resolving.writes], resolving.reads]
 
 
 def test_resolve_refuses_an_edited_proposal_before_any_io() -> None:
@@ -4689,8 +4713,8 @@ def test_plan_put_if_reads_the_live_memory_and_writes_as_put_does() -> None:
     # a conflict returns. A retry also looks for the item that carries the
     # write id, live or expired, by primary key
     read = store.sql.record("user.alice", "k")
-    assert plan.reads(retry=False) == [read]
-    assert plan.reads(retry=True) == [
+    assert plan.reads(may_have_committed=False) == [read]
+    assert plan.reads(may_have_committed=True) == [
         read,
         store.sql.applied_items("user.alice", ["k"], write_id=write_id),
     ]
@@ -4749,11 +4773,11 @@ def test_plan_delete_if_deletes_as_delete_does() -> None:
         assert plan.deletes
         write_id = plan.write_id
         read = store.sql.record("user.alice", "k")
-        assert plan.reads(retry=False) == [read]
+        assert plan.reads(may_have_committed=False) == [read]
         # A retry on a store with history looks for its own history row.
         # Without history no row can prove which attempt deleted the memory
         proof = [store.sql.applied_history("user.alice", ["k"], write_id=write_id)]
-        assert plan.reads(retry=True) == [read, *(proof if history else [])]
+        assert plan.reads(may_have_committed=True) == [read, *(proof if history else [])]
         # The statements delete sends, with the write id on the archived version
         deleting = store._plan_puts([PutOp(NS, "k", None)])
         deleting.write_id = write_id
@@ -4781,7 +4805,7 @@ def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
     put = plan_put_if(store, expected=record_of(version=2))
 
     # Unchanged: the attempt writes
-    assert store._check_conditional(put, [[live]], retry=False) is None
+    assert store._check_conditional(put, [[live]], may_have_committed=False) is None
     # Written since, written by a 0.5.x store, which leaves the version, or
     # gone: a conflict, with the live memory as current
     for rows in (
@@ -4789,7 +4813,7 @@ def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
         [candidate_row("k", version=2, updated_at=LATER)],
         [],
     ):
-        assert store._check_conditional(put, [rows], retry=False) == ConditionalWrite(
+        assert store._check_conditional(put, [rows], may_have_committed=False) == ConditionalWrite(
             applied=False,
             key="k",
             version=None,
@@ -4797,23 +4821,35 @@ def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
         )
     # Create only: no live memory may have the key
     create = plan_put_if(store)
-    assert store._check_conditional(create, [[]], retry=False) is None
-    assert store._check_conditional(create, [[live]], retry=False) == ConditionalWrite(
+    assert store._check_conditional(create, [[]], may_have_committed=False) is None
+    assert store._check_conditional(create, [[live]], may_have_committed=False) == ConditionalWrite(
         applied=False, key="k", version=None, current=record_of(version=2)
     )
-    # On a retry, the item that carries the write id proves that an earlier
-    # attempt wrote it, which moved the token itself
+    # After an attempt that may have committed, the item that carries the
+    # write id proves that it wrote, which moved the token itself
     proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
-    written = [candidate_row("k", version=3, updated_at=LATER)]
+    written = [{**candidate_row("k", version=3, updated_at=LATER), "value": TEXT}]
     for plan in (put, create):
-        assert store._check_conditional(plan, [written, proof], retry=True) == ConditionalWrite(
-            applied=True, key="k", version=3, current=None, already_applied=True
+        assert store._check_conditional(
+            plan, [written, proof], may_have_committed=True
+        ) == ConditionalWrite(applied=True, key="k", version=3, current=None, already_applied=True)
+        # So does an item that expired since, with no live row to compare
+        assert store._check_conditional(
+            plan, [[], proof], may_have_committed=True
+        ) == ConditionalWrite(applied=True, key="k", version=3, current=None, already_applied=True)
+        # A 0.5.x store leaves the write id alone: a live item with another
+        # value was replaced since, and is the current state
+        replaced = [candidate_row("k", version=3, updated_at=LATER)]
+        assert store._check_conditional(
+            plan, [replaced, proof], may_have_committed=True
+        ) == ConditionalWrite(
+            applied=False, key="k", version=None, current=store_base._row_to_record(NS, replaced[0])
         )
-    # Without it a retry is as strict as the first attempt
-    assert store._check_conditional(put, [[], []], retry=True) == ConditionalWrite(
+    # Without it the check is as strict as the first attempt's
+    assert store._check_conditional(put, [[], []], may_have_committed=True) == ConditionalWrite(
         applied=False, key="k", version=None, current=None
     )
-    assert store._check_conditional(put, [[live], []], retry=True) is None
+    assert store._check_conditional(put, [[live], []], may_have_committed=True) is None
 
 
 def test_check_conditional_lets_a_retried_delete_if_find_the_memory_gone() -> None:
@@ -4824,17 +4860,22 @@ def test_check_conditional_lets_a_retried_delete_if_find_the_memory_gone() -> No
         no_proof: list = [[]] if history else []
 
         assert (
-            store._check_conditional(plan, [[candidate_row("k", version=2)]], retry=False) is None
+            store._check_conditional(
+                plan, [[candidate_row("k", version=2)]], may_have_committed=False
+            )
+            is None
         )
         # The first attempt is strict: a memory gone since is a conflict
-        assert store._check_conditional(plan, [[]], retry=False) == ConditionalWrite(
+        assert store._check_conditional(plan, [[]], may_have_committed=False) == ConditionalWrite(
             applied=False, key="k", version=None, current=None
         )
         # A retry that finds it gone has the state delete_if asked for. It
         # deletes again, which changes nothing, as no row proves the earlier commit
-        assert store._check_conditional(plan, [[], *no_proof], retry=True) is None
+        assert store._check_conditional(plan, [[], *no_proof], may_have_committed=True) is None
         # A live memory written since still counts
-        assert store._check_conditional(plan, [[put_again], *no_proof], retry=True) == (
+        assert store._check_conditional(
+            plan, [[put_again], *no_proof], may_have_committed=True
+        ) == (
             ConditionalWrite(
                 applied=False,
                 key="k",
@@ -4846,11 +4887,13 @@ def test_check_conditional_lets_a_retried_delete_if_find_the_memory_gone() -> No
     store = conditional_store(history=True)
     plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
     deleted = [{"key": "k", "reason": "deleted"}]
-    assert store._check_conditional(plan, [[], deleted], retry=True) == ConditionalWrite(
-        applied=True, key="k", version=None, current=None, already_applied=True
-    )
+    assert store._check_conditional(
+        plan, [[], deleted], may_have_committed=True
+    ) == ConditionalWrite(applied=True, key="k", version=None, current=None, already_applied=True)
     # unless another writer put the key again since: that memory is the current state
-    assert store._check_conditional(plan, [[put_again], deleted], retry=True) == ConditionalWrite(
+    assert store._check_conditional(
+        plan, [[put_again], deleted], may_have_committed=True
+    ) == ConditionalWrite(
         applied=False, key="k", version=None, current=store_base._row_to_record(NS, put_again)
     )
 
@@ -4879,9 +4922,11 @@ class ConditionalReads:
     the others, or no row for None, with its write id as a uuid.UUID, as
     psycopg reads it. The reads of the rows that carry the write id return
     ``proof``; like the real reads, they have no write id column. The item
-    upsert returns version 2. With
-    ``fail`` the first attempt fails with a 40003 as its block ends, after
-    its writes went out, as when the result of its commit is lost. Like
+    upsert returns version 2. ``fail`` is an error the first attempt raises:
+    with ``fail_at="commit"`` as its block ends, after its writes went out,
+    so the COMMIT went out too; with ``fail_at="read"`` at its first read,
+    before anything was written. A 40003 there is a commit whose result was
+    lost, and a 40001 a serialization failure, which rolled it back. Like
     psycopg, a cursor keeps its result from execute, and an execute after
     the block raises.
     """
@@ -4892,15 +4937,20 @@ class ConditionalReads:
         *,
         retry_row: dict[str, object] | None = None,
         proof: list[dict[str, object]] | None = None,
-        fail: bool = False,
+        fail: type[psycopg.Error] | None = None,
+        fail_at: str = "commit",
     ) -> None:
         self.row = row
         self.retry_row = retry_row
         self.proof = proof or []
         self.fail = fail
+        self.fail_at = fail_at
         self.attempts: list[list[tuple[str, list]]] = []
         self.arguments: list[dict[str, object]] = []
         self.closed = False
+
+    def failing(self, at: str) -> bool:
+        return self.fail is not None and self.fail_at == at and len(self.attempts) == 1
 
     @contextlib.contextmanager
     def cursor(self, **kwargs: object) -> Iterator["ConditionalCursor"]:
@@ -4909,11 +4959,13 @@ class ConditionalReads:
         self.closed = False
         yield ConditionalCursor(self)
         self.closed = True
-        if self.fail and len(self.attempts) == 1:
-            raise psycopg.errors.StatementCompletionUnknown("injected 40003 after COMMIT")
+        if self.fail is not None and self.failing("commit"):
+            raise self.fail("injected as the COMMIT went out")
 
     def answer(self, sql: str) -> list[dict[str, object]]:
         if sql.startswith("SELECT key, value, created_at"):
+            if self.fail is not None and self.failing("read"):
+                raise self.fail("injected at the first read")
             row = self.row if len(self.attempts) == 1 else self.retry_row
             return [] if row is None else [as_read(row)]
         if sql.startswith(APPLIED_READS):
@@ -4979,7 +5031,9 @@ def test_put_if_checks_then_writes_in_one_attempt() -> None:
     [plan] = plans
     # The read goes out first, as one round trip, then the writes, in one
     # transaction: nothing is sent after the block
-    assert reads.attempts == [[*plan.reads(retry=False), *store._conditional_writes(plan)]]
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *store._conditional_writes(plan)]
+    ]
     assert reads.arguments == [
         {
             "pipeline": True,
@@ -5000,7 +5054,7 @@ def test_put_if_returns_the_current_record_and_writes_nothing() -> None:
 
     # One attempt, which sent only the read: a conflict is returned, not retried
     [plan] = plans
-    assert reads.attempts == [plan.reads(retry=False)]
+    assert reads.attempts == [plan.reads(may_have_committed=False)]
     assert result == ConditionalWrite(
         applied=False, key="k", version=None, current=store_base._row_to_record(NS, newer)
     )
@@ -5012,15 +5066,19 @@ def test_a_retried_put_if_looks_for_its_write_id(committed: bool, monkeypatch) -
     mine = uuid.UUID(int=7)
     monkeypatch.setattr(store_base.uuid, "uuid4", lambda: mine)
     # The live row carries the write id of the put that wrote it, and the
-    # row the first attempt wrote carries this call's
+    # row the first attempt wrote carries this call's, and its value
     row = {**candidate_row("k", version=2), "write_id": str(uuid.UUID(int=1))}
-    written = {**candidate_row("k", version=3, updated_at=LATER), "write_id": str(mine)}
+    written = {
+        **candidate_row("k", version=3, updated_at=LATER),
+        "value": {"text": "aisle"},
+        "write_id": str(mine),
+    }
     proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
     reads = ConditionalReads(
         row,
         retry_row=written if committed else row,
         proof=proof if committed else [],
-        fail=True,
+        fail=psycopg.errors.StatementCompletionUnknown,
     )
     store, plans = conditional_attempts(reads)
 
@@ -5030,16 +5088,16 @@ def test_a_retried_put_if_looks_for_its_write_id(committed: bool, monkeypatch) -
     assert plan.write_id == str(mine)
     writes = store._conditional_writes(plan)
     first, second = reads.attempts
-    assert first == [*plan.reads(retry=False), *writes]
+    assert first == [*plan.reads(may_have_committed=False), *writes]
     if committed:
         # Its write id on the row proves the first attempt committed: nothing more is sent
-        assert second == plan.reads(retry=True)
+        assert second == plan.reads(may_have_committed=True)
         assert result == ConditionalWrite(
             applied=True, key="k", version=3, current=None, already_applied=True
         )
     else:
         # Nothing carries the write id, the record still matches, and the retry writes again
-        assert second == [*plan.reads(retry=True), *writes]
+        assert second == [*plan.reads(may_have_committed=True), *writes]
         assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
 
 
@@ -5047,7 +5105,12 @@ def test_a_retried_put_if_looks_for_its_write_id(committed: bool, monkeypatch) -
 def test_a_retried_delete_if_reports_a_memory_it_finds_gone_as_deleted(history: bool) -> None:
     # The first attempt deleted the memory and committed, and its result was lost
     proof = [{"key": "k", "reason": "deleted"}] if history else []
-    reads = ConditionalReads(candidate_row("k", version=2), retry_row=None, proof=proof, fail=True)
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=None,
+        proof=proof,
+        fail=psycopg.errors.StatementCompletionUnknown,
+    )
     store, plans = conditional_attempts(reads, history=history)
 
     result = store.delete_if(NS, "k", expected=record_of(version=2))
@@ -5055,16 +5118,66 @@ def test_a_retried_delete_if_reports_a_memory_it_finds_gone_as_deleted(history: 
     [plan] = plans
     writes = store._conditional_writes(plan)
     first, second = reads.attempts
-    assert first == [*plan.reads(retry=False), *writes]
+    assert first == [*plan.reads(may_have_committed=False), *writes]
     assert [arguments["label"] for arguments in reads.arguments] == ["store delete_if"] * 2
     if history:
         # Its own history row proves the delete: nothing more is sent
-        assert second == plan.reads(retry=True)
+        assert second == plan.reads(may_have_committed=True)
         assert result == ConditionalWrite(
             applied=True, key="k", version=None, current=None, already_applied=True
         )
     else:
         # Gone is the state it asked for. It deletes again, which changes
         # nothing, and no row proves which attempt deleted the memory
-        assert second == [*plan.reads(retry=True), *writes]
+        assert second == [*plan.reads(may_have_committed=True), *writes]
         assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+
+
+@pytest.mark.parametrize(
+    ("fail", "fail_at", "may_have_committed"),
+    [
+        (psycopg.errors.SerializationFailure, "commit", False),
+        (psycopg.errors.StatementCompletionUnknown, "read", False),
+        (psycopg.errors.StatementCompletionUnknown, "commit", True),
+    ],
+    ids=["40001 at the commit", "40003 before the commit", "40003 at the commit"],
+)
+def test_a_retried_delete_if_counts_a_gone_memory_as_deleted_only_after_a_possible_commit(
+    fail: type[psycopg.Error], fail_at: str, may_have_committed: bool
+) -> None:
+    # The memory is gone when the retry reads it
+    reads = ConditionalReads(
+        candidate_row("k", version=2), retry_row=None, fail=fail, fail_at=fail_at
+    )
+    store, plans = conditional_attempts(reads)
+
+    result = store.delete_if(NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    second = reads.attempts[1]
+    if may_have_committed:
+        # The first attempt sent its COMMIT and its result was lost, so it may
+        # have deleted the memory: gone is the state it asked for
+        assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+        assert second == [*plan.reads(may_have_committed=True), *store._conditional_writes(plan)]
+    else:
+        # A serialization failure rolled the first attempt back, and one that
+        # failed before its COMMIT wrote nothing: another writer removed the
+        # memory, and the retry, as strict as the first attempt, says so
+        assert result == ConditionalWrite(applied=False, key="k", version=None, current=None)
+        assert second == plan.reads(may_have_committed=False)
+
+
+def test_a_put_if_retried_after_a_serialization_failure_checks_as_the_first_attempt_did() -> None:
+    # The first attempt rolled back, so no row can carry its write id: the
+    # retry reads no proof, compares the record again and writes again
+    row = candidate_row("k", version=2)
+    reads = ConditionalReads(row, retry_row=row, fail=psycopg.errors.SerializationFailure)
+    store, plans = conditional_attempts(reads)
+
+    result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    assert reads.attempts == [[*plan.reads(may_have_committed=False), *writes]] * 2
+    assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
