@@ -268,8 +268,11 @@ def test_put_if_retried_after_a_lost_commit_is_already_applied(
     embedded = index["embed"].calls
     fault.armed = True
 
+    # Numbers too: the retry compares the stored value with its own
+    value = text(AISLE, stars=1.0, count=3)
+
     with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
-        result = store.put_if(NS, "k", text(AISLE), expected=record)
+        result = store.put_if(NS, "k", value, expected=record)
 
     assert fault.fired == 1
     found = retries(caplog, "store put_if")
@@ -281,14 +284,14 @@ def test_put_if_retried_after_a_lost_commit_is_already_applied(
     assert index["embed"].calls == embedded + 1
     # One version bump and, with history, one archived version
     now = store.record(NS, "k")
-    assert now is not None and (now.version, now.item.value) == (2, text(AISLE))
+    assert now is not None and (now.version, now.item.value) == (2, value)
     if history:
         assert [(v.version, v.reason) for v in store.history(NS, "k")] == [(1, "overwritten")]
     assert vector_keys(admin, store) == ["k"]
 
     # Create only, the same way: the retry finds its own memory, not a conflict
     fault.armed = True
-    created = store.put_if(NS, "new", text(VEGETARIAN), expected=None)
+    created = store.put_if(NS, "new", text(VEGETARIAN, stars=4.5, count=0), expected=None)
     assert fault.fired == 2
     assert created == ConditionalWrite(
         applied=True, key="new", version=1, current=None, already_applied=True
@@ -420,14 +423,17 @@ def test_a_retry_after_another_writer_reports_the_current_memory(
     real = store._cursor
     attempts = 0
 
+    mine = text(AISLE, stars=1.0, count=3)
+    # The 0.5.x store's value differs from put_if's in a number only
+    theirs = text(LONG_FLIGHTS) if writer == "store" else text(AISLE, stars=1.0, count=4)
+
     def write_over() -> None:
         if writer == "store":
-            other.put(NS, "k", text(LONG_FLIGHTS))
+            other.put(NS, "k", theirs)
         else:
             # The 0.5 statement sets updated_at, and leaves the version and
             # the write id as they were
-            value = json.dumps(text(LONG_FLIGHTS))
-            admin.execute(*store.sql.upsert_items([(PREFIX, "k", value, None)]))
+            admin.execute(*store.sql.upsert_items([(PREFIX, "k", json.dumps(theirs), None)]))
 
     @contextlib.contextmanager
     def cursor(**kwargs: Any) -> Iterator[Any]:
@@ -443,13 +449,13 @@ def test_a_retry_after_another_writer_reports_the_current_memory(
     fault.armed = True
 
     if method == "put_if":
-        result = store.put_if(NS, "k", text(AISLE), expected=record)
+        result = store.put_if(NS, "k", mine, expected=record)
     else:
         result = store.delete_if(NS, "k", expected=record)
 
     assert fault.fired == 1 and attempts == 2
     current = store.record(NS, "k")
-    assert current is not None and current.item.value == text(LONG_FLIGHTS)
+    assert current is not None and current.item.value == theirs
     assert result == ConditionalWrite(applied=False, key="k", version=None, current=current)
     if writer == "0.5.x store":
         # The row still carries put_if's write id, which proves its commit,

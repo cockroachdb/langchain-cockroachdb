@@ -1227,14 +1227,16 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         the one under the new key included, counts as unchanged when it is
         gone. The retry applies the decision again, which changes nothing
         there, and returns its result without ``already_applied``, since no
-        row proves the earlier commit. After a serialization failure the
-        retry checks as strictly as the first attempt: a memory gone since
-        was removed by another writer, and is a change. A new call checks
-        strictly again too: if an error escaped an earlier call, as when its
-        retries ran out or the hang guard stopped it, and the caller calls
-        resolve again, such a decision raises ConflictsChanged naming the
-        keys that the earlier call removed. find_conflicts then shows the
-        current state.
+        row proves the earlier commit. After only serialization failures or
+        deadlocks (40001, 40P01), which roll attempts back, the retry checks
+        as strictly as the first attempt: a memory gone since was removed by
+        another writer, and is a change. Once an attempt may have committed,
+        the retries after it stay lenient, whatever error ends them next. A
+        new call checks strictly again too: if an error escaped an earlier
+        call, as when its retries ran out or the hang guard stopped it, and
+        the caller calls resolve again, such a decision raises
+        ConflictsChanged naming the keys that the earlier call removed.
+        find_conflicts then shows the current state.
 
         Without a ``valid_at`` given to find_conflicts, the new memory
         stores no valid time, so it is valid from its write, and the
@@ -1437,10 +1439,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         row, which proves the earlier attempt deleted the memory, and the
         result has ``already_applied``. A store without history keeps no row
         that proves which attempt deleted it, so ``already_applied`` stays
-        False. A serialization failure rolls an attempt back, so after one a
-        memory gone since is a conflict: another writer removed it. If another
-        writer put the key again before the retry, the retry reports a
-        conflict with that memory.
+        False. Serialization failures and deadlocks (40001, 40P01) roll
+        attempts back, so after only those a memory gone since is a conflict:
+        another writer removed it. Once an attempt may have committed, the
+        retries after it stay lenient, whatever error ends them next. If
+        another writer put the key again before the retry, the retry reports
+        a conflict with that memory.
 
         Args:
             namespace: The memory's namespace. It cannot be empty.

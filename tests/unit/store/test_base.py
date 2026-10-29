@@ -8,7 +8,7 @@ import logging
 import math
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from datetime import date, datetime, timedelta, timezone
 
 import psycopg
@@ -3447,38 +3447,45 @@ class ReconcileReads:
 
     Every attempt logs its statements. The candidate read returns ``rows``,
     the already-applied reads ``applied`` (the items, then the history), the
-    token read ``tokens``, and the item upsert version 2. ``fail`` makes the
-    first attempt fail: "read" with a 40001 at its first fetch, before any
-    decision; "commit" with a 40001 as its block ends, after its writes went
-    out, so the attempt rolled back; and "lost commit" with a 40003 there,
-    as when the result of its COMMIT is lost and it may have committed.
+    token read ``tokens``, and the item upsert version 2. ``fail`` says how
+    the first attempt fails, or, as a tuple, each attempt in turn: "read"
+    with a 40001 at its first fetch, before any decision; "lost write" with
+    a 40003 as its first write goes out, before its COMMIT; "commit" with a
+    40001 as its block ends, after its writes and COMMIT went out, so the
+    attempt rolled back; "lost commit" with a 40003 there, as when the
+    result of its COMMIT is lost and it may have committed; or "none".
     """
 
     def __init__(
         self,
         rows: list[dict[str, object]],
         *,
-        fail: str,
+        fail: str | tuple[str, ...],
         applied: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], []),
         tokens: list[dict[str, object]] | None = None,
     ) -> None:
         self.rows = rows
-        self.fail = fail
+        self.fail = (fail,) if isinstance(fail, str) else fail
         self.applied = applied
         self.tokens = tokens or []
         self.attempts: list[list[tuple[str, list]]] = []
+
+    def fails(self, mode: str) -> bool:
+        """Whether the current attempt fails as ``mode`` says."""
+        attempt = len(self.attempts)
+        return attempt <= len(self.fail) and self.fail[attempt - 1] == mode
 
     @contextlib.contextmanager
     def cursor(self, **kwargs: object) -> Iterator["ReconcileCursor"]:
         self.attempts.append([])
         yield ReconcileCursor(self)
-        if self.fail == "commit" and len(self.attempts) == 1:
+        if self.fails("commit"):
             raise psycopg.errors.SerializationFailure("restart transaction")
-        if self.fail == "lost commit" and len(self.attempts) == 1:
+        if self.fails("lost commit"):
             raise psycopg.errors.StatementCompletionUnknown("result is ambiguous")
 
     def answer(self, sql: str) -> list[dict[str, object]]:
-        if self.fail == "read" and len(self.attempts) == 1:
+        if self.fails("read"):
             raise psycopg.errors.SerializationFailure("restart transaction")
         if sql.startswith("SELECT now()"):
             return [{"now": NOW}]
@@ -3509,6 +3516,8 @@ class ReconcileCursor:
     def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
         self.reads.attempts[-1].append((sql, params or []))
         self.sql = sql
+        if not sql.startswith("SELECT") and self.reads.fails("lost write"):
+            raise psycopg.errors.StatementCompletionUnknown("result is ambiguous")
         if sql.endswith("RETURNING version"):
             self.description = ["version"]
 
@@ -3540,7 +3549,10 @@ def test_a_retried_reconcile_looks_up_only_the_keys_its_earlier_decision_named(
     rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup"), candidate_row("kept")]
     target = {"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}
     applied = ([target], [{"key": "old", "reason": "superseded"}]) if committed else ([], [])
-    reads = ReconcileReads(rows, fail="commit", applied=applied)
+    # The first attempt fails after its writes and COMMIT went out: with a
+    # 40003 when it committed and its result was lost, with a 40001 when it
+    # rolled back
+    reads = ReconcileReads(rows, fail="lost commit" if committed else "commit", applied=applied)
     store = reconciling_store(reads)
     decided: list[str] = []
 
@@ -3936,7 +3948,8 @@ WRITTEN = ReconcileResult(
 class LateApplied(ReconcileReads):
     """ReconcileReads whose already-applied reads find ``applied`` from the second attempt on.
 
-    The first attempt committed before its 40001: its retry finds its rows.
+    The first attempt committed and the result of its COMMIT was lost (a
+    "lost commit"): its retry finds its rows.
     """
 
     def answer(self, sql: str) -> list[dict[str, object]]:
@@ -4001,14 +4014,16 @@ def test_resolving_the_same_conflicts_again_returns_the_first_result() -> None:
 
 @pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
 def test_a_retried_resolve_looks_for_its_write_id_again(committed: bool) -> None:
-    # The first attempt fails with a 40001 as its block ends, after its writes went out
+    # The first attempt fails as its block ends, after its writes and COMMIT
+    # went out: with a 40003 when it committed and its result was lost, with
+    # a 40001 when it rolled back
     applied = (
         [{"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}],
         [{"key": "old", "reason": "superseded"}],
     )
     store, reads, conflicts = resolving_store(
         LateApplied if committed else ReconcileReads,
-        fail="commit",
+        fail="lost commit" if committed else "commit",
         applied=applied if committed else ([], []),
         tokens=TOKENS,
     )
@@ -4922,13 +4937,14 @@ class ConditionalReads:
     the others, or no row for None, with its write id as a uuid.UUID, as
     psycopg reads it. The reads of the rows that carry the write id return
     ``proof``; like the real reads, they have no write id column. The item
-    upsert returns version 2. ``fail`` is an error the first attempt raises:
-    with ``fail_at="commit"`` as its block ends, after its writes went out,
-    so the COMMIT went out too; with ``fail_at="read"`` at its first read,
-    before anything was written. A 40003 there is a commit whose result was
-    lost, and a 40001 a serialization failure, which rolled it back. Like
-    psycopg, a cursor keeps its result from execute, and an execute after
-    the block raises.
+    upsert returns version 2. ``failures`` are the errors that attempts
+    raise, the first attempt's first, each with where it raises: "read" at
+    the record read, before anything was written; "write" as the first
+    write goes out, before the COMMIT; or "commit" as the block ends, after
+    the writes and the COMMIT went out. A 40003 at the commit is a commit
+    whose result was lost, and a 40001 a serialization failure, which rolled
+    the attempt back. Like psycopg, a cursor keeps its result from execute,
+    and an execute after the block raises.
     """
 
     def __init__(
@@ -4937,20 +4953,23 @@ class ConditionalReads:
         *,
         retry_row: dict[str, object] | None = None,
         proof: list[dict[str, object]] | None = None,
-        fail: type[psycopg.Error] | None = None,
-        fail_at: str = "commit",
+        failures: Sequence[tuple[type[psycopg.Error], str]] = (),
     ) -> None:
         self.row = row
         self.retry_row = retry_row
         self.proof = proof or []
-        self.fail = fail
-        self.fail_at = fail_at
+        self.failures = failures
         self.attempts: list[list[tuple[str, list]]] = []
         self.arguments: list[dict[str, object]] = []
         self.closed = False
 
-    def failing(self, at: str) -> bool:
-        return self.fail is not None and self.fail_at == at and len(self.attempts) == 1
+    def fail(self, at: str) -> None:
+        """Raise the current attempt's error if it fails ``at`` this point."""
+        attempt = len(self.attempts)
+        if attempt <= len(self.failures):
+            error, where = self.failures[attempt - 1]
+            if where == at:
+                raise error(f"injected at the {at}")
 
     @contextlib.contextmanager
     def cursor(self, **kwargs: object) -> Iterator["ConditionalCursor"]:
@@ -4959,13 +4978,13 @@ class ConditionalReads:
         self.closed = False
         yield ConditionalCursor(self)
         self.closed = True
-        if self.fail is not None and self.failing("commit"):
-            raise self.fail("injected as the COMMIT went out")
+        self.fail("commit")
 
     def answer(self, sql: str) -> list[dict[str, object]]:
+        if not sql.startswith("SELECT"):
+            self.fail("write")
         if sql.startswith("SELECT key, value, created_at"):
-            if self.fail is not None and self.failing("read"):
-                raise self.fail("injected at the first read")
+            self.fail("read")
             row = self.row if len(self.attempts) == 1 else self.retry_row
             return [] if row is None else [as_read(row)]
         if sql.startswith(APPLIED_READS):
@@ -5078,7 +5097,7 @@ def test_a_retried_put_if_looks_for_its_write_id(committed: bool, monkeypatch) -
         row,
         retry_row=written if committed else row,
         proof=proof if committed else [],
-        fail=psycopg.errors.StatementCompletionUnknown,
+        failures=[(psycopg.errors.StatementCompletionUnknown, "commit")],
     )
     store, plans = conditional_attempts(reads)
 
@@ -5109,7 +5128,7 @@ def test_a_retried_delete_if_reports_a_memory_it_finds_gone_as_deleted(history: 
         candidate_row("k", version=2),
         retry_row=None,
         proof=proof,
-        fail=psycopg.errors.StatementCompletionUnknown,
+        failures=[(psycopg.errors.StatementCompletionUnknown, "commit")],
     )
     store, plans = conditional_attempts(reads, history=history)
 
@@ -5147,7 +5166,7 @@ def test_a_retried_delete_if_counts_a_gone_memory_as_deleted_only_after_a_possib
 ) -> None:
     # The memory is gone when the retry reads it
     reads = ConditionalReads(
-        candidate_row("k", version=2), retry_row=None, fail=fail, fail_at=fail_at
+        candidate_row("k", version=2), retry_row=None, failures=[(fail, fail_at)]
     )
     store, plans = conditional_attempts(reads)
 
@@ -5172,7 +5191,9 @@ def test_a_put_if_retried_after_a_serialization_failure_checks_as_the_first_atte
     # The first attempt rolled back, so no row can carry its write id: the
     # retry reads no proof, compares the record again and writes again
     row = candidate_row("k", version=2)
-    reads = ConditionalReads(row, retry_row=row, fail=psycopg.errors.SerializationFailure)
+    reads = ConditionalReads(
+        row, retry_row=row, failures=[(psycopg.errors.SerializationFailure, "commit")]
+    )
     store, plans = conditional_attempts(reads)
 
     result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
@@ -5181,3 +5202,127 @@ def test_a_put_if_retried_after_a_serialization_failure_checks_as_the_first_atte
     writes = store._conditional_writes(plan)
     assert reads.attempts == [[*plan.reads(may_have_committed=False), *writes]] * 2
     assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+# Leniency is sticky: once an attempt may have committed, a later
+# definite abort proves nothing about it
+
+LOST = psycopg.errors.StatementCompletionUnknown
+ABORTED = psycopg.errors.SerializationFailure
+
+
+@pytest.mark.parametrize("history", [False, True], ids=["no-history", "history"])
+def test_a_delete_if_stays_lenient_once_an_attempt_may_have_committed(history: bool) -> None:
+    # The first attempt sent its COMMIT and its result was lost, so it may
+    # have deleted the memory. The second finds it gone, deletes again and
+    # fails with a 40001, which rolls back only itself. The third still lets
+    # the memory be gone
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=None,
+        failures=[(LOST, "commit"), (ABORTED, "commit")],
+    )
+    store, plans = conditional_attempts(reads, history=history)
+
+    result = store.delete_if(NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *writes],
+        [*plan.reads(may_have_committed=True), *writes],
+        [*plan.reads(may_have_committed=True), *writes],
+    ]
+
+
+def test_a_put_if_stays_lenient_once_an_attempt_may_have_committed() -> None:
+    # The first attempt sent its COMMIT and its result was lost. The second
+    # fails with a 40001 at its first read, which proves nothing about the
+    # first. The third still looks for the write id, and finds it on the row
+    written = {**candidate_row("k", version=3, updated_at=LATER), "value": {"text": "aisle"}}
+    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=written,
+        proof=proof,
+        failures=[(LOST, "commit"), (ABORTED, "read")],
+    )
+    store, plans = conditional_attempts(reads)
+
+    result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    assert result == ConditionalWrite(
+        applied=True, key="k", version=3, current=None, already_applied=True
+    )
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *store._conditional_writes(plan)],
+        [plan.read],
+        plan.reads(may_have_committed=True),
+    ]
+
+
+def test_a_resolve_stays_lenient_once_an_attempt_may_have_committed() -> None:
+    # As for delete_if: a lost commit, then a 40001 as the retry's COMMIT
+    # goes out. The third attempt still lets the deleted memories be gone,
+    # and applies the decision instead of raising ConflictsChanged
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail=("lost commit", "commit"), tokens=TOKENS)
+    store = reconciling_store(reads, history=False)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    result = store.resolve(conflicts, decision)
+
+    resolving = store._plan_resolve(conflicts, decision)
+    assert result == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("dup", "old"),
+        confirmed=(),
+        kept=("k",),
+    )
+    assert reads.attempts == [[*resolving.reads, *resolving.writes]] * 3
+
+
+# The commit marker: only an attempt whose writes all went out, so that its
+# COMMIT went out too, may have committed
+
+
+def test_a_delete_if_that_failed_while_its_writes_went_out_retries_strictly() -> None:
+    # A 40003 while the delete goes out, before the COMMIT: the attempt
+    # cannot have committed, so the memory gone before the retry was
+    # removed by another writer
+    reads = ConditionalReads(
+        candidate_row("k", version=2), retry_row=None, failures=[(LOST, "write")]
+    )
+    store, plans = conditional_attempts(reads)
+
+    result = store.delete_if(NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    first_write = store._conditional_writes(plan)[0]
+    assert result == ConditionalWrite(applied=False, key="k", version=None, current=None)
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), first_write],
+        plan.reads(may_have_committed=False),
+    ]
+
+
+def test_a_resolve_that_failed_while_its_writes_went_out_retries_strictly() -> None:
+    # The same for resolve: memories gone before its retry count as changed
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="lost write", tokens=TOKENS)
+    store = reconciling_store(reads, history=False)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, decision)
+
+    assert error.value.keys == ("dup", "old")
+    resolving = store._plan_resolve(conflicts, decision)
+    assert reads.attempts == [[*resolving.reads, resolving.writes[0]], resolving.reads]

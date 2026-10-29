@@ -2576,13 +2576,16 @@ class BaseCockroachDBStore:
 
         ``may_have_committed`` says whether an earlier attempt of the same
         call may have committed: it sent its COMMIT and failed with an error
-        that is not a definite abort (retry.may_have_committed). On a store
-        without history a decision that only deletes or supersedes leaves no
-        row with the write id, so after such an attempt the candidates in
-        ``resolving.removed`` may be gone: the state the decision asked for.
-        Otherwise they must still be live, as every key the check covers
-        must. After a serialization failure, which rolled the attempt back,
-        a memory gone since was removed by another writer.
+        that is not a definite abort (retry.may_have_committed). Once that
+        holds it holds for the rest of the call: a later definite abort says
+        nothing about the earlier attempt. On a store without history a
+        decision that only deletes or supersedes leaves no row with the write
+        id, so after such an attempt the candidates in ``resolving.removed``
+        may be gone: the state the decision asked for. Otherwise they must
+        still be live, as every key the check covers must. Until an attempt
+        may have committed, as after only definite aborts (40001, 40P01),
+        which roll attempts back, a memory gone since was removed by another
+        writer.
 
         Raises:
             ConflictsChanged: If a key of ``resolving.expected`` changed
@@ -2749,21 +2752,24 @@ class BaseCockroachDBStore:
 
         ``may_have_committed`` says whether an earlier attempt of the same
         call may have committed: it sent its COMMIT and failed with an error
-        that is not a definite abort (retry.may_have_committed). Then the
-        item that carries put_if's write id proves that it wrote, and moved
-        the version itself, so the result is applied with that item's
-        version and ``already_applied``. A 0.5.x store leaves the write id
-        alone when it writes, so a live item whose value is not put_if's
-        was replaced since, and is a conflict. delete_if asked for the
-        memory to be gone, so after such an attempt finding it gone applies,
-        as resolve lets a memory its decision deletes be gone
-        (``may_be_gone``). On a store with history its own history row
-        proves the delete, and the result has ``already_applied``. Without
-        history the attempt deletes again, which changes nothing. After a
-        serialization failure, which rolled the attempt back, a memory gone
-        since is a conflict: another writer removed it. A live memory that
-        differs is a conflict on every attempt, also when another writer put
-        the key after a lost commit: that memory is the current state.
+        that is not a definite abort (retry.may_have_committed). Once that
+        holds it holds for the rest of the call: a later definite abort says
+        nothing about the earlier attempt. Then the item that carries
+        put_if's write id proves that it wrote, and moved the version
+        itself, so the result is applied with that item's version and
+        ``already_applied``. A 0.5.x store leaves the write id alone when it
+        writes, so a live item whose value is not put_if's was replaced
+        since, and is a conflict. delete_if asked for the memory to be gone,
+        so after such an attempt finding it gone applies, as resolve lets a
+        memory its decision deletes be gone (``may_be_gone``). On a store
+        with history its own history row proves the delete, and the result
+        has ``already_applied``. Without history the attempt deletes again,
+        which changes nothing. Until an attempt may have committed, as after
+        only definite aborts (40001, 40P01), which roll attempts back, a
+        memory gone since is a conflict: another writer removed it. A live
+        memory that differs is a conflict on every attempt, also when
+        another writer put the key after a lost commit: that memory is the
+        current state.
         """
         rows, proof = found[0], found[1] if len(found) > 1 else []
         current = _row_to_record(plan.namespace, rows[0]) if rows else None
