@@ -359,7 +359,8 @@ graph state, give the checkpointer a serializer that allows these:
 ``JsonPlusSerializer(allowed_msgpack_modules=RECONCILE_SERDE_TYPES)``, with
 your own state's types added if they are not built in. The pairs are the form
 that ``allowed_msgpack_modules`` takes, from langgraph-checkpoint 4.0.1.
-Earlier releases have no allowlist and rebuild every class.
+Before 4.0.1, JsonPlusSerializer has no ``allowed_msgpack_modules`` argument,
+and passing it raises TypeError; those releases rebuild every class.
 """
 
 
@@ -425,14 +426,18 @@ def supersede_same_slot() -> Policy:
 
 
 def skip_duplicates(threshold: float = 0.97) -> Policy:
-    """Return a policy that skips near-duplicate memories.
+    """Return a policy that skips a memory that repeats one already stored.
 
-    If a candidate has a value equal to the proposal's, or a candidate under
-    another key scores at or above threshold, skip the proposal and confirm
-    the highest-scoring duplicate (equal values count as score 1.0). The
-    memory under the proposal's own key counts only with an equal value: a
-    near duplicate there is an update the caller aimed at that key, so this
-    policy leaves it to be written.
+    A new memory, one with no live memory under its key, is skipped when a
+    candidate has an equal value or scores at or above threshold, and the
+    highest-scoring such candidate is confirmed (an equal value counts as
+    score 1.0). A memory whose key holds a live memory is skipped only when
+    it saves that memory's value again, which confirms it. Any other value
+    there is an update, which this policy never skips, whatever repeats it
+    under another key: skipping it would leave the key with its old value,
+    which may contradict the new one. Then it returns the decision that
+    writes the new memory and keeps every candidate, so first_of moves on to
+    the next policy.
 
     Args:
         threshold: Similarity threshold (default 0.97).
@@ -446,14 +451,21 @@ def skip_duplicates(threshold: float = 0.97) -> Policy:
     _validate_threshold(threshold, "threshold")
 
     def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
-        # Find duplicates: an equal value, or a near duplicate under another
-        # key. Under the proposal's own key a near duplicate is an update
+        target = next((c for c in candidates if c.key == proposal.key), None)
+        if target is not None:
+            # Saving the live memory's value again repeats it. Anything else
+            # under its key is an update, never a repeat
+            if target.item.value == proposal.value:
+                return Decision(new="skip", actions={target.key: Action.CONFIRM})
+            return Decision()
+
+        # A new memory: an equal value or a near duplicate elsewhere repeats it
         duplicates = []
         for c in candidates:
             if c.item.value == proposal.value:
                 # Equal value counts as score 1.0
                 duplicates.append((c, 1.0))
-            elif c.key != proposal.key and c.score is not None and c.score >= threshold:
+            elif c.score is not None and c.score >= threshold:
                 duplicates.append((c, c.score))
 
         if not duplicates:

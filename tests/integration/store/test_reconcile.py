@@ -47,6 +47,7 @@ from langchain_cockroachdb.store import (
     MemoryRecord,
     Policy,
     ReconcileResult,
+    first_of,
     keep_all,
     skip_duplicates,
     supersede_same_slot,
@@ -851,6 +852,34 @@ def test_skip_duplicates_writes_an_update_under_its_own_key(store_factory, mode)
     record = store.record(NS, "w")
     assert record is not None and (record.version, record.confirmations) == (2, 1)
     assert len(store.history(NS, "w")) == 1
+
+
+def test_first_of_writes_an_update_of_a_live_slot_key_next_to_a_near_duplicate(
+    store_factory, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "seat", in_slot(AISLE))
+    store.put(NS, "other", text(WINDOW))  # 0.98 against LONG_FLIGHTS, in no slot
+
+    # An update of the live key "seat", next to a near duplicate under another
+    # key: skip_duplicates leaves it to supersede_same_slot, which writes it
+    policy = first_of(skip_duplicates(), supersede_same_slot())
+    result = store.reconcile(NS, "seat", in_slot(LONG_FLIGHTS), slot="seat", policy=policy)
+
+    assert result == ReconcileResult(
+        key="seat",
+        new="written",
+        version=2,
+        superseded=(),
+        deleted=(),
+        confirmed=(),
+        kept=("other",),
+    )
+    record = store.record(NS, "seat")
+    assert record is not None and record.item.value == in_slot(LONG_FLIGHTS)
+    # The near duplicate is left as it was, not confirmed
+    other = store.record(NS, "other")
+    assert other is not None and (other.version, other.confirmations) == (1, 0)
 
 
 def test_reconcile_records_a_late_fact_as_superseded(store_factory, admin, mode) -> None:

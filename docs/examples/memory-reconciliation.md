@@ -15,7 +15,7 @@ docker-compose up -d
 python examples/memory_reconciliation.py
 ```
 
-It needs no API key. `KeywordEmbeddings`, defined in the script, stands in for an embedding model: it gives each text one dimension for each keyword it mentions, so texts that share keywords score high against each other, as a real model scores texts about the same thing. "I prefer aisle seats now." and "Aisle seats, please." score 0.99, and the window and aisle preferences score 0.50. The judge in the two-step flow is a scripted function that stands in for an LLM or a person.
+It needs no API key. `KeywordEmbeddings`, defined in the script, stands in for an embedding model. It gives each text one dimension for each keyword the text mentions. So texts that share keywords score high against each other, as a real model scores texts about the same thing. "I prefer aisle seats now." and "Aisle seats, please." score 0.99, and the window and aisle preferences score 0.50. The judge in the two-step flow is a scripted function that stands in for an LLM or a person.
 
 The store uses its own tables (`memory_reconciliation`, `memory_reconciliation_vectors`, `memory_reconciliation_history` and `memory_reconciliation_migrations`) and drops them at the end, even after a failure. The script gives its memories readable keys. An agent usually passes `None` as the key, and the store picks a uuid4.
 

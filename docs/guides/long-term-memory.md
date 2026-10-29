@@ -614,11 +614,7 @@ Each `Candidate` has the memory as `item`, a `SearchItem` with its `score`, alon
 
 Scores come from the store's score function, as in `search`: 1 minus the distance on a cosine store, and the negated distance on an `l2` or `inner_product` store. On a cosine store `threshold` defaults to 0.8 and must lie between -1 and 1. On an `l2` or `inner_product` store no default fits, so pass one. The new memory is embedded as a document, with `embed_documents`, while `search` embeds its query with `embed_query`. Some models embed the two differently, so search scores are a poor guide here. Pick `threshold` from the scores that `find_conflicts` gives memories you know to be related.
 
-### The Scan Limit
-
-`reconcile_scan_limit` is a store setting, 2000 by default, passed to the constructor or to `from_conn_string`. A namespace with at most that many vectors has every one of them ranked exactly, read by primary key. Serializable isolation covers that whole read, so a concurrent insert into the namespace makes one of the two transactions retry.
-
-A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. A selective `filter`, many key and slot matches, or expired memories can fill the window and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.
+In a namespace with many vectors, similar candidates come from the C-SPANN index instead of an exact scan, as [The Scan Limit](#the-scan-limit) explains.
 
 ### Policies
 
@@ -626,8 +622,8 @@ A policy is a function of the `Proposal` and the candidates that returns a `Deci
 
 | Policy | What it decides |
 |---|---|
-| `supersede_same_slot()` | Supersedes the slot candidates whose valid time is not later than the new memory's. If one is later, records the new memory as superseded by the latest of them. If the memory under the new key is later, skips the new memory |
-| `skip_duplicates(threshold=0.97)` | If a candidate has an equal value, or a candidate under another key scores at or above `threshold`, skips the new memory and confirms the best such candidate. Under the new memory's own key only an equal value counts, so a reworded update to that key is written |
+| `supersede_same_slot()` | Skips the new memory if the memory under its key has a later valid time. Otherwise, if a slot candidate's valid time is later than the new memory's, records the new memory as superseded by the latest such candidate and keeps the rest. If none is later, supersedes every slot candidate |
+| `skip_duplicates(threshold=0.97)` | Skips a new memory, one whose key holds no live memory, if a candidate has an equal value or scores at or above `threshold`, and confirms the best such candidate. Saving a live memory's value again under its key skips it and confirms that memory. Any other value under a live key is an update, which it never skips: it writes the new memory and keeps everything, so `first_of` tries the next policy |
 | `supersede_similar(threshold=0.9)` | Works like `supersede_same_slot`, for the slot candidates and the candidates that score at or above `threshold`. It is blunt: similar is not contradictory |
 | `keep_all()` | Writes the new memory and keeps every candidate |
 | `first_of(*policies)` | Tries the policies in order and uses the first decision that does more than write the new memory and keep everything |
@@ -649,7 +645,12 @@ A `Decision` says what to do with the new memory and with each candidate:
 | `DELETE` | Ends the memory as deleted, at the write, and keeps it in history | Deletes the memory and its vectors |
 | `CONFIRM` | Sets `confirmed_at`, counts the confirmation and renews the expiry from the memory's own TTL. The version and `updated_at` stay as they are | The same |
 
-A decision that does not fit its candidates raises `ValueError` before anything is written. Some examples: an action for a key that is not a candidate, an action other than `KEEP` for the memory the new one overwrites, `SUPERSEDE` while skipping the new memory (use `DELETE`), and a `superseded_by` that is not a kept or confirmed candidate.
+A decision that does not fit its candidates raises `ValueError` before anything is written, for example:
+
+- an action for a key that is not a candidate;
+- an action other than `KEEP` for the memory the new one overwrites;
+- `SUPERSEDE` while skipping the new memory (use `DELETE`);
+- a `superseded_by` that is not a kept or confirmed candidate.
 
 Your own policy can use anything the candidates carry. This one weighs confidence from provenance:
 
@@ -824,7 +825,7 @@ with CockroachDBSaver.from_conn_string(DB_URI, serde=serde) as checkpointer:
     print(graph.invoke(Command(resume=decision), config)["result"])
 ```
 
-The constant covers `Conflicts` with what it keeps for `resolve`, `Decision`, `ReconcileResult`, `ConditionalWrite`, `MemoryRecord` and `MemoryVersion`. With a list of types, the serializer refuses every other type that is not built in, so add your own state types to it, as in `[*RECONCILE_SERDE_TYPES, ("my_app.state", "Ticket")]`. Releases of langgraph-checkpoint before 4.0.1, back to 2.1.2, the oldest this package supports, take no `allowed_msgpack_modules` and rebuild every type, so they need no list.
+The constant covers `Conflicts` with what it keeps for `resolve`, `Decision`, `ReconcileResult`, `ConditionalWrite`, `MemoryRecord` and `MemoryVersion`. With a list of types, the serializer refuses every other type that is not built in, so add your own state types to it, as in `[*RECONCILE_SERDE_TYPES, ("my_app.state", "Ticket")]`. Before langgraph-checkpoint 4.0.1, `JsonPlusSerializer` has no `allowed_msgpack_modules` argument, and passing it raises TypeError, so leave it out there. Those releases, back to 2.1.2, the oldest this package supports, rebuild every type.
 
 ### History
 
@@ -917,7 +918,13 @@ Retrieval is not confirmation. `record` and `find_conflicts` never push back an 
 
 ### Concurrent Reconciles
 
-The candidate read and the writes of a reconcile share one serializable transaction. If another writer changes what a policy saw, one of the two transactions retries, and its policy sees the other's write. So two agents that reconcile contradictory memories in one namespace, with a policy that supersedes, end with exactly one live fact. For similar candidates in a namespace above the scan limit, see [The Scan Limit](#the-scan-limit).
+The candidate read and the writes of a reconcile share one serializable transaction. If another writer changes what a policy saw, one of the two transactions retries, and its policy sees the other's write. So two agents that reconcile contradictory memories in one namespace, with a policy that supersedes, end with exactly one live fact. For similar candidates this holds up to the scan limit, as [The Scan Limit](#the-scan-limit) explains next.
+
+### The Scan Limit
+
+`reconcile_scan_limit` is a store setting, 2000 by default, passed to the constructor or to `from_conn_string`. A namespace with at most that many vectors has every one of them ranked exactly, read by primary key. Serializable isolation covers that whole read, so a concurrent insert into the namespace makes one of the two transactions retry.
+
+A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. A selective `filter`, many key and slot matches, or expired memories can fill the window and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.
 
 ### Conditional Writes
 
@@ -941,9 +948,9 @@ while True:
 
 A conflict is an expected outcome here, so it is returned, not raised. `expected=None` writes only if no live memory has the key, so a memory is created once, as in the first pass of this loop. An expired memory counts as absent. On a match `put_if` writes as `put` does, in the transaction that checked, with `provenance` and `valid_at` if given, and with history on it keeps the version it replaces. The result is a `ConditionalWrite` with `applied`, `key`, `version` (the version written, or None), `current` and `already_applied`.
 
-`delete_if(namespace, key, expected=record)` deletes the same way. Its `applied=True` means the memory is gone because of this call: it matched `expected` when the call checked it.
+`delete_if(namespace, key, expected=record)` deletes the same way. Its `applied=True` means the memory matched `expected` and this call deleted it, or, after an attempt of the call that may have committed, that the memory is gone and was this call's to delete.
 
-Both are safe to retry, and a retry never reports a false conflict. If an attempt commits and its result is lost, the next attempt reports `applied=True`. `put_if` finds its own write id on the memory and sets `already_applied`. `delete_if` finds the memory gone, and sets `already_applied` when its own history row proves the delete, which needs history on. Both are single-key calls, outside `batch`, since LangGraph's batch operations cannot carry a precondition.
+Both are safe to retry, and a retry never reports a false conflict. If an attempt commits and its result is lost, the next attempt reports `applied=True`. `put_if` finds its own write id on the memory and sets `already_applied`. `delete_if` finds the memory gone, and sets `already_applied` when its own history row proves the delete, which needs history on. If another writer replaced the memory between the lost commit and the retry, the retry reports a conflict, with that writer's memory as `current`: that is the current state. Both are single-key calls, outside `batch`, since LangGraph's batch operations cannot carry a precondition.
 
 ### Retries and Rebuilt Results
 

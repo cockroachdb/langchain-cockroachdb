@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import inspect
 import math
 import pickle
-from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -34,6 +32,7 @@ from langchain_cockroachdb.store.reconcile import (
     supersede_similar,
     validate_decision,
 )
+from tests.unit.store.serde_helpers import strict_serializer
 
 # Test time constants
 T0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -168,18 +167,41 @@ def test_skip_duplicates_confirms_an_equal_value_under_its_own_key() -> None:
     validate_decision(proposal, found, decision)
 
 
-def test_skip_duplicates_confirms_a_near_duplicate_under_another_key() -> None:
-    # The memory under the new key does not count as a near duplicate, but
-    # one under another key still does, and the new value is skipped
+def test_skip_duplicates_never_skips_an_update_of_a_live_memory() -> None:
+    # A new value for a key that holds a live memory is an update. Skipping it
+    # for a repeat stored under another key would leave the key with its old
+    # value, which may contradict the new one
     proposal = make_proposal("k", value={"text": "aisle seats, please"})
-    found = [
-        candidate("k", reason="key", score=0.995, value={"text": "aisle seats"}),
+    for elsewhere in (
         candidate("other", score=0.98, value={"text": "aisle seats!"}),
+        candidate("same", reason="slot", value={"text": "aisle seats, please"}),
+    ):
+        found = [
+            candidate("k", reason="key", score=0.995, value={"text": "aisle seats"}),
+            elsewhere,
+        ]
+
+        decision = skip_duplicates()(proposal, found)
+
+        assert decision == Decision()
+        validate_decision(proposal, found, decision)
+        assert first_of(skip_duplicates(), keep_all())(proposal, found) == Decision()
+
+
+def test_first_of_writes_an_update_of_a_live_slot_key_next_to_a_near_duplicate() -> None:
+    # skip_duplicates leaves the update to the next policy, and
+    # supersede_same_slot writes it over the older memory in its slot
+    proposal = make_proposal("k", value={"text": "aisle seats on long flights"}, valid_at=T1)
+    found = [
+        candidate("k", reason="key", score=0.9, value={"text": "window seats"}, valid_at=T0),
+        candidate("old", reason="slot", valid_at=T0),
+        candidate("dup", score=0.99, value={"text": "aisle seats on long flights!"}),
     ]
 
-    decision = skip_duplicates()(proposal, found)
+    decision = first_of(skip_duplicates(), supersede_same_slot())(proposal, found)
 
-    assert decision == Decision(new="skip", actions={"other": Action.CONFIRM})
+    assert decision == Decision(actions={"old": Action.SUPERSEDE})
+    assert decision.new == "write"
     validate_decision(proposal, found, decision)
 
 
@@ -616,20 +638,6 @@ def test_conditional_write_is_exported_from_the_store_package_only() -> None:
 # what the reconcile values need
 
 
-def strict_serializer(allowed: Iterable[tuple[str, ...]] = ()) -> JsonPlusSerializer:
-    """A JsonPlusSerializer that rebuilds its built-in safe types and ``allowed``, and no other.
-
-    LangGraph's strict mode runs this: the serializer allows nothing beyond
-    its safe types (``allowed_msgpack_modules=None``), and a graph adds what
-    its state schema names with ``with_msgpack_allowlist``. langgraph-checkpoint
-    has the allowlist from 4.0.1. Older releases rebuild every type, so tests
-    that need a strict serializer skip there.
-    """
-    if "allowed_msgpack_modules" not in inspect.signature(JsonPlusSerializer).parameters:
-        pytest.skip("langgraph-checkpoint before 4.0.1 has no msgpack allowlist")
-    return JsonPlusSerializer(allowed_msgpack_modules=None).with_msgpack_allowlist(allowed)
-
-
 def test_the_serde_allowlist_names_every_class_a_reconcile_value_holds() -> None:
     import langchain_cockroachdb
     from langchain_cockroachdb import store as store_package
@@ -645,7 +653,25 @@ def test_the_serde_allowlist_names_every_class_a_reconcile_value_holds() -> None
         and all(isinstance(part, str) for part in entry)
         for entry in RECONCILE_SERDE_TYPES
     )
-    assert len(set(RECONCILE_SERDE_TYPES)) == len(RECONCILE_SERDE_TYPES)
+    # Every path is spelled out here, so changing one is a deliberate edit of
+    # this test: saved checkpoints refer to these paths
+    assert RECONCILE_SERDE_TYPES == (
+        ("langchain_cockroachdb.store.reconcile", "Action"),
+        ("langchain_cockroachdb.store.reconcile", "Candidate"),
+        ("langchain_cockroachdb.store.reconcile", "ConditionalWrite"),
+        ("langchain_cockroachdb.store.reconcile", "Conflicts"),
+        ("langchain_cockroachdb.store.reconcile", "Decision"),
+        ("langchain_cockroachdb.store.reconcile", "MemoryRecord"),
+        ("langchain_cockroachdb.store.reconcile", "MemoryVersion"),
+        ("langchain_cockroachdb.store.reconcile", "Proposal"),
+        ("langchain_cockroachdb.store.reconcile", "ReconcileResult"),
+        ("langchain_cockroachdb.store.base", "ConflictsState"),
+        ("langchain_cockroachdb.store.base", "ProposalPlan"),
+        ("langchain_cockroachdb.store.base", "PutPlan"),
+        ("langchain_cockroachdb.store.base", "StoreIdentity"),
+        ("langgraph.store.base", "Item"),
+        ("langgraph.store.base", "SearchItem"),
+    )
     classes = [
         getattr(importlib.import_module(module), name) for module, name in RECONCILE_SERDE_TYPES
     ]

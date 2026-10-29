@@ -70,7 +70,7 @@ from langchain_cockroachdb.store.reconcile import (
 )
 from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, StoreSQL
 from langchain_cockroachdb.store.store import CockroachDBStore
-from tests.unit.store.test_reconcile import strict_serializer
+from tests.unit.store.serde_helpers import strict_serializer
 
 FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
 
