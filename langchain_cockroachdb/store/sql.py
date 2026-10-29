@@ -1573,6 +1573,29 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         )
         return (renewed + sql, [*ttl_params, prefix, key, *match_params, *params])
 
+    def confirm_write_id_check(self, prefix: str, key: str, *, write_id: str) -> tuple[str, list]:
+        """Build the statement that checks if a live memory has a write_id.
+
+        This is used on a retry after a lost commit when the UPDATE's
+        rowcount is 0. It checks whether the memory already has this
+        write_id, which means the earlier attempt committed.
+
+        Args:
+            prefix: The memory's prefix.
+            key: The memory's key.
+            write_id: This confirm's write id.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement returns a row if the
+            live memory has this write_id, or no rows otherwise.
+        """
+        sql = (
+            f"SELECT 1 FROM {self.items} WHERE prefix = %s AND key = %s "
+            "AND (expires_at IS NULL OR expires_at > now()) "
+            "AND write_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, key, write_id])
+
     def applied_items(self, prefix: str, keys: Sequence[str], *, write_id: str) -> tuple[str, list]:
         """Build the read of the items under ``keys`` that carry a write id.
 

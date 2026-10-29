@@ -142,6 +142,46 @@ def _check_ttl(ttl: object) -> None:
         raise ValueError(f"ttl must be a positive number of minutes, or None, got {ttl!r}")
 
 
+def _validate_confirm_ttl(
+    ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None],
+) -> None:
+    """Validate the ttl argument to confirm, before any I/O.
+
+    Raises:
+        ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
+            number of minutes, or a callable.
+    """
+    if isinstance(ttl, (NotProvided, type(None))) or callable(ttl):
+        return
+    _check_ttl(ttl)
+
+
+def _resolve_confirm_ttl(
+    ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None],
+    record: MemoryRecord,
+) -> float | None | NotProvided:
+    """Resolve a confirm ttl, calling it if callable and validating the result.
+
+    Args:
+        ttl: The ttl argument, which may be a callable.
+        record: The MemoryRecord to pass to the callable.
+
+    Returns:
+        The resolved ttl: NOT_PROVIDED, None, or a number of minutes.
+
+    Raises:
+        ValueError: If the callable returns a value that is not None or a
+            positive finite number of minutes.
+    """
+    if not callable(ttl):
+        return ttl
+    resolved = ttl(record)
+    if resolved is None:
+        return None
+    _check_ttl(resolved)
+    return resolved
+
+
 def _check_valid_at(valid_at: object) -> None:
     """Raise ValueError unless ``valid_at`` is None or a timezone-aware datetime."""
     if valid_at is not None and (
@@ -1063,7 +1103,7 @@ class BaseCockroachDBStore:
     # Whether the fallback to the column read has been logged, to log it once
     _logged_column_fallback: bool
     # Marks the threads that are running a reconcile policy of this store,
-    # as ``inside``. A store call from a policy is refused (_refuse_inside_policy)
+    # as ``inside``. A store call from a policy is refused (_refuse_inside_user_callable)
     _policy_marks: threading.local
 
     def _configure(
@@ -2005,31 +2045,45 @@ class BaseCockroachDBStore:
         its connection. On a single connection a store call from the policy
         would wait for that connection forever, and on a pool it would read
         outside the transaction. The mark makes such a call fail at once
-        instead (_refuse_inside_policy). It ends with the policy, however
-        the policy ends, and other threads never see it.
+        instead (_refuse_inside_user_callable). It ends with the policy,
+        however the policy ends, and other threads never see it.
+        """
+        return self._run_user_callable(policy, proposal, candidates)
+
+    def _run_user_callable(self, fn: Callable[..., object], *args: object) -> object:
+        """Run a user callable with this thread marked as inside one of this store.
+
+        The callable runs in a transaction, while the store holds its
+        connection. On a single connection a store call from the callable
+        would wait for that connection forever, and on a pool it would read
+        outside the transaction. The mark makes such a call fail at once
+        instead (_refuse_inside_user_callable). It ends with the callable,
+        however the callable ends, and other threads never see it.
         """
         marks = self._policy_marks
         outer = getattr(marks, "inside", False)
         marks.inside = True
         try:
-            return policy(proposal, candidates)
+            return fn(*args)
         finally:
             marks.inside = outer
 
-    def _refuse_inside_policy(self) -> None:
-        """Raise RuntimeError when this thread is running a reconcile policy of this store.
+    def _refuse_inside_user_callable(self) -> None:
+        """Raise RuntimeError when this thread is running a user callable of this store.
 
         The store checks it before every connection checkout and every
-        embedding call, so a store call from a policy fails before any I/O.
+        embedding call, so a store call from a reconcile policy or a confirm
+        TTL function fails before any I/O.
 
         Raises:
-            RuntimeError: If called from inside a reconcile policy.
+            RuntimeError: If called from inside a reconcile policy or a
+                confirm TTL function.
         """
         if getattr(self._policy_marks, "inside", False):
             raise RuntimeError(
-                "A reconcile policy must not call the store: it runs inside the reconcile's "
-                "transaction, while the store holds its connection. For a decision that "
-                "needs more data, use find_conflicts, decide, then call resolve."
+                "A reconcile policy or a confirm TTL function must not call the store: it "
+                "runs inside the transaction, while the store holds its connection. For a "
+                "decision that needs more data, use find_conflicts, decide, then call resolve."
             )
 
     @staticmethod
@@ -2403,70 +2457,17 @@ class BaseCockroachDBStore:
             raise ConflictsChanged(changed)
         return None
 
-    def _validate_confirm_ttl(
-        self, ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None]
-    ) -> None:
-        """Validate the ttl argument to confirm, before any I/O.
-
-        Raises:
-            ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
-                number of minutes, or a callable.
-        """
-        if isinstance(ttl, (NotProvided, type(None))) or callable(ttl):
-            return
-        if not isinstance(ttl, (int, float)):
-            raise ValueError("ttl must be NOT_PROVIDED, None, a number, or a callable")
-        if not (math.isfinite(ttl) and ttl > 0):
-            raise ValueError("ttl must be a positive finite number of minutes")
-
-    def _resolve_confirm_ttl(
-        self,
-        ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None],
-        record: MemoryRecord,
-    ) -> float | None | NotProvided:
-        """Resolve a confirm ttl, calling it if callable and validating the result.
+    def _confirm_result(self, rowcount: int, check_rows: Sequence[Mapping[str, Any]]) -> bool:
+        """Interpret the result of a confirm attempt.
 
         Args:
-            ttl: The ttl argument, which may be a callable.
-            record: The MemoryRecord to pass to the callable.
+            rowcount: The confirm UPDATE's rowcount.
+            check_rows: The rows from the write_id check, sent in the same
+                transaction.
 
         Returns:
-            The resolved ttl: NOT_PROVIDED, None, or a number of minutes.
-
-        Raises:
-            ValueError: If the callable returns a value that is not None or a
-                positive finite number of minutes.
+            True if the memory was confirmed (rows updated or the memory
+            already has this write_id from a lost commit), False if no live
+            memory has the key.
         """
-        if not callable(ttl):
-            return ttl
-        resolved = ttl(record)
-        if resolved is None:
-            return None
-        if not isinstance(resolved, (int, float)):
-            raise ValueError("Callable ttl must return None or a number of minutes")
-        if not (math.isfinite(resolved) and resolved > 0):
-            raise ValueError("Callable ttl must return a positive finite number of minutes")
-        return resolved
-
-    def _confirm_write_id_check(self, prefix: str, key: str, write_id: str) -> tuple[str, list]:
-        """Build the statement that checks if a memory has a write_id.
-
-        This is used on a retry after a lost commit when rowcount is 0. It
-        checks whether the memory already has this write_id, which means the
-        earlier attempt committed.
-
-        Args:
-            prefix: The memory's prefix.
-            key: The memory's key.
-            write_id: This confirm's write id.
-
-        Returns:
-            Tuple of (SQL, parameters). The statement returns a row if the
-            live memory has this write_id, or no rows otherwise.
-        """
-        sql = (
-            f"SELECT 1 FROM {self.sql.items} WHERE prefix = %s AND key = %s "
-            "AND (expires_at IS NULL OR expires_at > now()) "
-            "AND write_id = CAST(%s AS UUID)"
-        )
-        return (sql, [prefix, key, write_id])
+        return rowcount > 0 or bool(check_rows)

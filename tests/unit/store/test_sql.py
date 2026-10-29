@@ -1544,3 +1544,14 @@ def test_candidate_scores_count_record_and_now_bind_everything() -> None:
     ):
         with pytest.raises(ValueError, match="index"):
             builder(StoreSQL("public", "store"))
+
+
+def test_confirm_write_id_check_filters_for_live_rows_with_write_id() -> None:
+    sql = StoreSQL("public", "store", index=None)
+    statement, params = sql.confirm_write_id_check("user.alice", "key-1", write_id="write-id-123")
+    # Checks prefix, key, live row, and write_id
+    assert "prefix = %s" in statement
+    assert "key = %s" in statement
+    assert "expires_at IS NULL OR expires_at > now()" in statement
+    assert "write_id = CAST(%s AS UUID)" in statement
+    assert params == ["user.alice", "key-1", "write-id-123"]

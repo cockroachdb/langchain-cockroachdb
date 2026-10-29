@@ -46,8 +46,10 @@ from langchain_cockroachdb.store.base import (
     _check_paging,
     _check_policy,
     _memory_prefix,
+    _resolve_confirm_ttl,
     _row_to_record,
     _row_to_version,
+    _validate_confirm_ttl,
 )
 from langchain_cockroachdb.store.config import (
     DEFAULT_RECONCILE_SCAN_LIMIT,
@@ -420,9 +422,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """PsycopgOps._cursor, refused while this thread runs a reconcile policy of the store.
 
         Every connection checkout of the store comes through here. Inside a
-        policy the reconcile holds the connection: see _refuse_inside_policy.
+        policy the reconcile holds the connection: see _refuse_inside_user_callable.
         """
-        self._refuse_inside_policy()
+        self._refuse_inside_user_callable()
         with super()._cursor(
             pipeline=pipeline, transaction=transaction, timeout=timeout, label=label
         ) as cur:
@@ -497,7 +499,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         reconcile policy it refuses before calling the model.
         """
         assert self.index is not None
-        self._refuse_inside_policy()
+        self._refuse_inside_user_callable()
         texts = plan.query_texts()
         vectors = [self.index.embeddings.embed_query(text) for text in texts]
         self._bind_query_vectors(plan, texts, vectors)
@@ -604,7 +606,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         embed_documents: the vectors are the ones the write stores. Inside a
         reconcile policy it refuses before calling the model.
         """
-        self._refuse_inside_policy()
+        self._refuse_inside_user_callable()
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
             embeddings = self.index.embeddings.embed_documents(
@@ -913,7 +915,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 renews from the row's own TTL. None removes the expiry. A
                 number is minutes. A callable takes the MemoryRecord read in
                 the same transaction and returns a number of minutes or None.
-                Keep it fast and deterministic: it runs again on each retry.
+                Keep it fast and deterministic: it runs again on each retry,
+                and must not call the store.
 
         Returns:
             True if a live memory was confirmed, False if no live memory has
@@ -921,13 +924,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Raises:
             InvalidNamespaceError: If the namespace is empty or a label is invalid
-            ValueError: If setup() has not added the columns this method needs,
-                or if the callable returns an invalid value (not None or a
-                positive finite number)
+            ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
+                number of minutes, or a callable; if setup() has not added the
+                columns this method needs; or if the callable returns an
+                invalid value (not None or a positive finite number)
         """
         prefix = _memory_prefix(namespace, "confirm")
+        _validate_confirm_ttl(ttl)
         self._require_columns(self._reconcile_columns(refresh=True))
-        self._validate_confirm_ttl(ttl)
 
         # Choose the write id before the first attempt
         write_id = str(uuid.uuid4())
@@ -947,37 +951,34 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     # If ttl is a callable, read the record first
                     resolved_ttl: float | None | NotProvided
                     if callable(ttl):
-                        read_cursor = conn.cursor(binary=True, row_factory=dict_row)
-                        cursors.append(read_cursor)
-                        read_cursor.execute(*self.sql.record(prefix, key_str))
-                        rows = read_cursor.fetchall()
+                        read_sent = self._send(conn, [self.sql.record(prefix, key_str)], cursors)
+                        rows = read_sent[0].fetchall()
                         if not rows:
                             # No live memory to confirm
                             return False
                         record = _row_to_record(tuple(namespace), rows[0])
-                        resolved_ttl = self._resolve_confirm_ttl(ttl, record)
+                        # If the record already has this write_id, an earlier attempt
+                        # committed. Return True without calling the callable again
+                        if rows[0].get("write_id") == write_id:
+                            return True
+                        resolved_ttl = self._run_user_callable(_resolve_confirm_ttl, ttl, record)  # type: ignore[assignment]
                     else:
                         resolved_ttl = ttl
 
-                    # Execute the confirm statement
-                    confirm_cursor = conn.cursor(binary=True, row_factory=dict_row)
-                    cursors.append(confirm_cursor)
-                    confirm_cursor.execute(
-                        *self.sql.confirm(prefix, key_str, write_id=write_id, ttl=resolved_ttl)
+                    # Execute the confirm and the write_id check in the same transaction
+                    sent = self._send(
+                        conn,
+                        [
+                            self.sql.confirm(prefix, key_str, write_id=write_id, ttl=resolved_ttl),
+                            self.sql.confirm_write_id_check(prefix, key_str, write_id=write_id),
+                        ],
+                        cursors,
                     )
 
-                # Transaction committed. Check if any rows were updated
-                rowcount = confirm_cursor.rowcount
-                if rowcount > 0:
-                    return True
-
-                # No rows updated. Check if the memory already has this write_id
-                # (retried after a lost commit)
-                check_cursor = conn.cursor(binary=True, row_factory=dict_row)
-                cursors.append(check_cursor)
-                check_cursor.execute(*self._confirm_write_id_check(prefix, key_str, write_id))
-                row = check_cursor.fetchone()
-                return bool(row)
+                # Transaction committed. Interpret the result
+                rowcount = sent[0].rowcount
+                check_rows = sent[1].fetchall()
+                return self._confirm_result(rowcount, check_rows)
             finally:
                 for cursor in cursors:
                     cursor.close()

@@ -18,6 +18,7 @@ from langgraph.store.base import (
     NOT_PROVIDED,
     GetOp,
     InvalidNamespaceError,
+    Item,
     ListNamespacesOp,
     MatchCondition,
     PutOp,
@@ -37,6 +38,8 @@ from langchain_cockroachdb.store.base import (
     SchemaCheck,
     StoreIdentity,
     _group_ops,
+    _resolve_confirm_ttl,
+    _validate_confirm_ttl,
     changed_keys,
     default_valid_at,
     merge_candidates,
@@ -50,6 +53,7 @@ from langchain_cockroachdb.store.reconcile import (
     Conflicts,
     ConflictsChanged,
     Decision,
+    MemoryRecord,
     Proposal,
     ReconcileResult,
     keep_all,
@@ -3644,6 +3648,23 @@ def make_proposal() -> Proposal:
     )
 
 
+def make_record() -> MemoryRecord:
+    return MemoryRecord(
+        item=Item(
+            namespace=NS,
+            key="k",
+            value={"text": "x"},
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+        version=1,
+        provenance=None,
+        valid_at=NOW,
+        confirmed_at=None,
+        confirmations=0,
+    )
+
+
 def test_a_policy_that_calls_the_store_fails_at_once() -> None:
     embeddings = CountingEmbeddings()
     store = CockroachDBStore(
@@ -3674,14 +3695,16 @@ def test_a_policy_that_calls_the_store_fails_at_once() -> None:
 
             error = raised_within(lambda policy=policy: store._decide(policy, make_proposal(), []))
             assert isinstance(error, RuntimeError), error
-            assert str(error).startswith("A reconcile policy must not call the store")
+            assert str(error).startswith(
+                "A reconcile policy or a confirm TTL function must not call the store"
+            )
             assert "find_conflicts" in str(error) and "resolve" in str(error)
     finally:
         store.lock.release()
     # Refused before the embedding model was called, too
     assert embeddings.calls == 0
     # The mark lasts only while the policy runs
-    store._refuse_inside_policy()
+    store._refuse_inside_user_callable()
 
 
 def test_the_policy_mark_belongs_to_one_thread_and_one_policy_run() -> None:
@@ -3689,20 +3712,20 @@ def test_the_policy_mark_belongs_to_one_thread_and_one_policy_run() -> None:
 
     def policy(proposal: Proposal, candidates: object) -> Decision:
         # Another thread, as on a pool, is not inside this policy
-        assert raised_within(store._refuse_inside_policy) is None
+        assert raised_within(store._refuse_inside_user_callable) is None
         with pytest.raises(RuntimeError, match="must not call the store"):
-            store._refuse_inside_policy()
+            store._refuse_inside_user_callable()
         return Decision(new="skip")
 
     assert store._decide(policy, make_proposal(), []) == Decision(new="skip")
-    store._refuse_inside_policy()
+    store._refuse_inside_user_callable()
 
     def failing(proposal: Proposal, candidates: object) -> Decision:
         raise LookupError("the judge failed")
 
     with pytest.raises(LookupError, match="the judge failed"):
         store._decide(failing, make_proposal(), [])
-    store._refuse_inside_policy()
+    store._refuse_inside_user_callable()
 
 
 # resolve: the change check, the checks before any I/O, and the attempt
@@ -4187,3 +4210,68 @@ def test_resolve_refuses_an_edited_proposal_before_any_io() -> None:
     for changed in (back, conflicts):
         with pytest.raises(ValueError, match="in these fields: value\\."):
             store.resolve(changed, decision)
+
+
+def test_a_confirm_ttl_function_that_calls_the_store_fails_at_once() -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    store._columns_ready = True
+    # On a single connection the callable holds the store's lock
+    store.lock.acquire()
+    try:
+
+        def ttl_fn(record: MemoryRecord) -> float:
+            store.record(NS, "k")
+            return 10.0
+
+        error = raised_within(lambda: store._run_user_callable(ttl_fn, make_record()))
+        assert isinstance(error, RuntimeError), error
+        assert "A reconcile policy or a confirm TTL function must not call the store" in str(error)
+    finally:
+        store.lock.release()
+    # The mark lasts only while the callable runs
+    store._refuse_inside_user_callable()
+
+
+def test_validate_confirm_ttl_before_io() -> None:
+    """Invalid ttl raises ValueError before any I/O."""
+    store = CockroachDBStore(object())  # type: ignore[arg-type]
+    # These should raise before touching the connection
+    with pytest.raises(ValueError, match="ttl must be"):
+        store.confirm(NS, "k", ttl=-1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ttl must be"):
+        store.confirm(NS, "k", ttl="x")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ttl must be"):
+        store.confirm(NS, "k", ttl=math.nan)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ttl must be"):
+        store.confirm(NS, "k", ttl=True)  # type: ignore[arg-type]
+
+
+def test_validate_and_resolve_confirm_ttl() -> None:
+    """Test module-level validation and resolution functions."""
+    record = make_record()
+    # Validation accepts valid values
+    _validate_confirm_ttl(NOT_PROVIDED)
+    _validate_confirm_ttl(None)
+    _validate_confirm_ttl(10.0)
+    _validate_confirm_ttl(lambda r: 10.0)
+    # Validation rejects invalid values
+    with pytest.raises(ValueError, match="got -1"):
+        _validate_confirm_ttl(-1)
+    with pytest.raises(ValueError, match="got 'x'"):
+        _validate_confirm_ttl("x")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="got nan"):
+        _validate_confirm_ttl(math.nan)
+    with pytest.raises(ValueError, match="got True"):
+        _validate_confirm_ttl(True)  # type: ignore[arg-type]
+    # Resolution returns non-callable as-is
+    assert _resolve_confirm_ttl(NOT_PROVIDED, record) is NOT_PROVIDED
+    assert _resolve_confirm_ttl(None, record) is None
+    assert _resolve_confirm_ttl(10.0, record) == 10.0
+    # Resolution calls callable and validates
+    assert _resolve_confirm_ttl(lambda r: (r.confirmations + 1) * 60.0, record) == 60.0
+    assert _resolve_confirm_ttl(lambda r: None, record) is None
+    # Resolution rejects invalid returns
+    with pytest.raises(ValueError, match="got -1"):
+        _resolve_confirm_ttl(lambda r: -1, record)
+    with pytest.raises(ValueError, match="got nan"):
+        _resolve_confirm_ttl(lambda r: math.nan, record)
