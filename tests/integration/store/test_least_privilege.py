@@ -84,7 +84,7 @@ def test_a_role_granted_only_the_store_tables_uses_migration_2(
 
     store.put(NS, "seat", WINDOW)
     # The migrations read was denied, and the check fell back to the columns
-    assert store._migrations_denied is True
+    assert store._migrations_unreadable is True
     store.put(NS, "seat", AISLE)
     store.put(NS, "food", VEGETARIAN)
     item = store.get(NS, "seat")
@@ -134,7 +134,7 @@ async def test_async_role_granted_only_the_store_tables_uses_migration_2(
     )
 
     await store.aput(NS, "seat", WINDOW)
-    assert store._migrations_denied is True
+    assert store._migrations_unreadable is True
     await store.aput(NS, "seat", AISLE)
     await store.aput(NS, "food", VEGETARIAN)
     item = await store.aget(NS, "seat")
@@ -206,7 +206,7 @@ def test_a_role_that_can_read_the_migrations_table_keeps_reading_it(
     store.put(NS, "seat", WINDOW)
     store.put(NS, "seat", AISLE)
     assert checks == [[store.sql.reconcile_migration_recorded(), store.sql.history_exists()]]
-    assert store._migrations_denied is False
+    assert store._migrations_unreadable is False
     [old] = store.history(NS, "seat")
     assert old.value == WINDOW
 
@@ -219,7 +219,7 @@ async def test_async_role_that_can_read_the_migrations_table_keeps_reading_it(
     await store.aput(NS, "seat", WINDOW)
     await store.aput(NS, "seat", AISLE)
     assert checks == [[store.sql.reconcile_migration_recorded(), store.sql.history_exists()]]
-    assert store._migrations_denied is False
+    assert store._migrations_unreadable is False
 
 
 def test_a_denied_migrations_read_in_a_callers_transaction_goes_to_the_caller(

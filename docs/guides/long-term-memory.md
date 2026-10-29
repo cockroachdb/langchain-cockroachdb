@@ -928,7 +928,7 @@ The candidate read and the writes of a reconcile share one serializable transact
 
 `reconcile_scan_limit` is a store setting, 2000 by default, passed to the constructor or to `from_conn_string`. A namespace with at most that many vectors has every one of them ranked exactly, read by primary key. Serializable isolation covers that whole read, so a concurrent insert into the namespace makes one of the two transactions retry.
 
-A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. A selective `filter`, many key and slot matches, or expired memories can fill the window and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.
+A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. The window makes room for the vectors of the key and slot matches, which are candidates already. A selective `filter`, or expired memories, can still fill it and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.
 
 ### Conditional Writes
 
@@ -961,8 +961,8 @@ Both are safe to retry, and a retry never reports a false conflict. If an attemp
 Every method here retries transient errors under the store's `RetryPolicy`, like every other store call. Each `reconcile` and `resolve` picks a write id before its first attempt and marks the rows it writes with it, and the memories it confirms with it as their confirmation id. `confirm` marks a memory with a confirmation id of its own and leaves its write id alone, so a confirmation that lands between a lost commit and the retry of a write does not disturb the retry. An attempt can commit and still lose its result on the way back, as when the connection drops while the COMMIT's answer travels. The retry then finds the rows with its write id, writes nothing, and returns the result rebuilt from those rows, with `already_applied=True`. A rebuilt result lists only what the stored rows prove:
 
 - `kept` is empty, and on a store without history so are `superseded` and `deleted`, since such a store keeps no trace of what it removed.
-- A written memory that another writer replaced before the retry gives `new="written"` with `version=None`.
-- A write to a new key that another writer replaced between the lost commit and the retry leaves no trace, so the retry runs it again.
+- A written memory that another writer replaced before the retry gives `new="written"` with `version=None`, when a history row proves the write: the version it overwrote, or a memory it superseded.
+- A write to a new key that superseded nothing, and that another writer replaced between the lost commit and the retry, leaves no trace, so the retry runs it again.
 - Without history, a decision that skipped the new memory or recorded it as superseded, and otherwise only deleted or superseded candidates, leaves no row either, and runs again after a lost commit.
 - On a store without history, calling `resolve` again after an error escaped it, as when its retries ran out, can raise `ConflictsChanged` for the keys its own earlier call removed. `find_conflicts` then shows the current state.
 
@@ -1017,7 +1017,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE store_history TO app;  -- with his
 GRANT SELECT ON TABLE store_migrations TO app;
 ```
 
-The store reads the migrations table to learn whether migration 2 is in place. Without SELECT on it, the store looks for migration 2's columns on the items table instead. Those can show up a moment before every node uses them, so on a multi-node cluster one write can fail in the seconds after `setup()` applies migration 2. Run `setup()` before rolling out 0.6.0, or grant SELECT on the migrations table, to avoid that. Without that grant, the first store call that runs inside a transaction the caller opened also gets the permission error, once per store. Only the grant avoids it.
+The store reads the migrations table to learn whether migration 2 is in place. Without SELECT on it, or without a migrations table, as when the tables were created without `setup()`, the store looks for migration 2's columns on the items table instead. Those can show up a moment before every node uses them, so on a multi-node cluster one write can fail in the seconds after `setup()` applies migration 2. Run `setup()` before rolling out 0.6.0, or grant SELECT on the migrations table, to avoid that. Without that grant, the first store call that runs inside a transaction the caller opened also gets the permission error, once per store. Only the grant avoids it.
 
 ## Differences from PostgresStore
 

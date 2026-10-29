@@ -1045,9 +1045,12 @@ LIMIT %s OFFSET %s"""
     # read by primary key, which also lets a serializable transaction notice
     # a concurrent insert. A larger one gets the index form: a window of the
     # nearest vectors from the C-SPANN index, as in semantic_search_in, then
-    # the join, filter and expiry check. Rows that the filter, the expiry
-    # check or the excluded keys remove still take places in the window, so
-    # a match beyond it would be missed. The index form therefore reports
+    # the join, filter and expiry check. The window makes room for the
+    # vectors of the excluded keys, the target and the slot matches, at the
+    # index's estimated vectors per item. Rows that the filter or the expiry
+    # check remove, or excluded keys with more vectors than estimated, still
+    # take places in it, so a match beyond it would be missed. The index form
+    # therefore reports
     # the window's size and lowest score, over every vector in it, and the
     # namespace's vectors counted up to over_fetch, as semantic_search_in
     # does. When it returned limit rows, or the window is whole and its

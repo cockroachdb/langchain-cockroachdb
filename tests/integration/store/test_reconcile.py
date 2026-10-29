@@ -348,16 +348,27 @@ def test_find_conflicts_looks_past_a_window_the_filter_emptied(
     assert "GROUP BY i.prefix, i.key" in exact and session is None
 
 
-def test_find_conflicts_looks_past_a_window_of_excluded_slot_matches(
+def test_the_index_window_makes_room_for_the_excluded_slot_matches(
     store_factory, mode, monkeypatch
 ) -> None:
     # Twenty-nine memories in the new memory's slot lie nearer to it than a
-    # similar memory outside the slot. The similar statement leaves the slot
-    # matches out, since they are candidates already, but they still fill the
-    # index's window
-    store = dense_store(store_factory, mode)
+    # similar memory outside the slot, and thirty more lie far from it. The
+    # similar statement leaves the slot matches out, since they are
+    # candidates already, and its window makes room for their vectors. So the
+    # match lies inside the window, whose lowest score is below the
+    # threshold, and the index result stands without the exact scan
+    vectors = {AISLE: SEATS[AISLE], "match": toward(SEATS[AISLE], 0.85)}
+    for i in range(29):
+        vectors[f"near {i}"] = toward(SEATS[AISLE], 0.99 - 0.001 * i)
+        vectors[f"far {i}"] = toward(SEATS[AISLE], 0.1 - 0.001 * i)
+    store = store_factory(
+        mode,
+        index={"dims": 4, "embed": FixedEmbeddings(vectors), "fields": ["text"]},
+        reconcile_scan_limit=10,
+    )
     store.batch(
         [PutOp(NS, f"s{i:02}", {"text": f"near {i}", "seat": "x"}) for i in range(29)]
+        + [PutOp(NS, f"f{i:02}", {"text": f"far {i}"}) for i in range(29)]
         + [PutOp(NS, "m", {"text": "match"})]
     )
     sent = spy_on_reads(store, monkeypatch)
@@ -367,7 +378,15 @@ def test_find_conflicts_looks_past_a_window_of_excluded_slot_matches(
     found = reasons(conflicts)
     assert found[:29] == [(f"s{i:02}", "slot") for i in range(29)]
     assert found[29:] == [("m", "similar")]
-    assert [label for label, _, _ in sent][-1] == "store find conflicts exact"
+    assert conflicts.candidates[29].score == pytest.approx(0.85, abs=1e-3)
+    assert [label for label, _, _ in sent] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
+    # The slot matches' scores, then the index scan
+    [(_, [scores, indexed], _)] = [s for s in sent if s[0] == "store find conflicts similar"]
+    assert scores.startswith("SELECT key, 1 - min(embedding")
+    assert "window_stats" in indexed
 
 
 def test_find_conflicts_looks_past_a_window_of_expired_memories(

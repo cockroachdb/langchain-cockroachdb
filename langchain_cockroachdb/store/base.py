@@ -1277,11 +1277,13 @@ class BaseCockroachDBStore:
     # Pooled batches check the schema concurrently. The lock keeps a read
     # that finishes late from replacing a True another read cached.
     _schema_lock: threading.Lock
-    # Whether the store's role was denied the migrations table (SQLSTATE
-    # 42501). From then on the schema check reads the items table's columns
-    # instead, for good: grants rarely change, and that read is always
-    # allowed for the role.
-    _migrations_denied: bool
+    # Whether the migrations read failed because the store's role has no
+    # grant on the migrations table (SQLSTATE 42501) or because there is no
+    # migrations table (42P01), as when the tables were created without
+    # setup(). From then on the schema check reads the items table's columns
+    # instead, for good: grants and tables rarely change, and that read is
+    # always allowed for the role.
+    _migrations_unreadable: bool
     # Whether the fallback to the column read has been logged, to log it once
     _logged_column_fallback: bool
     # Marks the threads that are running a reconcile policy of this store,
@@ -1311,7 +1313,7 @@ class BaseCockroachDBStore:
         self._history_ready = None
         self._schema_read_at = 0.0
         self._schema_lock = threading.Lock()
-        self._migrations_denied = False
+        self._migrations_unreadable = False
         self._logged_column_fallback = False
         self._policy_marks = threading.local()
 
@@ -1382,12 +1384,13 @@ class BaseCockroachDBStore:
         its schema change has settled on every node, so a store that finds
         the row can use the new columns wherever its next statement runs.
 
-        A role with no grant on that table reads the items table's own
-        columns instead (see _fall_back_to_columns). They can show up a
-        moment before every node uses them, so on a multi-node cluster one
-        write of such a role can fail in the seconds after migration 2
-        completes. Run setup() before rolling out 0.6.0, or grant the role
-        SELECT on the migrations table, to avoid that.
+        A role with no grant on that table, or a store whose tables were
+        created without setup() and so have no migrations table, reads the
+        items table's own columns instead (see _fall_back_to_columns). They
+        can show up a moment before every node uses them, so on a multi-node
+        cluster one write of such a role can fail in the seconds after
+        migration 2 completes. Run setup() before rolling out 0.6.0, or grant
+        the role SELECT on the migrations table, to avoid that.
         """
         if read_migrations:
             statements = [self.sql.reconcile_migration_recorded()]
@@ -1398,28 +1401,33 @@ class BaseCockroachDBStore:
         return statements
 
     def _fall_back_to_columns(self, error: BaseException, *, read_migrations: bool) -> bool:
-        """Whether a schema check denied with SQLSTATE 42501 runs again with the column read.
+        """Whether a schema check whose migrations read failed runs again with the column read.
 
-        Only a denied migrations read falls back. The store remembers the
-        denial, so its later checks go straight to the column read without
+        ``error`` is the failed read's error: SQLSTATE 42501, the store's
+        role has no grant on the migrations table, or 42P01, there is no
+        migrations table, as when the tables were created without setup().
+        Only the migrations read falls back. The store remembers the
+        failure, so its later checks go straight to the column read without
         the error. The failed statement ended its round trip, so the column
         read and the history check go out together in the next one. Inside a
-        transaction the caller opened, the denial aborted that transaction
+        transaction the caller opened, the error aborted that transaction
         and no read can run in it: the error goes to the caller, whose retry
         reads the columns.
         """
         if not read_migrations:
             return False
-        if not self._migrations_denied:
+        if not self._migrations_unreadable:
             with self._warning_lock:
                 if not self._logged_column_fallback:
                     self._log.info(
-                        "The store's role has no SELECT on %s. The schema check now reads the "
-                        "items table's columns.",
+                        "The store cannot read %s (SQLSTATE %s): its role has no SELECT on it, "
+                        "or it does not exist. The schema check now reads the items table's "
+                        "columns.",
                         self.sql.migrations_table,
+                        getattr(error, "sqlstate", None),
                     )
                     self._logged_column_fallback = True
-        self._migrations_denied = True
+        self._migrations_unreadable = True
         return not _psycopg_conn.in_caller_transaction(error)
 
     def _cached_schema(self, *, refresh: bool) -> SchemaCheck | None:
@@ -2142,11 +2150,12 @@ class BaseCockroachDBStore:
         those keys and the new memory's own key out. The namespace's vectors
         are ranked exactly when it holds at most reconcile_scan_limit of
         them, or the index is flat. Otherwise the C-SPANN index gives a
-        window of the store search's over_fetch for ``limit``, with the beam
-        size set when the index configures one, and the exact form of each
-        statement is kept for a window that may have left matches out. Empty
-        when the new memory has no vectors. Run it as SimilarRead says, and
-        pass the rows to _conflicts.
+        window of the store search's over_fetch for ``limit``, widened by
+        the estimated vectors of every excluded key, with the beam size set
+        when the index configures one, and the exact form of each statement
+        is kept for a window that may have left matches out. Empty when the
+        new memory has no vectors. Run it as SimilarRead says, and pass the
+        rows to _conflicts.
         """
         if not vector_rows:
             return SimilarRead(scores=[], similar=[], session=[])
@@ -2160,7 +2169,13 @@ class BaseCockroachDBStore:
             return SimilarRead(scores=scores, similar=[], session=[])
         above = read.vectors is not None and read.vectors > self.reconcile_scan_limit
         scans: list[Literal["exact", "index"]] = ["exact", "index"] if above else ["exact"]
-        over_fetch = plan.limit * index.estimated_vectors * 2 + 1
+        exclude = list(dict.fromkeys([plan.key, *keys]))
+        # The store search's window for the limit, and room for the vectors of
+        # the excluded keys, which take places in the window though they are
+        # never similar candidates
+        over_fetch = (
+            plan.limit * index.estimated_vectors * 2 + 1 + len(exclude) * index.estimated_vectors
+        )
         built: dict[str, list[tuple[str, list]]] = {}
         for scan in scans:
             statement = self.sql.similar_candidates(
@@ -2170,7 +2185,7 @@ class BaseCockroachDBStore:
                 filter=plan.filter,
                 scan=scan,
                 over_fetch=over_fetch,
-                exclude=list(dict.fromkeys([plan.key, *keys])),
+                exclude=exclude,
             )
             built[scan] = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
         if not above:
@@ -2359,9 +2374,13 @@ class BaseCockroachDBStore:
         row has the version. A confirmation sets only a memory's confirm id,
         so one that lands after the write leaves that proof alone. Only a
         write archives the memory it replaces under the new key as
-        overwritten, so that history row proves the write too. When another
-        writer replaced the new memory before the retry, that row is all
-        that is left: the memory was written, and its version is None. Every
+        overwritten, so that history row proves the write too. Only a write
+        or a new memory recorded straight into history supersedes other
+        memories, and the latter leaves its own superseded row under the new
+        key, so without that row a superseded row under another key proves
+        the write as well. When another writer replaced the new memory
+        before the retry, such rows are all that is left: the memory was
+        written, and its version is None. Every
         item that carries the write id as its confirm id was confirmed. The
         history rows give the keys superseded and deleted, and a row of the
         new key that ended as superseded is the new memory, recorded
@@ -2382,18 +2401,20 @@ class BaseCockroachDBStore:
 
         # A decision never both writes and confirms the memory under its own key
         target = next((row for row in items if row["key"] == plan.key and row["written"]), None)
+        superseded = keys(
+            row for row in history if row["reason"] == "superseded" and row["key"] != plan.key
+        )
+        late = ended_as("superseded")
         new: Literal["written", "skipped", "superseded"] = "skipped"
-        if target is not None or ended_as("overwritten"):
+        if target is not None or ended_as("overwritten") or (superseded and not late):
             new = "written"
-        elif ended_as("superseded"):
+        elif late:
             new = "superseded"
         return ReconcileResult(
             key=plan.key,
             new=new,
             version=None if target is None else int(target["version"]),
-            superseded=keys(
-                row for row in history if row["reason"] == "superseded" and row["key"] != plan.key
-            ),
+            superseded=superseded,
             deleted=keys(row for row in history if row["reason"] == "deleted"),
             confirmed=keys(row for row in items if row["confirmed"]),
             kept=(),

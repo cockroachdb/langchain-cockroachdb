@@ -1478,7 +1478,7 @@ async def test_reconcile_uses_the_schema_check_it_ran(make: str, monkeypatch) ->
 
 
 class DeniedSchemaReads(SchemaReads):
-    """SchemaReads for a role without a grant on the migrations table.
+    """SchemaReads for a role without a grant on the migrations table, or with no such table.
 
     The migrations read raises ``error``, by default the InsufficientPrivilege
     that CockroachDB raises. The column read and the history check answer as
@@ -1538,18 +1538,32 @@ async def check_columns(
     return store._reconcile_columns(refresh=refresh)
 
 
+# Why the migrations read fails: the role has no grant on the migrations
+# table (42501), or there is no migrations table (42P01), as when the tables
+# were created without setup(). The store falls back to the column read for both
+UNREADABLE = {
+    "denied": lambda: psycopg.errors.InsufficientPrivilege(
+        "user app does not have SELECT privilege on relation store_migrations"
+    ),
+    "missing": lambda: psycopg.errors.UndefinedTable(
+        'relation "public.store_migrations" does not exist'
+    ),
+}
+
+
 def sent(reads: SchemaReads) -> list[list[tuple[str, list]]]:
     """The statements of every schema check round trip, in order."""
     assert all(label == "store schema check" for _, label in reads.calls)
     return [statements for statements, _ in reads.calls]
 
 
+@pytest.mark.parametrize("why", list(UNREADABLE))
 @pytest.mark.parametrize("history", [False, True], ids=["plain", "history"])
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_a_denied_migrations_read_falls_back_to_the_columns_for_good(
-    make: str, history: bool, monkeypatch
+async def test_an_unreadable_migrations_table_falls_back_to_the_columns_for_good(
+    make: str, history: bool, why: str, monkeypatch
 ) -> None:
-    reads = DeniedSchemaReads(columns=False, history=True)
+    reads = DeniedSchemaReads(columns=False, history=True, error=UNREADABLE[why]())
     store = store_reading(make, reads, history=history)
     migrations = store.sql.reconcile_migration_recorded()
     columns = store.sql.reconcile_columns_exist()
@@ -1559,6 +1573,7 @@ async def test_a_denied_migrations_read_falls_back_to_the_columns_for_good(
     # The denial ended its round trip, so the column read and the history
     # check go out together in a second one
     assert sent(reads) == [[migrations, *tail], [columns, *tail]]
+    assert store._migrations_unreadable is True
     # From then on the check reads the columns only, cached as on the
     # migrations path: False holds for _SCHEMA_RECHECK_SECONDS, and refresh
     # reads again
@@ -1575,18 +1590,21 @@ async def test_a_denied_migrations_read_falls_back_to_the_columns_for_good(
     assert len(reads.calls) == 4
 
 
+@pytest.mark.parametrize(("why", "sqlstate"), [("denied", "42501"), ("missing", "42P01")])
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_a_denied_migrations_read_logs_the_fallback_once(make: str, caplog) -> None:
-    reads = DeniedSchemaReads(columns=True, history=False)
+async def test_an_unreadable_migrations_table_logs_the_fallback_once(
+    make: str, why: str, sqlstate: str, caplog
+) -> None:
+    reads = DeniedSchemaReads(columns=True, history=False, error=UNREADABLE[why]())
     store = store_reading(make, reads)
 
     with caplog.at_level("INFO"):
         await check_columns(store)
 
-    # Exactly one INFO log about the fallback
+    # Exactly one INFO log about the fallback, with the reason
     info_logs = [rec for rec in caplog.records if rec.levelname == "INFO"]
     assert len(info_logs) == 1
-    assert "has no SELECT on" in info_logs[0].message
+    assert f"(SQLSTATE {sqlstate})" in info_logs[0].message
     assert "The schema check now reads the items table's columns" in info_logs[0].message
     assert store.sql.migrations_table in info_logs[0].message
 
@@ -1601,11 +1619,11 @@ async def test_a_denied_migrations_read_logs_the_fallback_once(make: str, caplog
 
 @pytest.mark.parametrize("make", ["sync", "async"])
 async def test_other_errors_of_the_migrations_read_propagate(make: str) -> None:
-    missing = psycopg.errors.UndefinedTable('relation "public.store_migrations" does not exist')
-    reads = DeniedSchemaReads(columns=True, error=missing)
+    broken = psycopg.errors.UndefinedColumn('column "v" does not exist')
+    reads = DeniedSchemaReads(columns=True, error=broken)
     store = store_reading(make, reads)
     for _ in range(2):
-        with pytest.raises(psycopg.errors.UndefinedTable):
+        with pytest.raises(psycopg.errors.UndefinedColumn):
             await check_columns(store)
     # No column read: each check tried the migrations table, and nothing was cached
     assert sent(reads) == [[store.sql.reconcile_migration_recorded()]] * 2
@@ -1632,17 +1650,18 @@ async def test_a_denied_column_read_raises_without_trying_the_migrations_again(
     assert sent(reads) == [[migrations], [columns], [columns]]
 
 
+@pytest.mark.parametrize("why", list(UNREADABLE))
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_a_migrations_read_denied_in_a_callers_transaction_raises_once(make: str) -> None:
-    denied = psycopg.errors.InsufficientPrivilege(
-        "user app does not have SELECT privilege on relation store_migrations"
-    )
-    _psycopg_conn.mark_in_caller_transaction(denied)
-    reads = DeniedSchemaReads(columns=True, error=denied)
+async def test_a_migrations_read_that_fails_in_a_callers_transaction_raises_once(
+    make: str, why: str
+) -> None:
+    error = UNREADABLE[why]()
+    _psycopg_conn.mark_in_caller_transaction(error)
+    reads = DeniedSchemaReads(columns=True, error=error)
     store = store_reading(make, reads)
-    # The denial aborted the caller's transaction, so no read can run in it:
+    # The error aborted the caller's transaction, so no read can run in it:
     # the error goes to the caller
-    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+    with pytest.raises(type(error)):
         await check_columns(store)
     assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
     # When the caller tries again, the check goes straight to the columns
@@ -1679,7 +1698,7 @@ async def test_a_denied_write_is_not_taken_for_a_denied_migrations_read(make: st
             await store.aput(("a",), "k", {"x": 1})
     # The schema check read the migrations table once and was not denied
     assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
-    assert store._migrations_denied is False
+    assert store._migrations_unreadable is False
 
 
 def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) -> None:
@@ -1795,6 +1814,10 @@ async def test_history_and_purge_validate_before_any_io(make: str) -> None:
             await check()
     with pytest.raises(ValueError, match="limit must be non-negative"):
         await call(store, "history", ("a",), "k", limit=-1)
+    # A limit that is not an int is refused before any I/O too, as find_conflicts refuses it
+    for bad in (1.5, "3", True, None):
+        with pytest.raises(ValueError, match="limit must be a non-negative integer"):
+            await call(store, "history", ("a",), "k", limit=bad)
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
@@ -2718,7 +2741,9 @@ async def test_find_conflicts_reads_twice_and_scans_by_the_count(
                 limit=10,
                 filter={"source": "chat"},
                 scan=scan,  # type: ignore[arg-type]
-                over_fetch=10 * 1 * 2 + 1,
+                # The store search's window for the limit, and room for
+                # the vectors of the two excluded keys
+                over_fetch=10 * 1 * 2 + 1 + 2 * 1,
                 exclude=["k", "s"],
             ),
             vector,
@@ -2867,6 +2892,31 @@ async def test_reconcile_scan_limit_is_a_positive_int_on_both_stores() -> None:
             AsyncCockroachDBStore(pool, reconcile_scan_limit=bad)  # type: ignore[arg-type]
 
 
+def test_the_index_window_makes_room_for_the_excluded_keys() -> None:
+    # The excluded keys, the new memory's own and the key and slot matches,
+    # are left out of the similar candidates, but their vectors still take
+    # places in the index's window. Each takes an item's estimated vectors
+    store = proposal_store()
+    store.reconcile_scan_limit = 5
+    plan = plan_proposal(store, {"text": "aisle", "seat": "x"}, slot="seat", limit=4)
+    vector_rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    rows = [candidate_row(key) for key in ("k", "s1", "s2", "s3")]
+    read = store_base.KeySlotRead(now=NOW, rows=rows, vectors=6)
+
+    similar = store._similar_read(plan, vector_rows, read)
+
+    assert store.index is not None and store.index.estimated_vectors == 1
+    # The store search's window for the limit, 4 * 1 * 2 + 1, and the four
+    # excluded keys' vectors
+    assert similar.over_fetch == 4 * 1 * 2 + 1 + 4 * 1
+    [indexed] = similar.similar
+    assert indexed[1].count(similar.over_fetch) == 2  # the window and the count's cap
+    # A new key is excluded too, so a target-less proposal makes room for itself
+    plan = plan_proposal(store, {"text": "aisle", "seat": "x"}, key="new", slot="seat", limit=4)
+    similar = store._similar_read(plan, vector_rows, read)
+    assert similar.over_fetch == 4 * 1 * 2 + 1 + 5 * 1
+
+
 def test_needs_exact_candidates() -> None:
     hit = candidate_row("a", score=0.9)
     other = candidate_row("b", score=0.88)
@@ -2962,7 +3012,7 @@ async def test_find_conflicts_runs_the_exact_scan_where_the_window_may_hide_matc
         limit=10,
         filter=None,
         scan="exact",
-        over_fetch=10 * 2 * 2 + 1,
+        over_fetch=10 * 2 * 2 + 1 + 1 * 2,
         exclude=["k"],
     )
     _, sent, session = calls[2]
@@ -3595,6 +3645,33 @@ def test_a_write_replaced_before_the_retry_is_still_reported_written() -> None:
     rebuilt = store._applied_result(plan, [[written_row("k", 4)], history])
     assert rebuilt is not None
     assert (rebuilt.new, rebuilt.version, rebuilt.confirmed) == ("written", 4, ())
+
+
+def test_a_superseded_memory_under_another_key_proves_the_write() -> None:
+    # The write went to a new key and superseded "old". Another writer
+    # replaced the new memory before the retry, so no item carries the write
+    # id, and no memory was overwritten under the new key. Only a write or a
+    # late fact supersedes other memories, and a late fact leaves a row of
+    # its own under the new key, so the row under "old" proves the write
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    history = [{"key": "old", "reason": "superseded"}, {"key": "gone", "reason": "deleted"}]
+    assert store._applied_result(plan, [[], history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=None,
+        superseded=("old",),
+        deleted=("gone",),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    # With the late fact's own row, the new memory went straight into history
+    late = store._applied_result(plan, [[], [*history, {"key": "k", "reason": "superseded"}]])
+    assert late is not None and (late.new, late.superseded) == ("superseded", ("old",))
+    # A delete alone proves nothing about the new memory: any decision deletes
+    deleted = store._applied_result(plan, [[confirmed_row("dup")], history[1:]])
+    assert deleted is not None and (deleted.new, deleted.deleted) == ("skipped", ("gone",))
 
 
 def test_applied_result_lists_only_what_the_rows_prove() -> None:

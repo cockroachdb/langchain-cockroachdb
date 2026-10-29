@@ -149,9 +149,10 @@ class ReconcileResult:
     removed, reports them empty too. A confirmation of the new memory
     before the retry leaves the write's proof on it. If another writer
     replaced the new memory before the retry, the history row of the
-    version the write overwrote still proves the write: the result says
-    "written", but its version is None. A rebuilt result lists keys in key
-    order; a normal one in the order of the candidates.
+    version the write overwrote, or of a memory it superseded, still proves
+    the write: the result says "written", but its version is None. A
+    rebuilt result lists keys in key order; a normal one in the order of the
+    candidates.
 
     Attributes:
         key: The new memory's key, whether it was written or not.

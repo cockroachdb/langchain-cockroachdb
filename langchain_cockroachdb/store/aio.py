@@ -51,7 +51,7 @@ from langchain_cockroachdb.store.base import (
     PutPlan,
     SchemaCheck,
     _carries_confirm_id,
-    _check_paging,
+    _check_limit,
     _check_policy,
     _memory_prefix,
     _resolve_confirm_ttl,
@@ -377,8 +377,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         An application role that did not run setup() needs SELECT, INSERT,
         UPDATE and DELETE on the store's items and vectors tables, and on
         the history table when history is on. Without SELECT on the migrations
-        table, the store finds migration 2 through the items table's columns
-        instead. On a multi-node cluster, one write can then fail in the
+        table, or without a migrations table, as when the tables were created
+        without setup(), the store finds migration 2 through the items table's
+        columns instead. On a multi-node cluster, one write can then fail in the
         seconds after setup() applies migration 2. Running setup() before
         rolling out 0.6.0, or granting SELECT on the migrations table, avoids
         that. The first store call inside a transaction the caller opened gets
@@ -740,8 +741,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         It reads whether setup() has recorded migration 2, and on a store
         with history whether the history table exists, in one round trip. A
-        role denied the migrations table reads the items table's columns
-        instead (see _schema_statements). It reads them the first time, and
+        role denied the migrations table, or a store with no migrations
+        table, reads the items table's columns instead (see
+        _schema_statements). It reads them the first time, and
         again when an answer it found missing is older than
         _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. What it found present
         it trusts for good.
@@ -752,17 +754,20 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         return schema
 
     async def _aread_schema(self) -> list[list[DictRow]]:
-        """Send the schema check, with the column read if the migrations read is denied.
+        """Send the schema check, with the column read if the migrations read fails.
 
-        Only the schema check's own round trip is caught: a 42501 from any
-        other statement still raises.
+        The migrations read falls back when the store's role has no grant on
+        the migrations table (42501), or there is no migrations table
+        (42P01), as when the tables were created without setup(). Only the
+        schema check's own round trip is caught: either error from any other
+        statement still raises.
         """
-        read_migrations = not self._migrations_denied
+        read_migrations = not self._migrations_unreadable
         try:
             return await self._read_all(
                 self._schema_statements(read_migrations=read_migrations), "store schema check"
             )
-        except psycopg.errors.InsufficientPrivilege as error:
+        except (psycopg.errors.InsufficientPrivilege, psycopg.errors.UndefinedTable) as error:
             if not self._fall_back_to_columns(error, read_migrations=read_migrations):
                 raise
         return await self._read_all(
@@ -927,11 +932,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Raises:
             ValueError: If the store keeps no history (create it with
                 history=True and run setup()), setup() has not created the
-                history table, or ``limit`` is negative
+                history table, or ``limit`` is not a non-negative int
             InvalidNamespaceError: If the namespace is empty or a label is invalid
         """
         prefix = _memory_prefix(namespace, "ahistory")
-        _check_paging(limit, 0)
+        _check_limit(limit)
         await self._ahistory_schema()
         statement = self.sql.history_versions(prefix, str(key), limit=limit)
         [rows] = await self._read_all([statement], "store history")

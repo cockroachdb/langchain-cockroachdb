@@ -208,6 +208,55 @@ def test_a_batch_stores_one_write_id_on_every_row(store_factory, admin, mode) ->
     assert seat["version"] == food["version"] == 1
 
 
+def test_a_store_without_a_migrations_table_reads_the_items_columns(
+    store_factory, admin, mode
+) -> None:
+    # The tables were created without setup(), as by managed DDL: the items
+    # table has migration 2's columns, and there is no migrations table. The
+    # schema check falls back to the items table's columns, for good
+    owner = store_factory(mode, index=seat_index())
+    admin.execute(f"DROP TABLE {owner.sql.migrations_table}")
+    store = store_factory(mode, setup=False, index=seat_index())
+
+    store.put(NS, "seat", {"text": "Prefers window seats"})
+    assert store._migrations_unreadable is True
+    store.put(NS, "seat", {"text": "Prefers aisle seats"})
+
+    row = row_of(admin, store, "seat")
+    assert row["version"] == 2 and row["write_id"] is not None
+    record = store.record(NS, "seat")
+    assert record is not None and record.item.value == {"text": "Prefers aisle seats"}
+    result = store.reconcile(NS, "seat", {"text": "Prefers window seats"}, policy=keep_all())
+    assert (result.new, result.version) == ("written", 3)
+
+
+def test_0_5_tables_without_a_migrations_table_keep_working_as_0_5_did(
+    store_factory, admin, table_name, mode
+) -> None:
+    # 0.5 tables created without setup() and without a migrations table:
+    # plain writes use the 0.5 statements, as 0.5.x did
+    store = store_factory(mode, setup=False, index=seat_index())
+    for statement in [store.sql.migrations()[1], *store.sql.vector_statements()]:
+        admin.execute(statement)
+
+    store.put(NS, "seat", {"text": "Prefers window seats"})
+    store.put(NS, "food", {"text": "Vegetarian"})
+    store.put(NS, "seat", {"text": "Prefers aisle seats"})
+    item = store.get(NS, "seat")
+    assert item is not None and item.value == {"text": "Prefers aisle seats"}
+    assert [result.key for result in store.search(NS, query="Prefers window seats")] == [
+        "seat",
+        "food",
+    ]
+    store.delete(NS, "food")
+    assert store.get(NS, "food") is None
+    assert store._migrations_unreadable is True
+    assert not set(RECONCILE_COLUMNS) & set(columns_of(admin, table_name))
+    # The methods that need migration 2 ask for setup()
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.record(NS, "seat")
+
+
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
 def test_a_put_retried_after_a_lost_commit_bumps_the_version_once(
     store_factory, admin, unsafe_internals, caplog, mode: str
