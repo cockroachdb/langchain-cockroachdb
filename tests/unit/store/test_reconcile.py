@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import pickle
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -14,6 +15,7 @@ from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
     Conflicts,
+    ConflictsChanged,
     Decision,
     MemoryRecord,
     MemoryVersion,
@@ -495,3 +497,20 @@ def test_a_decision_keeps_its_actions_as_actions() -> None:
         Decision(actions={"old": "remove"})  # type: ignore[dict-item]
     with pytest.raises(ValueError, match="'write', 'skip' or 'superseded', got 'writ'"):
         Decision(new="writ")  # type: ignore[arg-type]
+
+
+def test_conflicts_changed_survives_pickle_with_its_keys_and_message() -> None:
+    # Pickled to cross processes, as a task runner or multiprocessing does
+    error = ConflictsChanged(("k", "old"))
+    # The store marks an error raised inside a transaction the caller opened
+    error.in_caller_transaction = True  # type: ignore[attr-defined]
+
+    back = pickle.loads(pickle.dumps(error))
+
+    assert type(back) is ConflictsChanged
+    assert back.keys == ("k", "old")
+    assert str(back) == str(error) == "Conflicts changed for keys: k, old"
+    assert back.args == error.args
+    assert back.in_caller_transaction is True
+    # Keys given as a list are kept as the tuple they stand for
+    assert ConflictsChanged(["k"]).keys == ("k",)  # type: ignore[arg-type]

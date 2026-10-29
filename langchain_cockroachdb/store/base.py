@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar, Literal
@@ -754,9 +754,15 @@ class ResolvePlan:
             key: first the new memory's key, with None when no live memory
             had it, then each candidate the decision does more than keep or
             names as superseding the new memory, in candidate order.
-        reads: The read of the live (version, updated_at) of those keys
-            (StoreSQL.tokens), then the reads of the rows that carry the
-            write id under the new key and under every candidate's key.
+        removed: The candidates the decision deletes or supersedes, other
+            than the one under the new memory's key. On a retry within the
+            same call, one of them that is gone counts as unchanged: the
+            earlier attempt may have removed it, and removing it again
+            changes nothing.
+        reads: The read of the live (version, updated_at) of the keys in
+            ``expected`` (StoreSQL.tokens), then the reads of the rows that
+            carry the write id under the new key and under every
+            candidate's key.
         writes: The statements that apply the decision, as reconcile's.
     """
 
@@ -764,6 +770,7 @@ class ResolvePlan:
     candidates: tuple[Candidate, ...]
     decision: Decision
     expected: dict[str, tuple[int, datetime] | None]
+    removed: frozenset[str]
     reads: list[tuple[str, list]]
     writes: list[tuple[str, list]]
 
@@ -931,7 +938,10 @@ def _acted(candidates: Sequence[Candidate], decision: Decision, action: Action) 
 
 
 def changed_keys(
-    expected: Mapping[str, tuple[int, datetime] | None], rows: Iterable[Mapping[str, Any]]
+    expected: Mapping[str, tuple[int, datetime] | None],
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    may_be_gone: Collection[str] = (),
 ) -> tuple[str, ...]:
     """The keys whose live memory is not the one that was read, in the order of ``expected``.
 
@@ -944,12 +954,17 @@ def changed_keys(
     key that had no live memory has one now. Confirming a memory changes
     neither the version nor updated_at, so it never counts. A token that
     came back from a checkpoint as a list compares as the tuple it was.
+
+    A key in ``may_be_gone`` whose memory is gone counts as unchanged, as
+    for the retry of a write that deletes it, whose earlier attempt may have
+    committed. A live memory under it that differs still counts.
     """
     live = {row["key"]: (int(row["version"]), row["updated_at"]) for row in rows}
     return tuple(
         key
         for key, token in expected.items()
-        if live.get(key) != (None if token is None else tuple(token))
+        if not (key in may_be_gone and key not in live)
+        and live.get(key) != (None if token is None else tuple(token))
     )
 
 
@@ -2261,6 +2276,8 @@ class BaseCockroachDBStore:
             checked.add(decision.superseded_by)
         expected: dict[str, tuple[int, datetime] | None] = {plan.key: state.target}
         expected.update((c.key, state.tokens[c.key]) for c in candidates if c.key in checked)
+        removing = _acted(candidates, decision, Action.DELETE)
+        removing += _acted(candidates, decision, Action.SUPERSEDE)
         reads = [
             self.sql.tokens(plan.prefix, sorted(expected)),
             *self._applied_statements(plan, [plan.key, *(c.key for c in candidates)]),
@@ -2277,12 +2294,17 @@ class BaseCockroachDBStore:
             candidates=candidates,
             decision=decision,
             expected=expected,
+            removed=frozenset(removing) - {plan.key},
             reads=reads,
             writes=writes,
         )
 
     def _check_resolve(
-        self, resolving: ResolvePlan, found: Sequence[Sequence[Mapping[str, Any]]]
+        self,
+        resolving: ResolvePlan,
+        found: Sequence[Sequence[Mapping[str, Any]]],
+        *,
+        retry: bool,
     ) -> ReconcileResult | None:
         """What the first round trip of a resolve attempt found, before anything is written.
 
@@ -2294,6 +2316,13 @@ class BaseCockroachDBStore:
         Otherwise None means that nothing the decision depends on changed,
         and the attempt applies it.
 
+        ``retry`` says whether an earlier attempt of the same call ran. Its
+        commit may have been lost, and on a store without history a decision
+        that only deletes or supersedes leaves no row with the write id.
+        So on a retry the candidates in ``resolving.removed`` may be gone:
+        the state the decision asked for. On the first attempt they must
+        still be live, as every key the check covers must.
+
         Raises:
             ConflictsChanged: If a key of ``resolving.expected`` changed
                 (changed_keys). Raised in the attempt's transaction, it rolls
@@ -2303,7 +2332,8 @@ class BaseCockroachDBStore:
         applied = self._applied_result(resolving.plan, found[1:])
         if applied is not None:
             return applied
-        changed = changed_keys(resolving.expected, found[0])
+        gone = resolving.removed if retry else frozenset()
+        changed = changed_keys(resolving.expected, found[0], may_be_gone=gone)
         if changed:
             raise ConflictsChanged(changed)
         return None

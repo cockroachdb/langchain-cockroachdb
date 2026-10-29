@@ -276,9 +276,14 @@ class ConflictsChanged(Exception):
     """
 
     def __init__(self, keys: tuple[str, ...]) -> None:
-        self.keys = keys
-        key_list = ", ".join(keys)
+        self.keys = tuple(keys)
+        key_list = ", ".join(self.keys)
         super().__init__(f"Conflicts changed for keys: {key_list}")
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Pickle rebuilds an exception from its args, which hold the message,
+        # not the keys. Rebuild it from the keys, with the rest of its state
+        return (type(self), (self.keys,), self.__dict__)
 
 
 # Policy type

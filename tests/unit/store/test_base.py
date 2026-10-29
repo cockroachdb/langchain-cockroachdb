@@ -3510,9 +3510,9 @@ class ReconcileCursor:
         pass
 
 
-def reconciling_store(reads: ReconcileReads) -> CockroachDBStore:
-    """A store with history and no index whose reconcile attempts go to ``reads``."""
-    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+def reconciling_store(reads: ReconcileReads, *, history: bool = True) -> CockroachDBStore:
+    """A store with no index, and history unless told otherwise, whose attempts go to ``reads``."""
+    store = CockroachDBStore(object(), history=history, retry_policy=FAST)  # type: ignore[arg-type]
     # Migration 2 and the history table were seen: no schema read
     store._columns_ready = True
     store._history_ready = True
@@ -3854,6 +3854,8 @@ def test_plan_resolve_checks_the_target_and_every_key_the_decision_names() -> No
     assert [c.key for c in conflicts.candidates] == ["k", "dup", "gone", "kept", "newer", "old"]
     assert resolving.expected == {"k": token, "dup": token, "gone": token, "old": token}
     assert list(resolving.expected) == ["k", "dup", "gone", "old"]
+    # The candidates it deletes or supersedes may be gone on a retry
+    assert resolving.removed == {"gone", "old"}
     # One round trip reads their live tokens, and the rows that carry the
     # write id under the new key and every candidate's key, whatever this
     # decision names: an earlier resolve of the same Conflicts may have
@@ -3996,3 +3998,102 @@ def test_a_retried_resolve_looks_for_its_write_id_again(committed: bool) -> None
         # Nothing carries the write id, the check passes again, and the retry writes again
         assert second == first
         assert result == WRITTEN
+
+
+def test_changed_keys_lets_a_key_that_may_be_gone_be_gone() -> None:
+    later = T0 + timedelta(seconds=1)
+    expected: dict = {"gone": (2, T0), "rewritten": (2, T0), "strict": (2, T0)}
+    rows = [{"key": "rewritten", "version": 3, "updated_at": later}]
+    # Gone counts as unchanged only for the keys that may be gone, and a live
+    # memory that differs still counts
+    assert changed_keys(expected, rows, may_be_gone={"gone", "rewritten"}) == (
+        "rewritten",
+        "strict",
+    )
+    assert changed_keys(expected, rows) == ("gone", "rewritten", "strict")
+
+
+def test_a_retry_lets_only_the_candidates_the_decision_removes_be_gone() -> None:
+    store = reconciling_store(ReconcileReads([], fail="none"))
+    rows = [candidate_row(key) for key in ("k", "old", "gone", "dup", "newer", "kept")]
+    conflicts = found_conflicts(store, rows)
+    # A late fact that deletes the memory under its own key, supersedes and
+    # deletes two candidates, and confirms another
+    decision = Decision(
+        new="superseded",
+        superseded_by="newer",
+        actions={
+            "k": Action.DELETE,
+            "old": Action.SUPERSEDE,
+            "gone": Action.DELETE,
+            "dup": Action.CONFIRM,
+        },
+    )
+    resolving = store._plan_resolve(conflicts, decision)
+    assert resolving.removed == {"old", "gone"}
+    nothing: list = [[], [], []]
+
+    # The first attempt is strict: every key it checks must still be live
+    with pytest.raises(ConflictsChanged) as first:
+        store._check_resolve(resolving, nothing, retry=False)
+    assert first.value.keys == ("k", "dup", "gone", "newer", "old")
+    # A retry lets the deleted and superseded candidates be gone, but not the
+    # memory under the new key, the confirmed one or the newer fact
+    with pytest.raises(ConflictsChanged) as again:
+        store._check_resolve(resolving, nothing, retry=True)
+    assert again.value.keys == ("k", "dup", "newer")
+    # Gone as the decision asked, the rest unchanged: the retry applies it
+    live = [{"key": key, "version": 1, "updated_at": T0} for key in ("k", "dup", "newer")]
+    assert store._check_resolve(resolving, [live, [], []], retry=True) is None
+    with pytest.raises(ConflictsChanged) as strict:
+        store._check_resolve(resolving, [live, [], []], retry=False)
+    assert strict.value.keys == ("gone", "old")
+    # A removed candidate that is live but was written since still counts
+    rewritten = [*live, {"key": "old", "version": 2, "updated_at": T0}]
+    with pytest.raises(ConflictsChanged) as written:
+        store._check_resolve(resolving, [rewritten, [], []], retry=True)
+    assert written.value.keys == ("old",)
+
+
+class GoneOnRetry(ReconcileReads):
+    """ReconcileReads whose token read leaves out ``gone`` from the second attempt on.
+
+    The first attempt deleted them and committed before its 40001, and a
+    store without history keeps no row of that.
+    """
+
+    def __init__(self, rows: list[dict[str, object]], *, gone: set[str], **kwargs: object) -> None:
+        super().__init__(rows, **kwargs)  # type: ignore[arg-type]
+        self.gone = gone
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        found = super().answer(sql)
+        if sql.startswith(TOKEN_READ) and len(self.attempts) > 1:
+            return [row for row in found if row["key"] not in self.gone]
+        return found
+
+
+def test_a_retried_resolve_finishes_the_deletes_a_lost_commit_made() -> None:
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="commit", tokens=TOKENS)
+    store = reconciling_store(reads, history=False)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    result = store.resolve(conflicts, decision)
+
+    # The retry finds the deleted memories gone, as the decision asked, and
+    # applies it again: deleting them again changes nothing
+    resolving = store._plan_resolve(conflicts, decision)
+    first, second = reads.attempts
+    assert first == second == [*resolving.reads, *resolving.writes]
+    # No row proves the earlier commit, so the result is not marked applied
+    assert result == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("dup", "old"),
+        confirmed=(),
+        kept=("k",),
+    )

@@ -1121,8 +1121,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         reconcile, a rebuilt result lists only what the rows prove: ``kept``
         is empty, and on a store without history so are ``superseded`` and
         ``deleted``. Such a store keeps no row of a decision that only
-        supersedes or deletes, so when the commit of such a resolve is lost,
-        its retry finds those memories gone and raises ConflictsChanged.
+        supersedes or deletes. When the commit of such a resolve is lost, its
+        retry finds those memories gone, as the decision asked. So on a retry
+        within the same call, a candidate the decision supersedes or deletes
+        counts as unchanged when it is gone. The retry applies the decision
+        again, which changes nothing there, and returns its result without
+        ``already_applied``, since no row proves the earlier commit.
 
         Without a ``valid_at`` given to find_conflicts, the new memory
         stores no valid time, so it is valid from its write, and the
@@ -1155,8 +1159,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             self._history_schema()
         else:
             self._require_columns(self._reconcile_columns(refresh=True))
+        # Attempts of this call so far. A retry may follow a commit that was lost
+        attempts = 0
 
         def attempt() -> ReconcileResult:
+            nonlocal attempts
+            attempts += 1
             cursors: list[Cursor[DictRow]] = []
             try:
                 with self._cursor(
@@ -1171,7 +1179,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     # so the transaction stays open
                     reads = self._send(conn, resolving.reads, cursors)
                     found = [statement_cursor.fetchall() for statement_cursor in reads]
-                    applied = self._check_resolve(resolving, found)
+                    applied = self._check_resolve(resolving, found, retry=attempts > 1)
                     if applied is not None:
                         return applied
                     writes = self._send(conn, resolving.writes, cursors)

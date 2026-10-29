@@ -1933,9 +1933,9 @@ def test_a_write_racing_a_resolve_is_seen_on_its_retry(
     check = store._check_resolve
     checks: list[int] = []
 
-    def check_then_race(resolving: Any, found: Any) -> Any:
+    def check_then_race(resolving: Any, found: Any, **kwargs: Any) -> Any:
         checks.append(len(checks))
-        result = check(resolving, found)
+        result = check(resolving, found, **kwargs)
         if len(checks) == 1:
             # Another store replaces the memory the decision supersedes
             other.put(NS, "old", in_slot(LONG_FLIGHTS))
@@ -1960,23 +1960,49 @@ def test_a_write_racing_a_resolve_is_seen_on_its_retry(
 
 
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
-def test_a_lost_commit_of_a_delete_without_history_reads_as_changed(
-    store_factory, admin, unsafe_internals, mode
+def test_a_resolve_that_only_deletes_finishes_after_a_lost_commit_without_history(
+    store_factory, admin, unsafe_internals, caplog, mode
 ) -> None:
-    # Without history a decision that only deletes leaves no row with its
-    # write id, so its retry cannot tell its own delete from another writer's
     fault = FailAfterCommit(unsafe_internals)
     store = store_factory(
         mode, index=seat_index(), connect_kwargs={"cursor_factory": fault.cursor_class()}
     )
+    store.put(NS, "taken", in_slot(PEANUTS))
     store.put(NS, "gone", in_slot(WINDOW))
+    store.put(NS, "also", in_slot(VEGETARIAN))
+    store.put(NS, "kept", text(LONG_FLIGHTS))
+    # The first attempt is strict: a memory another writer deleted after
+    # find_conflicts is a change, even one the decision deletes
+    early = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    store.delete(NS, "taken")
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(early, Decision(new="skip", actions={"taken": Action.DELETE}))
+    assert error.value.keys == ("taken",)
+
     conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    assert reasons(conflicts) == [("gone", "slot"), ("also", "slot"), ("kept", "similar")]
     fault.armed = True
 
-    with pytest.raises(ConflictsChanged) as error:
-        store.resolve(conflicts, Decision(new="skip", actions={"gone": Action.DELETE}))
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        result = store.resolve(
+            conflicts, Decision(new="skip", actions={"gone": Action.DELETE, "also": Action.DELETE})
+        )
 
-    assert fault.fired == 1 and error.value.keys == ("gone",)
-    # The delete committed once, and find_conflicts no longer finds the memory
-    assert store.get(NS, "gone") is None and vector_keys(admin, store) == []
-    assert reasons(store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")) == []
+    # Without history a decision that only deletes leaves no row with its
+    # write id. The retry finds the memories gone, as the decision asked,
+    # deletes them again, which changes nothing, and returns normally
+    assert fault.fired == 1
+    found = retries(caplog, "store resolve")
+    assert len(found) == 1 and "SQLSTATE 40003" in found[0]
+    # No row proves the earlier commit, so the result is not marked applied
+    assert result == ReconcileResult(
+        key=conflicts.proposal.key,
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("gone", "also"),
+        confirmed=(),
+        kept=("kept",),
+    )
+    assert store.get(NS, "gone") is None and store.get(NS, "also") is None
+    assert vector_keys(admin, store) == ["kept"]
