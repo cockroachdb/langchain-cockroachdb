@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import math
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -928,13 +927,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """
         prefix = _memory_prefix(namespace, "confirm")
         self._require_columns(self._reconcile_columns(refresh=True))
-
-        # Validate ttl before any I/O
-        if not isinstance(ttl, (NotProvided, type(None))) and not callable(ttl):
-            if not isinstance(ttl, (int, float)):
-                raise ValueError("ttl must be NOT_PROVIDED, None, a number, or a callable")
-            if not (math.isfinite(ttl) and ttl > 0):
-                raise ValueError("ttl must be a positive finite number of minutes")
+        self._validate_confirm_ttl(ttl)
 
         # Choose the write id before the first attempt
         write_id = str(uuid.uuid4())
@@ -962,16 +955,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                             # No live memory to confirm
                             return False
                         record = _row_to_record(tuple(namespace), rows[0])
-                        resolved_ttl = ttl(record)
-                        if resolved_ttl is not None:
-                            if not isinstance(resolved_ttl, (int, float)):
-                                raise ValueError(
-                                    "Callable ttl must return None or a number of minutes"
-                                )
-                            if not (math.isfinite(resolved_ttl) and resolved_ttl > 0):
-                                raise ValueError(
-                                    "Callable ttl must return a positive finite number of minutes"
-                                )
+                        resolved_ttl = self._resolve_confirm_ttl(ttl, record)
                     else:
                         resolved_ttl = ttl
 
@@ -988,15 +972,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     return True
 
                 # No rows updated. Check if the memory already has this write_id
-                # (retried after a lost commit). Only live memories count
+                # (retried after a lost commit)
                 check_cursor = conn.cursor(binary=True, row_factory=dict_row)
                 cursors.append(check_cursor)
-                check_cursor.execute(
-                    f"SELECT 1 FROM {self.sql.items} WHERE prefix = %s AND key = %s "
-                    "AND (expires_at IS NULL OR expires_at > now()) "
-                    "AND write_id = CAST(%s AS UUID)",
-                    [prefix, key_str, write_id],
-                )
+                check_cursor.execute(*self._confirm_write_id_check(prefix, key_str, write_id))
                 row = check_cursor.fetchone()
                 return bool(row)
             finally:

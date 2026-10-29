@@ -2402,3 +2402,71 @@ class BaseCockroachDBStore:
         if changed:
             raise ConflictsChanged(changed)
         return None
+
+    def _validate_confirm_ttl(
+        self, ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None]
+    ) -> None:
+        """Validate the ttl argument to confirm, before any I/O.
+
+        Raises:
+            ValueError: If ttl is not NOT_PROVIDED, None, a positive finite
+                number of minutes, or a callable.
+        """
+        if isinstance(ttl, (NotProvided, type(None))) or callable(ttl):
+            return
+        if not isinstance(ttl, (int, float)):
+            raise ValueError("ttl must be NOT_PROVIDED, None, a number, or a callable")
+        if not (math.isfinite(ttl) and ttl > 0):
+            raise ValueError("ttl must be a positive finite number of minutes")
+
+    def _resolve_confirm_ttl(
+        self,
+        ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None],
+        record: MemoryRecord,
+    ) -> float | None | NotProvided:
+        """Resolve a confirm ttl, calling it if callable and validating the result.
+
+        Args:
+            ttl: The ttl argument, which may be a callable.
+            record: The MemoryRecord to pass to the callable.
+
+        Returns:
+            The resolved ttl: NOT_PROVIDED, None, or a number of minutes.
+
+        Raises:
+            ValueError: If the callable returns a value that is not None or a
+                positive finite number of minutes.
+        """
+        if not callable(ttl):
+            return ttl
+        resolved = ttl(record)
+        if resolved is None:
+            return None
+        if not isinstance(resolved, (int, float)):
+            raise ValueError("Callable ttl must return None or a number of minutes")
+        if not (math.isfinite(resolved) and resolved > 0):
+            raise ValueError("Callable ttl must return a positive finite number of minutes")
+        return resolved
+
+    def _confirm_write_id_check(self, prefix: str, key: str, write_id: str) -> tuple[str, list]:
+        """Build the statement that checks if a memory has a write_id.
+
+        This is used on a retry after a lost commit when rowcount is 0. It
+        checks whether the memory already has this write_id, which means the
+        earlier attempt committed.
+
+        Args:
+            prefix: The memory's prefix.
+            key: The memory's key.
+            write_id: This confirm's write id.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement returns a row if the
+            live memory has this write_id, or no rows otherwise.
+        """
+        sql = (
+            f"SELECT 1 FROM {self.sql.items} WHERE prefix = %s AND key = %s "
+            "AND (expires_at IS NULL OR expires_at > now()) "
+            "AND write_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, key, write_id])
