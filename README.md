@@ -129,6 +129,7 @@ See the [Long-Term Memory guide](https://cockroachdb.github.io/langchain-cockroa
 - Semantic search on a C-SPANN vector index, with metadata filters
 - Expiry through CockroachDB row-level TTL, with no sweeper thread
 - `delete_namespace` deletes a user's memories in one transaction
+- Keeping memories true: `reconcile` settles a new memory against the ones it may conflict with in one serializable transaction, or `find_conflicts` and `resolve` let an LLM or a person decide, with opt-in version history, provenance, `confirm` and conditional writes
 
 ### Reliability and Retries
 - Retries transient CockroachDB errors (40001, 40003, 08xxx, 57P01, 58C00, 58C01, 53300) on every operation
@@ -181,6 +182,7 @@ See the [Long-Term Memory guide](https://cockroachdb.github.io/langchain-cockroa
 - [`chat_history.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/chat_history.py) - Persistent conversations
 - [`checkpointer.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/checkpointer.py) - LangGraph checkpointer
 - [`long_term_memory.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/long_term_memory.py) - LangGraph long-term memory store
+- [`memory_reconciliation.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/memory_reconciliation.py) - Keeping memories true: reconcile, history, confirm and conditional writes
 - [`multi_tenancy.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/multi_tenancy.py) - Namespace-based multi-tenancy
 - [`retry_configuration.py`](https://github.com/cockroachdb/langchain-cockroachdb/blob/main/examples/retry_configuration.py) - Configuration patterns
 
