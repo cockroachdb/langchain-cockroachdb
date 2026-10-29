@@ -1259,7 +1259,7 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             assert len(ttl_statements(cursor)) == 1
 
 
-def test_cache_columns_reads_whether_the_items_table_has_them() -> None:
+def test_cache_columns_reads_the_ready_row() -> None:
     store = make_base()
     assert store._columns_ready is None
     assert store._cache_columns([]) is False
@@ -1535,6 +1535,30 @@ async def test_a_denied_migrations_read_falls_back_to_the_columns_for_good(
     # True holds for good
     assert await check_columns(store, refresh=True) is True
     assert len(reads.calls) == 4
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_migrations_read_logs_the_fallback_once(make: str, caplog) -> None:
+    reads = DeniedSchemaReads(columns=True, history=False)
+    store = store_reading(make, reads)
+
+    with caplog.at_level("INFO"):
+        await check_columns(store)
+
+    # Exactly one INFO log about the fallback
+    info_logs = [rec for rec in caplog.records if rec.levelname == "INFO"]
+    assert len(info_logs) == 1
+    assert "has no SELECT on" in info_logs[0].message
+    assert "The schema check now reads the items table's columns" in info_logs[0].message
+    assert store.sql.migrations_table in info_logs[0].message
+
+    # Second check does not log again
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        await check_columns(store, refresh=True)
+
+    info_logs = [rec for rec in caplog.records if rec.levelname == "INFO"]
+    assert len(info_logs) == 0
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])

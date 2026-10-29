@@ -298,6 +298,16 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         even if its ``retry_on`` would refuse it; ``max_attempts=1`` turns this
         off.
 
+        An application role that did not run setup() needs SELECT, INSERT,
+        UPDATE and DELETE on the store's items and vectors tables, and on
+        the history table when history is on. Without SELECT on the migrations
+        table, the store finds migration 2 through the items table's columns
+        instead. On a multi-node cluster, one write can then fail in the
+        seconds after setup() applies migration 2. Running setup() before
+        rolling out 0.6.0, or granting SELECT on the migrations table, avoids
+        that. The first store call inside a transaction the caller opened gets
+        the permission error once. Only the SELECT grant avoids it.
+
         Raises:
             ValueError: If the vectors table exists with other dims, or its
                 index uses another distance. A different partition size, or

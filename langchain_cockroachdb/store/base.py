@@ -906,9 +906,11 @@ class BaseCockroachDBStore:
     _schema_lock: threading.Lock
     # Whether the store's role was denied the migrations table (SQLSTATE
     # 42501). From then on the schema check reads the items table's columns
-    # instead, for good: grants rarely change, and that read is always right
-    # for the role.
+    # instead, for good: grants rarely change, and that read is always
+    # allowed for the role.
     _migrations_denied: bool
+    # Whether the fallback to the column read has been logged, to log it once
+    _logged_column_fallback: bool
 
     def _configure(
         self,
@@ -934,6 +936,7 @@ class BaseCockroachDBStore:
         self._schema_read_at = 0.0
         self._schema_lock = threading.Lock()
         self._migrations_denied = False
+        self._logged_column_fallback = False
 
     def _trusted(self, ready: bool | None, *, refresh: bool) -> bool | None:
         """A cached schema answer, or None when the schema check must read it again.
@@ -1030,6 +1033,15 @@ class BaseCockroachDBStore:
         """
         if not read_migrations:
             return False
+        if not self._migrations_denied:
+            with self._warning_lock:
+                if not self._logged_column_fallback:
+                    self._log.info(
+                        "The store's role has no SELECT on %s. The schema check now reads the "
+                        "items table's columns.",
+                        self.sql.migrations_table,
+                    )
+                    self._logged_column_fallback = True
         self._migrations_denied = True
         return not _psycopg_conn.in_caller_transaction(error)
 
