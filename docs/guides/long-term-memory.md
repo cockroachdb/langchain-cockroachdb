@@ -132,7 +132,7 @@ Create an `AsyncCockroachDBStore` inside a running event loop. Its sync methods 
 
 ## Retries and Atomic Writes
 
-Every call retries transient CockroachDB errors under the store's `RetryPolicy`. Pass `retry_policy=` to change it; see [Retries and Resilience](resilience.md) for the fields. Every write is an UPSERT, a DELETE, an UPDATE that pushes back an expiry or confirms a memory, or an INSERT into history that skips versions already there. Each is safe to run twice, so a retry after an ambiguous result is safe.
+Every call retries transient CockroachDB errors under the store's `RetryPolicy`. Pass `retry_policy=` to change it; see [Retries and Resilience](resilience.md) for the fields. Every write is an UPSERT, a DELETE, an UPDATE that pushes back an expiry or confirms a memory, or an INSERT into history that skips versions already there. Each is safe to run twice, so a retry after an ambiguous result is safe. For the rare windows where a retry after a lost commit cannot tell its own earlier commit from another writer's work, see [Retries and Rebuilt Results](#retries-and-rebuilt-results) in the reconciliation section.
 
 A `batch()` call validates every op and serializes every value before any statement runs. It then runs its reads, one round trip each for its gets, its searches and its listings, and commits all its puts and deletes together in one transaction. Semantic searches under a namespace add a round trip before the searches, and sometimes one after them, as [How Searches Use the Index](#how-searches-use-the-index) explains. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
 
@@ -966,8 +966,10 @@ Every method here retries transient errors under the store's `RetryPolicy`, like
 
 - `kept` is empty, and on a store without history so are `superseded` and `deleted`, since such a store keeps no trace of what it removed.
 - A written memory that another writer replaced before the retry gives `new="written"` with `version=None`, when a history row proves the write: the version it overwrote, or a memory it superseded.
-- A write to a new key that superseded nothing, and that another writer replaced between the lost commit and the retry, leaves no trace, so the retry runs it again.
+- A write to a new key that superseded, deleted and confirmed nothing, and that another writer replaced between the lost commit and the retry, leaves no trace, so the retry runs it again. Otherwise the rebuilt result says `new="skipped"` with the keys it confirmed or deleted, although the memory was written and then replaced.
 - Without history, a decision that skipped the new memory or recorded it as superseded, and otherwise only deleted or superseded candidates, leaves no row either, and runs again after a lost commit.
+- A `confirm` call, or a confirm-only `reconcile` or `resolve`, whose commit was lost can count twice if another confirmation of the same memory lands before the retry.
+- A create-only `put_if(expected=None)` whose commit was lost can create the memory again if another writer deleted it before the retry.
 - On a store without history, calling `resolve` again after an error escaped it, as when its retries ran out, can raise `ConflictsChanged` for the keys its own earlier call removed. `find_conflicts` then shows the current state.
 
 ### Tools for an Agent

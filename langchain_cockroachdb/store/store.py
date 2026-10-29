@@ -923,8 +923,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Each call picks a confirmation id before its first attempt and stores
         it on the memory, so a retry after a commit whose result was lost
-        counts nothing again. The memory's write id stays as it is, so a write
-        retried after its own lost commit still finds it.
+        counts nothing again, unless another confirmation of the same memory
+        lands in between, in which case the retry counts again. The memory's
+        write id stays as it is, so a write retried after its own lost commit
+        still finds it.
 
         Args:
             namespace: The memory's namespace.

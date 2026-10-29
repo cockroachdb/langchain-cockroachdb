@@ -1117,7 +1117,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         pending afind_conflicts. Confirmations belong to the memory's value:
         a write that changes it starts them again from none. Each call picks
         a confirmation id of its own, so a retry after a lost commit counts
-        nothing again, and the memory's write id stays as it is.
+        nothing again, unless another confirmation of the same memory lands in
+        between, in which case the retry counts again. The memory's write id
+        stays as it is.
 
         Args:
             namespace: The memory's namespace.
