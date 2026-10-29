@@ -62,6 +62,7 @@ from langchain_cockroachdb.store.config import (
 from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.reconcile import (
     Conflicts,
+    Decision,
     MemoryRecord,
     MemoryVersion,
     Policy,
@@ -426,6 +427,25 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             pipeline=pipeline, transaction=transaction, timeout=timeout, label=label
         ) as cur:
             yield cur
+
+    @staticmethod
+    def _send(
+        conn: Connection[DictRow],
+        statements: Sequence[tuple[str, list]],
+        cursors: list[Cursor[DictRow]],
+    ) -> list[Cursor[DictRow]]:
+        """Execute each statement on a cursor of its own, without fetching, and return the cursors.
+
+        They are added to ``cursors`` as well, for the caller to close. In a
+        pipeline, statements sent together take one round trip, and fetching
+        their rows flushes without a sync, so an open transaction stays open.
+        """
+        sent = []
+        for statement in statements:
+            sent.append(conn.cursor(binary=True, row_factory=dict_row))
+            cursors.append(sent[-1])
+            sent[-1].execute(*statement)
+        return sent
 
     def _read_all(
         self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
@@ -1017,19 +1037,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                 ) as cur:
                     conn = cur.connection
 
-                    def send(statements: Sequence[tuple[str, list]]) -> list[Cursor[DictRow]]:
-                        sent = []
-                        for statement in statements:
-                            sent.append(conn.cursor(binary=True, row_factory=dict_row))
-                            cursors.append(sent[-1])
-                            sent[-1].execute(*statement)
-                        return sent
-
                     def fetch(statements: Sequence[tuple[str, list]]) -> list[list[DictRow]]:
                         # In a pipeline the fetch flushes without a sync, so the
                         # transaction stays open
                         return [
-                            statement_cursor.fetchall() for statement_cursor in send(statements)
+                            statement_cursor.fetchall()
+                            for statement_cursor in self._send(conn, statements, cursors)
                         ]
 
                     # A retry first looks for the rows its write id is on, in
@@ -1055,15 +1068,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                         proposal, candidates, self._decide(policy, proposal, candidates)
                     )
                     named.update(self._decision_keys(plan, decision))
-                    writes = send(
-                        self._decision_statements(
-                            plan,
-                            candidates,
-                            decision,
-                            vector_rows=vector_rows,
-                            valid_at=proposal.valid_at,
-                        )
+                    statements = self._decision_statements(
+                        plan,
+                        candidates,
+                        decision,
+                        vector_rows=vector_rows,
+                        valid_at=proposal.valid_at,
                     )
+                    writes = self._send(conn, statements, cursors)
                 # Committed. Only the item upsert returns rows: the version written
                 returned = [
                     statement_cursor.fetchall()
@@ -1076,6 +1088,107 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     statement_cursor.close()
 
         return self._retry(attempt, label="store reconcile")
+
+    def resolve(self, conflicts: Conflicts, decision: Decision) -> ReconcileResult:
+        """Apply a decision about what find_conflicts found, in one transaction.
+
+        This is the second step of the two-step flow: find_conflicts reads
+        the candidates, an LLM or a person decides while no transaction is
+        open, and resolve applies the decision as reconcile applies a
+        policy's. It writes the new memory that find_conflicts planned, with
+        its provenance, valid time and write id, and the vectors it embedded
+        then, so nothing is embedded again.
+
+        In the same transaction, before it writes, resolve checks that
+        nothing the decision depends on has changed. The memory under the
+        new memory's key, and every candidate the decision supersedes,
+        deletes or confirms, or names as superseding the new memory, must
+        still have the version and updated_at that find_conflicts read. A
+        memory written since counts as changed, also when a 0.5.x store
+        wrote it, which sets updated_at without bumping the version. So does
+        one deleted or expired since, and a live memory under the new key
+        where find_conflicts found none. resolve then raises ConflictsChanged
+        with those keys, writes nothing and does not retry: run
+        find_conflicts again and decide again. Candidates the decision keeps
+        are not checked, and confirming a memory changes neither its version
+        nor updated_at, so a confirmation in between never counts.
+
+        The write id comes from find_conflicts. If a resolve of the same
+        Conflicts already committed, as when an error left its outcome
+        unknown and the caller calls again, resolve writes nothing and
+        returns that write's result rebuilt from its rows, with
+        ``already_applied`` set, whatever decision this call passes. As with
+        reconcile, a rebuilt result lists only what the rows prove: ``kept``
+        is empty, and on a store without history so are ``superseded`` and
+        ``deleted``. Such a store keeps no row of a decision that only
+        supersedes or deletes, so when the commit of such a resolve is lost,
+        its retry finds those memories gone and raises ConflictsChanged.
+
+        Without a ``valid_at`` given to find_conflicts, the new memory
+        stores no valid time, so it is valid from its write, and the
+        versions the decision ends end at that write. A Conflicts and a
+        Decision can wait in a LangGraph checkpoint while a person decides:
+        resolve takes them as the checkpoint gives them back.
+
+        Args:
+            conflicts: What find_conflicts returned, on a store with the same
+                table and index.
+            decision: What to do with the new memory and each candidate.
+
+        Returns:
+            What happened, as reconcile reports it.
+
+        Raises:
+            ConflictsChanged: If a memory the decision depends on changed
+                since find_conflicts. The attempt that found it wrote nothing.
+            ValueError: Before any I/O, if ``conflicts`` is not what
+                find_conflicts returned, as when it was built by hand or
+                changed since, or a store with another table or index made
+                it, or if ``decision`` is not a valid Decision for its
+                proposal and candidates. After a schema read, if setup() has
+                not added the columns this method needs or, on a store with
+                history, created the history table.
+        """
+        resolving = self._plan_resolve(conflicts, decision)
+        # As in reconcile: with history, the write also needs the history table
+        if self._history is not None:
+            self._history_schema()
+        else:
+            self._require_columns(self._reconcile_columns(refresh=True))
+
+        def attempt() -> ReconcileResult:
+            cursors: list[Cursor[DictRow]] = []
+            try:
+                with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store resolve",
+                ) as cur:
+                    conn = cur.connection
+                    # The check and the reads of an earlier commit go out as one
+                    # round trip. In a pipeline the fetch flushes without a sync,
+                    # so the transaction stays open
+                    reads = self._send(conn, resolving.reads, cursors)
+                    found = [statement_cursor.fetchall() for statement_cursor in reads]
+                    applied = self._check_resolve(resolving, found)
+                    if applied is not None:
+                        return applied
+                    writes = self._send(conn, resolving.writes, cursors)
+                # Committed. Only the item upsert returns rows: the version written
+                returned = [
+                    statement_cursor.fetchall()
+                    for statement_cursor in writes
+                    if statement_cursor.description is not None
+                ]
+                return self._reconcile_result(
+                    resolving.plan, resolving.candidates, resolving.decision, returned
+                )
+            finally:
+                for statement_cursor in cursors:
+                    statement_cursor.close()
+
+        return self._retry(attempt, label="store resolve")
 
     def sweep_ttl(self) -> int:
         """Delete expired items now, without waiting for CockroachDB's TTL job.

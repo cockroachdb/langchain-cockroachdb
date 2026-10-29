@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -36,6 +37,7 @@ from langchain_cockroachdb.store.base import (
     SchemaCheck,
     StoreIdentity,
     _group_ops,
+    changed_keys,
     default_valid_at,
     merge_candidates,
     needs_exact_candidates,
@@ -45,6 +47,8 @@ from langchain_cockroachdb.store.config import resolve_history_config, resolve_i
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
+    Conflicts,
+    ConflictsChanged,
     Decision,
     Proposal,
     ReconcileResult,
@@ -3429,16 +3433,18 @@ def test_reconcile_checks_everything_before_any_io() -> None:
 
 
 APPLIED_READS = ("SELECT key, version, updated_at, confirmed_at FROM", "SELECT key, reason FROM")
+TOKEN_READ = "SELECT key, version, updated_at FROM"
 
 
 class ReconcileReads:
-    """Stands in for a store's _cursor in reconcile, and answers its statements.
+    """Stands in for a store's _cursor in reconcile and resolve, and answers their statements.
 
     Every attempt logs its statements. The candidate read returns ``rows``,
-    the already-applied reads ``applied`` (the items, then the history), and
-    the item upsert version 2. ``fail`` makes the first attempt fail with a
-    retryable 40001: "read" at its first fetch, before any decision, and
-    "commit" as its block ends, after its writes went out.
+    the already-applied reads ``applied`` (the items, then the history), the
+    token read ``tokens``, and the item upsert version 2. ``fail`` makes the
+    first attempt fail with a retryable 40001: "read" at its first fetch,
+    before any decision, and "commit" as its block ends, after its writes
+    went out.
     """
 
     def __init__(
@@ -3447,10 +3453,12 @@ class ReconcileReads:
         *,
         fail: str,
         applied: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], []),
+        tokens: list[dict[str, object]] | None = None,
     ) -> None:
         self.rows = rows
         self.fail = fail
         self.applied = applied
+        self.tokens = tokens or []
         self.attempts: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -3469,6 +3477,8 @@ class ReconcileReads:
             return self.applied[0]
         if sql.startswith(APPLIED_READS[1]):
             return self.applied[1]
+        if sql.startswith(TOKEN_READ):
+            return self.tokens
         if sql.startswith("SELECT key, value, created_at"):
             return self.rows
         # The item upsert, the only write that returns rows
@@ -3693,3 +3703,296 @@ def test_the_policy_mark_belongs_to_one_thread_and_one_policy_run() -> None:
     with pytest.raises(LookupError, match="the judge failed"):
         store._decide(failing, make_proposal(), [])
     store._refuse_inside_policy()
+
+
+# resolve: the change check, the checks before any I/O, and the attempt
+
+
+def test_changed_keys_compares_version_and_updated_at_of_live_rows() -> None:
+    later = T0 + timedelta(seconds=1)
+    expected: dict = {
+        "same": (2, T0),
+        "bumped": (2, T0),
+        "touched": (2, T0),
+        "gone": (2, T0),
+        "listed": [2, T0],
+    }
+    rows = [
+        {"key": "same", "version": 2, "updated_at": T0},
+        # A write bumps the version
+        {"key": "bumped", "version": 3, "updated_at": later},
+        # A 0.5.x writer sets updated_at and leaves the version alone
+        {"key": "touched", "version": 2, "updated_at": later},
+        {"key": "listed", "version": 2, "updated_at": T0},
+        # A key nobody expects is never checked
+        {"key": "other", "version": 9, "updated_at": later},
+    ]
+    # In the order of expected. A token read back as a list is the tuple it was
+    assert changed_keys(expected, rows) == ("bumped", "touched", "gone")
+    # A live memory where none was expected changed too; no memory still is none
+    live = [{"key": "k", "version": 1, "updated_at": T0}]
+    assert changed_keys({"k": None}, live) == ("k",)
+    assert changed_keys({"k": None}, []) == ()
+    # The same instant in another zone, as a checkpoint may give it back, is no change
+    shifted = T0.astimezone(timezone(timedelta(hours=-5)))
+    assert changed_keys({"same": (2, shifted)}, rows) == ()
+
+
+def found_conflicts(
+    store: BaseCockroachDBStore, rows: list[dict[str, object]], **kwargs: object
+) -> Conflicts:
+    """What find_conflicts returns on ``store``, a store without an index, when its read finds ``rows``.
+
+    The new memory is {"seat": "x", "text": "aisle"} under NS and key "k", in slot "seat".
+    """
+    plan = plan_proposal(store, {"seat": "x", "text": "aisle"}, slot="seat", **kwargs)
+    read = store._key_slot_read(plan, [[{"now": NOW}], rows])
+    return store._conflicts(plan, [], read, store._similar_read(plan, [], read), [])
+
+
+def test_resolve_checks_the_conflicts_and_the_decision_before_any_io() -> None:
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=1,
+        similar=[candidate_row("a", score=0.95)],
+    )
+    finder, embeddings = finding_store(reads)
+    conflicts = finder.find_conflicts(NS, "k", {"seat": "x", "text": "aisle"}, slot="seat")
+    embedded = embeddings.calls
+    model = CountingEmbeddings()
+    index = {"dims": 3, "embed": model, "fields": ["text"]}
+
+    def resolver(**settings: object) -> CockroachDBStore:
+        # A connection the store must never touch: using it would raise TypeError
+        return CockroachDBStore(object(), retry_policy=FAST, **settings)  # type: ignore[arg-type]
+
+    store = resolver(index=index)
+    decision = Decision(actions={"s": Action.SUPERSEDE})
+    # A Conflicts built by hand has none of what find_conflicts planned for the write
+    by_hand = Conflicts(
+        proposal=conflicts.proposal,
+        candidates=conflicts.candidates,
+        target_version=3,
+        target_updated_at=T0,
+    )
+    for given in (by_hand, object()):
+        with pytest.raises(ValueError, match="the Conflicts that find_conflicts returned"):
+            store.resolve(given, decision)  # type: ignore[arg-type]
+    # Another table, schema, dims, distance or fields, or no index, is another store
+    for settings in (
+        {"index": index, "table_name": "other"},
+        {"index": index, "schema": "app"},
+        {"index": {**index, "dims": 4}},
+        {"index": {**index, "distance_type": "l2"}},
+        {"index": {**index, "fields": ["text", "note"]}},
+        {},
+    ):
+        with pytest.raises(ValueError, match="another store"):
+            resolver(**settings).resolve(conflicts, decision)
+    # A Conflicts whose proposal or candidates were changed after find_conflicts
+    renamed = dataclasses.replace(conflicts.proposal, key="other")
+    for changed in (
+        dataclasses.replace(conflicts, candidates=conflicts.candidates[1:]),
+        dataclasses.replace(conflicts, proposal=renamed),
+    ):
+        with pytest.raises(ValueError, match="changed after find_conflicts"):
+            store.resolve(changed, decision)
+    # Decisions that are not valid for this Conflicts
+    for bad, match in (
+        (None, "resolve needs a Decision, got NoneType"),
+        (Decision(actions={"missing": Action.DELETE}), "unknown candidate key: missing"),
+        (Decision(actions={"k": Action.SUPERSEDE}), "cannot give the target key"),
+        (Decision(new="superseded"), "superseded_by"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            store.resolve(conflicts, bad)  # type: ignore[arg-type]
+
+    # Without migration 2 the schema check refuses, before any attempt
+    def no_columns(*, refresh: bool = False) -> bool:
+        assert refresh, "a method that needs migration 2 reads the schema again"
+        return False
+
+    store._reconcile_columns = no_columns  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.resolve(conflicts, decision)
+    # A store with history refuses until setup() has created the history table
+    keeping = resolver(index=index, history=True)
+    schema = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return schema.answer(statements, label)
+
+    keeping._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        keeping.resolve(conflicts, decision)
+    # Nothing was embedded again
+    assert (embeddings.calls, model.calls) == (embedded, 0)
+
+
+def test_plan_resolve_checks_the_target_and_every_key_the_decision_names() -> None:
+    store = reconciling_store(ReconcileReads([], fail="none"))
+    keys = ["k", "old", "gone", "dup", "kept", "newer"]
+    rows = [candidate_row(key, version=2) for key in keys]
+    conflicts = found_conflicts(store, rows)
+    state = conflicts._state
+    plan, token = state.plan, (2, T0)
+    decision = Decision(
+        actions={
+            "old": Action.SUPERSEDE,
+            "gone": Action.DELETE,
+            "dup": Action.CONFIRM,
+            "kept": Action.KEEP,
+        }
+    )
+
+    resolving = store._plan_resolve(conflicts, decision)
+
+    # The new key, then the candidates the decision acts on, in candidate
+    # order. A kept candidate is not checked
+    assert [c.key for c in conflicts.candidates] == ["k", "dup", "gone", "kept", "newer", "old"]
+    assert resolving.expected == {"k": token, "dup": token, "gone": token, "old": token}
+    assert list(resolving.expected) == ["k", "dup", "gone", "old"]
+    # One round trip reads their live tokens, and the rows that carry the
+    # write id under the new key and every candidate's key, whatever this
+    # decision names: an earlier resolve of the same Conflicts may have
+    # decided otherwise
+    named = sorted(keys)
+    assert resolving.reads == [
+        store.sql.tokens("user.alice", ["dup", "gone", "k", "old"]),
+        store.sql.applied_items("user.alice", named, write_id=plan.write_id),
+        store.sql.applied_history("user.alice", named, write_id=plan.write_id),
+    ]
+    # The writes are reconcile's, with the stored vectors and the valid time
+    # the decision was made against
+    assert resolving.writes == store._decision_statements(
+        plan,
+        conflicts.candidates,
+        decision,
+        vector_rows=state.vector_rows,
+        valid_at=conflicts.proposal.valid_at,
+    )
+    assert (resolving.plan, resolving.candidates, resolving.decision) == (
+        plan,
+        conflicts.candidates,
+        decision,
+    )
+    # The candidate that supersedes a late fact is checked even when kept
+    late = Decision(new="superseded", superseded_by="newer")
+    assert list(store._plan_resolve(conflicts, late).expected) == ["k", "newer"]
+    # A key that had no live memory must still have none
+    absent = found_conflicts(store, rows[1:])
+    assert store._plan_resolve(absent, Decision(actions={"old": Action.DELETE})).expected == {
+        "k": None,
+        "old": token,
+    }
+
+
+# The live tokens of the candidates of resolving_store, unchanged
+TOKENS = [{"key": key, "version": 1, "updated_at": T0} for key in ("k", "old", "dup")]
+DECIDED = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+WRITTEN = ReconcileResult(
+    key="k",
+    new="written",
+    version=2,
+    superseded=("old",),
+    deleted=(),
+    confirmed=("dup",),
+    kept=(),
+)
+
+
+class LateApplied(ReconcileReads):
+    """ReconcileReads whose already-applied reads find ``applied`` from the second attempt on.
+
+    The first attempt committed before its 40001: its retry finds its rows.
+    """
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if sql.startswith(APPLIED_READS) and len(self.attempts) == 1:
+            return []
+        return super().answer(sql)
+
+
+def resolving_store(
+    reads_class: type[ReconcileReads] = ReconcileReads, **reads: object
+) -> tuple[CockroachDBStore, ReconcileReads, Conflicts]:
+    """A store with history whose resolve attempts go to a ReconcileReads, and its Conflicts.
+
+    The Conflicts has the target "k" and the slot matches "old" and "dup".
+    """
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    calls = reads_class(rows, **reads)  # type: ignore[arg-type]
+    store = reconciling_store(calls)
+    return store, calls, found_conflicts(store, rows)
+
+
+def test_resolve_checks_then_writes_in_one_attempt() -> None:
+    store, reads, conflicts = resolving_store(fail="none", tokens=TOKENS)
+
+    result = store.resolve(conflicts, DECIDED)
+
+    # The check goes out first, as one round trip, then the decision's statements
+    resolving = store._plan_resolve(conflicts, DECIDED)
+    assert reads.attempts == [[*resolving.reads, *resolving.writes]]
+    assert result == WRITTEN
+
+
+def test_resolve_raises_conflicts_changed_and_writes_nothing() -> None:
+    # "old" was written since find_conflicts, and "dup" is gone
+    tokens = [TOKENS[0], {"key": "old", "version": 2, "updated_at": T0 + timedelta(seconds=1)}]
+    store, reads, conflicts = resolving_store(fail="none", tokens=tokens)
+
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, DECIDED)
+
+    assert error.value.keys == ("dup", "old")
+    # One attempt, which sent only the check: it is not retried
+    assert reads.attempts == [store._plan_resolve(conflicts, DECIDED).reads]
+
+
+def test_resolving_the_same_conflicts_again_returns_the_first_result() -> None:
+    # Rows under the new key carry the Conflicts' write id: an earlier
+    # resolve committed. The tokens changed with it, which is no conflict
+    applied = (
+        [{"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}],
+        [{"key": "old", "reason": "superseded"}],
+    )
+    store, reads, conflicts = resolving_store(fail="none", applied=applied, tokens=[])
+    other = Decision(actions={"dup": Action.DELETE})
+
+    # Even with another decision, the first one's result comes back
+    result = store.resolve(conflicts, other)
+
+    assert result == dataclasses.replace(WRITTEN, confirmed=(), already_applied=True)
+    assert reads.attempts == [store._plan_resolve(conflicts, other).reads]
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+def test_a_retried_resolve_looks_for_its_write_id_again(committed: bool) -> None:
+    # The first attempt fails with a 40001 as its block ends, after its writes went out
+    applied = (
+        [{"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}],
+        [{"key": "old", "reason": "superseded"}],
+    )
+    store, reads, conflicts = resolving_store(
+        LateApplied if committed else ReconcileReads,
+        fail="commit",
+        applied=applied if committed else ([], []),
+        tokens=TOKENS,
+    )
+
+    result = store.resolve(conflicts, DECIDED)
+
+    resolving = store._plan_resolve(conflicts, DECIDED)
+    first, second = reads.attempts
+    assert first == [*resolving.reads, *resolving.writes]
+    if committed:
+        # Its rows prove the first attempt committed: nothing more is sent
+        assert second == resolving.reads
+        assert result == dataclasses.replace(WRITTEN, confirmed=(), already_applied=True)
+    else:
+        # Nothing carries the write id, the check passes again, and the retry writes again
+        assert second == first
+        assert result == WRITTEN

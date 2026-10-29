@@ -1613,6 +1613,27 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         )
         return (sql, [prefix, list(keys), write_id])
 
+    def tokens(self, prefix: str, keys: Sequence[str]) -> tuple[str, list]:
+        """Build the read of the version and updated_at of the live items under ``keys``.
+
+        resolve() compares them with what find_conflicts read, to tell
+        whether a memory changed in between (base.changed_keys). A put
+        bumps the version, and a 0.5.x store, which does not, still sets
+        updated_at, so both are read. An expired item is not read: it counts
+        as gone. The keys are looked up by primary key, and the read pushes
+        back no expiry.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key``, ``version`` and
+            ``updated_at``.
+        """
+        sql = (
+            f"SELECT key, version, updated_at FROM {self.items}\n"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+            "    AND (expires_at IS NULL OR expires_at > now())"
+        )
+        return (sql, [prefix, list(keys)])
+
     def history_versions(self, prefix: str, key: str, *, limit: int) -> tuple[str, list]:
         """Build the SELECT for the versions of one key in history, newest first.
 

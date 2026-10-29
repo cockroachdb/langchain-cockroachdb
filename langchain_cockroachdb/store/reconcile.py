@@ -93,12 +93,27 @@ class Decision:
     Attributes:
         new: What to do with the new memory (write, skip, or superseded).
         superseded_by: Key that superseded the proposal, or None.
-        actions: Mapping from candidate key to action (missing means KEEP).
+        actions: Mapping from candidate key to an Action, or its value such
+            as "delete" (missing means KEEP).
     """
 
     new: Literal["write", "skip", "superseded"] = "write"
     superseded_by: str | None = None
     actions: Mapping[str, Action] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # A decision from an LLM judge or a person may say anything. One it
+        # cannot mean fails here, before any validation or write
+        if self.new not in ("write", "skip", "superseded"):
+            raise ValueError(
+                f"Decision new must be 'write', 'skip' or 'superseded', got {self.new!r}"
+            )
+        # Keep a copy whose values are Actions, also when they are given as
+        # their values, as in an LLM judge's JSON or from a checkpoint
+        # serializer that does not allow Action. Anything else raises ValueError
+        object.__setattr__(
+            self, "actions", {key: Action(action) for key, action in self.actions.items()}
+        )
 
     def action(self, key: str) -> Action:
         """Return the action for a candidate key (KEEP if not specified)."""
@@ -153,6 +168,11 @@ class ReconcileResult:
     kept: tuple[str, ...]
     already_applied: bool = False
 
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        for name in ("superseded", "deleted", "confirmed", "kept"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
 
 @dataclass(frozen=True)
 class MemoryVersion:
@@ -183,6 +203,10 @@ class MemoryVersion:
     ended_at: datetime
     reason: Literal["overwritten", "superseded", "deleted"]
     superseded_by: str | None
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        object.__setattr__(self, "namespace", tuple(self.namespace))
 
 
 @dataclass(frozen=True)
@@ -240,10 +264,15 @@ class Conflicts:
 
 
 class ConflictsChanged(Exception):
-    """Raised when candidates changed between find_conflicts and resolve.
+    """Raised by resolve() when what a decision depends on changed after find_conflicts.
+
+    The transaction that found the change wrote nothing. Run find_conflicts
+    again and decide again.
 
     Attributes:
-        keys: Tuple of keys that changed.
+        keys: The keys whose memory was written, deleted or expired since,
+            or that have a live memory where find_conflicts found none: the
+            new memory's key first, then the candidates in their order.
     """
 
     def __init__(self, keys: tuple[str, ...]) -> None:

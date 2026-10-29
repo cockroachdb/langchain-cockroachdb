@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
-from langgraph.store.base import SearchItem
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.store.base import Item, SearchItem
 
 from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
     Conflicts,
     Decision,
+    MemoryRecord,
+    MemoryVersion,
     Proposal,
+    ReconcileResult,
     first_of,
     keep_all,
     skip_duplicates,
@@ -321,3 +326,172 @@ def test_the_reconcile_types_resolve_their_type_hints() -> None:
     ):
         assert typing.get_type_hints(kind)
     assert "_state" in typing.get_type_hints(Conflicts)
+
+
+# A LangGraph checkpoint keeps a Conflicts and a Decision while a person
+# decides, and the results and records an agent keeps in its state
+
+# Aware, with an offset other than UTC's and microseconds
+AWARE = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone(timedelta(hours=2)))
+
+
+def checkpoint_round_trip(value: object) -> object:
+    """``value`` as a LangGraph checkpoint gives it back."""
+    serde = JsonPlusSerializer()
+    return serde.loads_typed(serde.dumps_typed(value))
+
+
+def assert_same_types(before: object, after: object) -> None:
+    """Assert that ``after`` has the types of ``before`` all the way down.
+
+    Tuples stay tuples, enums stay enums, and aware datetimes keep their offset.
+    """
+    assert type(after) is type(before), (before, after)
+    if dataclasses.is_dataclass(before):
+        for f in dataclasses.fields(before):
+            assert_same_types(getattr(before, f.name), getattr(after, f.name))
+    elif isinstance(before, Item):
+        names = ["namespace", "key", "value", "created_at", "updated_at"]
+        for name in [*names, "score"] if isinstance(before, SearchItem) else names:
+            assert_same_types(getattr(before, name), getattr(after, name))
+    elif isinstance(before, (tuple, list)):
+        assert isinstance(after, (tuple, list))
+        for one, other in zip(before, after, strict=True):
+            assert_same_types(one, other)
+    elif isinstance(before, dict):
+        assert isinstance(after, dict) and list(after) == list(before)
+        for key, one in before.items():
+            assert_same_types(one, after[key])
+    elif isinstance(before, datetime):
+        assert isinstance(after, datetime)
+        assert after.utcoffset() == before.utcoffset() is not None
+
+
+ROUND_TRIPS = {
+    "proposal": Proposal(
+        namespace=("user", "123"),
+        key="k",
+        value={"text": "aisle", "tags": ["a", "b"]},
+        slot="seat",
+        slot_value="x",
+        provenance={"source": "chat", "confidence": 0.9},
+        valid_at=AWARE,
+    ),
+    "candidate": Candidate(
+        item=SearchItem(
+            namespace=("user", "123"),
+            key="old",
+            value={"text": "window"},
+            created_at=AWARE,
+            updated_at=AWARE,
+            score=0.85,
+        ),
+        reason="similar",
+        version=3,
+        valid_at=AWARE,
+        provenance={"source": "import"},
+        confirmed_at=AWARE,
+        confirmations=2,
+    ),
+    "candidate without a score": candidate("s", reason="slot", valid_at=AWARE),
+    "decision": Decision(
+        new="superseded",
+        superseded_by="newer",
+        actions={
+            "newer": Action.CONFIRM,
+            "old": Action.SUPERSEDE,
+            "gone": Action.DELETE,
+            "kept": Action.KEEP,
+        },
+    ),
+    "default decision": Decision(),
+    "result": ReconcileResult(
+        key="k",
+        new="written",
+        version=4,
+        superseded=("old",),
+        deleted=("gone", "lost"),
+        confirmed=(),
+        kept=("kept",),
+        already_applied=True,
+    ),
+    "version": MemoryVersion(
+        namespace=("user", "123"),
+        key="k",
+        version=2,
+        value={"text": "window"},
+        provenance={"source": "chat"},
+        valid_at=AWARE,
+        invalid_at=AWARE + timedelta(days=1),
+        written_at=AWARE,
+        ended_at=AWARE + timedelta(days=2),
+        reason="superseded",
+        superseded_by="new",
+    ),
+    "open version": MemoryVersion(
+        namespace=("user", "123"),
+        key="k",
+        version=1,
+        value={"text": "window"},
+        provenance=None,
+        valid_at=AWARE,
+        invalid_at=None,
+        written_at=AWARE,
+        ended_at=AWARE,
+        reason="deleted",
+        superseded_by=None,
+    ),
+    "record": MemoryRecord(
+        item=Item(
+            namespace=("user", "123"),
+            key="k",
+            value={"text": "window"},
+            created_at=AWARE,
+            updated_at=AWARE,
+        ),
+        version=2,
+        provenance={"source": "chat"},
+        valid_at=AWARE,
+        confirmed_at=None,
+        confirmations=0,
+    ),
+}
+
+
+@pytest.mark.parametrize("value", list(ROUND_TRIPS.values()), ids=list(ROUND_TRIPS))
+def test_every_reconcile_type_survives_a_checkpoint_round_trip(value: object) -> None:
+    back = checkpoint_round_trip(value)
+
+    assert back == value
+    assert_same_types(value, back)
+
+
+def test_a_decision_from_a_checkpoint_is_still_valid() -> None:
+    proposal = make_proposal("k", valid_at=T1)
+    found = [candidate("k", reason="key"), candidate("old", reason="slot"), candidate("dup")]
+    decision = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+
+    back = checkpoint_round_trip(decision)
+
+    assert isinstance(back, Decision)
+    validate_decision(proposal, found, back)
+    assert back.action("old") is Action.SUPERSEDE and back.action("k") is Action.KEEP
+
+
+def test_a_decision_keeps_its_actions_as_actions() -> None:
+    # An LLM judge's JSON, or a checkpoint whose serializer does not know
+    # Action, gives the actions as their values
+    given = {"old": "supersede", "dup": Action.CONFIRM}
+    decision = Decision(actions=given)
+
+    assert decision.actions == {"old": Action.SUPERSEDE, "dup": Action.CONFIRM}
+    assert all(type(action) is Action for action in decision.actions.values())
+    # The decision keeps its own copy
+    given["old"] = "delete"
+    assert decision.action("old") is Action.SUPERSEDE
+    # An action that is not one of Action's fails at once, and so does a new
+    # memory's fate that is not one of the three
+    with pytest.raises(ValueError, match="remove"):
+        Decision(actions={"old": "remove"})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="'write', 'skip' or 'superseded', got 'writ'"):
+        Decision(new="writ")  # type: ignore[arg-type]

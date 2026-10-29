@@ -12,10 +12,16 @@ transaction: it reads them, runs the policy, and supersedes, deletes,
 confirms or keeps each one, keeping what it ends in history on a store with
 history. A retry after a commit whose result was lost finds its own write
 and returns the result rebuilt from the rows.
+
+resolve applies a decision about what find_conflicts found, in one
+transaction, once it has checked that the target and every candidate the
+decision names still have the version and updated_at find_conflicts read.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import math
 import threading
@@ -26,6 +32,7 @@ from typing import Any
 
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.base import PutOp
 from psycopg import Connection
 
@@ -34,6 +41,7 @@ from langchain_cockroachdb._sql import parse_vector
 from langchain_cockroachdb.store import (
     Action,
     Conflicts,
+    ConflictsChanged,
     Decision,
     MemoryRecord,
     Policy,
@@ -1536,3 +1544,439 @@ def test_a_policy_that_calls_the_store_fails_at_once(store_factory, admin, mode)
     # The transaction was rolled back and the connection given back
     item = store.get(NS, "w")
     assert item is not None and item.value == in_slot(WINDOW)
+
+
+# resolve
+
+
+def test_resolve_applies_a_decision(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", text(PEANUTS))
+    store.put(NS, "old", in_slot(WINDOW))
+    store.put(NS, "gone", in_slot(VEGETARIAN))
+    store.put(NS, "dup", text(LONG_FLIGHTS))
+    store.put(NS, "food", text(VEGETARIAN))
+    conflicts = store.find_conflicts(
+        NS, "k", in_slot(AISLE), slot="seat", provenance={"source": "chat"}
+    )
+    assert reasons(conflicts) == [
+        ("k", "key"),
+        ("old", "slot"),
+        ("gone", "slot"),
+        ("dup", "similar"),
+    ]
+    decision = Decision(
+        actions={"old": Action.SUPERSEDE, "gone": Action.DELETE, "dup": Action.CONFIRM}
+    )
+
+    result = store.resolve(conflicts, decision)
+
+    assert result == ReconcileResult(
+        key="k",
+        new="written",
+        version=2,
+        superseded=("old",),
+        deleted=("gone",),
+        confirmed=("dup",),
+        kept=(),
+    )
+    # The new memory replaced the target, which went to history, with the
+    # provenance and the write id that find_conflicts planned
+    record = store.record(NS, "k")
+    assert record is not None
+    assert (record.version, record.item.value, record.provenance) == (
+        2,
+        in_slot(AISLE),
+        {"source": "chat"},
+    )
+    assert conflicts._state is not None
+    row = admin.execute(
+        f"SELECT write_id FROM {store.sql.items} WHERE prefix = %s AND key = 'k'", (PREFIX,)
+    ).fetchone()
+    assert row is not None and str(row["write_id"]) == conflicts._state.plan.write_id
+    assert [(v.version, v.reason, v.value) for v in store.history(NS, "k")] == [
+        (1, "overwritten", text(PEANUTS))
+    ]
+    [old] = store.history(NS, "old")
+    assert (old.reason, old.superseded_by, old.value) == ("superseded", "k", in_slot(WINDOW))
+    [gone] = store.history(NS, "gone")
+    assert (gone.reason, gone.superseded_by) == ("deleted", None)
+    assert store.get(NS, "old") is None and store.get(NS, "gone") is None
+    # Confirming changed neither the version nor updated_at
+    dup = store.record(NS, "dup")
+    assert dup is not None and (dup.version, dup.confirmations) == (1, 1)
+    assert dup.item.updated_at == conflicts.candidates[3].item.updated_at
+    assert vector_keys(admin, store) == ["dup", "food", "k"]
+
+
+def test_resolve_raises_conflicts_changed_after_a_concurrent_write(
+    store_factory, admin, caplog, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    store.put(NS, "dup", text(LONG_FLIGHTS))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    decision = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+    # Another writer replaces the memory the decision supersedes
+    store.put(NS, "old", in_slot(LONG_FLIGHTS))
+    before = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+
+    with (
+        caplog.at_level(logging.WARNING, logger=RETRY_LOGGER),
+        pytest.raises(ConflictsChanged) as error,
+    ):
+        store.resolve(conflicts, decision)
+
+    assert error.value.keys == ("old",)
+    # Nothing was written, not even the confirmation, and nothing was retried
+    after = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+    assert after == before
+    dup = store.record(NS, "dup")
+    assert dup is not None and dup.confirmations == 0
+    assert not retries(caplog, "store resolve")
+    # Found again, the same decision applies
+    again = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    result = store.resolve(again, decision)
+    assert (result.new, result.superseded, result.confirmed) == ("written", ("old",), ("dup",))
+
+
+def test_resolve_detects_a_0_5_style_write_through_updated_at(store_factory, admin, mode) -> None:
+    store = store_factory(mode, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    # A 0.5.x store writes with the 0.5 statement during a rolling upgrade: it
+    # sets updated_at and leaves the version as it was
+    value = json.dumps(in_slot(LONG_FLIGHTS))
+    admin.execute(*store.sql.upsert_items([(PREFIX, "old", value, None)]))
+    record = store.record(NS, "old")
+    assert record is not None and (record.version, record.item.value) == (1, in_slot(LONG_FLIGHTS))
+    before = (item_rows(admin, store), vector_keys(admin, store))
+
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    assert error.value.keys == ("old",)
+    assert (item_rows(admin, store), vector_keys(admin, store)) == before
+
+
+def test_resolve_ignores_changes_to_candidates_it_keeps(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    store.put(NS, "also", in_slot(VEGETARIAN))
+    store.put(NS, "near", text(LONG_FLIGHTS))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    assert reasons(conflicts) == [("old", "slot"), ("also", "slot"), ("near", "similar")]
+    # Another writer changes one candidate the decision keeps and deletes the other
+    store.put(NS, "near", text(WINDOW))
+    store.delete(NS, "also")
+
+    result = store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    assert (result.new, result.superseded, result.kept) == ("written", ("old",), ("also", "near"))
+    assert {item.key for item in store.search(NS)} == {result.key, "near"}
+
+
+def test_resolve_rejects_an_invalid_decision_before_writing(
+    store_factory, admin, mode, monkeypatch
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", text(PEANUTS))
+    store.put(NS, "old", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, "k", in_slot(AISLE), slot="seat")
+    before = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+
+    def no_connection(**kwargs: Any) -> Any:
+        raise AssertionError("resolve used the connection before rejecting the decision")
+
+    monkeypatch.setattr(store, "_cursor", no_connection)
+    for bad in (
+        Decision(actions={"missing": Action.DELETE}),
+        Decision(actions={"k": Action.SUPERSEDE}),
+        Decision(new="skip", actions={"old": Action.SUPERSEDE}),
+        Decision(new="superseded", superseded_by="k"),
+        {"old": "supersede"},
+    ):
+        with pytest.raises(ValueError):
+            store.resolve(conflicts, bad)  # type: ignore[arg-type]
+    monkeypatch.undo()
+
+    after = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+    assert after == before
+    # A valid decision about the same Conflicts still applies
+    result = store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+    assert (result.new, result.version, result.superseded) == ("written", 2, ("old",))
+
+
+def test_resolve_embeds_nothing(store_factory, admin, mode) -> None:
+    index = seat_index()
+    store = store_factory(mode, index=index)
+    store.put(NS, "old", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    calls = index["embed"].calls
+
+    result = store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    assert index["embed"].calls == calls
+    # The new memory's vector is the one find_conflicts embedded
+    row = admin.execute(
+        f"SELECT embedding FROM {store.sql.vectors} WHERE prefix = %s AND key = %s",
+        (PREFIX, result.key),
+    ).fetchone()
+    assert row is not None
+    assert parse_vector(row["embedding"]) == pytest.approx(SEATS[AISLE], abs=1e-6)
+    assert vector_keys(admin, store) == [result.key]
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_resolve_retried_after_a_lost_commit_is_already_applied(
+    store_factory, admin, unsafe_internals, caplog, mode
+) -> None:
+    # The resolve commits, then the store sees 40003 and runs it again. The
+    # retry finds the rows that carry its write id, not a conflict
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    store.put(NS, "old", in_slot(WINDOW))
+    store.put(NS, "dup", text(LONG_FLIGHTS))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    fault.armed = True
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        result = store.resolve(
+            conflicts, Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+        )
+
+    assert fault.fired == 1
+    found = retries(caplog, "store resolve")
+    assert len(found) == 1 and "SQLSTATE 40003" in found[0]
+    assert result == ReconcileResult(
+        key=conflicts.proposal.key,
+        new="written",
+        version=1,
+        superseded=("old",),
+        deleted=(),
+        confirmed=("dup",),
+        kept=(),
+        already_applied=True,
+    )
+    # One write: one history row, the new memory once, one confirmation
+    assert [(row["key"], row["reason"]) for row in history_rows(admin, store)] == [
+        ("old", "superseded")
+    ]
+    assert {item.key for item in store.search(NS)} == {result.key, "dup"}
+    dup = store.record(NS, "dup")
+    assert dup is not None and dup.confirmations == 1
+
+
+def test_resolving_the_same_conflicts_twice_returns_the_first_result(
+    store_factory, admin, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    store.put(NS, "dup", text(LONG_FLIGHTS))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    first = store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+    written = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+
+    # Called again, as after an error that left the outcome unknown, resolve
+    # finds its own write rather than a conflict. Another decision about the
+    # same Conflicts changes nothing either
+    for decision in (
+        Decision(actions={"old": Action.SUPERSEDE}),
+        Decision(new="skip", actions={"dup": Action.DELETE}),
+    ):
+        again = store.resolve(conflicts, decision)
+        assert again == dataclasses.replace(first, kept=(), already_applied=True)
+
+    assert first.kept == ("dup",)
+    assert (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store)) == (
+        written
+    )
+    assert store.get(NS, "dup") is not None
+
+
+def test_resolve_counts_a_memory_that_appeared_or_expired_under_the_key_as_changed(
+    store_factory, admin, mode
+) -> None:
+    store = store_factory(mode, index=seat_index())
+
+    def move_expiry(key: str, by: str) -> None:
+        # Moves only the expiry: the version and updated_at stay as they are
+        admin.execute(
+            f"UPDATE {store.sql.items} SET expires_at = now() + CAST(%s AS INTERVAL) "
+            "WHERE prefix = %s AND key = %s",
+            (by, PREFIX, key),
+        )
+
+    # No memory had the key when find_conflicts ran, and another writer puts one
+    fresh = store.find_conflicts(NS, "new", text(AISLE))
+    store.put(NS, "new", text(WINDOW))
+    # The memory under the key had expired, and comes back to life
+    store.put(NS, "back", text(WINDOW), ttl=60)
+    move_expiry("back", "-1 minute")
+    revived = store.find_conflicts(NS, "back", text(AISLE))
+    assert revived.target_version is None
+    move_expiry("back", "1 hour")
+    # The memory under the key was live, and expires before resolve
+    store.put(NS, "lapsed", text(WINDOW), ttl=60)
+    lapsing = store.find_conflicts(NS, "lapsed", text(AISLE))
+    assert lapsing.target_version == 1
+    move_expiry("lapsed", "-1 minute")
+    before = item_rows(admin, store)
+
+    for conflicts, key in ((fresh, "new"), (revived, "back"), (lapsing, "lapsed")):
+        with pytest.raises(ConflictsChanged) as error:
+            store.resolve(conflicts, Decision())
+        assert error.value.keys == (key,)
+    assert item_rows(admin, store) == before
+
+
+def test_resolve_ends_old_facts_at_its_own_write_without_a_valid_time(
+    store_factory, admin, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    assert conflicts._state is not None and conflicts._state.plan.valid_at is None
+
+    result = store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    # The new memory stores no valid time, so it is valid from its write: the
+    # resolve's, not the read find_conflicts made. The fact it superseded
+    # ended at that write
+    new = store.record(NS, result.key)
+    assert new is not None
+    assert stored_valid_at(admin, store, result.key) is None
+    assert new.valid_at == new.item.updated_at > conflicts.proposal.valid_at
+    [old] = store.history(NS, "old")
+    assert old.invalid_at == new.item.updated_at
+
+
+def test_resolve_uses_a_given_valid_time_as_reconcile_does(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.reconcile(NS, "older", in_slot(WINDOW), policy=keep_all(), slot="seat", valid_at=OLDER)
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat", valid_at=OLD)
+
+    result = store.resolve(conflicts, Decision(actions={"older": Action.SUPERSEDE}))
+
+    # The new memory stores its valid time, and the fact it superseded ended at it
+    assert stored_valid_at(admin, store, result.key) == OLD
+    [old] = store.history(NS, "older")
+    assert (old.valid_at, old.invalid_at) == (OLDER, OLD)
+    # A late fact goes straight into history, true from its own valid time
+    # until the newer fact became true
+    late = store.find_conflicts(NS, None, in_slot(PEANUTS), slot="seat", valid_at=OLDER)
+    recorded = store.resolve(late, Decision(new="superseded", superseded_by=result.key))
+    assert (recorded.new, recorded.version, recorded.kept) == ("superseded", None, (result.key,))
+    assert store.record(NS, recorded.key) is None
+    [row] = store.history(NS, recorded.key)
+    assert (row.reason, row.superseded_by) == ("superseded", result.key)
+    assert (row.valid_at, row.invalid_at) == (OLDER, OLD)
+
+
+def test_resolve_accepts_a_conflicts_and_a_decision_from_a_checkpoint(
+    store_factory, admin, mode
+) -> None:
+    # A LangGraph interrupt keeps both in a checkpoint while a person decides,
+    # and the process that resumes the graph has a store of its own
+    serde = JsonPlusSerializer()
+    finder = store_factory(mode, history=True, index=seat_index())
+    finder.put(NS, "k", text(PEANUTS))
+    finder.put(NS, "old", in_slot(WINDOW))
+    finder.put(NS, "dup", text(LONG_FLIGHTS))
+    conflicts = finder.find_conflicts(
+        NS, "k", in_slot(AISLE), slot="seat", provenance={"source": "chat"}
+    )
+    decision = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+    saved = serde.loads_typed(serde.dumps_typed(conflicts))
+    decided = serde.loads_typed(serde.dumps_typed(decision))
+    assert (saved, decided) == (conflicts, decision)
+    resumed = store_factory(mode, history=True, index=seat_index())
+
+    result = resumed.resolve(saved, decided)
+
+    assert result == ReconcileResult(
+        key="k",
+        new="written",
+        version=2,
+        superseded=("old",),
+        deleted=(),
+        confirmed=("dup",),
+        kept=(),
+    )
+    assert serde.loads_typed(serde.dumps_typed(result)) == result
+    record = resumed.record(NS, "k")
+    assert record is not None
+    assert (record.item.value, record.provenance) == (in_slot(AISLE), {"source": "chat"})
+    row = admin.execute(
+        f"SELECT embedding FROM {resumed.sql.vectors} WHERE prefix = %s AND key = 'k'",
+        (PREFIX,),
+    ).fetchone()
+    assert row is not None
+    assert parse_vector(row["embedding"]) == pytest.approx(SEATS[AISLE], abs=1e-6)
+
+
+def test_a_write_racing_a_resolve_is_seen_on_its_retry(
+    store_factory, admin, caplog, mode, monkeypatch
+) -> None:
+    # The check runs in the resolve's transaction. A write that commits after
+    # the check and before the resolve's own writes makes serializable
+    # isolation run the resolve again, and the check then sees it
+    store = store_factory(mode, history=True, index=seat_index())
+    other = store_factory("pool", history=True, index=seat_index())
+    store.put(NS, "old", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    check = store._check_resolve
+    checks: list[int] = []
+
+    def check_then_race(resolving: Any, found: Any) -> Any:
+        checks.append(len(checks))
+        result = check(resolving, found)
+        if len(checks) == 1:
+            # Another store replaces the memory the decision supersedes
+            other.put(NS, "old", in_slot(LONG_FLIGHTS))
+        return result
+
+    monkeypatch.setattr(store, "_check_resolve", check_then_race)
+    with (
+        caplog.at_level(logging.WARNING, logger=RETRY_LOGGER),
+        pytest.raises(ConflictsChanged) as error,
+    ):
+        store.resolve(conflicts, Decision(actions={"old": Action.SUPERSEDE}))
+
+    assert retries(caplog, "store resolve") and len(checks) == 2
+    assert error.value.keys == ("old",)
+    # The racing write stands, and nothing of the resolve was written
+    record = store.record(NS, "old")
+    assert record is not None and (record.version, record.item.value) == (2, in_slot(LONG_FLIGHTS))
+    assert [(row["key"], row["version"], row["reason"]) for row in history_rows(admin, store)] == [
+        ("old", 1, "overwritten")
+    ]
+    assert store.record(NS, conflicts.proposal.key) is None
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_a_lost_commit_of_a_delete_without_history_reads_as_changed(
+    store_factory, admin, unsafe_internals, mode
+) -> None:
+    # Without history a decision that only deletes leaves no row with its
+    # write id, so its retry cannot tell its own delete from another writer's
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode, index=seat_index(), connect_kwargs={"cursor_factory": fault.cursor_class()}
+    )
+    store.put(NS, "gone", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    fault.armed = True
+
+    with pytest.raises(ConflictsChanged) as error:
+        store.resolve(conflicts, Decision(new="skip", actions={"gone": Action.DELETE}))
+
+    assert fault.fired == 1 and error.value.keys == ("gone",)
+    # The delete committed once, and find_conflicts no longer finds the memory
+    assert store.get(NS, "gone") is None and vector_keys(admin, store) == []
+    assert reasons(store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")) == []

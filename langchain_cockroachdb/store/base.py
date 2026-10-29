@@ -2,8 +2,9 @@
 
 Everything here runs without a database: grouping and validating ops,
 planning the rows a put batch writes, building search, candidate and
-decision statements, and turning result rows into items, candidates and
-reconcile results. The store classes run the statements.
+decision statements, checking a decision that resolve applies and what
+changed since find_conflicts, and turning result rows into items,
+candidates and reconcile results. The store classes run the statements.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from langchain_cockroachdb.store.reconcile import (
     Action,
     Candidate,
     Conflicts,
+    ConflictsChanged,
     Decision,
     MemoryRecord,
     MemoryVersion,
@@ -734,6 +736,38 @@ class ConflictsState:
         )
 
 
+@dataclass(frozen=True)
+class ResolvePlan:
+    """What resolve() sends to apply a decision about a Conflicts, built before any I/O.
+
+    Each attempt sends ``reads`` as one round trip and passes their rows to
+    BaseCockroachDBStore._check_resolve. Unless that returns the result of
+    an earlier commit or raises ConflictsChanged, the attempt sends
+    ``writes`` and commits, and passes the rows they return to
+    _reconcile_result with ``plan``, ``candidates`` and ``decision``.
+
+    Attributes:
+        plan: The new memory's plan, as find_conflicts made it, with its write id.
+        candidates: The candidates find_conflicts found.
+        decision: The decision about them, validated.
+        expected: The (version, updated_at) that find_conflicts read, by
+            key: first the new memory's key, with None when no live memory
+            had it, then each candidate the decision does more than keep or
+            names as superseding the new memory, in candidate order.
+        reads: The read of the live (version, updated_at) of those keys
+            (StoreSQL.tokens), then the reads of the rows that carry the
+            write id under the new key and under every candidate's key.
+        writes: The statements that apply the decision, as reconcile's.
+    """
+
+    plan: ProposalPlan
+    candidates: tuple[Candidate, ...]
+    decision: Decision
+    expected: dict[str, tuple[int, datetime] | None]
+    reads: list[tuple[str, list]]
+    writes: list[tuple[str, list]]
+
+
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
     """Build an Item from a get row."""
     return Item(
@@ -894,6 +928,29 @@ def default_valid_at(now: datetime, candidates: Sequence[Candidate]) -> datetime
 def _acted(candidates: Sequence[Candidate], decision: Decision, action: Action) -> list[str]:
     """The keys of the candidates that ``decision`` gives ``action``, in candidate order."""
     return [c.key for c in candidates if decision.action(c.key) == action]
+
+
+def changed_keys(
+    expected: Mapping[str, tuple[int, datetime] | None], rows: Iterable[Mapping[str, Any]]
+) -> tuple[str, ...]:
+    """The keys whose live memory is not the one that was read, in the order of ``expected``.
+
+    ``expected`` maps each key to the (version, updated_at) of its live
+    memory when it was read, or to None when no live memory had the key.
+    ``rows`` are the live memories now, with ``key``, ``version`` and
+    ``updated_at``, as StoreSQL.tokens reads them. A key changed when its
+    memory was written since, which moves the version, or only updated_at
+    when a 0.5.x store wrote it; when it was deleted or expired; and when a
+    key that had no live memory has one now. Confirming a memory changes
+    neither the version nor updated_at, so it never counts. A token that
+    came back from a checkpoint as a list compares as the tuple it was.
+    """
+    live = {row["key"]: (int(row["version"]), row["updated_at"]) for row in rows}
+    return tuple(
+        key
+        for key, token in expected.items()
+        if live.get(key) != (None if token is None else tuple(token))
+    )
 
 
 class BaseCockroachDBStore:
@@ -2149,3 +2206,104 @@ class BaseCockroachDBStore:
             confirmed=tuple(_acted(candidates, decision, Action.CONFIRM)),
             kept=tuple(key for key in kept if not (writes and key == plan.key)),
         )
+
+    def _plan_resolve(self, conflicts: Conflicts, decision: Decision) -> ResolvePlan:
+        """Check a decision about a Conflicts and build what resolve() sends, before any I/O.
+
+        The Conflicts must be one that find_conflicts returned, as it
+        returned it or as a LangGraph checkpoint gives it back, from a store
+        with this store's items table and index, since resolve writes the
+        plan find_conflicts made. The decision must be valid for its
+        proposal and candidates.
+
+        The check before the write covers the new memory's key, whose memory
+        the write replaces, and every candidate the decision supersedes,
+        deletes or confirms, or names as superseding the new memory. A
+        candidate it keeps is left out, so a write to it in between changes
+        nothing. The rows that carry the write id are looked for under the
+        new key and every candidate's key, not only under the keys this
+        decision names: an earlier resolve of the same Conflicts may have
+        decided otherwise.
+
+        Raises:
+            ValueError: If ``conflicts`` is not what find_conflicts
+                returned, as when it was built by hand or changed since, or
+                a store with another items table or index made it; or if
+                ``decision`` is not a valid Decision for its proposal and
+                candidates.
+        """
+        state = conflicts._state if isinstance(conflicts, Conflicts) else None
+        if not isinstance(state, ConflictsState):
+            raise ValueError(
+                "resolve needs the Conflicts that find_conflicts returned. This one holds "
+                "no plan for the write, as when it is built by hand, or read back by a "
+                "checkpoint serializer that does not allow the store's types."
+            )
+        identity = self._identity()
+        if state.store != identity:
+            raise ValueError(
+                f"This Conflicts was found by another store, {state.store}, while this store "
+                f"is {identity}. Resolve it on a store with the same table and index."
+            )
+        tokens = {c.key: (c.version, c.item.updated_at) for c in conflicts.candidates}
+        if conflicts.proposal.key != state.plan.key or tokens != state.tokens:
+            raise ValueError(
+                "This Conflicts was changed after find_conflicts returned it: its proposal "
+                "or candidates are not the ones find_conflicts found."
+            )
+        if not isinstance(decision, Decision):
+            raise ValueError(f"resolve needs a Decision, got {type(decision).__name__}")
+        validate_decision(conflicts.proposal, conflicts.candidates, decision)
+
+        plan, candidates = state.plan, conflicts.candidates
+        checked = self._decision_keys(plan, decision)
+        if decision.superseded_by is not None:
+            checked.add(decision.superseded_by)
+        expected: dict[str, tuple[int, datetime] | None] = {plan.key: state.target}
+        expected.update((c.key, state.tokens[c.key]) for c in candidates if c.key in checked)
+        reads = [
+            self.sql.tokens(plan.prefix, sorted(expected)),
+            *self._applied_statements(plan, [plan.key, *(c.key for c in candidates)]),
+        ]
+        writes = self._decision_statements(
+            plan,
+            candidates,
+            decision,
+            vector_rows=state.vector_rows,
+            valid_at=conflicts.proposal.valid_at,
+        )
+        return ResolvePlan(
+            plan=plan,
+            candidates=candidates,
+            decision=decision,
+            expected=expected,
+            reads=reads,
+            writes=writes,
+        )
+
+    def _check_resolve(
+        self, resolving: ResolvePlan, found: Sequence[Sequence[Mapping[str, Any]]]
+    ) -> ReconcileResult | None:
+        """What the first round trip of a resolve attempt found, before anything is written.
+
+        ``found`` are the rows of ``resolving.reads``, in order. Rows that
+        carry the write id mean that an earlier attempt, or an earlier
+        resolve of the same Conflicts, committed: its result comes back,
+        rebuilt from them as reconcile's retry rebuilds it (_applied_result).
+        That comes first, because such a write changed the tokens itself.
+        Otherwise None means that nothing the decision depends on changed,
+        and the attempt applies it.
+
+        Raises:
+            ConflictsChanged: If a key of ``resolving.expected`` changed
+                (changed_keys). Raised in the attempt's transaction, it rolls
+                the transaction back. It is not a database error, so the
+                retry policy does not retry it.
+        """
+        applied = self._applied_result(resolving.plan, found[1:])
+        if applied is not None:
+            return applied
+        changed = changed_keys(resolving.expected, found[0])
+        if changed:
+            raise ConflictsChanged(changed)
+        return None
