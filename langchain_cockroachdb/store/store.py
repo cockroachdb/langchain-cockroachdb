@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import math
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Literal
@@ -891,6 +892,118 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         self._require_columns(self._reconcile_columns(refresh=True))
         [rows] = self._read_all([self.sql.record(prefix, str(key))], "store record")
         return _row_to_record(tuple(namespace), rows[0]) if rows else None
+
+    def confirm(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        *,
+        ttl: float | None | NotProvided | Callable[[MemoryRecord], float | None] = NOT_PROVIDED,
+    ) -> bool:
+        """Mark a live memory as confirmed, renewing its expiry and counting confirmations.
+
+        This counts the confirmation and renews the expiry. That way expiry can
+        follow how often a fact is confirmed, not how often it is read.
+        Confirming does not change the version or updated_at, so it never
+        invalidates a pending find_conflicts.
+
+        Args:
+            namespace: The memory's namespace.
+            key: The memory's key.
+            ttl: How long the memory stays after confirmation. NOT_PROVIDED
+                renews from the row's own TTL. None removes the expiry. A
+                number is minutes. A callable takes the MemoryRecord read in
+                the same transaction and returns a number of minutes or None.
+                Keep it fast and deterministic: it runs again on each retry.
+
+        Returns:
+            True if a live memory was confirmed, False if no live memory has
+            that key: there is none, or it expired.
+
+        Raises:
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If setup() has not added the columns this method needs,
+                or if the callable returns an invalid value (not None or a
+                positive finite number)
+        """
+        prefix = _memory_prefix(namespace, "confirm")
+        self._require_columns(self._reconcile_columns(refresh=True))
+
+        # Validate ttl before any I/O
+        if not isinstance(ttl, (NotProvided, type(None))) and not callable(ttl):
+            if not isinstance(ttl, (int, float)):
+                raise ValueError("ttl must be NOT_PROVIDED, None, a number, or a callable")
+            if not (math.isfinite(ttl) and ttl > 0):
+                raise ValueError("ttl must be a positive finite number of minutes")
+
+        # Choose the write id before the first attempt
+        write_id = str(uuid.uuid4())
+        key_str = str(key)
+
+        def attempt() -> bool:
+            cursors: list[Cursor[DictRow]] = []
+            try:
+                with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store confirm",
+                ) as cur:
+                    conn = cur.connection
+
+                    # If ttl is a callable, read the record first
+                    resolved_ttl: float | None | NotProvided
+                    if callable(ttl):
+                        read_cursor = conn.cursor(binary=True, row_factory=dict_row)
+                        cursors.append(read_cursor)
+                        read_cursor.execute(*self.sql.record(prefix, key_str))
+                        rows = read_cursor.fetchall()
+                        if not rows:
+                            # No live memory to confirm
+                            return False
+                        record = _row_to_record(tuple(namespace), rows[0])
+                        resolved_ttl = ttl(record)
+                        if resolved_ttl is not None:
+                            if not isinstance(resolved_ttl, (int, float)):
+                                raise ValueError(
+                                    "Callable ttl must return None or a number of minutes"
+                                )
+                            if not (math.isfinite(resolved_ttl) and resolved_ttl > 0):
+                                raise ValueError(
+                                    "Callable ttl must return a positive finite number of minutes"
+                                )
+                    else:
+                        resolved_ttl = ttl
+
+                    # Execute the confirm statement
+                    confirm_cursor = conn.cursor(binary=True, row_factory=dict_row)
+                    cursors.append(confirm_cursor)
+                    confirm_cursor.execute(
+                        *self.sql.confirm(prefix, key_str, write_id=write_id, ttl=resolved_ttl)
+                    )
+
+                # Transaction committed. Check if any rows were updated
+                rowcount = confirm_cursor.rowcount
+                if rowcount > 0:
+                    return True
+
+                # No rows updated. Check if the memory already has this write_id
+                # (retried after a lost commit). Only live memories count
+                check_cursor = conn.cursor(binary=True, row_factory=dict_row)
+                cursors.append(check_cursor)
+                check_cursor.execute(
+                    f"SELECT 1 FROM {self.sql.items} WHERE prefix = %s AND key = %s "
+                    "AND (expires_at IS NULL OR expires_at > now()) "
+                    "AND write_id = CAST(%s AS UUID)",
+                    [prefix, key_str, write_id],
+                )
+                row = check_cursor.fetchone()
+                return bool(row)
+            finally:
+                for cursor in cursors:
+                    cursor.close()
+
+        return self._retry(attempt, label="store confirm")
 
     def reconcile(
         self,

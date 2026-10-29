@@ -2070,3 +2070,153 @@ def test_resolve_called_again_after_an_error_escaped_checks_strictly(
         store.resolve(conflicts, decision)
     assert error.value.keys == ("gone",)
     assert reasons(store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")) == []
+
+
+def test_confirm_renews_expiry_and_counts(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, ttl={"default_ttl": 10.0})
+    store.put(NS, "w", text(WINDOW), ttl=10.0)
+    admin.execute(
+        f"UPDATE {store.sql.items} SET expires_at = now() + INTERVAL '1 minute' WHERE prefix = %s",
+        (PREFIX,),
+    )
+    admin.commit()
+    before = store.record(NS, "w")
+    assert before is not None
+    assert before.confirmations == 0
+    assert before.confirmed_at is None
+    before_expiry = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+
+    confirmed = store.confirm(NS, "w", ttl=10.0)
+
+    assert confirmed is True
+    after = store.record(NS, "w")
+    assert after is not None
+    assert after.confirmations == 1
+    assert after.confirmed_at is not None
+    assert after.version == before.version
+    assert after.item.updated_at == before.item.updated_at
+    # Expiry was renewed
+    after_expiry = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+    assert after_expiry > before_expiry
+    # Vectors' expiry renewed too
+    if store.sql._index:
+        vector_expiry = admin.execute(
+            f"SELECT expires_at FROM {store.sql.vectors} WHERE prefix = %s AND key = 'w'",
+            (PREFIX,),
+        ).fetchone()["expires_at"]
+        assert vector_expiry is not None
+        assert abs((vector_expiry - after_expiry).total_seconds()) < 1.0
+
+
+def test_confirm_with_a_callable_ttl(store_factory, admin, mode) -> None:
+    store = store_factory(mode, ttl={"default_ttl": 10.0})
+    store.put(NS, "w", text(WINDOW), ttl=10.0)
+
+    # First confirmation: (0 + 1) * 60 = 60 minutes
+    confirmed = store.confirm(NS, "w", ttl=lambda r: min((r.confirmations + 1) * 60, 600))
+    assert confirmed is True
+    first = store.record(NS, "w")
+    assert first is not None
+    assert first.confirmations == 1
+    first_expiry = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+
+    # Second confirmation: (1 + 1) * 60 = 120 minutes
+    confirmed = store.confirm(NS, "w", ttl=lambda r: min((r.confirmations + 1) * 60, 600))
+    assert confirmed is True
+    second = store.record(NS, "w")
+    assert second is not None
+    assert second.confirmations == 2
+    second_expiry = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+    # Second expiry should be about 60 minutes later than first (120 - 60)
+    delta_minutes = (second_expiry - first_expiry).total_seconds() / 60
+    assert 59 < delta_minutes < 61
+
+
+def test_confirm_with_ttl_none_removes_expiry(store_factory, admin, mode) -> None:
+    store = store_factory(mode, ttl={"default_ttl": 10.0})
+    store.put(NS, "w", text(WINDOW), ttl=10.0)
+    before = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+    assert before is not None
+
+    confirmed = store.confirm(NS, "w", ttl=None)
+
+    assert confirmed is True
+    after = admin.execute(
+        f"SELECT expires_at FROM {store.sql.items} WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()["expires_at"]
+    assert after is None
+    # Vectors too
+    if store.sql._index:
+        vector_expiry = admin.execute(
+            f"SELECT expires_at FROM {store.sql.vectors} WHERE prefix = %s AND key = 'w'",
+            (PREFIX,),
+        ).fetchone()["expires_at"]
+        assert vector_expiry is None
+
+
+def test_confirm_returns_false_for_missing_or_expired(store_factory, admin, mode) -> None:
+    store = store_factory(mode)
+
+    # Missing key
+    confirmed = store.confirm(NS, "missing", ttl=10.0)
+    assert confirmed is False
+
+    # Expired key
+    store.put(NS, "expired", text(WINDOW), ttl=0.01)
+    time.sleep(1)
+    confirmed = store.confirm(NS, "expired", ttl=10.0)
+    assert confirmed is False
+
+
+def test_confirm_retried_after_a_lost_commit_counts_once(
+    store_factory, admin, unsafe_internals, mode
+) -> None:
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        retry_policy=RetryPolicy(max_attempts=3),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    store.put(NS, "w", text(WINDOW), ttl=10.0)
+
+    fault.armed = True
+    confirmed = store.confirm(NS, "w", ttl=20.0)
+
+    assert confirmed is True
+    # Should have incremented confirmations only once despite the retry
+    record = store.record(NS, "w")
+    assert record is not None
+    assert record.confirmations == 1
+
+
+def test_confirm_between_find_and_resolve_does_not_invalidate(store_factory, admin, mode) -> None:
+    store = store_factory(mode, index=seat_index(), history=True)
+    store.put(NS, "w", in_slot(WINDOW))
+    conflicts = store.find_conflicts(NS, None, in_slot(AISLE), slot="seat")
+    assert len(conflicts.candidates) == 1
+    assert conflicts.candidates[0].key == "w"
+
+    # Confirming does not change version or updated_at, so resolve should succeed
+    confirmed = store.confirm(NS, "w", ttl=10.0)
+    assert confirmed is True
+
+    decision = Decision(new="write", actions={"w": Action.KEEP})
+    result = store.resolve(conflicts, decision)
+    assert result.new == "written"
+    assert result.kept == ("w",)
