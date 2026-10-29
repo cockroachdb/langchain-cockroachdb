@@ -7,6 +7,12 @@ migrations table first. When that read is denied, the store learns that
 migration 2 is applied from the items table's own columns, so this role
 still writes with versions and history. A role that can read the migrations
 table keeps reading it.
+
+Every method works for such a role, the forget path included: purge and
+delete_namespace delete history rows, so the role needs SELECT and DELETE on
+the history table. With history off, delete_namespace still deletes the rows
+of a history table left from when history was on, and fails as a whole
+without those grants.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import psycopg
 import pytest
 from psycopg import Connection, sql
 
-from langchain_cockroachdb.store import keep_all
+from langchain_cockroachdb.store import Decision, keep_all
 from tests.integration.store.conftest import seat_index
 
 NS = ("user", "alice")
@@ -174,6 +180,125 @@ async def test_async_role_granted_only_the_store_tables_uses_migration_2(
         (2, "overwritten"),
         (1, "overwritten"),
     ]
+
+
+def history_count(admin: Connection[Any], store: Any) -> int:
+    row = admin.execute(
+        f"SELECT count(*) AS n FROM {store.sql.history} WHERE prefix = %s", (PREFIX,)
+    ).fetchone()
+    assert row is not None
+    return int(row["n"])
+
+
+def test_a_role_granted_only_the_store_tables_confirms_writes_conditionally_and_forgets(
+    app_role, store_factory, admin, libpq_url, mode
+) -> None:
+    owner = store_factory(mode, history=True, index=seat_index())  # root runs setup()
+    grant_store_tables(admin, libpq_url, app_role, owner)
+    store = store_factory(
+        mode, setup=False, history=True, index=seat_index(), connect_kwargs={"user": app_role}
+    )
+    store.put(NS, "seat", WINDOW)
+    assert store._migrations_unreadable is True
+
+    # confirm counts the confirmation
+    assert store.confirm(NS, "seat") is True
+    record = store.record(NS, "seat")
+    assert record is not None and record.confirmations == 1
+
+    # put_if writes from the record, and returns the current memory for a stale one
+    written = store.put_if(NS, "seat", AISLE, expected=record)
+    assert (written.applied, written.version) == (True, 2)
+    stale = store.put_if(NS, "seat", LONG_FLIGHTS, expected=record)
+    assert stale.applied is False and stale.current is not None
+    assert stale.current.item.value == AISLE
+
+    # resolve applies a decision about what find_conflicts found
+    conflicts = store.find_conflicts(NS, "seat", LONG_FLIGHTS)
+    result = store.resolve(conflicts, Decision())
+    assert (result.new, result.version) == ("written", 3)
+
+    # delete_if deletes from the record, and keeps the version in history
+    store.put(NS, "food", VEGETARIAN)
+    food = store.record(NS, "food")
+    assert store.delete_if(NS, "food", expected=food).applied
+    assert [v.reason for v in store.history(NS, "food")] == ["deleted"]
+
+    # purge and delete_namespace delete history rows too, with the DELETE grant
+    assert store.purge(NS, "food") is True
+    assert store.history(NS, "food") == []
+    assert store.delete_namespace(NS) == 1
+    assert store.get(NS, "seat") is None
+    assert history_count(admin, store) == 0
+
+
+async def test_async_role_granted_only_the_store_tables_confirms_writes_conditionally_and_forgets(
+    app_role, astore_factory, admin, aadmin, libpq_url, mode
+) -> None:
+    owner = await astore_factory(mode, history=True, index=seat_index())  # root runs setup()
+    await asyncio.to_thread(grant_store_tables, admin, libpq_url, app_role, owner)
+    store = await astore_factory(
+        mode, setup=False, history=True, index=seat_index(), connect_kwargs={"user": app_role}
+    )
+    await store.aput(NS, "seat", WINDOW)
+    assert store._migrations_unreadable is True
+
+    assert await store.aconfirm(NS, "seat") is True
+    record = await store.arecord(NS, "seat")
+    assert record is not None and record.confirmations == 1
+
+    written = await store.aput_if(NS, "seat", AISLE, expected=record)
+    assert (written.applied, written.version) == (True, 2)
+    stale = await store.aput_if(NS, "seat", LONG_FLIGHTS, expected=record)
+    assert stale.applied is False and stale.current is not None
+    assert stale.current.item.value == AISLE
+
+    conflicts = await store.afind_conflicts(NS, "seat", LONG_FLIGHTS)
+    result = await store.aresolve(conflicts, Decision())
+    assert (result.new, result.version) == ("written", 3)
+
+    await store.aput(NS, "food", VEGETARIAN)
+    food = await store.arecord(NS, "food")
+    assert (await store.adelete_if(NS, "food", expected=food)).applied
+    assert [v.reason for v in await store.ahistory(NS, "food")] == ["deleted"]
+
+    assert await store.apurge(NS, "food") is True
+    assert await store.ahistory(NS, "food") == []
+    assert await store.adelete_namespace(NS) == 1
+    assert await store.aget(NS, "seat") is None
+    cur = await aadmin.execute(
+        f"SELECT count(*) AS n FROM {store.sql.history} WHERE prefix = %s", (PREFIX,)
+    )
+    row = await cur.fetchone()
+    assert row is not None and row["n"] == 0
+
+
+def test_delete_namespace_fails_loudly_without_delete_on_a_leftover_history_table(
+    app_role, store_factory, admin, libpq_url
+) -> None:
+    # The store keeps no history now, but a history table is left from when
+    # it did. delete_namespace deletes the namespace's history there too, so
+    # a role needs SELECT and DELETE on that table: a DELETE with a WHERE
+    # clause reads the rows it deletes. Without them the whole delete fails,
+    # and nothing of the namespace is deleted: better than forgetting part
+    owner = store_factory("pool", history=True, index=seat_index())
+    owner.put(NS, "seat", WINDOW)
+    owner.put(NS, "seat", AISLE)
+    tables = ", ".join((owner.sql.items, owner.sql.vectors))
+    admin.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {tables} TO {app_role}")
+    store = store_factory(
+        "pool", setup=False, index=seat_index(), connect_kwargs={"user": app_role}
+    )
+
+    history_table = owner.sql.history.split(".", 1)[1]
+    with pytest.raises(psycopg.errors.InsufficientPrivilege, match=history_table):
+        store.delete_namespace(NS)
+
+    assert store.get(NS, "seat") is not None and history_count(admin, store) == 1
+    # With the grant the docs ask for, the namespace goes with its history
+    admin.execute(f"GRANT SELECT, DELETE ON TABLE {owner.sql.history} TO {app_role}")
+    assert store.delete_namespace(NS) == 1
+    assert store.get(NS, "seat") is None and history_count(admin, store) == 0
 
 
 def schema_checks(store: Any, monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, list]]]:

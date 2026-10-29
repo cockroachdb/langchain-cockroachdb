@@ -24,7 +24,6 @@ import psycopg
 from langgraph.store.base import (
     NOT_PROVIDED,
     BaseStore,
-    InvalidNamespaceError,
     NotProvided,
     Op,
     Result,
@@ -48,6 +47,7 @@ from langchain_cockroachdb.store.base import (
     _check_limit,
     _check_policy,
     _memory_prefix,
+    _namespace_to_delete,
     _resolve_confirm_ttl,
     _row_to_record,
     _row_to_version,
@@ -63,7 +63,6 @@ from langchain_cockroachdb.store.config import (
     resolve_index_config,
     resolve_reconcile_scan_limit,
 )
-from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.reconcile import (
     ConditionalWrite,
     Conflicts,
@@ -669,13 +668,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             ValueError: If the store keeps history and setup() has not
                 created the history table
         """
-        prefix = validate_labels(namespace_prefix)
-        if not prefix:
-            raise InvalidNamespaceError(
-                "delete_namespace needs a non-empty namespace prefix. To clear the whole "
-                "store on purpose, delete each top-level namespace from list_namespaces("
-                "max_depth=1), or drop the store's tables."
-            )
+        prefix = _namespace_to_delete(namespace_prefix, "delete_namespace", "list_namespaces")
         if self._history is not None:
             self._history_schema()
             history = True

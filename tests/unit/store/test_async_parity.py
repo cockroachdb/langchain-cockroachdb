@@ -27,8 +27,9 @@ import pytest
 from langchain_cockroachdb.store import aio, store
 
 # (sync method, its async twin): the methods the async store gained for
-# reconciliation, history and conditional writes, and the helpers that
-# their attempts go through
+# reconciliation, history and conditional writes, the writes and the schema
+# check they share with plain puts, and the helpers that their attempts go
+# through
 TWINS = [
     ("history", "ahistory"),
     ("purge", "apurge"),
@@ -44,14 +45,21 @@ TWINS = [
     ("_cursor", "_cursor"),
     ("_read_all", "_read_all"),
     ("_embed_put", "_embed_put"),
+    ("setup", "setup"),
+    ("_run_puts", "_run_puts"),
+    ("delete_namespace", "adelete_namespace"),
+    ("_schema", "_aschema"),
+    ("_read_schema", "_aread_schema"),
+    ("_reconcile_columns", "_areconcile_columns"),
+    ("_history_schema", "_ahistory_schema"),
+    ("_history_table_exists", "_ahistory_table_exists"),
 ]
 
 # Async names, as names, attributes or string constants, and the sync names
-# they stand for
+# they stand for: the store methods above, and the names that errors give
 RENAMED = {
-    "_ahistory_schema": "_history_schema",
-    "_areconcile_columns": "_reconcile_columns",
     "aembed_documents": "embed_documents",
+    "alist_namespaces": "list_namespaces",
     **{async_name: sync_name for sync_name, async_name in TWINS if async_name != sync_name},
 }
 

@@ -25,7 +25,6 @@ from typing import Any, Literal, TypeVar
 import psycopg
 from langgraph.store.base import (
     NOT_PROVIDED,
-    InvalidNamespaceError,
     Item,
     NamespacePath,
     NotProvided,
@@ -54,6 +53,7 @@ from langchain_cockroachdb.store.base import (
     _check_limit,
     _check_policy,
     _memory_prefix,
+    _namespace_to_delete,
     _resolve_confirm_ttl,
     _row_to_record,
     _row_to_version,
@@ -69,7 +69,6 @@ from langchain_cockroachdb.store.config import (
     resolve_index_config,
     resolve_reconcile_scan_limit,
 )
-from langchain_cockroachdb.store.namespaces import validate_labels
 from langchain_cockroachdb.store.reconcile import (
     ConditionalWrite,
     Conflicts,
@@ -833,10 +832,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         # The schema check comes first. With history, a write refuses to run
         # until setup() has created the history table, since it could not
         # keep what it replaces, and a refused batch costs no embedding call
-        if self._history is not None:
-            schema = await self._ahistory_schema()
-        else:
-            schema = await self._aschema()
+        schema = (
+            await self._ahistory_schema() if self._history is not None else await self._aschema()
+        )
         vector_rows = await self._embed_put(plan)
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
@@ -879,13 +877,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             ValueError: If the store keeps history and setup() has not
                 created the history table
         """
-        prefix = validate_labels(namespace_prefix)
-        if not prefix:
-            raise InvalidNamespaceError(
-                "adelete_namespace needs a non-empty namespace prefix. To clear the whole "
-                "store on purpose, delete each top-level namespace from alist_namespaces("
-                "max_depth=1), or drop the store's tables."
-            )
+        prefix = _namespace_to_delete(namespace_prefix, "adelete_namespace", "alist_namespaces")
         if self._history is not None:
             await self._ahistory_schema()
             history = True

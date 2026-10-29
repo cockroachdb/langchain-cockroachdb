@@ -118,6 +118,28 @@ def _memory_prefix(namespace: Sequence[str], method: str) -> str:
     return to_text(labels)
 
 
+def _namespace_to_delete(
+    namespace_prefix: Sequence[str], method: str, listing: str
+) -> tuple[str, ...]:
+    """The labels of the namespace that delete_namespace deletes, with its descendants.
+
+    ``method`` and ``listing`` name the store's delete_namespace and
+    list_namespaces in the error, as delete_namespace and list_namespaces on
+    the sync store, adelete_namespace and alist_namespaces on the async one.
+
+    Raises:
+        InvalidNamespaceError: If the prefix is empty or a label is invalid.
+    """
+    prefix = validate_labels(namespace_prefix)
+    if not prefix:
+        raise InvalidNamespaceError(
+            f"{method} needs a non-empty namespace prefix. To clear the whole store on "
+            f"purpose, delete each top-level namespace from {listing}(max_depth=1), or drop "
+            "the store's tables."
+        )
+    return prefix
+
+
 def _check_limit(limit: object) -> None:
     """Raise ValueError unless ``limit`` is a non-negative int."""
     if isinstance(limit, bool) or not isinstance(limit, int):

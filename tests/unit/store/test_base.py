@@ -1966,6 +1966,28 @@ def deleting_store_without_history(
     return store, reads, sent
 
 
+@pytest.mark.parametrize(
+    ("make", "method", "listing"),
+    [
+        ("sync", "delete_namespace", "list_namespaces"),
+        ("async", "adelete_namespace", "alist_namespaces"),
+    ],
+)
+async def test_delete_namespace_refuses_an_empty_prefix_before_any_io(
+    make: str, method: str, listing: str
+) -> None:
+    # A connection the store must never touch: using it would raise. The
+    # error names the method that was called, and how to clear a store on purpose
+    store = make_store(make)
+    with pytest.raises(
+        InvalidNamespaceError,
+        match=rf"^{method} needs a non-empty namespace prefix\. .* {listing}\(max_depth=1\)",
+    ):
+        await call(store, "delete_namespace", ())
+    with pytest.raises(InvalidNamespaceError):
+        await call(store, "delete_namespace", ("a.b",))
+
+
 def test_delete_namespace_without_history_looks_for_a_history_table_each_time() -> None:
     store, reads, sent = deleting_store_without_history(exists=False)
     assert store.delete_namespace(("user", "a")) == 0
