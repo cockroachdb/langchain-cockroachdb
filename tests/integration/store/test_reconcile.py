@@ -1307,3 +1307,232 @@ def test_an_archived_version_never_ends_before_it_began(store_factory, mode) -> 
     assert late.new == "superseded"
     [row] = store.history(NS, "late")
     assert (row.valid_at, row.invalid_at) == (OLD, OLD)
+
+
+def deciding(decision: Decision) -> Policy:
+    """A policy that returns ``decision``, whatever the candidates."""
+    return lambda proposal, candidates: decision
+
+
+def test_reconcile_deletes_a_candidate_into_history(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "gone", in_slot(WINDOW))
+    store.put(NS, "food", text(VEGETARIAN))
+
+    result = store.reconcile(
+        NS,
+        None,
+        in_slot(AISLE),
+        policy=deciding(Decision(actions={"gone": Action.DELETE})),
+        slot="seat",
+        valid_at=OLD,
+    )
+
+    assert (result.new, result.deleted, result.superseded) == ("written", ("gone",), ())
+    assert store.get(NS, "gone") is None
+    assert vector_keys(admin, store) == sorted(["food", result.key])
+    [old] = store.history(NS, "gone")
+    written = store.record(NS, result.key)
+    assert written is not None
+    assert (old.reason, old.superseded_by, old.value) == ("deleted", None, in_slot(WINDOW))
+    # A deleted fact ends when the reconcile writes, not at the new memory's valid time
+    assert old.ended_at == old.invalid_at == written.item.updated_at
+    assert written.valid_at == OLD
+
+
+@pytest.mark.parametrize("action", [Action.DELETE, Action.SUPERSEDE])
+def test_reconcile_without_history_removes_a_candidate_with_its_vectors(
+    store_factory, admin, mode, action: Action
+) -> None:
+    store = store_factory(mode, index=seat_index())
+    store.put(NS, "gone", in_slot(WINDOW))
+    store.put(NS, "food", text(VEGETARIAN))
+
+    result = store.reconcile(
+        NS, None, in_slot(AISLE), policy=deciding(Decision(actions={"gone": action})), slot="seat"
+    )
+
+    reported = result.deleted if action == Action.DELETE else result.superseded
+    assert reported == ("gone",)
+    assert store.get(NS, "gone") is None
+    assert {item.key for item in store.search(NS)} == {"food", result.key}
+    assert vector_keys(admin, store) == sorted(["food", result.key])
+    # Without history nothing was kept anywhere: the store has no history table
+    row = admin.execute("SELECT to_regclass(%s) IS NULL AS absent", (store.sql.history,)).fetchone()
+    assert row is not None and row["absent"]
+
+
+def test_a_late_fact_can_delete_the_memory_under_its_own_key(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.reconcile(NS, "k", in_slot(VEGETARIAN), policy=keep_all(), slot="seat", valid_at=OLDER)
+    store.reconcile(NS, "newer", in_slot(WINDOW), policy=keep_all(), slot="seat")
+    decision = Decision(new="superseded", superseded_by="newer", actions={"k": Action.DELETE})
+
+    late = store.reconcile(
+        NS, "k", in_slot(AISLE), policy=deciding(decision), slot="seat", valid_at=OLD
+    )
+
+    assert late == ReconcileResult(
+        key="k",
+        new="superseded",
+        version=None,
+        superseded=(),
+        deleted=("k",),
+        confirmed=(),
+        kept=("newer",),
+    )
+    assert store.get(NS, "k") is None
+    assert vector_keys(admin, store) == ["newer"]
+    # The deleted version and the late fact both stay in history, numbered in turn
+    versions = [(v.version, v.reason, v.superseded_by, v.value) for v in store.history(NS, "k")]
+    assert versions == [
+        (2, "superseded", "newer", in_slot(AISLE)),
+        (1, "deleted", None, in_slot(VEGETARIAN)),
+    ]
+
+
+def test_reconcile_confirms_on_a_store_without_an_index(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, ttl={"default_ttl": 10.0})
+    store.reconcile(NS, "w", in_slot(WINDOW), policy=keep_all(), slot="seat")
+    admin.execute(
+        f"UPDATE {store.sql.items} SET expires_at = now() + INTERVAL '1 minute' WHERE prefix = %s",
+        (PREFIX,),
+    )
+    before = store.record(NS, "w")
+    assert before is not None
+
+    # Without an index there are no scores: the slot match with an equal value
+    # is the duplicate
+    again = store.reconcile(NS, None, in_slot(WINDOW), policy=skip_duplicates(), slot="seat")
+
+    assert (again.new, again.version, again.confirmed) == ("skipped", None, ("w",))
+    record = store.record(NS, "w")
+    assert record is not None and record.confirmed_at is not None
+    assert (record.version, record.confirmations) == (1, 1)
+    assert record.item.updated_at == before.item.updated_at
+    # Its expiry was renewed from its own TTL
+    row = admin.execute(
+        f"SELECT expires_at > now() + INTERVAL '5 minutes' AS renewed FROM {store.sql.items} "
+        "WHERE prefix = %s AND key = 'w'",
+        (PREFIX,),
+    ).fetchone()
+    assert row is not None and row["renewed"]
+
+
+def test_a_late_fact_retried_after_a_lost_commit_is_already_applied(
+    store_factory, admin, unsafe_internals, mode
+) -> None:
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    live = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+    fault.armed = True
+
+    late = store.reconcile(
+        NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat", valid_at=OLD
+    )
+
+    assert fault.fired == 1
+    # The history row under its own key proves the late fact
+    assert late == ReconcileResult(
+        key=late.key,
+        new="superseded",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    assert [
+        (row["key"], row["reason"], row["superseded_by"]) for row in history_rows(admin, store)
+    ] == [(late.key, "superseded", live.key)]
+    assert [item.key for item in store.search(NS)] == [live.key]
+
+
+def test_a_delete_retried_after_a_lost_commit_is_already_applied(
+    store_factory, admin, unsafe_internals, mode
+) -> None:
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    store.put(NS, "gone", in_slot(WINDOW))
+    fault.armed = True
+
+    result = store.reconcile(
+        NS,
+        None,
+        in_slot(AISLE),
+        policy=deciding(Decision(new="skip", actions={"gone": Action.DELETE})),
+        slot="seat",
+    )
+
+    assert fault.fired == 1
+    assert result == ReconcileResult(
+        key=result.key,
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("gone",),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    assert [(row["key"], row["reason"]) for row in history_rows(admin, store)] == [
+        ("gone", "deleted")
+    ]
+    assert store.get(NS, "gone") is None and vector_keys(admin, store) == []
+
+
+def raised_within(call: Callable[[], Any], timeout: float = 60.0) -> BaseException | None:
+    """What ``call`` raised in another thread, or None if it returned.
+
+    A store call that waits for a connection the store itself holds never
+    returns: the thread stays blocked, and the test fails instead of hanging.
+    """
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as error:  # noqa: BLE001
+            raised.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), f"the call still runs after {timeout} s"
+    return raised[0] if raised else None
+
+
+def test_a_policy_that_calls_the_store_fails_at_once(store_factory, admin, mode) -> None:
+    # On a single connection the policy runs while the store holds it, so a
+    # store call from the policy would wait forever. On a pool it would read
+    # outside the reconcile's transaction. Either way it fails at once
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "w", in_slot(WINDOW))
+    before = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+
+    def policy(proposal: Any, candidates: Any) -> Decision:
+        store.get(NS, "w")
+        return Decision()
+
+    error = raised_within(
+        lambda: store.reconcile(NS, None, in_slot(AISLE), policy=policy, slot="seat")
+    )
+
+    assert isinstance(error, RuntimeError), error
+    assert str(error).startswith("A reconcile policy must not call the store")
+    after = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+    assert after == before
+    # The transaction was rolled back and the connection given back
+    item = store.get(NS, "w")
+    assert item is not None and item.value == in_slot(WINDOW)

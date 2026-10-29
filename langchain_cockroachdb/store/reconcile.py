@@ -120,7 +120,10 @@ class ReconcileResult:
     A rebuilt result lists only what the rows prove: ``kept`` is empty, and
     ``superseded`` and ``deleted`` come from the history rows the write
     created, so a store without history, which keeps no trace of what it
-    removed, reports them empty too. A rebuilt result lists keys in key
+    removed, reports them empty too. If another writer replaced or
+    confirmed the new memory before the retry, the history row of the
+    version the write overwrote still proves the write: the result says
+    "written", but its version is None. A rebuilt result lists keys in key
     order; a normal one in the order of the candidates.
 
     Attributes:
@@ -129,7 +132,9 @@ class ReconcileResult:
             "superseded" when it went straight into history because a
             newer fact supersedes it. A store without history skips such a
             memory, and the result says "skipped".
-        version: The version written, or None when nothing was written.
+        version: The version written, or None when nothing was written. A
+            rebuilt result also has None for a written memory that another
+            writer replaced or confirmed before the retry.
         superseded: Keys of the candidates the new memory superseded.
         deleted: Keys of the candidates deleted.
         confirmed: Keys of the candidates confirmed.

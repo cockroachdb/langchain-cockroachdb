@@ -1453,9 +1453,12 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         upsert numbers them on a store with history, so it never takes a
         version the key has or gets later. It is valid from ``valid_at``
         until ``invalid_at``, never earlier, and the store held it for no
-        time: written_at and ended_at are both now. If a row of the key
-        already carries ``write_id``, this write inserted it in an attempt
-        that committed before its result was lost, and nothing is inserted.
+        time: written_at and ended_at are both now. If a superseded row of
+        the key already carries ``write_id``, this write inserted it in an
+        attempt that committed before its result was lost, and nothing is
+        inserted. The same write's archive of the memory under the key, as
+        when it deletes that memory, has another reason and never counts,
+        whatever order the statements run in.
 
         Args:
             prefix: Namespace text.
@@ -1486,6 +1489,7 @@ FROM (
 WHERE NOT EXISTS (
     SELECT 1 FROM {self.history} AS h
     WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id
+        AND h.reason = p.reason
 )
 ON CONFLICT (prefix, key, version) DO NOTHING"""
         params: list[Any] = [

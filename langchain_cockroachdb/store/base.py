@@ -59,6 +59,7 @@ from langchain_cockroachdb.store.reconcile import (
     Decision,
     MemoryRecord,
     MemoryVersion,
+    Policy,
     Proposal,
     ReconcileResult,
     validate_decision,
@@ -890,6 +891,11 @@ def default_valid_at(now: datetime, candidates: Sequence[Candidate]) -> datetime
     return max([now, *(candidate.item.updated_at for candidate in candidates)])
 
 
+def _acted(candidates: Sequence[Candidate], decision: Decision, action: Action) -> list[str]:
+    """The keys of the candidates that ``decision`` gives ``action``, in candidate order."""
+    return [c.key for c in candidates if decision.action(c.key) == action]
+
+
 class BaseCockroachDBStore:
     """State and planning shared by CockroachDBStore and its async twin."""
 
@@ -935,6 +941,9 @@ class BaseCockroachDBStore:
     _migrations_denied: bool
     # Whether the fallback to the column read has been logged, to log it once
     _logged_column_fallback: bool
+    # Marks the threads that are running a reconcile policy of this store,
+    # as ``inside``. A store call from a policy is refused (_refuse_inside_policy)
+    _policy_marks: threading.local
 
     def _configure(
         self,
@@ -961,6 +970,7 @@ class BaseCockroachDBStore:
         self._schema_lock = threading.Lock()
         self._migrations_denied = False
         self._logged_column_fallback = False
+        self._policy_marks = threading.local()
 
     def _trusted(self, ready: bool | None, *, refresh: bool) -> bool | None:
         """A cached schema answer, or None when the schema check must read it again.
@@ -1486,8 +1496,7 @@ class BaseCockroachDBStore:
                     plan, write_id=plan.write_id, ttl_days=self._history.ttl_days
                 )
             )
-        for prefix, keys in plan.reindexed.items():
-            statements.append(self.sql.delete_vectors(prefix, keys))
+        statements.extend(self._reindex_deletes(plan))
         rows: Sequence[ItemRow] | Sequence[ItemRowV2] = plan.items
         if plan.write_id is not None:
             # A plain put writes no provenance and no valid time
@@ -1500,14 +1509,27 @@ class BaseCockroachDBStore:
                     history=keeps_history,
                 )
             )
-        for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT):
-            statements.append(
-                self.sql.upsert_vectors(vector_rows[start : start + VECTORS_PER_STATEMENT])
-            )
+        statements.extend(self._vector_upserts(vector_rows))
         for prefix, keys in plan.deletes.items():
-            statements.append(self.sql.delete_items(prefix, keys))
-            if self.index is not None:
-                statements.append(self.sql.delete_vectors(prefix, keys))
+            statements.extend(self._delete_statements(prefix, keys))
+        return statements
+
+    def _reindex_deletes(self, plan: PutPlan) -> list[tuple[str, list]]:
+        """The deletes of the old vectors of every item a put plan re-indexes."""
+        return [self.sql.delete_vectors(prefix, keys) for prefix, keys in plan.reindexed.items()]
+
+    def _vector_upserts(self, vector_rows: Sequence[VectorRow]) -> list[tuple[str, list]]:
+        """The upserts of a write's vectors, VECTORS_PER_STATEMENT rows to a statement."""
+        return [
+            self.sql.upsert_vectors(vector_rows[start : start + VECTORS_PER_STATEMENT])
+            for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT)
+        ]
+
+    def _delete_statements(self, prefix: str, keys: Sequence[str]) -> list[tuple[str, list]]:
+        """The deletes of some items of a namespace, with their vectors on a store with an index."""
+        statements = [self.sql.delete_items(prefix, keys)]
+        if self.index is not None:
+            statements.append(self.sql.delete_vectors(prefix, keys))
         return statements
 
     def _archive_statements(
@@ -1852,6 +1874,42 @@ class BaseCockroachDBStore:
         validate_decision(proposal, candidates, decision)
         return decision
 
+    def _decide(
+        self, policy: Policy, proposal: Proposal, candidates: Sequence[Candidate]
+    ) -> object:
+        """Run ``policy`` with this thread marked as inside a policy of this store.
+
+        The policy runs in the reconcile's transaction, while the store holds
+        its connection. On a single connection a store call from the policy
+        would wait for that connection forever, and on a pool it would read
+        outside the transaction. The mark makes such a call fail at once
+        instead (_refuse_inside_policy). It ends with the policy, however
+        the policy ends, and other threads never see it.
+        """
+        marks = self._policy_marks
+        outer = getattr(marks, "inside", False)
+        marks.inside = True
+        try:
+            return policy(proposal, candidates)
+        finally:
+            marks.inside = outer
+
+    def _refuse_inside_policy(self) -> None:
+        """Raise RuntimeError when this thread is running a reconcile policy of this store.
+
+        The store checks it before every connection checkout and every
+        embedding call, so a store call from a policy fails before any I/O.
+
+        Raises:
+            RuntimeError: If called from inside a reconcile policy.
+        """
+        if getattr(self._policy_marks, "inside", False):
+            raise RuntimeError(
+                "A reconcile policy must not call the store: it runs inside the reconcile's "
+                "transaction, while the store holds its connection. For a decision that "
+                "needs more data, use find_conflicts, decide, then call resolve."
+            )
+
     @staticmethod
     def _decision_keys(plan: ProposalPlan, decision: Decision) -> set[str]:
         """The keys whose rows a decision can mark with the plan's write id.
@@ -1900,30 +1958,44 @@ class BaseCockroachDBStore:
         key carries the write id when this write wrote it or confirmed it.
         Confirming changes neither the version nor updated_at, so a
         confirmed_at later than its updated_at means it was confirmed;
-        otherwise it was written, and the row has the version. Every other
-        item that carries the write id was confirmed. The history rows give
-        the keys superseded and deleted, and a row of the new key that ended
-        as superseded is the new memory, recorded straight into history.
-        Nothing records which candidates were kept, so ``kept`` is empty,
-        and without history so are ``superseded`` and ``deleted``. Keys come
-        in key order.
+        otherwise it was written, and the row has the version. Only a write
+        archives the memory it replaces under the new key as overwritten,
+        so that history row proves the write too. When another writer
+        replaced or confirmed the new memory before the retry, that row is
+        all that is left: the memory was written, and its version is None.
+        Every other item that carries the write id was confirmed. The
+        history rows give the keys superseded and deleted, and a row of the
+        new key that ended as superseded is the new memory, recorded
+        straight into history. Nothing records which candidates were kept,
+        so ``kept`` is empty, and without history so are ``superseded`` and
+        ``deleted``. Keys come in key order.
         """
         items = found[0]
         history = found[1] if len(found) > 1 else []
         if not items and not history:
             return None
+
+        def ended_as(reason: str) -> bool:
+            return any(row["key"] == plan.key and row["reason"] == reason for row in history)
+
+        overwrote = ended_as("overwritten")
         target = next((row for row in items if row["key"] == plan.key), None)
-        written = target is not None and not (
-            target["confirmed_at"] is not None and target["confirmed_at"] > target["updated_at"]
+        # A write never confirms the memory under its own key
+        confirmed_target = (
+            target is not None
+            and not overwrote
+            and target["confirmed_at"] is not None
+            and target["confirmed_at"] > target["updated_at"]
         )
+        written = target is not None and not confirmed_target
 
         def keys(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
             return tuple(sorted({row["key"] for row in rows}))
 
         new: Literal["written", "skipped", "superseded"] = "skipped"
-        if written:
+        if written or overwrote:
             new = "written"
-        elif any(row["key"] == plan.key and row["reason"] == "superseded" for row in history):
+        elif ended_as("superseded"):
             new = "superseded"
         return ReconcileResult(
             key=plan.key,
@@ -1969,11 +2041,8 @@ class BaseCockroachDBStore:
         version it wrote. Pass them to _reconcile_result.
         """
         write_id = plan.write_id
-
-        def acted(action: Action) -> list[str]:
-            return [c.key for c in candidates if decision.action(c.key) == action]
-
-        superseded, deleted = acted(Action.SUPERSEDE), acted(Action.DELETE)
+        superseded = _acted(candidates, decision, Action.SUPERSEDE)
+        deleted = _acted(candidates, decision, Action.DELETE)
         writes = decision.new == "write"
         statements: list[tuple[str, list]] = []
         if self._history is not None:
@@ -2015,8 +2084,8 @@ class BaseCockroachDBStore:
                 for reason, keys, superseded_by, invalid_at in ended
             )
         if writes:
-            if self.index is not None:
-                statements.append(self.sql.delete_vectors(plan.prefix, [plan.key]))
+            # As put writes it: the old vectors go, then the item and the new vectors
+            statements.extend(self._reindex_deletes(plan.put))
             row = (plan.prefix, plan.key, plan.value_json, plan.ttl, plan.provenance_json)
             statements.append(
                 self.sql.upsert_items(
@@ -2026,17 +2095,13 @@ class BaseCockroachDBStore:
                     return_version=True,
                 )
             )
-            statements.extend(
-                self.sql.upsert_vectors(vector_rows[start : start + VECTORS_PER_STATEMENT])
-                for start in range(0, len(vector_rows), VECTORS_PER_STATEMENT)
-            )
+            statements.extend(self._vector_upserts(vector_rows))
         removed = superseded + deleted
         if removed:
-            statements.append(self.sql.delete_items(plan.prefix, removed))
-            if self.index is not None:
-                statements.append(self.sql.delete_vectors(plan.prefix, removed))
+            statements.extend(self._delete_statements(plan.prefix, removed))
         statements.extend(
-            self.sql.confirm(plan.prefix, key, write_id=write_id) for key in acted(Action.CONFIRM)
+            self.sql.confirm(plan.prefix, key, write_id=write_id)
+            for key in _acted(candidates, decision, Action.CONFIRM)
         )
         return statements
 
@@ -2056,25 +2121,31 @@ class BaseCockroachDBStore:
         memory overwrote it. On a store without history a new memory that a
         newer fact supersedes is recorded nowhere, and the result says it
         was skipped.
+
+        Raises:
+            RuntimeError: If a written memory's upsert returned no version.
+                The attempt carried a fresh write id, so the upsert always
+                writes its row; this can only be a broken invariant, and the
+                write has committed.
         """
         writes = decision.new == "write"
-
-        def acted(action: Action) -> tuple[str, ...]:
-            return tuple(c.key for c in candidates if decision.action(c.key) == action)
-
         new: Literal["written", "skipped", "superseded"] = "skipped"
+        version = None
         if writes:
-            new = "written"
+            if not returned or not returned[0]:
+                raise RuntimeError(
+                    f"The upsert of {plan.prefix}/{plan.key} committed but returned no version"
+                )
+            new, version = "written", int(returned[0][0]["version"])
         elif decision.new == "superseded" and self._history is not None:
             new = "superseded"
-        version = int(returned[0][0]["version"]) if writes and returned and returned[0] else None
-        kept = tuple(key for key in acted(Action.KEEP) if not (writes and key == plan.key))
+        kept = _acted(candidates, decision, Action.KEEP)
         return ReconcileResult(
             key=plan.key,
             new=new,
             version=version,
-            superseded=acted(Action.SUPERSEDE),
-            deleted=acted(Action.DELETE),
-            confirmed=acted(Action.CONFIRM),
-            kept=kept,
+            superseded=tuple(_acted(candidates, decision, Action.SUPERSEDE)),
+            deleted=tuple(_acted(candidates, decision, Action.DELETE)),
+            confirmed=tuple(_acted(candidates, decision, Action.CONFIRM)),
+            kept=tuple(key for key in kept if not (writes and key == plan.key)),
         )

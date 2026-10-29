@@ -7,7 +7,7 @@ import logging
 import math
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import date, datetime, timedelta, timezone
 
 import psycopg
@@ -3215,6 +3215,11 @@ def test_reconcile_result_reports_what_the_decision_did() -> None:
     # Without history a late fact is not kept anywhere: the result says skipped
     plain = history_store()
     assert plain._reconcile_result(plan, candidates, late, []).new == "skipped"
+    # A written memory always gets its version back from the upsert
+    with pytest.raises(RuntimeError, match="returned no version"):
+        store._reconcile_result(plan, candidates, Decision(), [[]])
+    with pytest.raises(RuntimeError, match="returned no version"):
+        store._reconcile_result(plan, candidates, Decision(), [])
 
 
 def test_decision_keys_name_the_new_key_and_every_key_acted_on() -> None:
@@ -3253,6 +3258,32 @@ def test_applied_statements_look_up_only_the_named_keys() -> None:
         plain.sql.applied_items("user.alice", ["k"], write_id=w)
     ]
     assert store._applied_statements(plan, set()) == []
+
+
+def test_a_write_replaced_before_the_retry_is_still_reported_written() -> None:
+    # Another writer replaced or confirmed the new memory between the lost
+    # commit and the retry, so the item no longer carries the write id. Only
+    # a write archives the memory under the new key as overwritten, so that
+    # row proves the write; the version it wrote is gone from the item
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    history = [{"key": "k", "reason": "overwritten"}, {"key": "old", "reason": "superseded"}]
+    assert store._applied_result(plan, [[], history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=None,
+        superseded=("old",),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    # With the archive, a target that carries the write id was written, whatever
+    # its timestamps say: a write never confirms the memory under its own key
+    target = {"key": "k", "version": 4, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)}
+    rebuilt = store._applied_result(plan, [[target], history])
+    assert rebuilt is not None
+    assert (rebuilt.new, rebuilt.version, rebuilt.confirmed) == ("written", 4, ())
 
 
 def test_applied_result_lists_only_what_the_rows_prove() -> None:
@@ -3567,3 +3598,98 @@ def test_reconcile_sends_no_applied_read_before_a_decision() -> None:
     assert second[:2] == first[:2]
     assert second[2][0].startswith(f"INSERT INTO {store.sql.history} (")
     assert (result.new, result.version, result.already_applied) == ("written", 2, False)
+
+
+def raised_within(call: Callable[[], object], timeout: float = 5.0) -> BaseException | None:
+    """What ``call`` raised in another thread, or None if it returned.
+
+    A store call that waits for a connection the store itself holds never
+    returns. The thread then stays blocked and the test fails instead of
+    hanging.
+    """
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as error:  # noqa: BLE001
+            raised.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), f"the call still runs after {timeout} s"
+    return raised[0] if raised else None
+
+
+def make_proposal() -> Proposal:
+    return Proposal(
+        namespace=NS,
+        key="k",
+        value={"text": "x"},
+        slot=None,
+        slot_value=None,
+        provenance=None,
+        valid_at=NOW,
+    )
+
+
+def test_a_policy_that_calls_the_store_fails_at_once() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    # Migration 2 was seen, so a put would go straight to its embedding call
+    store._columns_ready = True
+    calls: list[Callable[[], object]] = [
+        lambda: store.get(NS, "k"),
+        lambda: store.put(NS, "k", {"text": "x"}),
+        lambda: store.search(NS, query="x"),
+        lambda: store.record(NS, "k"),
+        lambda: store.reconcile(NS, None, {"text": "x"}, policy=keep_all()),
+    ]
+    # On a single connection the reconcile holds the store's lock while its
+    # policy runs: a store call that reached the connection would wait forever
+    store.lock.acquire()
+    try:
+        for call in calls:
+
+            def policy(
+                proposal: Proposal, candidates: object, call: Callable[[], object] = call
+            ) -> Decision:
+                call()
+                return Decision()
+
+            error = raised_within(lambda policy=policy: store._decide(policy, make_proposal(), []))
+            assert isinstance(error, RuntimeError), error
+            assert str(error).startswith("A reconcile policy must not call the store")
+            assert "find_conflicts" in str(error) and "resolve" in str(error)
+    finally:
+        store.lock.release()
+    # Refused before the embedding model was called, too
+    assert embeddings.calls == 0
+    # The mark lasts only while the policy runs
+    store._refuse_inside_policy()
+
+
+def test_the_policy_mark_belongs_to_one_thread_and_one_policy_run() -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+
+    def policy(proposal: Proposal, candidates: object) -> Decision:
+        # Another thread, as on a pool, is not inside this policy
+        assert raised_within(store._refuse_inside_policy) is None
+        with pytest.raises(RuntimeError, match="must not call the store"):
+            store._refuse_inside_policy()
+        return Decision(new="skip")
+
+    assert store._decide(policy, make_proposal(), []) == Decision(new="skip")
+    store._refuse_inside_policy()
+
+    def failing(proposal: Proposal, candidates: object) -> Decision:
+        raise LookupError("the judge failed")
+
+    with pytest.raises(LookupError, match="the judge failed"):
+        store._decide(failing, make_proposal(), [])
+    store._refuse_inside_policy()

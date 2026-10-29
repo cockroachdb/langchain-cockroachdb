@@ -1199,11 +1199,15 @@ def test_history_insert_superseded_binds_everything() -> None:
     ) in query
     # Never invalid before it became valid. The store held it for no time
     assert "GREATEST(p.invalid_at, p.valid_at), now(), now()" in query
-    # Inserted once per write id, whatever version a second run would compute
+    # Inserted once per write id, whatever version a second run would compute.
+    # The reason is part of the guard, so the same write's archive of the
+    # memory under this key, as when it deletes it, never stands in for the
+    # late fact, whatever order the statements run in
     assert (
         "WHERE NOT EXISTS (\n"
         "    SELECT 1 FROM public.store_history AS h\n"
         "    WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id\n"
+        "        AND h.reason = p.reason\n"
         ")"
     ) in query
     assert query.endswith("ON CONFLICT (prefix, key, version) DO NOTHING")

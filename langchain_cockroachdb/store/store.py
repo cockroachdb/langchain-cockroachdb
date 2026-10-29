@@ -407,6 +407,26 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         """Run ``batch`` in a worker thread, as PostgresStore does."""
         return await asyncio.get_running_loop().run_in_executor(None, self.batch, list(ops))
 
+    @contextmanager
+    def _cursor(
+        self,
+        *,
+        pipeline: bool = False,
+        transaction: bool = False,
+        timeout: float | None = None,
+        label: str | None = None,
+    ) -> Iterator[Cursor[DictRow]]:
+        """PsycopgOps._cursor, refused while this thread runs a reconcile policy of the store.
+
+        Every connection checkout of the store comes through here. Inside a
+        policy the reconcile holds the connection: see _refuse_inside_policy.
+        """
+        self._refuse_inside_policy()
+        with super()._cursor(
+            pipeline=pipeline, transaction=transaction, timeout=timeout, label=label
+        ) as cur:
+            yield cur
+
     def _read_all(
         self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
     ) -> list[list[DictRow]]:
@@ -453,9 +473,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Runs before the first attempt of any read, so a retry reuses the
         vectors. embed_query, not embed_documents: models that embed
-        queries and documents differently get the query form.
+        queries and documents differently get the query form. Inside a
+        reconcile policy it refuses before calling the model.
         """
         assert self.index is not None
+        self._refuse_inside_policy()
         texts = plan.query_texts()
         vectors = [self.index.embeddings.embed_query(text) for text in texts]
         self._bind_query_vectors(plan, texts, vectors)
@@ -557,10 +579,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
     def _embed_put(self, plan: PutPlan) -> list[VectorRow]:
         """Embed the texts a put plan writes, once, and pair the vectors with their rows.
 
-        Puts and find_conflicts call it before their first attempt, so a
-        retry reuses the vectors. Both embed documents, with embed_documents:
-        the vectors are the ones the write stores.
+        Puts, find_conflicts and reconcile call it before their first
+        attempt, so a retry reuses the vectors. All embed documents, with
+        embed_documents: the vectors are the ones the write stores. Inside a
+        reconcile policy it refuses before calling the model.
         """
+        self._refuse_inside_policy()
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
             embeddings = self.index.embeddings.embed_documents(
@@ -881,8 +905,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         retry, so it must be fast and deterministic. A slow policy holds the
         transaction open and can run past the attempt timeout. An LLM judge,
         or a person, belongs in find_conflicts and resolve, which hold no
-        transaction while the decision is made. A policy that raises rolls
-        the transaction back, and its exception propagates unchanged,
+        transaction while the decision is made. A policy must not call the
+        store either: the store holds its connection while the policy runs,
+        so such a call raises RuntimeError at once. A policy that raises
+        rolls the transaction back, and its exception propagates unchanged,
         without a retry. So does the ValueError for an invalid decision.
 
         The decision writes the new memory, as put does, with its provenance
@@ -910,7 +936,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         that carry its write id and writes nothing. It returns the result
         rebuilt from those rows, with ``already_applied`` set. That result
         lists only what the rows prove: ``kept`` is empty, and on a store
-        without history so are ``superseded`` and ``deleted``.
+        without history so are ``superseded`` and ``deleted``. If another
+        writer replaced or confirmed the new memory before the retry, the
+        history row of the version it overwrote still proves the write: the
+        result says it was written, with no version.
 
         Args:
             namespace: The new memory's namespace. It cannot be empty.
@@ -1023,7 +1052,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     conflicts = self._conflicts(plan, vector_rows, read, similar, scored)
                     proposal, candidates = conflicts.proposal, conflicts.candidates
                     decision = self._checked_decision(
-                        proposal, candidates, policy(proposal, candidates)
+                        proposal, candidates, self._decide(policy, proposal, candidates)
                     )
                     named.update(self._decision_keys(plan, decision))
                     writes = send(
