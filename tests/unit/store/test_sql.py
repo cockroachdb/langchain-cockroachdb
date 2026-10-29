@@ -88,8 +88,8 @@ def reconcile_statements(sql: StoreSQL) -> list[tuple[str, list]]:
         sql.confirm("a.b", "k1", write_id="w"),
         sql.confirm("a.b", "k1", write_id="w", ttl=60.0),
         sql.confirm("a.b", "k1", write_id="w", ttl=None),
-        sql.applied_items("a.b", "w"),
-        sql.applied_history("a.b", "w"),
+        sql.applied_items("a.b", ["k1", "k2"], write_id="w"),
+        sql.applied_history("a.b", ["k1", "k2"], write_id="w"),
     ]
 
 
@@ -1289,18 +1289,20 @@ def test_confirm_binds_everything_and_keeps_version_and_updated_at() -> None:
         ]
 
 
-def test_applied_reads_bind_the_write_id() -> None:
+def test_applied_reads_look_up_only_the_named_keys() -> None:
     sql = StoreSQL("public", "store")
-    # Every row a write carries its id on, live or not, in its namespace only
-    assert sql.applied_items("user.alice", "w-1") == (
+    # Primary key lookups of the keys a retry names, never a scan of the
+    # namespace, and only rows that carry the write id, live or not
+    assert sql.applied_items("user.alice", ["k", "old"], write_id="w-1") == (
         "SELECT key, version, updated_at, confirmed_at FROM public.store\n"
-        "WHERE prefix = %s AND write_id = CAST(%s AS UUID)",
-        ["user.alice", "w-1"],
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)",
+        ["user.alice", ["k", "old"], "w-1"],
     )
-    assert sql.applied_history("user.alice", "w-1") == (
+    # History's primary key is (prefix, key, version): each key's versions only
+    assert sql.applied_history("user.alice", ["k", "old"], write_id="w-1") == (
         "SELECT key, reason FROM public.store_history\n"
-        "WHERE prefix = %s AND write_id = CAST(%s AS UUID)",
-        ["user.alice", "w-1"],
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)",
+        ["user.alice", ["k", "old"], "w-1"],
     )
 
 

@@ -972,11 +972,12 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         else:
             self._require_columns(self._reconcile_columns(refresh=True))
         vector_rows = self._embed_put(plan.put)
-        attempts = 0
+        # The keys that the decisions of earlier attempts named. A retry
+        # looks for its write id under them only: an attempt that committed
+        # wrote nowhere else, and one that reached no decision wrote nothing
+        named: set[str] = set()
 
         def attempt() -> ReconcileResult:
-            nonlocal attempts
-            attempts += 1
             cursors: list[Cursor[DictRow]] = []
             try:
                 with self._cursor(
@@ -1006,7 +1007,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     # the same round trip as the first candidate read. If an
                     # earlier attempt committed, it returns that result
                     reads = self._key_slot_statements(plan)
-                    checks = self._applied_statements(plan) if attempts > 1 else []
+                    checks = self._applied_statements(plan, named)
                     found = fetch([*reads, *checks])
                     applied = self._applied_result(plan, found[len(reads) :]) if checks else None
                     if applied is not None:
@@ -1024,6 +1025,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                     decision = self._checked_decision(
                         proposal, candidates, policy(proposal, candidates)
                     )
+                    named.update(self._decision_keys(plan, decision))
                     writes = send(
                         self._decision_statements(
                             plan,

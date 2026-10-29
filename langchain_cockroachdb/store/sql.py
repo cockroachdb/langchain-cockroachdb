@@ -1569,13 +1569,16 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         )
         return (renewed + sql, [*ttl_params, prefix, key, *match_params, *params])
 
-    def applied_items(self, prefix: str, write_id: str) -> tuple[str, list]:
-        """Build the read of the items that carry a write id, in one namespace.
+    def applied_items(self, prefix: str, keys: Sequence[str], *, write_id: str) -> tuple[str, list]:
+        """Build the read of the items under ``keys`` that carry a write id.
 
         A reconcile retried after a commit whose result was lost reads them,
         with applied_history, to tell what its earlier attempt did: the
-        memory it wrote or confirmed, and the others it confirmed. Expired
-        rows count, since they were written all the same.
+        memory it wrote or confirmed, and the others it confirmed. ``keys``
+        are the keys that the decisions of earlier attempts named, looked up
+        by primary key, so the retry's transaction reads only their rows,
+        not the whole namespace. Expired rows count, since they were
+        written all the same.
 
         Returns:
             Tuple of (SQL, parameters). Each row has ``key``, ``version``,
@@ -1583,24 +1586,28 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         """
         sql = (
             f"SELECT key, version, updated_at, confirmed_at FROM {self.items}\n"
-            "WHERE prefix = %s AND write_id = CAST(%s AS UUID)"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)"
         )
-        return (sql, [prefix, write_id])
+        return (sql, [prefix, list(keys), write_id])
 
-    def applied_history(self, prefix: str, write_id: str) -> tuple[str, list]:
-        """Build the read of the history rows that carry a write id, in one namespace.
+    def applied_history(
+        self, prefix: str, keys: Sequence[str], *, write_id: str
+    ) -> tuple[str, list]:
+        """Build the read of the history rows under ``keys`` that carry a write id.
 
         They are the versions a reconcile archived, and a new memory it
-        recorded straight into history. See applied_items.
+        recorded straight into history. History's primary key starts with
+        (prefix, key), so only the versions of ``keys`` are read. See
+        applied_items.
 
         Returns:
             Tuple of (SQL, parameters). Each row has ``key`` and ``reason``.
         """
         sql = (
             f"SELECT key, reason FROM {self.history}\n"
-            "WHERE prefix = %s AND write_id = CAST(%s AS UUID)"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)"
         )
-        return (sql, [prefix, write_id])
+        return (sql, [prefix, list(keys), write_id])
 
     def history_versions(self, prefix: str, key: str, *, limit: int) -> tuple[str, list]:
         """Build the SELECT for the versions of one key in history, newest first.

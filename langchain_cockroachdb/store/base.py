@@ -1852,16 +1852,39 @@ class BaseCockroachDBStore:
         validate_decision(proposal, candidates, decision)
         return decision
 
-    def _applied_statements(self, plan: ProposalPlan) -> list[tuple[str, list]]:
-        """The reads of the rows that carry a new memory's write id, in its namespace.
+    @staticmethod
+    def _decision_keys(plan: ProposalPlan, decision: Decision) -> set[str]:
+        """The keys whose rows a decision can mark with the plan's write id.
 
-        The items it wrote or confirmed and, on a store with history, the
-        history rows it created. A retried reconcile sends them with its
-        first candidate read. Pass their rows to _applied_result.
+        The new memory's key, which carries the memory written or confirmed
+        there, the version it overwrote and a late fact recorded straight
+        into history, and every key the decision does more than keep. An
+        attempt that committed wrote nowhere else, so a retry looks only at
+        these (_applied_statements).
         """
-        statements = [self.sql.applied_items(plan.prefix, plan.write_id)]
+        acted = (key for key, action in decision.actions.items() if action != Action.KEEP)
+        return {plan.key, *acted}
+
+    def _applied_statements(
+        self, plan: ProposalPlan, keys: Iterable[str]
+    ) -> list[tuple[str, list]]:
+        """The reads of the rows under ``keys`` that carry the plan's write id.
+
+        ``keys`` are the keys that earlier attempts' decisions named
+        (_decision_keys). The items written or confirmed under them and, on
+        a store with history, the history rows created under them are looked
+        up by primary key, so a retry under contention reads those rows
+        only, never the whole namespace. Without keys there is nothing to
+        read: an attempt that reached no decision wrote nothing. A retried
+        reconcile sends these with its first candidate read. Pass their rows
+        to _applied_result.
+        """
+        named = sorted(set(keys))
+        if not named:
+            return []
+        statements = [self.sql.applied_items(plan.prefix, named, write_id=plan.write_id)]
         if self._history is not None:
-            statements.append(self.sql.applied_history(plan.prefix, plan.write_id))
+            statements.append(self.sql.applied_history(plan.prefix, named, write_id=plan.write_id))
         return statements
 
     def _applied_result(

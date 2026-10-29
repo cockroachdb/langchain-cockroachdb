@@ -3217,13 +3217,47 @@ def test_reconcile_result_reports_what_the_decision_did() -> None:
     assert plain._reconcile_result(plan, candidates, late, []).new == "skipped"
 
 
+def test_decision_keys_name_the_new_key_and_every_key_acted_on() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    actions = {
+        "old": Action.SUPERSEDE,
+        "gone": Action.DELETE,
+        "dup": Action.CONFIRM,
+        "kept": Action.KEEP,
+    }
+    # The new key carries a written or confirmed memory, the version it
+    # overwrote and a late fact; the others carry what the decision did to them
+    assert store._decision_keys(plan, Decision(actions=actions)) == {"k", "old", "gone", "dup"}
+    late = Decision(new="superseded", superseded_by="newer")
+    assert store._decision_keys(plan, late) == {"k"}
+
+
+def test_applied_statements_look_up_only_the_named_keys() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    w = plan.write_id
+    statements = store._applied_statements(plan, {"old", "k", "dup"})
+    assert statements == [
+        store.sql.applied_items("user.alice", ["dup", "k", "old"], write_id=w),
+        store.sql.applied_history("user.alice", ["dup", "k", "old"], write_id=w),
+    ]
+    # Each binds the namespace, the keys and the write id, and names the
+    # keys in its WHERE clause: no read of the whole namespace
+    for sql, params in statements:
+        assert "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id" in sql
+        assert params == ["user.alice", ["dup", "k", "old"], w]
+    # Without history only the items are read, and with no keys nothing is
+    plain = history_store()
+    assert plain._applied_statements(plan, {"k"}) == [
+        plain.sql.applied_items("user.alice", ["k"], write_id=w)
+    ]
+    assert store._applied_statements(plan, set()) == []
+
+
 def test_applied_result_lists_only_what_the_rows_prove() -> None:
     store = history_store(history=True)
     plan = plan_proposal(store, {"text": "aisle"})
-    assert store._applied_statements(plan) == [
-        store.sql.applied_items("user.alice", plan.put.write_id),  # type: ignore[arg-type]
-        store.sql.applied_history("user.alice", plan.put.write_id),  # type: ignore[arg-type]
-    ]
     # Nothing carries the write id: no earlier attempt committed
     assert store._applied_result(plan, [[], []]) is None
 
@@ -3275,9 +3309,6 @@ def test_applied_result_lists_only_what_the_rows_prove() -> None:
 
     # Without history only the items are read
     plain = history_store()
-    assert plain._applied_statements(plan) == [
-        plain.sql.applied_items("user.alice", plan.put.write_id)  # type: ignore[arg-type]
-    ]
     assert plain._applied_result(plan, [[]]) is None
     assert plain._applied_result(plan, [confirmed]) == ReconcileResult(
         key="k",
@@ -3364,3 +3395,175 @@ def test_reconcile_checks_everything_before_any_io() -> None:
     with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
         keeping.reconcile(NS, "k", TEXT, policy=policy)
     assert embeddings.calls == 0
+
+
+APPLIED_READS = ("SELECT key, version, updated_at, confirmed_at FROM", "SELECT key, reason FROM")
+
+
+class ReconcileReads:
+    """Stands in for a store's _cursor in reconcile, and answers its statements.
+
+    Every attempt logs its statements. The candidate read returns ``rows``,
+    the already-applied reads ``applied`` (the items, then the history), and
+    the item upsert version 2. ``fail`` makes the first attempt fail with a
+    retryable 40001: "read" at its first fetch, before any decision, and
+    "commit" as its block ends, after its writes went out.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        fail: str,
+        applied: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], []),
+    ) -> None:
+        self.rows = rows
+        self.fail = fail
+        self.applied = applied
+        self.attempts: list[list[tuple[str, list]]] = []
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ReconcileCursor"]:
+        self.attempts.append([])
+        yield ReconcileCursor(self)
+        if self.fail == "commit" and len(self.attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if self.fail == "read" and len(self.attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+        if sql.startswith("SELECT now()"):
+            return [{"now": NOW}]
+        if sql.startswith(APPLIED_READS[0]):
+            return self.applied[0]
+        if sql.startswith(APPLIED_READS[1]):
+            return self.applied[1]
+        if sql.startswith("SELECT key, value, created_at"):
+            return self.rows
+        # The item upsert, the only write that returns rows
+        return [{"version": 2}]
+
+
+class ReconcileCursor:
+    """A cursor of ReconcileReads: it logs each statement and answers its fetch."""
+
+    def __init__(self, reads: ReconcileReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.sql = ""
+        self.description: list[str] | None = None
+
+    def cursor(self, **kwargs: object) -> "ReconcileCursor":
+        return ReconcileCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        self.reads.attempts[-1].append((sql, params or []))
+        self.sql = sql
+        if sql.endswith("RETURNING version"):
+            self.description = ["version"]
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.reads.answer(self.sql)
+
+    def close(self) -> None:
+        pass
+
+
+def reconciling_store(reads: ReconcileReads) -> CockroachDBStore:
+    """A store with history and no index whose reconcile attempts go to ``reads``."""
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    # Migration 2 and the history table were seen: no schema read
+    store._columns_ready = True
+    store._history_ready = True
+    store._cursor = reads.cursor  # type: ignore[method-assign,assignment]
+    return store
+
+
+def applied_reads(statements: list[tuple[str, list]]) -> list[tuple[str, list]]:
+    return [(sql, params) for sql, params in statements if sql.startswith(APPLIED_READS)]
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+def test_a_retried_reconcile_looks_up_only_the_keys_its_earlier_decision_named(
+    committed: bool,
+) -> None:
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup"), candidate_row("kept")]
+    target = {"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}
+    applied = ([target], [{"key": "old", "reason": "superseded"}]) if committed else ([], [])
+    reads = ReconcileReads(rows, fail="commit", applied=applied)
+    store = reconciling_store(reads)
+    decided: list[str] = []
+
+    def policy(proposal: Proposal, candidates: object) -> Decision:
+        decided.append(proposal.key)
+        return Decision(
+            actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM, "kept": Action.KEEP}
+        )
+
+    result = store.reconcile(NS, "k", {"seat": "x", "text": "aisle"}, policy=policy, slot="seat")
+
+    first, second = reads.attempts
+    # The first attempt had no earlier decision to look for
+    assert applied_reads(first) == []
+    [upsert] = [params for sql, params in first if sql.startswith("INSERT INTO public.store (")]
+    write_id = upsert[0]
+    # Its retry looks up the new key and the keys that decision acted on, by
+    # primary key, in the round trip of its first candidate read
+    keys = ["dup", "k", "old"]
+    assert second[:4] == [
+        store.sql.now(),
+        store.sql.key_slot_candidates(
+            "user.alice", "k", slot_field="seat", slot_value_json='"x"', filter=None
+        ),
+        store.sql.applied_items("user.alice", keys, write_id=write_id),
+        store.sql.applied_history("user.alice", keys, write_id=write_id),
+    ]
+    assert all(
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))" in sql
+        for sql, _ in applied_reads(second)
+    )
+    if committed:
+        # The rows prove the earlier attempt committed: nothing more is sent
+        assert len(second) == 4 and decided == ["k"]
+        assert result == ReconcileResult(
+            key="k",
+            new="written",
+            version=2,
+            superseded=("old",),
+            deleted=(),
+            confirmed=(),
+            kept=(),
+            already_applied=True,
+        )
+    else:
+        # Nothing carries the write id: the retry decides and writes again
+        assert decided == ["k", "k"]
+        assert second[4:] == first[2:]
+        assert result == ReconcileResult(
+            key="k",
+            new="written",
+            version=2,
+            superseded=("old",),
+            deleted=(),
+            confirmed=("dup",),
+            kept=("kept",),
+        )
+
+
+def test_reconcile_sends_no_applied_read_before_a_decision() -> None:
+    # The first attempt fails at its first read, so it reached no decision
+    # and could not have written anything
+    reads = ReconcileReads([candidate_row("k"), candidate_row("old")], fail="read")
+    store = reconciling_store(reads)
+
+    result = store.reconcile(
+        NS, "k", {"seat": "x", "text": "aisle"}, policy=keep_all(), slot="seat"
+    )
+
+    first, second = reads.attempts
+    assert applied_reads(first) == [] and applied_reads(second) == []
+    # The retry ran from the start: the candidate read, then the archive of
+    # the memory the new one overwrites, with no read for an earlier write
+    assert second[:2] == first[:2]
+    assert second[2][0].startswith(f"INSERT INTO {store.sql.history} (")
+    assert (result.new, result.version, result.already_applied) == ("written", 2, False)
