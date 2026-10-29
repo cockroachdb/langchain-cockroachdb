@@ -24,6 +24,7 @@ from langgraph.store.base import (
 )
 from psycopg_pool import AsyncConnectionPool
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.retry import RetryPolicy
 from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
@@ -1336,7 +1337,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
     store._read_all = read_all  # type: ignore[method-assign,assignment]
     assert store._reconcile_columns() is False
     assert store._reconcile_columns() is False
-    assert reads.calls == [([store.sql.reconcile_columns_exist()], "store schema check")]
+    assert reads.calls == [([store.sql.reconcile_migration_recorded()], "store schema check")]
     with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
         store._require_columns(store._reconcile_columns())
     # A method that needs migration 2 reads again rather than trust the cached False
@@ -1379,7 +1380,7 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
     store._read_all = read_all  # type: ignore[method-assign,assignment]
     assert await store._areconcile_columns() is False
     assert await store._areconcile_columns() is False
-    assert reads.calls == [([store.sql.reconcile_columns_exist()], "store schema check")]
+    assert reads.calls == [([store.sql.reconcile_migration_recorded()], "store schema check")]
     with pytest.raises(ValueError, match=r"run setup\(\)"):
         store._require_columns(await store._areconcile_columns())
     assert await store._areconcile_columns(refresh=True) is False
@@ -1438,6 +1439,187 @@ def test_reconcile_uses_the_schema_check_it_ran(monkeypatch) -> None:
         store.reconcile(("a",), "k", {"text": "x"}, policy=lambda proposal, candidates: None)
 
 
+class DeniedSchemaReads(SchemaReads):
+    """SchemaReads for a role without a grant on the migrations table.
+
+    The migrations read raises ``error``, by default the InsufficientPrivilege
+    that CockroachDB raises. The column read and the history check answer as
+    in SchemaReads. Every call is recorded, the failed ones too.
+    """
+
+    def __init__(
+        self, columns: bool, history: bool = False, error: Exception | None = None
+    ) -> None:
+        super().__init__(columns, history)
+        self.error = error or psycopg.errors.InsufficientPrivilege(
+            "user app does not have SELECT privilege on relation store_migrations"
+        )
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        if "_migrations" in statements[0][0]:
+            self.calls.append((statements, label))
+            raise self.error
+        return super().answer(statements, label)
+
+
+def store_reading(
+    make: str, reads: SchemaReads, **settings: object
+) -> CockroachDBStore | AsyncCockroachDBStore:
+    """A sync or async store whose reads go to ``reads``."""
+    if make == "sync":
+
+        def read_all(
+            statements: list[tuple[str, list]], label: str, session: object = None
+        ) -> list[list[dict]]:
+            return reads.answer(statements, label)
+
+        store = CockroachDBStore(object(), retry_policy=FAST, **settings)  # type: ignore[arg-type]
+        store._read_all = read_all  # type: ignore[method-assign,assignment]
+        return store
+
+    async def aread_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    astore = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        retry_policy=FAST,
+        **settings,  # type: ignore[arg-type]
+    )
+    astore._read_all = aread_all  # type: ignore[method-assign,assignment]
+    return astore
+
+
+async def check_columns(
+    store: CockroachDBStore | AsyncCockroachDBStore, *, refresh: bool = False
+) -> bool:
+    """The store's check for migration 2's columns, sync or async."""
+    if isinstance(store, AsyncCockroachDBStore):
+        return await store._areconcile_columns(refresh=refresh)
+    return store._reconcile_columns(refresh=refresh)
+
+
+def sent(reads: SchemaReads) -> list[list[tuple[str, list]]]:
+    """The statements of every schema check round trip, in order."""
+    assert all(label == "store schema check" for _, label in reads.calls)
+    return [statements for statements, _ in reads.calls]
+
+
+@pytest.mark.parametrize("history", [False, True], ids=["plain", "history"])
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_migrations_read_falls_back_to_the_columns_for_good(
+    make: str, history: bool, monkeypatch
+) -> None:
+    reads = DeniedSchemaReads(columns=False, history=True)
+    store = store_reading(make, reads, history=history)
+    migrations = store.sql.reconcile_migration_recorded()
+    columns = store.sql.reconcile_columns_exist()
+    tail = [store.sql.history_exists()] if history else []
+
+    assert await check_columns(store) is False
+    # The denial ended its round trip, so the column read and the history
+    # check go out together in a second one
+    assert sent(reads) == [[migrations, *tail], [columns, *tail]]
+    # From then on the check reads the columns only, cached as on the
+    # migrations path: False holds for _SCHEMA_RECHECK_SECONDS, and refresh
+    # reads again
+    assert await check_columns(store) is False
+    assert len(reads.calls) == 2
+    assert await check_columns(store, refresh=True) is False
+    assert sent(reads)[2:] == [[columns, *tail]]
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    reads.columns = True
+    assert await check_columns(store) is True
+    assert sent(reads)[3:] == [[columns, *tail]]
+    # True holds for good
+    assert await check_columns(store, refresh=True) is True
+    assert len(reads.calls) == 4
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_other_errors_of_the_migrations_read_propagate(make: str) -> None:
+    missing = psycopg.errors.UndefinedTable('relation "public.store_migrations" does not exist')
+    reads = DeniedSchemaReads(columns=True, error=missing)
+    store = store_reading(make, reads)
+    for _ in range(2):
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            await check_columns(store)
+    # No column read: each check tried the migrations table, and nothing was cached
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]] * 2
+    assert store._columns_ready is None
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_column_read_raises_without_trying_the_migrations_again(
+    make: str,
+) -> None:
+    reads = DeniedSchemaReads(columns=True)
+    store = store_reading(make, reads)
+
+    def deny(statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        reads.calls.append((statements, label))
+        raise psycopg.errors.InsufficientPrivilege("permission denied")
+
+    reads.answer = deny  # type: ignore[method-assign]
+    for _ in range(2):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await check_columns(store)
+    migrations = store.sql.reconcile_migration_recorded()
+    columns = store.sql.reconcile_columns_exist()
+    assert sent(reads) == [[migrations], [columns], [columns]]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_migrations_read_denied_in_a_callers_transaction_raises_once(make: str) -> None:
+    denied = psycopg.errors.InsufficientPrivilege(
+        "user app does not have SELECT privilege on relation store_migrations"
+    )
+    _psycopg_conn.mark_in_caller_transaction(denied)
+    reads = DeniedSchemaReads(columns=True, error=denied)
+    store = store_reading(make, reads)
+    # The denial aborted the caller's transaction, so no read can run in it:
+    # the error goes to the caller
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        await check_columns(store)
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
+    # When the caller tries again, the check goes straight to the columns
+    assert await check_columns(store) is True
+    assert sent(reads)[1:] == [[store.sql.reconcile_columns_exist()]]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_write_is_not_taken_for_a_denied_migrations_read(make: str) -> None:
+    reads = SchemaReads(columns=True)
+    store = store_reading(make, reads)
+    denied = psycopg.errors.InsufficientPrivilege(
+        "user app does not have INSERT privilege on relation store"
+    )
+    if isinstance(store, CockroachDBStore):
+
+        @contextlib.contextmanager
+        def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+            raise denied
+            yield
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            store.put(("a",), "k", {"x": 1})
+    else:
+
+        @contextlib.asynccontextmanager
+        async def afake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+            raise denied
+            yield
+
+        store._cursor = afake_cursor  # type: ignore[method-assign,assignment]
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await store.aput(("a",), "k", {"x": 1})
+    # The schema check read the migrations table once and was not denied
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
+    assert store._migrations_denied is False
+
+
 def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) -> None:
     clock = FakeClock()
     monkeypatch.setattr(store_base, "time", clock)
@@ -1472,7 +1654,7 @@ def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
     with pytest.raises(ValueError, match=missing_table):
         store._history_schema()
     # One round trip reads both, once
-    statements = [store.sql.reconcile_columns_exist(), store.sql.history_exists()]
+    statements = [store.sql.reconcile_migration_recorded(), store.sql.history_exists()]
     assert reads.calls == [(statements, "store schema check")]
     # A plain read of the columns trusts the answers for a while
     assert store._reconcile_columns() is True
@@ -1520,7 +1702,7 @@ async def test_async_history_check_reads_once_with_the_schema_before_refusing() 
         ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
     ):
         await store._ahistory_schema()
-    statements = [store.sql.reconcile_columns_exist(), store.sql.history_exists()]
+    statements = [store.sql.reconcile_migration_recorded(), store.sql.history_exists()]
     assert reads.calls == [(statements, "store schema check")]
     reads.history = True
     assert await store._ahistory_schema() == SchemaCheck(columns=True, history=True)
@@ -1707,7 +1889,9 @@ def test_delete_namespace_without_history_looks_for_a_history_table_each_time() 
     # The read leaves the schema check alone: its clock did not move, and
     # plain writes never look for the table
     assert store._schema_read_at == 0.0
-    assert store._schema_statements() == [store.sql.reconcile_columns_exist()]
+    assert store._schema_statements(read_migrations=True) == [
+        store.sql.reconcile_migration_recorded()
+    ]
 
 
 def test_delete_namespace_without_history_stops_looking_once_it_found_the_table() -> None:

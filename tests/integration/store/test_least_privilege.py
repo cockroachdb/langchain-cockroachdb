@@ -2,14 +2,17 @@
 
 An admin role runs setup(). The application's role then gets SELECT, INSERT,
 UPDATE and DELETE on the items, vectors and history tables, and no grant on
-the migrations table, as 0.5.x allowed. The store learns that migration 2 is
-applied from the items table's own columns, so this role still writes with
-versions and history.
+the migrations table, as 0.5.x allowed. The schema check reads the
+migrations table first. When that read is denied, the store learns that
+migration 2 is applied from the items table's own columns, so this role
+still writes with versions and history. A role that can read the migrations
+table keeps reading it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
 import warnings
 from collections.abc import Iterator
@@ -79,6 +82,8 @@ def test_a_role_granted_only_the_store_tables_uses_migration_2(
     )
 
     store.put(NS, "seat", WINDOW)
+    # The migrations read was denied, and the check fell back to the columns
+    assert store._migrations_denied is True
     store.put(NS, "seat", AISLE)
     store.put(NS, "food", VEGETARIAN)
     item = store.get(NS, "seat")
@@ -120,6 +125,7 @@ async def test_async_role_granted_only_the_store_tables_uses_migration_2(
     )
 
     await store.aput(NS, "seat", WINDOW)
+    assert store._migrations_denied is True
     await store.aput(NS, "seat", AISLE)
     await store.aput(NS, "food", VEGETARIAN)
     item = await store.aget(NS, "seat")
@@ -144,3 +150,92 @@ async def test_async_role_granted_only_the_store_tables_uses_migration_2(
         ("food", 1, "deleted", VEGETARIAN),
         ("seat", 1, "overwritten", WINDOW),
     ]
+
+
+def schema_checks(store: Any, monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, list]]]:
+    """Record the statements of every schema check round trip a sync or async store sends."""
+    checks: list[list[tuple[str, list]]] = []
+    real = store._read_all
+
+    def record(statements: list[tuple[str, list]], label: str) -> None:
+        if label == "store schema check":
+            checks.append(statements)
+
+    def read_all(statements: list[tuple[str, list]], label: str, session: Any = None) -> Any:
+        record(statements, label)
+        return real(statements, label, session)
+
+    async def aread_all(statements: list[tuple[str, list]], label: str, session: Any = None) -> Any:
+        record(statements, label)
+        return await real(statements, label, session)
+
+    is_async = inspect.iscoroutinefunction(real)
+    monkeypatch.setattr(store, "_read_all", aread_all if is_async else read_all)
+    return checks
+
+
+def test_a_role_that_can_read_the_migrations_table_keeps_reading_it(
+    store_factory, monkeypatch, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())  # root
+    checks = schema_checks(store, monkeypatch)
+    store.put(NS, "seat", WINDOW)
+    store.put(NS, "seat", AISLE)
+    assert checks == [[store.sql.reconcile_migration_recorded(), store.sql.history_exists()]]
+    assert store._migrations_denied is False
+    [old] = store.history(NS, "seat")
+    assert old.value == WINDOW
+
+
+async def test_async_role_that_can_read_the_migrations_table_keeps_reading_it(
+    astore_factory, monkeypatch, mode
+) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())  # root
+    checks = schema_checks(store, monkeypatch)
+    await store.aput(NS, "seat", WINDOW)
+    await store.aput(NS, "seat", AISLE)
+    assert checks == [[store.sql.reconcile_migration_recorded(), store.sql.history_exists()]]
+    assert store._migrations_denied is False
+
+
+def test_a_denied_migrations_read_in_a_callers_transaction_goes_to_the_caller(
+    app_role, store_factory, admin, libpq_url
+) -> None:
+    owner = store_factory("connection", history=True, index=seat_index())
+    grant_store_tables(admin, libpq_url, app_role, owner)
+    store = store_factory(
+        "connection",
+        setup=False,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"user": app_role},
+    )
+    # The denial aborts the caller's transaction, so it raises there
+    with pytest.raises(psycopg.errors.InsufficientPrivilege), store.conn.transaction():
+        store.put(NS, "seat", WINDOW)
+    # The caller's retry reads the columns
+    with store.conn.transaction():
+        store.put(NS, "seat", WINDOW)
+    record = store.record(NS, "seat")
+    assert record is not None and record.version == 1
+
+
+async def test_async_denied_migrations_read_in_a_callers_transaction_goes_to_the_caller(
+    app_role, astore_factory, admin, libpq_url
+) -> None:
+    owner = await astore_factory("connection", history=True, index=seat_index())
+    await asyncio.to_thread(grant_store_tables, admin, libpq_url, app_role, owner)
+    store = await astore_factory(
+        "connection",
+        setup=False,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"user": app_role},
+    )
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        async with store.conn.transaction():
+            await store.aput(NS, "seat", WINDOW)
+    async with store.conn.transaction():
+        await store.aput(NS, "seat", WINDOW)
+    item = await store.aget(NS, "seat")
+    assert item is not None and item.value == WINDOW

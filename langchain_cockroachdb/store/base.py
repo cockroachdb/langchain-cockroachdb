@@ -35,6 +35,7 @@ from langgraph.store.base import (
 )
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
+from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
 from langchain_cockroachdb.store.config import (
     DEFAULT_RECONCILE_SCAN_LIMIT,
@@ -903,6 +904,11 @@ class BaseCockroachDBStore:
     # Pooled batches check the schema concurrently. The lock keeps a read
     # that finishes late from replacing a True another read cached.
     _schema_lock: threading.Lock
+    # Whether the store's role was denied the migrations table (SQLSTATE
+    # 42501). From then on the schema check reads the items table's columns
+    # instead, for good: grants rarely change, and that read is always right
+    # for the role.
+    _migrations_denied: bool
 
     def _configure(
         self,
@@ -927,6 +933,7 @@ class BaseCockroachDBStore:
         self._history_ready = None
         self._schema_read_at = 0.0
         self._schema_lock = threading.Lock()
+        self._migrations_denied = False
 
     def _trusted(self, ready: bool | None, *, refresh: bool) -> bool | None:
         """A cached schema answer, or None when the schema check must read it again.
@@ -958,10 +965,11 @@ class BaseCockroachDBStore:
     def _cache_columns(self, rows: Sequence[Mapping[str, Any]]) -> bool:
         """Cache and return whether migration 2's columns exist.
 
-        ``rows`` are what StoreSQL.reconcile_columns_exist returned: whether
-        the items table has all of them, as ``ready``. A True cached before
-        is kept: a read that started before another process ran setup() can
-        finish late.
+        ``rows`` are what the schema check's first read returned, as
+        ``ready``: StoreSQL.reconcile_migration_recorded, or
+        reconcile_columns_exist once the migrations table was denied. A True
+        cached before is kept: a read that started before another process
+        ran setup() can finish late.
         """
         with self._schema_lock:
             ready = bool(rows and rows[0]["ready"]) or self._columns_ready is True
@@ -985,18 +993,45 @@ class BaseCockroachDBStore:
             self._history_ready = ready
         return ready
 
-    def _schema_statements(self) -> list[tuple[str, list]]:
+    def _schema_statements(self, *, read_migrations: bool) -> list[tuple[str, list]]:
         """The schema check's reads, sent as one round trip.
 
-        Whether the items table has migration 2's columns, and on a store
-        with history whether the history table exists. Neither read needs a
-        grant on the migrations table, so a role granted only the store's
-        tables can write once an admin role has run setup().
+        Whether migration 2 is in place, and on a store with history whether
+        the history table exists. With ``read_migrations`` the first read is
+        the migrations table. setup() records migration 2 there only after
+        its schema change has settled on every node, so a store that finds
+        the row can use the new columns wherever its next statement runs.
+
+        A role with no grant on that table reads the items table's own
+        columns instead (see _fall_back_to_columns). They can show up a
+        moment before every node uses them, so on a multi-node cluster one
+        write of such a role can fail in the seconds after migration 2
+        completes. Run setup() before rolling out 0.6.0, or grant the role
+        SELECT on the migrations table, to avoid that.
         """
-        statements = [self.sql.reconcile_columns_exist()]
+        if read_migrations:
+            statements = [self.sql.reconcile_migration_recorded()]
+        else:
+            statements = [self.sql.reconcile_columns_exist()]
         if self._history is not None:
             statements.append(self.sql.history_exists())
         return statements
+
+    def _fall_back_to_columns(self, error: BaseException, *, read_migrations: bool) -> bool:
+        """Whether a schema check denied with SQLSTATE 42501 runs again with the column read.
+
+        Only a denied migrations read falls back. The store remembers the
+        denial, so its later checks go straight to the column read without
+        the error. The failed statement ended its round trip, so the column
+        read and the history check go out together in the next one. Inside a
+        transaction the caller opened, the denial aborted that transaction
+        and no read can run in it: the error goes to the caller, whose retry
+        reads the columns.
+        """
+        if not read_migrations:
+            return False
+        self._migrations_denied = True
+        return not _psycopg_conn.in_caller_transaction(error)
 
     def _cached_schema(self, *, refresh: bool) -> SchemaCheck | None:
         """What the schema check can answer without a read, or None to read."""

@@ -23,8 +23,8 @@ NAMESPACES = object()
 # The migration that adds the columns reconcile, history and confirm use.
 # Until setup() applies it, the store writes with the 0.5 statements.
 MIGRATION_RECONCILE = 2
-# The columns migration 2 adds. The schema check looks for all of them in the
-# items table.
+# The columns migration 2 adds. A store whose role cannot read the migrations
+# table looks for all of them in the items table instead.
 _RECONCILE_COLUMNS = (
     "version",
     "provenance",
@@ -156,16 +156,27 @@ class StoreSQL:
     def migration_version(self) -> str:
         """The statement that reads the latest migration recorded, if any.
 
-        Only setup() reads the migrations table. The schema check before
-        writes uses reconcile_columns_exist instead.
+        setup() reads it to find the migrations it still has to run.
         """
         return f"SELECT v FROM {self.migrations_table} ORDER BY v DESC LIMIT 1"
+
+    def reconcile_migration_recorded(self) -> tuple[str, list]:
+        """The statement that tells whether setup() has recorded migration 2, as ``ready``.
+
+        The schema check reads it first. setup() records a migration only
+        after its schema change has settled on every node, so once the row
+        exists every node can use the new columns.
+        """
+        return (
+            f"SELECT EXISTS (SELECT 1 FROM {self.migrations_table} WHERE v >= %s) AS ready",
+            [MIGRATION_RECONCILE],
+        )
 
     def reconcile_columns_exist(self) -> tuple[str, list]:
         """The statement that tells whether the items table has migration 2's columns, as ``ready``.
 
-        It reads the table's own columns, not the migrations table, so a role
-        granted only the store's tables can run it. pg_attribute lists only
+        The schema check reads it instead of the migrations table when the
+        store's role has no grant on that table. pg_attribute lists only
         public columns, so columns that a schema change is still adding do
         not count. A missing items table has none of them.
         """

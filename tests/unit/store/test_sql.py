@@ -225,6 +225,7 @@ def test_no_cast_shorthand():
         sql.history_versions("a", "k1", limit=1),
         sql.history_exists(),
         sql.reconcile_columns_exist(),
+        sql.reconcile_migration_recorded(),
         sql.purge("a", "k1"),
         sql.delete_namespace(["a"], history=True),
         sql.upsert_items([("a", "k1", "{}", None, None, None)], write_id="w", history=True),
@@ -355,6 +356,12 @@ def test_the_column_check_binds_the_items_table_and_migration_2_columns() -> Non
     # The check requires exactly the columns migration 2 adds
     migration = sql.migrations()[MIGRATION_RECONCILE]
     assert re.findall(r"ADD COLUMN IF NOT EXISTS (\w+) ", migration) == columns
+
+
+def test_the_migrations_check_binds_the_migration_it_needs() -> None:
+    query, params = StoreSQL("memory", "facts").reconcile_migration_recorded()
+    assert query == "SELECT EXISTS (SELECT 1 FROM memory.facts_migrations WHERE v >= %s) AS ready"
+    assert params == [MIGRATION_RECONCILE]
 
 
 def test_upsert_with_a_write_id_bumps_the_version_only_for_a_new_write() -> None:
@@ -733,6 +740,7 @@ def test_every_builder_has_one_param_per_placeholder():
         sql.history_versions("a.b.c", "k1", limit=3),
         sql.history_exists(),
         sql.reconcile_columns_exist(),
+        sql.reconcile_migration_recorded(),
         sql.purge("a.b.c", "k1"),
         sql.upsert_items([("a.b.c", "k1", "{}", None, None, None)], write_id="w", history=True),
         *candidate_statements(sql),

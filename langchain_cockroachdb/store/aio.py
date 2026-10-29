@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from types import TracebackType
 from typing import Any, Literal
 
+import psycopg
 from langgraph.store.base import (
     NOT_PROVIDED,
     InvalidNamespaceError,
@@ -620,28 +621,46 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     async def _aschema(self, *, refresh: bool = False) -> SchemaCheck:
         """What the schema check knows: migration 2's columns and the history table.
 
-        It reads whether the items table has migration 2's columns, and on a
-        store with history whether the history table exists, in one round
-        trip. It reads them the first time, and again when an answer it found
-        missing is older than _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set.
-        What it found present it trusts for good.
+        It reads whether setup() has recorded migration 2, and on a store
+        with history whether the history table exists, in one round trip. A
+        role denied the migrations table reads the items table's columns
+        instead (see _schema_statements). It reads them the first time, and
+        again when an answer it found missing is older than
+        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. What it found present
+        it trusts for good.
         """
         schema = self._cached_schema(refresh=refresh)
         if schema is None:
-            schema = self._cache_schema(
-                await self._read_all(self._schema_statements(), "store schema check")
-            )
+            schema = self._cache_schema(await self._aread_schema())
         return schema
+
+    async def _aread_schema(self) -> list[list[DictRow]]:
+        """Send the schema check, with the column read if the migrations read is denied.
+
+        Only the schema check's own round trip is caught: a 42501 from any
+        other statement still raises.
+        """
+        read_migrations = not self._migrations_denied
+        try:
+            return await self._read_all(
+                self._schema_statements(read_migrations=read_migrations), "store schema check"
+            )
+        except psycopg.errors.InsufficientPrivilege as error:
+            if not self._fall_back_to_columns(error, read_migrations=read_migrations):
+                raise
+        return await self._read_all(
+            self._schema_statements(read_migrations=False), "store schema check"
+        )
 
     async def _areconcile_columns(self, *, refresh: bool = False) -> bool:
         """Whether migration 2's columns exist, as the schema check last read it.
 
-        It reads the items table's columns the first time, and again when it
-        last found them missing and that answer is older than
-        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. Methods that need the
-        columns pass ``refresh``, so they see a setup() that another process
-        ran since. Until setup() applies migration 2, puts write with the 0.5
-        statements and those methods raise ValueError.
+        It reads the schema the first time, and again when it last found the
+        columns missing and that answer is older than _SCHEMA_RECHECK_SECONDS,
+        or ``refresh`` is set. Methods that need the columns pass ``refresh``,
+        so they see a setup() that another process ran since. Until setup()
+        applies migration 2, puts write with the 0.5 statements and those
+        methods raise ValueError.
         """
         return (await self._aschema(refresh=refresh)).columns
 
