@@ -44,6 +44,7 @@ from langchain_cockroachdb.store.base import (
     ConditionalPlan,
     PutPlan,
     SchemaCheck,
+    _carries_write_id,
     _check_paging,
     _check_policy,
     _memory_prefix,
@@ -961,7 +962,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
                         record = _row_to_record(tuple(namespace), rows[0])
                         # If the record already has this write_id, an earlier attempt
                         # committed. Return True without calling the callable again
-                        if rows[0].get("write_id") == write_id:
+                        if _carries_write_id(rows[0], write_id):
                             return True
                         resolved_ttl = self._run_user_callable(_resolve_confirm_ttl, ttl, record)  # type: ignore[assignment]
                     else:

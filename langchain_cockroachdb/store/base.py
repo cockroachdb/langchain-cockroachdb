@@ -184,6 +184,16 @@ def _resolve_confirm_ttl(
     return resolved
 
 
+def _carries_write_id(row: Mapping[str, Any], write_id: str) -> bool:
+    """Whether ``row``, read back from the items table, carries ``write_id``.
+
+    psycopg reads a UUID column as a uuid.UUID, while a call chooses its
+    write id as a string, so both sides are compared as UUIDs.
+    """
+    found = row.get("write_id")
+    return found is not None and uuid.UUID(str(found)) == uuid.UUID(write_id)
+
+
 def _check_valid_at(valid_at: object) -> None:
     """Raise ValueError unless ``valid_at`` is None or a timezone-aware datetime."""
     if valid_at is not None and (

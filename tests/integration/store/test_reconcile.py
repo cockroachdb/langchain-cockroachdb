@@ -2261,6 +2261,37 @@ def test_confirm_retried_after_a_lost_commit_counts_once(
     assert record.confirmations == 1
 
 
+def test_a_ttl_function_runs_once_when_a_confirm_retries_after_a_lost_commit(
+    store_factory, admin, unsafe_internals, caplog, mode
+) -> None:
+    # The confirm commits and its result is lost. The retry reads the memory,
+    # finds its own write id on it, and returns without calling the function again
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(mode, connect_kwargs={"cursor_factory": fault.cursor_class()})
+    store.put(NS, "w", text(WINDOW), ttl=10.0)
+    calls: list[int] = []
+
+    def ttl(record: MemoryRecord) -> float:
+        calls.append(record.confirmations)
+        return 20.0
+
+    fault.armed = True
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        confirmed = store.confirm(NS, "w", ttl=ttl)
+
+    assert confirmed is True and fault.fired == 1
+    found = retries(caplog, "store confirm")
+    assert len(found) == 1 and "SQLSTATE 40003" in found[0]
+    # Called once, with the memory as the first attempt read it
+    assert calls == [0]
+    record = store.record(NS, "w")
+    assert record is not None and record.confirmations == 1
+    row = admin.execute(
+        f"SELECT ttl_minutes FROM {store.sql.items} WHERE prefix = %s AND key = 'w'", (PREFIX,)
+    ).fetchone()
+    assert row is not None and row["ttl_minutes"] == 20
+
+
 def test_confirm_between_find_and_resolve_does_not_invalidate(store_factory, admin, mode) -> None:
     store = store_factory(mode, index=seat_index(), history=True)
     store.put(NS, "w", in_slot(WINDOW))

@@ -37,6 +37,7 @@ from langchain_cockroachdb.store.base import (
     PutPlan,
     SchemaCheck,
     StoreIdentity,
+    _carries_write_id,
     _group_ops,
     _resolve_confirm_ttl,
     _validate_confirm_ttl,
@@ -4289,13 +4290,32 @@ def test_confirm_result_interprets_rowcount_and_check_rows() -> None:
     assert store._confirm_result(rowcount=0, check_rows=[]) is False
 
 
+def test_carries_write_id_matches_the_uuid_psycopg_reads_with_the_string_a_call_chose() -> None:
+    write_id = str(uuid.uuid4())
+    # psycopg reads a UUID column as a uuid.UUID, which never equals a str
+    assert uuid.UUID(write_id) != write_id
+    assert _carries_write_id({"write_id": uuid.UUID(write_id)}, write_id)
+    assert _carries_write_id({"write_id": write_id.upper()}, write_id)
+    assert not _carries_write_id({"write_id": uuid.uuid4()}, write_id)
+    assert not _carries_write_id({"write_id": None}, write_id)
+    assert not _carries_write_id({}, write_id)
+
+
+def as_read(row: dict[str, object]) -> dict[str, object]:
+    """``row`` as psycopg reads it back: a UUID column, such as write_id, comes as a uuid.UUID."""
+    if isinstance(row.get("write_id"), str):
+        return {**row, "write_id": uuid.UUID(str(row["write_id"]))}
+    return row
+
+
 class ConfirmReads:
     """Stands in for a store's _cursor in confirm, and answers its statements.
 
     Every attempt logs its statements. The record read returns ``record_row``
-    (or no rows if None), the UPDATE returns ``updated`` rows, and the write_id
-    check returns ``check_rows``. ``fail`` makes the first attempt fail with a
-    retryable 40001 as its block ends.
+    (or no rows if None), with its write id as a uuid.UUID, as psycopg reads
+    it. The UPDATE returns ``updated`` rows, and the write_id check returns
+    ``check_rows``. ``fail`` makes the first attempt fail with a retryable
+    40003 as its block ends.
     """
 
     def __init__(
@@ -4324,7 +4344,7 @@ class ConfirmReads:
 
     def answer(self, sql: str) -> list[dict[str, object]]:
         if sql.startswith("SELECT key, value"):
-            return [self.record_row] if self.record_row else []
+            return [as_read(self.record_row)] if self.record_row else []
         if sql.startswith("SELECT 1 FROM"):
             return self.check_rows
         return []
@@ -4488,14 +4508,15 @@ def test_confirm_on_retry_skips_callable_when_record_has_write_id() -> None:
             self.captured_write_id: str | None = None
 
         def answer(self, sql: str) -> list[dict[str, object]]:
-            # On retry, return record with the captured write_id
+            # On retry, return the record with the captured write_id, as
+            # psycopg reads a UUID column back: a uuid.UUID, not a str
             if (
                 sql.startswith("SELECT key, value")
                 and len(self.attempts) > 1
                 and self.captured_write_id
             ):
                 row = dict(self.record_row)  # type: ignore[arg-type]
-                row["write_id"] = self.captured_write_id
+                row["write_id"] = uuid.UUID(self.captured_write_id)
                 return [row]
             return super().answer(sql)
 
@@ -4855,8 +4876,10 @@ class ConditionalReads:
 
     Every attempt logs its statements and the arguments of its _cursor. The
     record read returns ``row`` on the first attempt and ``retry_row`` on
-    the others, or no row for None. The reads of the rows that carry the
-    write id return ``proof``. The item upsert returns version 2. With
+    the others, or no row for None, with its write id as a uuid.UUID, as
+    psycopg reads it. The reads of the rows that carry the write id return
+    ``proof``; like the real reads, they have no write id column. The item
+    upsert returns version 2. With
     ``fail`` the first attempt fails with a 40003 as its block ends, after
     its writes went out, as when the result of its commit is lost. Like
     psycopg, a cursor keeps its result from execute, and an execute after
@@ -4892,7 +4915,7 @@ class ConditionalReads:
     def answer(self, sql: str) -> list[dict[str, object]]:
         if sql.startswith("SELECT key, value, created_at"):
             row = self.row if len(self.attempts) == 1 else self.retry_row
-            return [] if row is None else [row]
+            return [] if row is None else [as_read(row)]
         if sql.startswith(APPLIED_READS):
             return self.proof
         if sql.endswith("RETURNING version"):
@@ -4984,10 +5007,14 @@ def test_put_if_returns_the_current_record_and_writes_nothing() -> None:
 
 
 @pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
-def test_a_retried_put_if_looks_for_its_write_id(committed: bool) -> None:
+def test_a_retried_put_if_looks_for_its_write_id(committed: bool, monkeypatch) -> None:
     # The first attempt fails with a 40003 as its block ends, after its writes went out
-    row = candidate_row("k", version=2)
-    written = candidate_row("k", version=3, updated_at=LATER)
+    mine = uuid.UUID(int=7)
+    monkeypatch.setattr(store_base.uuid, "uuid4", lambda: mine)
+    # The live row carries the write id of the put that wrote it, and the
+    # row the first attempt wrote carries this call's
+    row = {**candidate_row("k", version=2), "write_id": str(uuid.UUID(int=1))}
+    written = {**candidate_row("k", version=3, updated_at=LATER), "write_id": str(mine)}
     proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
     reads = ConditionalReads(
         row,
@@ -5000,6 +5027,7 @@ def test_a_retried_put_if_looks_for_its_write_id(committed: bool) -> None:
     result = store.put_if(NS, "k", {"text": "aisle"}, expected=record_of(version=2))
 
     [plan] = plans
+    assert plan.write_id == str(mine)
     writes = store._conditional_writes(plan)
     first, second = reads.attempts
     assert first == [*plan.reads(retry=False), *writes]
