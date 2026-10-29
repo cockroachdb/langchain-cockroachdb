@@ -42,7 +42,14 @@ from langchain_cockroachdb.store.base import (
     needs_exact_search,
 )
 from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
-from langchain_cockroachdb.store.reconcile import Candidate
+from langchain_cockroachdb.store.reconcile import (
+    Action,
+    Candidate,
+    Decision,
+    Proposal,
+    ReconcileResult,
+    keep_all,
+)
 from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, StoreSQL
 from langchain_cockroachdb.store.store import CockroachDBStore
 
@@ -1435,7 +1442,9 @@ def test_reconcile_uses_the_schema_check_it_ran(monkeypatch) -> None:
         return True
 
     monkeypatch.setattr(store, "_reconcile_columns", check)
-    with pytest.raises(NotImplementedError):
+    # Past the schema check, the first attempt checks out a connection: this
+    # store has none to give
+    with pytest.raises(TypeError, match="Invalid connection type"):
         store.reconcile(("a",), "k", {"text": "x"}, policy=lambda proposal, candidates: None)
 
 
@@ -2944,3 +2953,414 @@ def test_from_conn_string_builds_the_embedding_model_once(monkeypatch) -> None:
     ) as store:
         assert isinstance(store.index.embeddings, CountingEmbeddings)  # type: ignore[union-attr]
     assert built == ["fake:model"]
+
+
+# reconcile: the statements of a decision, the result, and the rebuilt result
+
+
+def make_candidate(
+    key: str, reason: str = "similar", *, valid_at: datetime = T0, version: int = 1
+) -> Candidate:
+    """A candidate under NS, as merge_candidates builds it from a row."""
+    row = candidate_row(key, version=version, valid_at=valid_at)
+    return store_base._row_to_candidate(NS, row, reason, None)  # type: ignore[arg-type]
+
+
+def history_store(*, history: object = None) -> BaseCockroachDBStore:
+    """Shared store state with a 3-dimension cosine index, and history when given."""
+    return make_base(fields=["text"], history=history)
+
+
+VALID = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+
+def test_decision_statements_write_archive_first_then_upsert_then_delete_and_confirm() -> None:
+    store = history_store(history={"ttl_days": 7})
+    plan = plan_proposal(
+        store, {"text": "aisle", "seat": "x"}, provenance={"source": "chat"}, valid_at=VALID
+    )
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("old", "slot"),
+        make_candidate("gone"),
+        make_candidate("dup"),
+        make_candidate("kept"),
+    ]
+    decision = Decision(
+        actions={"old": Action.SUPERSEDE, "gone": Action.DELETE, "dup": Action.CONFIRM}
+    )
+    statements = store._decision_statements(
+        plan, candidates, decision, vector_rows=rows, valid_at=VALID
+    )
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    assert statements == [
+        # Archiving comes first. The target and the superseded fact end at the
+        # new memory's valid time, a deleted one now
+        sql.archive(
+            "user.alice",
+            ["k"],
+            reason="overwritten",
+            superseded_by=None,
+            invalid_at=VALID,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.archive(
+            "user.alice",
+            ["old"],
+            reason="superseded",
+            superseded_by="k",
+            invalid_at=VALID,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.archive(
+            "user.alice",
+            ["gone"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        # Then the write, as put does it, with the provenance and valid time
+        sql.delete_vectors("user.alice", ["k"]),
+        sql.upsert_items(
+            [("user.alice", "k", plan.value_json, None, '{"source": "chat"}', VALID)],
+            write_id=w,
+            history=True,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old", "gone"]),
+        sql.delete_vectors("user.alice", ["old", "gone"]),
+        sql.confirm("user.alice", "dup", write_id=w),
+    ]
+    # Only the item upsert returns rows: the version it wrote
+    returning = [s for s, _ in statements if s.splitlines()[-1].startswith("RETURNING")]
+    assert returning == [statements[4][0]]
+    assert returning[0].endswith("\nRETURNING version")
+
+
+def test_decision_statements_with_a_default_valid_time_end_old_facts_now() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"}, key="new")
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    # No live memory under the new key: nothing to archive as overwritten
+    statements = store._decision_statements(
+        plan,
+        [make_candidate("old", "slot")],
+        Decision(actions={"old": Action.SUPERSEDE}),
+        vector_rows=rows,
+        valid_at=NOW,
+    )
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    assert statements == [
+        # No valid time was given: the archive passes none, so it is now(),
+        # and the item stores none, so its valid time is its updated_at
+        sql.archive(
+            "user.alice",
+            ["old"],
+            reason="superseded",
+            superseded_by="new",
+            invalid_at=None,
+            write_id=w,
+            ttl_days=None,
+        ),
+        sql.delete_vectors("user.alice", ["new"]),
+        sql.upsert_items(
+            [("user.alice", "new", plan.value_json, None, None, None)],
+            write_id=w,
+            history=True,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old"]),
+        sql.delete_vectors("user.alice", ["old"]),
+    ]
+
+
+def test_decision_statements_skip_and_record_a_late_fact() -> None:
+    store = history_store(history={"ttl_days": 7})
+    plan = plan_proposal(store, {"text": "aisle"}, provenance={"source": "old chat"})
+    newer_at = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("newer", "slot", valid_at=newer_at),
+        make_candidate("gone"),
+        make_candidate("dup"),
+    ]
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    rest = [
+        sql.archive(
+            "user.alice",
+            ["gone"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.delete_items("user.alice", ["gone"]),
+        sql.delete_vectors("user.alice", ["gone"]),
+        sql.confirm("user.alice", "dup", write_id=w),
+    ]
+    actions = {"gone": Action.DELETE, "dup": Action.CONFIRM}
+
+    # A skip writes nothing for the new memory and leaves the target alone
+    skip = Decision(new="skip", actions=actions)
+    assert store._decision_statements(plan, candidates, skip, vector_rows=[], valid_at=VALID) == (
+        rest
+    )
+
+    # A late fact goes straight into history, valid from the valid time the
+    # policy saw until the newer fact became valid
+    late = Decision(new="superseded", superseded_by="newer", actions=actions)
+    statements = store._decision_statements(plan, candidates, late, vector_rows=[], valid_at=VALID)
+    assert statements == [
+        sql.history_insert_superseded(
+            "user.alice",
+            "k",
+            value_json=plan.value_json,
+            provenance_json='{"source": "old chat"}',
+            valid_at=VALID,
+            invalid_at=newer_at,
+            superseded_by="newer",
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        *rest,
+    ]
+
+
+def test_decision_statements_without_history_delete_and_record_nothing() -> None:
+    store = history_store()
+    plan = plan_proposal(store, {"text": "aisle"}, valid_at=VALID)
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    candidates = [make_candidate("k", "key"), make_candidate("old", "slot"), make_candidate("dup")]
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    write = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+    assert store._decision_statements(
+        plan, candidates, write, vector_rows=rows, valid_at=VALID
+    ) == [
+        sql.delete_vectors("user.alice", ["k"]),
+        sql.upsert_items(
+            [("user.alice", "k", plan.value_json, None, None, VALID)],
+            write_id=w,
+            history=False,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old"]),
+        sql.delete_vectors("user.alice", ["old"]),
+        sql.confirm("user.alice", "dup", write_id=w),
+    ]
+    # A late fact without history is not kept anywhere
+    late = Decision(new="superseded", superseded_by="old", actions={"dup": Action.CONFIRM})
+    assert store._decision_statements(plan, candidates, late, vector_rows=rows, valid_at=VALID) == [
+        sql.confirm("user.alice", "dup", write_id=w)
+    ]
+
+    # Without an index there are no vectors to replace or delete
+    flat = make_base(history=True)
+    plan = plan_proposal(flat, {"text": "aisle"})
+    statements = flat._decision_statements(
+        plan, candidates, Decision(actions={"old": Action.DELETE}), vector_rows=[], valid_at=NOW
+    )
+    assert flat.sql.vectors not in " ".join(s for s, _ in statements)
+    assert statement_kinds(statements) == [
+        f"INSERT {flat.sql.history}",
+        f"INSERT {flat.sql.history}",
+        f"INSERT {flat.sql.items}",
+        f"DELETE {flat.sql.items}",
+    ]
+
+
+def test_reconcile_result_reports_what_the_decision_did() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("old", "slot"),
+        make_candidate("gone"),
+        make_candidate("dup"),
+        make_candidate("kept"),
+    ]
+    actions = {"old": Action.SUPERSEDE, "gone": Action.DELETE, "dup": Action.CONFIRM}
+    # The version is the one the item upsert returned. The target it
+    # overwrote is not kept
+    written = store._reconcile_result(
+        plan, candidates, Decision(actions=actions), [[{"version": 4}]]
+    )
+    assert written == ReconcileResult(
+        key="k",
+        new="written",
+        version=4,
+        superseded=("old",),
+        deleted=("gone",),
+        confirmed=("dup",),
+        kept=("kept",),
+    )
+    # Without a write there is no version, and a target left alone is kept
+    actions = {"gone": Action.DELETE, "dup": Action.CONFIRM}
+    skipped = store._reconcile_result(plan, candidates, Decision(new="skip", actions=actions), [])
+    assert (skipped.new, skipped.version, skipped.kept) == ("skipped", None, ("k", "old", "kept"))
+    late = Decision(new="superseded", superseded_by="old", actions=actions)
+    assert store._reconcile_result(plan, candidates, late, []).new == "superseded"
+    # Without history a late fact is not kept anywhere: the result says skipped
+    plain = history_store()
+    assert plain._reconcile_result(plan, candidates, late, []).new == "skipped"
+
+
+def test_applied_result_lists_only_what_the_rows_prove() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    assert store._applied_statements(plan) == [
+        store.sql.applied_items("user.alice", plan.put.write_id),  # type: ignore[arg-type]
+        store.sql.applied_history("user.alice", plan.put.write_id),  # type: ignore[arg-type]
+    ]
+    # Nothing carries the write id: no earlier attempt committed
+    assert store._applied_result(plan, [[], []]) is None
+
+    # The target carries it with a later update than confirmation: it was written
+    items = [
+        {"key": "k", "version": 3, "updated_at": T0 + timedelta(hours=1), "confirmed_at": T0},
+        {"key": "dup", "version": 1, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)},
+    ]
+    history = [
+        {"key": "k", "reason": "overwritten"},
+        {"key": "old", "reason": "superseded"},
+        {"key": "gone", "reason": "deleted"},
+        {"key": "after", "reason": "superseded"},
+    ]
+    assert store._applied_result(plan, [items, history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=3,
+        superseded=("after", "old"),
+        deleted=("gone",),
+        confirmed=("dup",),
+        kept=(),
+        already_applied=True,
+    )
+
+    # Confirmed later than updated: confirming changes neither, so it was confirmed
+    confirmed = [
+        {"key": "k", "version": 2, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)}
+    ]
+    assert store._applied_result(plan, [confirmed, []]) == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=("k",),
+        kept=(),
+        already_applied=True,
+    )
+
+    # A history row of the new key ending as superseded is the late fact itself
+    late = store._applied_result(
+        plan, [[], [{"key": "k", "reason": "superseded"}, {"key": "gone", "reason": "deleted"}]]
+    )
+    assert late is not None
+    assert (late.new, late.superseded, late.deleted) == ("superseded", (), ("gone",))
+    deleted = store._applied_result(plan, [[], [{"key": "k", "reason": "deleted"}]])
+    assert deleted is not None and (deleted.new, deleted.deleted) == ("skipped", ("k",))
+
+    # Without history only the items are read
+    plain = history_store()
+    assert plain._applied_statements(plan) == [
+        plain.sql.applied_items("user.alice", plan.put.write_id)  # type: ignore[arg-type]
+    ]
+    assert plain._applied_result(plan, [[]]) is None
+    assert plain._applied_result(plan, [confirmed]) == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=("k",),
+        kept=(),
+        already_applied=True,
+    )
+
+
+def test_a_policy_must_return_a_valid_decision() -> None:
+    store = history_store()
+    plan = plan_proposal(store, {"text": "aisle"})
+    proposal = Proposal(
+        namespace=NS,
+        key="k",
+        value=plan.value,
+        slot=None,
+        slot_value=None,
+        provenance=None,
+        valid_at=NOW,
+    )
+    candidates = [make_candidate("a")]
+    decision = Decision(actions={"a": Action.DELETE})
+    assert store._checked_decision(proposal, candidates, decision) is decision
+    with pytest.raises(ValueError, match="returned NoneType, not a Decision"):
+        store._checked_decision(proposal, candidates, None)
+    with pytest.raises(ValueError, match="unknown candidate key: b"):
+        store._checked_decision(proposal, candidates, Decision(actions={"b": Action.DELETE}))
+
+
+def test_reconcile_checks_everything_before_any_io() -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"], "distance_type": "l2"},
+        retry_policy=FAST,
+    )
+    policy = keep_all()
+    for call in (
+        lambda: store.reconcile((), "k", TEXT, policy=policy, threshold=-1.0),
+        lambda: store.reconcile(NS, "k", TEXT, policy=policy),
+        lambda: store.reconcile(NS, "k", TEXT, policy=policy, threshold=-1.0, slot="seat"),
+        lambda: store.reconcile(NS, "k", TEXT, policy=policy, threshold=-1.0, limit=-1),
+        lambda: store.reconcile(NS, "k", TEXT, policy=policy, threshold=-1.0, ttl=0),
+        lambda: store.reconcile(
+            NS, "k", TEXT, policy=policy, threshold=-1.0, valid_at=datetime(2026, 1, 1)
+        ),
+        lambda: store.reconcile(NS, "k", TEXT, policy="keep", threshold=-1.0),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError):
+            call()
+    assert embeddings.calls == 0
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    def no_columns(*, refresh: bool = False) -> bool:
+        assert refresh, "a method that needs migration 2 reads the schema again"
+        return False
+
+    store._reconcile_columns = no_columns  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        store.reconcile(NS, "k", TEXT, policy=policy, threshold=-1.0)
+    assert embeddings.calls == 0
+
+    # A store with history refuses until setup() has created the history table
+    keeping = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        history=True,
+        retry_policy=FAST,
+    )
+    reads = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    keeping._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        keeping.reconcile(NS, "k", TEXT, policy=policy)
+    assert embeddings.calls == 0

@@ -1,16 +1,26 @@
-"""find_conflicts and record: the memories a new one may conflict with, read without writing.
+"""find_conflicts, record and reconcile: the memories a new one may conflict with.
 
 Candidates are live memories in the new memory's own namespace: the one
 under its key, those in the same slot and, on a store with an index, those
 whose vectors score at or above the threshold. Expired memories are never
-candidates, and neither method pushes back an expiry. Without a valid_at
-from the caller, the new memory is valid from the database's clock.
+candidates, and neither find_conflicts nor record pushes back an expiry.
+Without a valid_at from the caller, the new memory is valid from the
+database's clock.
+
+reconcile writes a memory and settles its candidates in one serializable
+transaction: it reads them, runs the policy, and supersedes, deletes,
+confirms or keeps each one, keeping what it ends in history on a store with
+history. A retry after a commit whose result was lost finds its own write
+and returns the result rebuilt from the rows.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -20,11 +30,24 @@ from langgraph.store.base import PutOp
 from psycopg import Connection
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
-from langchain_cockroachdb.store import Conflicts, MemoryRecord
+from langchain_cockroachdb._sql import parse_vector
+from langchain_cockroachdb.store import (
+    Action,
+    Conflicts,
+    Decision,
+    MemoryRecord,
+    Policy,
+    ReconcileResult,
+    keep_all,
+    skip_duplicates,
+    supersede_same_slot,
+    supersede_similar,
+)
 from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store import reconcile as store_reconcile
 from langchain_cockroachdb.store import store as store_module
 from langchain_cockroachdb.store.sql import StoreSQL
+from tests.integration.faults import FailAfterCommit, PsycopgFaults
 from tests.integration.store.conftest import SEATS, FixedEmbeddings, seat_index
 from tests.integration.store.test_schema_upgrade import schema_0_5
 from tests.integration.store.test_semantic_filters import STATS_WAIT, explain
@@ -635,3 +658,652 @@ async def test_async_from_conn_string_takes_reconcile_scan_limit(libpq_url, tabl
         libpq_url, table_name=table_name, reconcile_scan_limit=3
     ) as store:
         assert store.reconcile_scan_limit == 3
+
+
+# reconcile
+
+RETRY_LOGGER = "langchain_cockroachdb.retry"
+# Of everything reconcile sends, only the key and slot candidate read contains this
+CANDIDATE_READ = "coalesce(valid_at, updated_at) as valid_at"
+OLD = datetime(2025, 1, 1, tzinfo=timezone.utc)
+OLDER = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+def retries(caplog: pytest.LogCaptureFixture, label: str) -> list[str]:
+    """The retry warnings logged for ``label``."""
+    prefix = f"Retrying {label} after "
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+def history_rows(admin: Connection[Any], store: Any) -> list[dict[str, Any]]:
+    """Every history row under PREFIX."""
+    return admin.execute(
+        f"SELECT key, version, reason, superseded_by, value, valid_at, invalid_at, write_id "
+        f"FROM {store.sql.history} WHERE prefix = %s ORDER BY key, version",
+        (PREFIX,),
+    ).fetchall()
+
+
+def vector_keys(admin: Connection[Any], store: Any) -> list[str]:
+    rows = admin.execute(
+        f"SELECT key FROM {store.sql.vectors} WHERE prefix = %s ORDER BY key", (PREFIX,)
+    ).fetchall()
+    return [row["key"] for row in rows]
+
+
+def stored_valid_at(admin: Connection[Any], store: Any, key: str) -> Any:
+    """The valid_at column of an item, None when the write stored no valid time."""
+    row = admin.execute(
+        f"SELECT valid_at FROM {store.sql.items} WHERE prefix = %s AND key = %s", (PREFIX, key)
+    ).fetchone()
+    assert row is not None
+    return row["valid_at"]
+
+
+def in_slot(value: str) -> dict[str, Any]:
+    return text(value, seat="x")
+
+
+def slot_policy() -> Policy:
+    return supersede_same_slot()
+
+
+def test_reconcile_supersedes_an_older_fact_in_the_same_slot(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    ns = ("user", "alice")
+    first = store.reconcile(
+        ns,
+        None,
+        {"seat": "x", "text": "Prefers window seats"},
+        policy=supersede_same_slot(),
+        slot="seat",
+    )
+    second = store.reconcile(
+        ns,
+        None,
+        {"seat": "x", "text": "Prefers aisle seats"},
+        policy=supersede_same_slot(),
+        slot="seat",
+    )
+    assert second.new == "written" and second.superseded == (first.key,)
+    assert [i.value["text"] for i in store.search(ns)] == ["Prefers aisle seats"]
+    [old] = store.history(ns, first.key)
+    assert old.reason == "superseded" and old.superseded_by == second.key
+
+    assert first == ReconcileResult(
+        key=first.key, new="written", version=1, superseded=(), deleted=(), confirmed=(), kept=()
+    )
+    assert second == ReconcileResult(
+        key=second.key,
+        new="written",
+        version=1,
+        superseded=(first.key,),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+    )
+    # No valid time was given: the new memory stores none, so it is valid from
+    # its write, and the fact it superseded ended at that write
+    new = store.record(ns, second.key)
+    assert new is not None and new.valid_at == new.item.updated_at
+    assert stored_valid_at(admin, store, second.key) is None
+    assert old.invalid_at == new.item.updated_at
+    assert (old.version, old.value) == (1, in_slot(WINDOW))
+    # The superseded memory's vectors went with it
+    assert vector_keys(admin, store) == [second.key]
+
+
+def test_reconcile_with_a_valid_time_ends_older_facts_at_it(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    first = store.reconcile(
+        NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat", valid_at=OLDER
+    )
+    second = store.reconcile(
+        NS,
+        None,
+        in_slot(AISLE),
+        policy=slot_policy(),
+        slot="seat",
+        valid_at=OLD,
+        provenance={"source": "chat"},
+    )
+    assert second.superseded == (first.key,)
+    [old] = store.history(NS, first.key)
+    assert (old.valid_at, old.invalid_at) == (OLDER, OLD)
+    # The valid time and the provenance are stored as given
+    assert stored_valid_at(admin, store, second.key) == OLD
+    record = store.record(NS, second.key)
+    assert record is not None and (record.valid_at, record.provenance) == (OLD, {"source": "chat"})
+
+
+def test_reconcile_skips_and_confirms_a_duplicate(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index(), ttl={"default_ttl": 10.0})
+    window = store.reconcile(NS, None, text(WINDOW), policy=keep_all())
+    for table in (store.sql.items, store.sql.vectors):
+        admin.execute(
+            f"UPDATE {table} SET expires_at = now() + INTERVAL '1 minute' WHERE prefix = %s",
+            (PREFIX,),
+        )
+    before = store.record(NS, window.key)
+    assert before is not None and before.confirmations == 0
+
+    result = store.reconcile(NS, None, text(LONG_FLIGHTS), policy=skip_duplicates())
+
+    assert result == ReconcileResult(
+        key=result.key,
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=(window.key,),
+        kept=(),
+    )
+    record = store.record(NS, window.key)
+    assert record is not None and record.confirmed_at is not None
+    assert (record.version, record.confirmations) == (1, 1)
+    # Confirming changes neither the version nor updated_at, and keeps no history
+    assert record.item.updated_at == before.item.updated_at
+    assert store.history(NS, window.key) == []
+    # Nothing was written for the duplicate
+    assert store.record(NS, result.key) is None
+    # The memory's expiry and its vector's were renewed from its own TTL
+    for table in (store.sql.items, store.sql.vectors):
+        row = admin.execute(
+            f"SELECT count(*) AS n FROM {table} "
+            "WHERE prefix = %s AND expires_at > now() + INTERVAL '5 minutes'",
+            (PREFIX,),
+        ).fetchone()
+        assert row is not None and row["n"] == 1
+
+
+def test_reconcile_records_a_late_fact_as_superseded(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    live = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+
+    late = store.reconcile(
+        NS,
+        None,
+        in_slot(AISLE),
+        policy=slot_policy(),
+        slot="seat",
+        provenance={"source": "old chat"},
+        valid_at=OLD,
+    )
+
+    assert late == ReconcileResult(
+        key=late.key,
+        new="superseded",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=(),
+        kept=(live.key,),
+    )
+    # The live fact is unchanged, and the late one never became live
+    assert [item.key for item in store.search(NS)] == [live.key]
+    assert store.record(NS, late.key) is None
+    current = store.record(NS, live.key)
+    assert current is not None and current.version == 1
+    assert store.history(NS, live.key) == []
+    [row] = store.history(NS, late.key)
+    assert (row.version, row.reason, row.superseded_by) == (1, "superseded", live.key)
+    assert (row.value, row.provenance) == (in_slot(AISLE), {"source": "old chat"})
+    # True from its own valid time until the newer fact became true. The store
+    # held it for no time
+    assert (row.valid_at, row.invalid_at) == (OLD, current.valid_at)
+    assert row.written_at == row.ended_at
+
+
+def test_reconcile_without_history_skips_a_late_fact(store_factory, admin, mode) -> None:
+    store = store_factory(mode, index=seat_index())
+    live = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+
+    late = store.reconcile(
+        NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat", valid_at=OLD
+    )
+
+    # With no history to record it in, the late fact is skipped, and the result says so
+    assert (late.new, late.version, late.kept) == ("skipped", None, (live.key,))
+    assert [item.key for item in store.search(NS)] == [live.key]
+    assert store.record(NS, late.key) is None
+    assert vector_keys(admin, store) == [live.key]
+
+
+def test_reconcile_keep_all_reports_candidates(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", text(PEANUTS))
+    store.put(NS, "s", text(VEGETARIAN, seat="x"))
+    store.put(NS, "w", text(WINDOW))
+    store.put(NS, "other", text(VEGETARIAN, seat="y"))
+
+    result = store.reconcile(NS, "k", in_slot(AISLE), policy=keep_all(), slot="seat")
+
+    # The memory under the key is overwritten, so only the slot and similar
+    # matches are kept
+    assert result == ReconcileResult(
+        key="k", new="written", version=2, superseded=(), deleted=(), confirmed=(), kept=("s", "w")
+    )
+    assert {item.key for item in store.search(NS)} == {"k", "s", "w", "other"}
+    [old] = store.history(NS, "k")
+    assert (old.version, old.reason, old.value) == (1, "overwritten", text(PEANUTS))
+    assert store.history(NS, "s") == [] and store.history(NS, "w") == []
+
+
+@pytest.mark.parametrize("failure", ["raises", "invalid decision"])
+def test_a_policy_exception_rolls_back(store_factory, admin, caplog, mode, failure: str) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    first = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+    before = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+    seen: list[list[str]] = []
+    raised = RuntimeError("the judge is unreachable")
+
+    def policy(proposal: Any, candidates: Any) -> Decision:
+        seen.append([c.key for c in candidates])
+        if failure == "raises":
+            raise raised
+        return Decision(actions={"missing": Action.DELETE})
+
+    expected = RuntimeError if failure == "raises" else ValueError
+    with (
+        caplog.at_level(logging.WARNING, logger=RETRY_LOGGER),
+        pytest.raises(expected) as error,
+    ):
+        store.reconcile(NS, None, in_slot(AISLE), policy=policy, slot="seat")
+
+    # The policy ran once, inside the transaction, and saw the slot fact. The
+    # error came out unchanged, nothing was retried and nothing was written
+    assert seen == [[first.key]]
+    if failure == "raises":
+        assert error.value is raised
+    else:
+        assert "unknown candidate key: missing" in str(error.value)
+    assert not retries(caplog, "store reconcile")
+    after = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
+    assert after == before
+    # The transaction was rolled back, so the store's connection works on
+    second = store.reconcile(NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat")
+    assert second.superseded == (first.key,)
+
+
+def test_reconcile_without_index_supersedes_by_slot(store_factory, mode) -> None:
+    store = store_factory(mode, history=True)
+    first = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+    store.put(NS, "food", text(VEGETARIAN))
+
+    # No threshold is needed, and one given is ignored
+    second = store.reconcile(
+        NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat", threshold=5.0
+    )
+
+    assert (second.new, second.superseded, second.kept) == ("written", (first.key,), ())
+    assert {item.key for item in store.search(NS)} == {second.key, "food"}
+    [old] = store.history(NS, first.key)
+    assert (old.reason, old.superseded_by) == ("superseded", second.key)
+
+
+def test_reconcile_on_an_l2_store_with_a_threshold(store_factory, mode) -> None:
+    index = seat_index(distance_type="l2")
+    store = store_factory(mode, history=True, index=index)
+    window = store.reconcile(NS, None, text(WINDOW), policy=keep_all(), threshold=-0.6)
+    store.put(NS, "food", text(VEGETARIAN))
+    index["embed"].calls = 0
+
+    with pytest.raises(ValueError, match="threshold"):
+        store.reconcile(NS, None, text(AISLE), policy=supersede_similar(threshold=-0.6))
+    assert index["embed"].calls == 0
+
+    # Scores are negated l2 distances: the window seat scores -0.5477 against
+    # the aisle seat, the food far less
+    result = store.reconcile(
+        NS, None, text(AISLE), policy=supersede_similar(threshold=-0.6), threshold=-0.6
+    )
+    assert (result.new, result.superseded, result.kept) == ("written", (window.key,), ())
+    assert {item.key for item in store.search(NS)} == {result.key, "food"}
+
+
+def run_together(*calls: Callable[[], Any]) -> list[Any]:
+    """Run each call in its own thread, started together, and return their results.
+
+    Raises the first error a call raised.
+    """
+    barrier = threading.Barrier(len(calls))
+    results: list[Any] = [None] * len(calls)
+    errors: list[BaseException] = []
+
+    def run(i: int, call: Callable[[], Any]) -> None:
+        try:
+            barrier.wait(timeout=10)
+            results[i] = call()
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(i, call)) for i, call in enumerate(calls)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
+    return results
+
+
+def before_first_decision(policy: Policy, wait: Callable[[], Any]) -> Policy:
+    """``policy``, calling ``wait`` before it decides for the first time.
+
+    The policy runs in the reconcile's transaction, after the candidate
+    reads, so ``wait`` holds the transaction open between its reads and its
+    writes. A retry decides without waiting.
+    """
+    lock = threading.Lock()
+    calls = 0
+
+    def decide(proposal: Any, candidates: Any) -> Decision:
+        nonlocal calls
+        with lock:
+            calls += 1
+            first = calls == 1
+        if first:
+            wait()
+        return policy(proposal, candidates)
+
+    return decide
+
+
+def test_two_reconciles_in_one_namespace_leave_one_live_fact(store_factory, admin, caplog) -> None:
+    # Both read the slot before either writes: each finds it empty. Serializable
+    # isolation then retries one of them, and its policy sees the other's fact
+    store = store_factory("pool", history=True, index=seat_index())
+    both_read = threading.Barrier(2, timeout=10)
+
+    def propose(value: str) -> Callable[[], ReconcileResult]:
+        policy = before_first_decision(slot_policy(), both_read.wait)
+        return lambda: store.reconcile(NS, None, in_slot(value), policy=policy, slot="seat")
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        results = run_together(propose(WINDOW), propose(AISLE))
+
+    assert retries(caplog, "store reconcile")
+    assert [result.new for result in results] == ["written", "written"]
+    live = admin.execute(
+        f"SELECT key FROM {store.sql.items} WHERE prefix = %s AND value ->> 'seat' = 'x'",
+        (PREFIX,),
+    ).fetchall()
+    assert len(live) == 1
+    winner = next(result for result in results if result.key == live[0]["key"])
+    loser = next(result for result in results if result is not winner)
+    assert winner.superseded == (loser.key,)
+    [old] = store.history(NS, loser.key)
+    assert (old.reason, old.superseded_by) == ("superseded", winner.key)
+    assert store.history(NS, winner.key) == []
+
+
+def test_a_put_racing_a_reconcile_is_serialized(store_factory, admin, caplog) -> None:
+    # The put commits between the reconcile's candidate read and its writes
+    store = store_factory("pool", history=True, index=seat_index())
+    store.put(NS, "slotted", in_slot(WINDOW))
+    read, put_done = threading.Event(), threading.Event()
+
+    def put() -> None:
+        assert read.wait(10)
+        store.put(NS, "slotted", in_slot(LONG_FLIGHTS))
+        put_done.set()
+
+    def wait_for_the_put() -> None:
+        read.set()
+        assert put_done.wait(10)
+
+    policy = before_first_decision(slot_policy(), wait_for_the_put)
+
+    def reconcile() -> ReconcileResult:
+        return store.reconcile(NS, "new", in_slot(AISLE), policy=policy, slot="seat")
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        _, result = run_together(put, reconcile)
+
+    # The reconcile read the first version of the memory in the slot, which
+    # the put replaced before the reconcile wrote. It ran again, after the put
+    assert retries(caplog, "store reconcile")
+    assert result.superseded == ("slotted",)
+    rows = admin.execute(
+        f"SELECT key, value FROM {store.sql.items} WHERE prefix = %s", (PREFIX,)
+    ).fetchall()
+    live = {row["key"]: row["value"]["text"] for row in rows}
+    archived = [
+        (row["key"], row["version"], row["reason"], row["value"]["text"])
+        for row in history_rows(admin, store)
+    ]
+    # The state of one of the two serial orders, with no version archived twice
+    put_first = (
+        {"new": AISLE},
+        [("slotted", 1, "overwritten", WINDOW), ("slotted", 2, "superseded", LONG_FLIGHTS)],
+    )
+    reconcile_first = (
+        {"new": AISLE, "slotted": LONG_FLIGHTS},
+        [("slotted", 1, "superseded", WINDOW)],
+    )
+    assert (live, archived) in (put_first, reconcile_first)
+    # Here the put came first
+    assert (live, archived) == put_first
+
+
+def test_the_policy_decides_in_the_write_transaction(store_factory, mode) -> None:
+    # The default valid time is the clock of the transaction that read the
+    # candidates. It equals the written memory's updated_at only when that
+    # transaction is the one that wrote it
+    store = store_factory(mode, history=True, index=seat_index())
+    seen: list[datetime] = []
+
+    def policy(proposal: Any, candidates: Any) -> Decision:
+        seen.append(proposal.valid_at)
+        return Decision()
+
+    result = store.reconcile(NS, None, text(WINDOW), policy=policy)
+
+    # The last decision is the one the committed attempt made
+    record = store.record(NS, result.key)
+    assert record is not None and seen[-1] == record.item.updated_at
+
+
+def test_reconcile_retries_a_40001(store_factory, unsafe_internals, caplog, mode) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": faults.cursor_class()},
+    )
+    first = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+    faults.fail_next("40001", match=CANDIDATE_READ)
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        second = store.reconcile(NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat")
+
+    assert faults.injected == ["40001"]
+    found = retries(caplog, "store reconcile")
+    assert len(found) == 1 and "SQLSTATE 40001" in found[0]
+    assert sum("Retrying" in r.getMessage() for r in caplog.records) == 1
+    assert second == ReconcileResult(
+        key=second.key,
+        new="written",
+        version=1,
+        superseded=(first.key,),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+    )
+    assert len(store.history(NS, first.key)) == 1
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_reconcile_retried_after_a_lost_commit_is_already_applied(
+    store_factory, admin, unsafe_internals, caplog, mode
+) -> None:
+    # The reconcile commits, then the store sees 40003 and runs it again. The
+    # retry finds the rows that carry its write id and writes nothing
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    first = store.reconcile(NS, None, in_slot(WINDOW), policy=slot_policy(), slot="seat")
+    clean = store.reconcile(
+        ("user", "bob"), None, in_slot(WINDOW), policy=slot_policy(), slot="seat"
+    )
+    clean_second = store.reconcile(
+        ("user", "bob"), None, in_slot(AISLE), policy=slot_policy(), slot="seat"
+    )
+    fault.armed = True
+
+    with caplog.at_level(logging.WARNING, logger=RETRY_LOGGER):
+        second = store.reconcile(NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat")
+
+    assert fault.fired == 1
+    found = retries(caplog, "store reconcile")
+    assert len(found) == 1 and "SQLSTATE 40003" in found[0]
+    # Rebuilt from the rows: the same superseded keys as a clean run reports
+    assert clean_second.superseded == (clean.key,) and not clean_second.already_applied
+    assert second == ReconcileResult(
+        key=second.key,
+        new="written",
+        version=1,
+        superseded=(first.key,),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    # One history row per superseded key, and one write of the new memory
+    assert [(row["key"], row["reason"]) for row in history_rows(admin, store)] == [
+        (first.key, "superseded")
+    ]
+    assert [item.key for item in store.search(NS)] == [second.key]
+    assert vector_keys(admin, store) == [second.key]
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+def test_a_confirmation_retried_after_a_lost_commit_is_already_applied(
+    store_factory, unsafe_internals, mode
+) -> None:
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    store.reconcile(NS, "w", text(WINDOW), policy=keep_all())
+    fault.armed = True
+
+    # The same fact again under its own key: a duplicate of the live memory, confirmed
+    again = store.reconcile(NS, "w", text(WINDOW), policy=skip_duplicates())
+
+    assert fault.fired == 1
+    # Its confirmation is later than its update, so the rows prove a confirmation
+    assert again == ReconcileResult(
+        key="w",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=("w",),
+        kept=(),
+        already_applied=True,
+    )
+    record = store.record(NS, "w")
+    assert record is not None and (record.version, record.confirmations) == (1, 1)
+
+
+def test_reconcile_embeds_once_across_retries(store_factory, admin, unsafe_internals, mode) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    index = seat_index()
+    store = store_factory(
+        mode, history=True, index=index, connect_kwargs={"cursor_factory": faults.cursor_class()}
+    )
+    store.put(NS, "w", in_slot(WINDOW))
+    index["embed"].calls = 0
+    faults.fail_next("40001", match=CANDIDATE_READ, times=2)
+
+    result = store.reconcile(NS, None, in_slot(AISLE), policy=slot_policy(), slot="seat")
+
+    assert faults.injected == ["40001", "40001"]
+    assert index["embed"].calls == 1
+    assert result.superseded == ("w",)
+    # The third attempt wrote the vector embedded before the first
+    row = admin.execute(
+        f"SELECT embedding FROM {store.sql.vectors} WHERE prefix = %s AND key = %s",
+        (PREFIX, result.key),
+    ).fetchone()
+    assert row is not None
+    assert parse_vector(row["embedding"]) == pytest.approx(SEATS[AISLE], abs=1e-6)
+
+
+def test_a_late_fact_under_a_live_key_keeps_every_version(store_factory, mode) -> None:
+    # The late fact goes to history under a key whose live memory stays. Its
+    # version follows the live one, and the next writes number after it, so
+    # archiving them later never collides with it
+    store = store_factory(mode, history=True, index=seat_index())
+    store.reconcile(NS, "k", text(VEGETARIAN), policy=keep_all(), valid_at=OLDER)
+    newer = store.reconcile(NS, None, in_slot(WINDOW), policy=keep_all(), slot="seat")
+
+    late = store.reconcile(NS, "k", in_slot(AISLE), policy=slot_policy(), slot="seat", valid_at=OLD)
+    assert (late.new, late.kept) == ("superseded", ("k", newer.key))
+    store.put(NS, "k", text(PEANUTS))
+    store.put(NS, "k", text(LONG_FLIGHTS))
+
+    versions = [(v.version, v.reason, v.value) for v in store.history(NS, "k")]
+    assert versions == [
+        (3, "overwritten", text(PEANUTS)),
+        (2, "superseded", in_slot(AISLE)),
+        (1, "overwritten", text(VEGETARIAN)),
+    ]
+    record = store.record(NS, "k")
+    assert record is not None and (record.version, record.item.value) == (4, text(LONG_FLIGHTS))
+
+
+def test_a_late_fact_under_a_key_with_history_does_not_collide(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", text(VEGETARIAN))
+    store.delete(NS, "k")
+    newer = store.reconcile(NS, None, in_slot(WINDOW), policy=keep_all(), slot="seat")
+
+    late = store.reconcile(NS, "k", in_slot(AISLE), policy=slot_policy(), slot="seat", valid_at=OLD)
+
+    assert late.new == "superseded"
+    versions = [(v.version, v.reason, v.superseded_by) for v in store.history(NS, "k")]
+    assert versions == [(2, "superseded", newer.key), (1, "deleted", None)]
+    # A write after it continues the versions, and its result reads the version back
+    written = store.reconcile(NS, "k", text(PEANUTS), policy=keep_all())
+    assert written.version == 3
+    record = store.record(NS, "k")
+    assert record is not None and record.version == 3
+
+
+def test_an_archived_version_never_ends_before_it_began(store_factory, mode) -> None:
+    # keep_all ignores valid times, so it can write a fact older than the one
+    # it overwrites. The overwritten version then ends where it began
+    store = store_factory(mode, history=True, index=seat_index())
+    store.reconcile(NS, "k", text(WINDOW), policy=keep_all(), valid_at=OLD)
+
+    result = store.reconcile(NS, "k", text(AISLE), policy=keep_all(), valid_at=OLDER)
+
+    assert (result.new, result.version) == ("written", 2)
+    [old] = store.history(NS, "k")
+    assert (old.reason, old.valid_at, old.invalid_at) == ("overwritten", OLD, OLD)
+    # A late fact recorded straight into history is held to the same rule: a
+    # policy may name an older candidate as the one that supersedes it
+    store.reconcile(
+        NS, "older", in_slot(VEGETARIAN), policy=keep_all(), slot="seat", valid_at=OLDER
+    )
+
+    def superseded_by_older(proposal: Any, candidates: Any) -> Decision:
+        return Decision(new="superseded", superseded_by="older")
+
+    late = store.reconcile(
+        NS, "late", in_slot(PEANUTS), policy=superseded_by_older, slot="seat", valid_at=OLD
+    )
+    assert late.new == "superseded"
+    [row] = store.history(NS, "late")
+    assert (row.valid_at, row.invalid_at) == (OLD, OLD)

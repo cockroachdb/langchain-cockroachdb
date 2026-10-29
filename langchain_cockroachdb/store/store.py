@@ -3,8 +3,9 @@
 Provides the interface of langgraph-checkpoint-postgres's PostgresStore on
 CockroachDB. Every operation retries transient errors under the store's
 RetryPolicy. Every write is an UPSERT, a DELETE, an UPDATE that pushes back
-an expiry, or an INSERT into history that skips versions already there, so
-a retry after an ambiguous result is safe.
+an expiry or confirms a memory once per write id, or an INSERT into history
+that skips versions and write ids already there, so a retry after an
+ambiguous result is safe.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import concurrent.futures
 import logging
 import threading
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Literal
@@ -43,6 +44,7 @@ from langchain_cockroachdb.store.base import (
     PutPlan,
     SchemaCheck,
     _check_paging,
+    _check_policy,
     _memory_prefix,
     _row_to_record,
     _row_to_version,
@@ -58,7 +60,13 @@ from langchain_cockroachdb.store.config import (
     resolve_reconcile_scan_limit,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
-from langchain_cockroachdb.store.reconcile import Conflicts, MemoryRecord, MemoryVersion
+from langchain_cockroachdb.store.reconcile import (
+    Conflicts,
+    MemoryRecord,
+    MemoryVersion,
+    Policy,
+    ReconcileResult,
+)
 from langchain_cockroachdb.store.sql import VectorRow
 
 logger = logging.getLogger(__name__)
@@ -846,7 +854,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         key: str | None,
         value: dict[str, Any],
         *,
-        policy: Callable[..., Any],
+        policy: Policy,
         slot: str | None = None,
         threshold: float | None = None,
         limit: int = 10,
@@ -855,17 +863,188 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         ttl: float | None | NotProvided = NOT_PROVIDED,
         provenance: dict[str, Any] | None = None,
         valid_at: datetime | None = None,
-    ) -> Any:
-        """Write a memory and settle the memories it may conflict with.
+    ) -> ReconcileResult:
+        """Write a memory and settle the memories it may conflict with, in one transaction.
 
-        Not available yet: it raises NotImplementedError once the table has
-        migration 2's columns.
+        The candidates are the ones find_conflicts finds: the live memory
+        under ``key``, the memories in the same slot and, on a store with an
+        index, those that score at or above ``threshold``. They are read in
+        the transaction, ``policy`` decides what to do with the new memory
+        and with each candidate, and the decision is applied before the
+        transaction commits. Serializable isolation covers all of it: if
+        another writer changes what the policy saw, one of the two
+        transactions retries, and its policy sees the other's write. Two
+        agents that reconcile contradicting memories for one user cannot
+        both win.
+
+        ``policy`` runs inside the transaction, and runs again on every
+        retry, so it must be fast and deterministic. A slow policy holds the
+        transaction open and can run past the attempt timeout. An LLM judge,
+        or a person, belongs in find_conflicts and resolve, which hold no
+        transaction while the decision is made. A policy that raises rolls
+        the transaction back, and its exception propagates unchanged,
+        without a retry. So does the ValueError for an invalid decision.
+
+        The decision writes the new memory, as put does, with its provenance
+        and valid time; skips it, as when it repeats a memory the decision
+        confirms; or records it as superseded by a candidate whose fact is
+        newer. A store with history records such a late fact straight into
+        history; a store without history skips it. Each candidate is kept,
+        superseded, deleted or confirmed. On a store with history, every
+        version the decision ends is kept in history: the memory the new one
+        overwrites and each candidate it supersedes end at the ``valid_at``
+        given, or at the write without one, and deleted ones end at the
+        write. Without history, superseding and deleting remove the memory.
+        Confirming sets confirmed_at, counts the confirmation and renews the
+        memory's expiry from its own TTL. It changes neither the version nor
+        updated_at.
+
+        The index fields of ``value`` are embedded once, before the first
+        attempt. Each attempt reads the candidates in two round trips, as
+        find_conflicts does, or three when the index's window may have left
+        matches out. Then the policy runs, and the writes and the COMMIT go
+        out together.
+
+        If an attempt commits and its result is lost, as when the connection
+        drops while the COMMIT's answer travels, the retry finds the rows
+        that carry its write id and writes nothing. It returns the result
+        rebuilt from those rows, with ``already_applied`` set. That result
+        lists only what the rows prove: ``kept`` is empty, and on a store
+        without history so are ``superseded`` and ``deleted``.
+
+        Args:
+            namespace: The new memory's namespace. It cannot be empty.
+            key: The new memory's key, or None for a new uuid4.
+            value: The new memory's value.
+            policy: Decides, from the new memory as a Proposal and its
+                candidates, what to do with each: a function that returns a
+                Decision. langchain_cockroachdb.store has built-in ones.
+            slot: A top-level field of ``value`` naming the fact it states,
+                as in find_conflicts.
+            threshold: The lowest score of a similar candidate, as in
+                find_conflicts: 0.8 by default on a cosine store, required on
+                an l2 or inner_product store, ignored without an index.
+            limit: Most similar candidates (default 10), on top of the key
+                and slot matches.
+            filter: Narrows the slot and similar candidates by value, as in
+                search.
+            index: Which fields of ``value`` to embed, as in put.
+            ttl: Minutes the new memory lives once written, or None for no
+                expiry. Defaults to the store's default TTL.
+            provenance: Where the new memory comes from, as a JSON object.
+                It is stored in its own column and kept in history.
+            valid_at: When the fact became true, as a timezone-aware datetime.
+                By default the database's current time, raised to the latest
+                candidate's updated_at if that is later. The memory then
+                stores no valid time and is valid from its updated_at.
+
+        Returns:
+            What happened: the new memory's key, whether it was written,
+            skipped or superseded, the version written, and the keys of the
+            candidates superseded, deleted, confirmed and kept.
 
         Raises:
-            ValueError: If setup() has not applied migration 2.
+            InvalidNamespaceError: If the namespace is empty or a label is invalid
+            ValueError: If another argument is invalid, as in find_conflicts;
+                if the policy returns an invalid decision; or if setup() has
+                not added the columns this method needs or, on a store with
+                history, created the history table
         """
-        self._require_columns(self._reconcile_columns(refresh=True))
-        raise NotImplementedError("reconcile arrives in a later task")
+        plan = self._plan_proposal(
+            namespace,
+            key,
+            value,
+            slot=slot,
+            threshold=threshold,
+            limit=limit,
+            filter=filter,
+            index=index,
+            ttl=ttl,
+            provenance=provenance,
+            valid_at=valid_at,
+            method="reconcile",
+        )
+        _check_policy(policy)
+        # The schema check comes first, so a store that cannot write costs no
+        # embedding call. With history, the write also needs the history table
+        if self._history is not None:
+            self._history_schema()
+        else:
+            self._require_columns(self._reconcile_columns(refresh=True))
+        vector_rows = self._embed_put(plan.put)
+        attempts = 0
+
+        def attempt() -> ReconcileResult:
+            nonlocal attempts
+            attempts += 1
+            cursors: list[Cursor[DictRow]] = []
+            try:
+                with self._cursor(
+                    pipeline=True,
+                    transaction=True,
+                    timeout=self.retry_policy.attempt_timeout,
+                    label="store reconcile",
+                ) as cur:
+                    conn = cur.connection
+
+                    def send(statements: Sequence[tuple[str, list]]) -> list[Cursor[DictRow]]:
+                        sent = []
+                        for statement in statements:
+                            sent.append(conn.cursor(binary=True, row_factory=dict_row))
+                            cursors.append(sent[-1])
+                            sent[-1].execute(*statement)
+                        return sent
+
+                    def fetch(statements: Sequence[tuple[str, list]]) -> list[list[DictRow]]:
+                        # In a pipeline the fetch flushes without a sync, so the
+                        # transaction stays open
+                        return [
+                            statement_cursor.fetchall() for statement_cursor in send(statements)
+                        ]
+
+                    # A retry first looks for the rows its write id is on, in
+                    # the same round trip as the first candidate read. If an
+                    # earlier attempt committed, it returns that result
+                    reads = self._key_slot_statements(plan)
+                    checks = self._applied_statements(plan) if attempts > 1 else []
+                    found = fetch([*reads, *checks])
+                    applied = self._applied_result(plan, found[len(reads) :]) if checks else None
+                    if applied is not None:
+                        return applied
+                    read = self._key_slot_read(plan, found[: len(reads)])
+                    similar = self._similar_read(plan, vector_rows, read)
+                    for setting in similar.session:
+                        cur.execute(setting, prepare=False)
+                    scored: Sequence[Sequence[dict[str, Any]]] = fetch(similar.statements())
+                    exact = similar.exact_statements(scored)
+                    if exact:
+                        scored = similar.fill_exact(scored, fetch(exact))
+                    conflicts = self._conflicts(plan, vector_rows, read, similar, scored)
+                    proposal, candidates = conflicts.proposal, conflicts.candidates
+                    decision = self._checked_decision(
+                        proposal, candidates, policy(proposal, candidates)
+                    )
+                    writes = send(
+                        self._decision_statements(
+                            plan,
+                            candidates,
+                            decision,
+                            vector_rows=vector_rows,
+                            valid_at=proposal.valid_at,
+                        )
+                    )
+                # Committed. Only the item upsert returns rows: the version written
+                returned = [
+                    statement_cursor.fetchall()
+                    for statement_cursor in writes
+                    if statement_cursor.description is not None
+                ]
+                return self._reconcile_result(plan, candidates, decision, returned)
+            finally:
+                for statement_cursor in cursors:
+                    statement_cursor.close()
+
+        return self._retry(attempt, label="store reconcile")
 
     def sweep_ttl(self) -> int:
         """Delete expired items now, without waiting for CockroachDB's TTL job.

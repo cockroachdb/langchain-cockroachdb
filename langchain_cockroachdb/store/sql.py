@@ -6,6 +6,8 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
 
+from langgraph.store.base import NOT_PROVIDED, NotProvided
+
 from langchain_cockroachdb._sql import validate_identifier, vector_literal
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
@@ -422,6 +424,7 @@ WHERE {where}"""
         *,
         write_id: str | None = None,
         history: bool = False,
+        return_version: bool = False,
     ) -> tuple[str, list]:
         """Build multi-row INSERT for items with ON CONFLICT.
 
@@ -437,22 +440,31 @@ WHERE {where}"""
                 provenance_json, valid_at) tuples with it. Callers must dedupe
                 (prefix, key) rows (ON CONFLICT cannot touch a row twice).
             write_id: The batch's write id, chosen before its first attempt.
-            history: For a store with history. A new row's version then
-                follows the highest version its key has in the history
-                table, so a key written again after a delete never reuses an
-                archived version. Needs ``write_id``.
+            history: For a store with history. A key's versions then stay
+                unique across its live row and its history: every new
+                version, inserted or updated, is one more than the larger of
+                the live version and the highest version the key has in the
+                history table. So a key written again after a delete, or
+                after reconcile recorded a late fact under it straight into
+                history, never reuses a version kept there. Needs ``write_id``.
+            return_version: Whether the statement returns the version of
+                each row it inserts or updates, as ``version``. A row it
+                leaves as it is returns nothing. Needs ``write_id``.
 
         Returns:
             Tuple of (SQL, parameters).
 
         Raises:
             ValueError: If rows is empty, a row has the wrong number of
-                fields, or ``history`` is set without ``write_id``.
+                fields, or ``history`` or ``return_version`` is set without
+                ``write_id``.
         """
         if not rows:
             raise ValueError("rows cannot be empty")
         if history and write_id is None:
             raise ValueError("upsert_items with history needs a write id")
+        if return_version and write_id is None:
+            raise ValueError("upsert_items needs a write id to return the version")
 
         columns = [
             ("prefix", "STRING"),
@@ -490,15 +502,15 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     ttl_minutes = EXCLUDED.ttl_minutes"""
             return (sql, params)
 
-        # A new row starts at version 1, the column's default, or with
-        # history after the versions its key already has there
+        # Without history a new row starts at version 1, the column's
+        # default, and an update adds one. With history both take the next
+        # version over the live row and the key's history, computed once here
         version_column, version_value = "", ""
+        version_update = f"{self.items}.version + 1"
         if history:
             version_column = ", version"
-            version_value = (
-                f",\n    COALESCE((SELECT max(h.version) FROM {self.history} AS h "
-                "WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key), 0) + 1"
-            )
+            version_value = ",\n    " + self._next_version("rows_to_insert")
+            version_update = "EXCLUDED.version"
         sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{version_column})
 SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){version_value}
 FROM ({union_sql}) AS rows_to_insert
@@ -510,9 +522,28 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     provenance = EXCLUDED.provenance,
     valid_at = EXCLUDED.valid_at,
     write_id = EXCLUDED.write_id,
-    version = {self.items}.version + 1
+    version = {version_update}
 WHERE {self.items}.write_id IS DISTINCT FROM EXCLUDED.write_id"""
+        if return_version:
+            sql += "\nRETURNING version"
         return (sql, params)
+
+    def _next_version(self, source: str) -> str:
+        """The next version of the key that ``source`` names, on a store with history.
+
+        One more than the larger of the key's version in the items table,
+        live or not, and its highest version in the history table, so a
+        key's versions stay unique across both. ``source`` is the alias of
+        a relation with ``prefix`` and ``key`` columns.
+        """
+        return (
+            "GREATEST(\n"
+            f"        COALESCE((SELECT i.version FROM {self.items} AS i "
+            f"WHERE i.prefix = {source}.prefix AND i.key = {source}.key), 0),\n"
+            f"        COALESCE((SELECT max(h.version) FROM {self.history} AS h "
+            f"WHERE h.prefix = {source}.prefix AND h.key = {source}.key), 0)\n"
+            "    ) + 1"
+        )
 
     def delete_items(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build DELETE for items by namespace and keys.
@@ -1369,6 +1400,9 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
             reason: Why they end: "overwritten", "superseded" or "deleted".
             superseded_by: The key that replaces them, or None.
             invalid_at: When the facts stopped being true, or None for now.
+                A version never ends before its own valid time: an earlier
+                time is raised to it, as when a fact written with an older
+                valid time overwrites a newer one.
             write_id: The write id of the batch that ends them.
             ttl_days: Days the versions stay in history, or None to keep them.
 
@@ -1377,7 +1411,8 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
         """
         sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
 SELECT prefix, key, version, value, provenance, COALESCE(valid_at, updated_at),
-    COALESCE(CAST(%s AS TIMESTAMPTZ), now()), updated_at, now(),
+    GREATEST(COALESCE(CAST(%s AS TIMESTAMPTZ), now()), COALESCE(valid_at, updated_at)),
+    updated_at, now(),
     CAST(%s AS STRING), CAST(%s AS STRING), CAST(%s AS UUID),
     now() + CAST(%s AS DECIMAL) * INTERVAL '1 day'
 FROM {self.items}
@@ -1396,6 +1431,176 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
             write_id,
         ]
         return (sql, params)
+
+    def history_insert_superseded(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        value_json: str,
+        provenance_json: str | None,
+        valid_at: datetime,
+        invalid_at: datetime,
+        superseded_by: str,
+        write_id: str,
+        ttl_days: float | None,
+    ) -> tuple[str, list]:
+        """Build the INSERT that records a new memory straight into history, as superseded.
+
+        reconcile runs it when the policy decides that a candidate whose
+        fact is newer already supersedes the new memory, so the new memory
+        is never live. The row takes the key's next version, as the item
+        upsert numbers them on a store with history, so it never takes a
+        version the key has or gets later. It is valid from ``valid_at``
+        until ``invalid_at``, never earlier, and the store held it for no
+        time: written_at and ended_at are both now. If a row of the key
+        already carries ``write_id``, this write inserted it in an attempt
+        that committed before its result was lost, and nothing is inserted.
+
+        Args:
+            prefix: Namespace text.
+            key: The new memory's key.
+            value_json: Its value, serialized.
+            provenance_json: Its provenance, serialized, or None.
+            valid_at: When its fact became true, as the policy saw it.
+            invalid_at: When the newer fact became true.
+            superseded_by: The key of the newer fact.
+            write_id: The write id of the reconcile.
+            ttl_days: Days the row stays in history, or None to keep it.
+
+        Returns:
+            Tuple of (SQL, parameters).
+        """
+        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
+SELECT p.prefix, p.key,
+    {self._next_version("p")},
+    p.value, p.provenance, p.valid_at, GREATEST(p.invalid_at, p.valid_at), now(), now(),
+    p.reason, p.superseded_by, p.write_id, now() + p.ttl_days * INTERVAL '1 day'
+FROM (
+    SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, CAST(%s AS JSONB) AS value,
+        CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at,
+        CAST(%s AS TIMESTAMPTZ) AS invalid_at, CAST(%s AS STRING) AS reason,
+        CAST(%s AS STRING) AS superseded_by, CAST(%s AS UUID) AS write_id,
+        CAST(%s AS DECIMAL) AS ttl_days
+) AS p
+WHERE NOT EXISTS (
+    SELECT 1 FROM {self.history} AS h
+    WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id
+)
+ON CONFLICT (prefix, key, version) DO NOTHING"""
+        params: list[Any] = [
+            prefix,
+            key,
+            value_json,
+            provenance_json,
+            valid_at,
+            invalid_at,
+            "superseded",
+            superseded_by,
+            write_id,
+            ttl_days,
+        ]
+        return (sql, params)
+
+    def confirm(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        write_id: str,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+    ) -> tuple[str, list]:
+        """Build the UPDATE that confirms one live memory.
+
+        It sets confirmed_at to now(), adds one to confirmations and stores
+        ``write_id``. Without ``ttl`` the memory's expiry is renewed from its
+        own TTL, and a memory without a TTL keeps none. A number of minutes
+        becomes its TTL, and None removes its expiry. Its vectors get the
+        same expiry, in the same statement and only when the memory is
+        confirmed: the CTE reads the item as it was before the update. The
+        version and updated_at stay as they are, so confirming never
+        invalidates a pending find_conflicts. A memory that already carries
+        ``write_id`` was confirmed by this write, in an attempt that committed
+        before its result was lost, and is left as it is, with its vectors.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement updates one row when it
+            confirms the memory, and none when no live memory has the key or
+            the memory already carries ``write_id``.
+        """
+        match = (
+            "prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
+            "{indent}AND write_id IS DISTINCT FROM CAST(%s AS UUID)"
+        )
+        match_params: list[Any] = [prefix, key, write_id]
+        ttl_params: list[Any] = []
+        if isinstance(ttl, NotProvided):
+            item_expiry = (
+                "expires_at = COALESCE(now() + ttl_minutes * INTERVAL '1 minute', expires_at)"
+            )
+            vector_expiry = "expires_at = now() + ttl_minutes * INTERVAL '1 minute'"
+            vector_filter = " AND ttl_minutes IS NOT NULL"
+        else:
+            new_ttl = (
+                "ttl_minutes = CAST(%s AS DECIMAL),\n"
+                "{indent}expires_at = now() + CAST(%s AS DECIMAL) * INTERVAL '1 minute'"
+            )
+            item_expiry = new_ttl.format(indent="    ")
+            vector_expiry = new_ttl.format(indent="        ")
+            vector_filter = ""
+            ttl_params = [ttl, ttl]
+        sql = (
+            f"UPDATE {self.items} SET confirmed_at = now(), confirmations = confirmations + 1,\n"
+            f"    write_id = CAST(%s AS UUID),\n    {item_expiry}\n"
+            f"WHERE {match.format(indent='    ')}"
+        )
+        params: list[Any] = [write_id, *ttl_params, *match_params]
+        if self._index is None:
+            return (sql, params)
+        renewed = (
+            "WITH renewed AS (\n"
+            f"    UPDATE {self.vectors} SET {vector_expiry}\n"
+            f"    WHERE prefix = %s AND key = %s{vector_filter} AND EXISTS (\n"
+            f"        SELECT 1 FROM {self.items}\n"
+            f"        WHERE {match.format(indent='            ')}\n"
+            "    )\n"
+            "    RETURNING key\n"
+            ")\n"
+        )
+        return (renewed + sql, [*ttl_params, prefix, key, *match_params, *params])
+
+    def applied_items(self, prefix: str, write_id: str) -> tuple[str, list]:
+        """Build the read of the items that carry a write id, in one namespace.
+
+        A reconcile retried after a commit whose result was lost reads them,
+        with applied_history, to tell what its earlier attempt did: the
+        memory it wrote or confirmed, and the others it confirmed. Expired
+        rows count, since they were written all the same.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key``, ``version``,
+            ``updated_at`` and ``confirmed_at``.
+        """
+        sql = (
+            f"SELECT key, version, updated_at, confirmed_at FROM {self.items}\n"
+            "WHERE prefix = %s AND write_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, write_id])
+
+    def applied_history(self, prefix: str, write_id: str) -> tuple[str, list]:
+        """Build the read of the history rows that carry a write id, in one namespace.
+
+        They are the versions a reconcile archived, and a new memory it
+        recorded straight into history. See applied_items.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key`` and ``reason``.
+        """
+        sql = (
+            f"SELECT key, reason FROM {self.history}\n"
+            "WHERE prefix = %s AND write_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, write_id])
 
     def history_versions(self, prefix: str, key: str, *, limit: int) -> tuple[str, list]:
         """Build the SELECT for the versions of one key in history, newest first.

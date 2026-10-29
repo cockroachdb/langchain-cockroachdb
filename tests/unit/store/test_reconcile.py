@@ -238,6 +238,23 @@ def test_validate_decision_rejects_skip_with_supersede_action() -> None:
         validate_decision(proposal, found, decision)
 
 
+def test_validate_decision_rejects_superseding_the_new_key() -> None:
+    # A late fact goes to history under its own key. The live memory under
+    # that key cannot be superseded by it
+    proposal = make_proposal("k", valid_at=T1)
+    found = [candidate("k", reason="key", valid_at=T0), candidate("b", reason="slot", valid_at=T2)]
+    decision = Decision(new="superseded", superseded_by="b", actions={"k": Action.SUPERSEDE})
+    with pytest.raises(ValueError, match="supersede the proposal's own key: k"):
+        validate_decision(proposal, found, decision)
+    # Deleting or confirming it, or superseding another candidate, stays valid
+    for actions in ({"k": Action.DELETE}, {"k": Action.CONFIRM}):
+        validate_decision(proposal, found, Decision("superseded", "b", actions))
+    older = candidate("a", reason="slot", valid_at=T0)
+    validate_decision(
+        proposal, [*found, older], Decision("superseded", "b", {"a": Action.SUPERSEDE})
+    )
+
+
 def test_policies_reject_a_threshold_that_is_not_finite() -> None:
     with pytest.raises(ValueError, match="finite"):
         skip_duplicates(threshold=math.nan)

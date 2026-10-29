@@ -111,17 +111,32 @@ class Decision:
 
 @dataclass(frozen=True)
 class ReconcileResult:
-    """Result of a reconcile or resolve operation.
+    """What a reconcile or resolve did.
+
+    An attempt can commit and still lose its result on the way back, as
+    when the connection drops while the COMMIT's answer travels. The retry
+    then finds the rows that carry its write id, writes nothing, and
+    returns a result rebuilt from those rows, with ``already_applied`` set.
+    A rebuilt result lists only what the rows prove: ``kept`` is empty, and
+    ``superseded`` and ``deleted`` come from the history rows the write
+    created, so a store without history, which keeps no trace of what it
+    removed, reports them empty too. A rebuilt result lists keys in key
+    order; a normal one in the order of the candidates.
 
     Attributes:
-        key: Key of the memory (written or not).
-        new: What happened to the new memory (written, skipped, or superseded).
-        version: New version number, or None if not written.
-        superseded: Keys of candidates that were superseded.
-        deleted: Keys of candidates that were deleted.
-        confirmed: Keys of candidates that were confirmed.
-        kept: Keys of candidates that were kept.
-        already_applied: Whether an earlier attempt had already committed.
+        key: The new memory's key, whether it was written or not.
+        new: What happened to the new memory: "written", "skipped", or
+            "superseded" when it went straight into history because a
+            newer fact supersedes it. A store without history skips such a
+            memory, and the result says "skipped".
+        version: The version written, or None when nothing was written.
+        superseded: Keys of the candidates the new memory superseded.
+        deleted: Keys of the candidates deleted.
+        confirmed: Keys of the candidates confirmed.
+        kept: Keys of the candidates kept. The memory under the new key is
+            not kept when the new memory overwrote it.
+        already_applied: Whether an earlier attempt had already committed,
+            so the result was rebuilt from the stored rows.
     """
 
     key: str
@@ -467,6 +482,14 @@ def validate_decision(
         _validate_superseded_by(proposal, candidate_keys, decision)
     elif decision.superseded_by is not None:
         raise ValueError("Decision superseded_by can only be set when new='superseded'")
+
+    # A late fact goes to history under its own key: it cannot supersede the
+    # memory live under that key. (A write overwrites that memory, and a skip
+    # supersedes nothing; both are checked below.)
+    if decision.new == "superseded" and decision.action(proposal.key) == Action.SUPERSEDE:
+        raise ValueError(
+            f"Decision cannot supersede the proposal's own key: {proposal.key}; use DELETE or KEEP"
+        )
 
     # Check write constraints
     if decision.new == "write" and proposal.key in decision.actions:

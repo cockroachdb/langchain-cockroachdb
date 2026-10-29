@@ -19,6 +19,7 @@ import pytest
 from langgraph.store.base import PutOp
 from psycopg import Connection
 
+from langchain_cockroachdb.store import keep_all
 from tests.integration.faults import FailAfterCommit
 from tests.integration.store.conftest import seat_index
 
@@ -163,15 +164,10 @@ def test_a_store_that_checked_before_setup_sees_migration_2_later(
 
     # A method that needs migration 2 reads the schema again when it is called,
     # and plain writes use what it read
-    with pytest.raises(NotImplementedError):
-        store.reconcile(
-            NS,
-            "seat",
-            {"text": "Prefers aisle seats"},
-            policy=lambda proposal, candidates: None,
-        )
-    store.put(NS, "seat", {"text": "Prefers aisle seats"})
-    assert row_of(admin, store, "seat")["version"] == 2
+    result = store.reconcile(NS, "seat", {"text": "Prefers aisle seats"}, policy=keep_all())
+    assert (result.new, result.version) == ("written", 2)
+    store.put(NS, "seat", {"text": "Prefers window seats"})
+    assert row_of(admin, store, "seat")["version"] == 3
 
     # A plain write trusts the missing migration for _SCHEMA_RECHECK_SECONDS,
     # then reads the schema again
