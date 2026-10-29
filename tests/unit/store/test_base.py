@@ -4322,8 +4322,6 @@ class ConfirmReads:
             raise psycopg.errors.StatementCompletionUnknown("40003")
 
     def answer(self, sql: str) -> list[dict[str, object]]:
-        if self.closed:
-            raise RuntimeError("Statement sent after _cursor block closed")
         if sql.startswith("SELECT key, value"):
             return [self.record_row] if self.record_row else []
         if sql.startswith("SELECT 1 FROM"):
@@ -4332,13 +4330,19 @@ class ConfirmReads:
 
 
 class ConfirmCursor:
-    """A cursor of ConfirmReads: it logs each statement and answers its fetch."""
+    """A cursor of ConfirmReads: it logs each statement and answers its fetch.
+
+    Like psycopg, execute computes and stores the result immediately, and
+    fetchall returns the stored result even after the block closes. Only
+    execute after the block raises.
+    """
 
     def __init__(self, reads: ConfirmReads) -> None:
         self.reads = reads
         self.connection = self
         self.sql = ""
         self.rowcount = 0
+        self._result: list[dict[str, object]] = []
 
     def cursor(self, **kwargs: object) -> "ConfirmCursor":
         return ConfirmCursor(self.reads)
@@ -4348,11 +4352,14 @@ class ConfirmCursor:
             raise RuntimeError("Statement sent after _cursor block closed")
         self.reads.attempts[-1].append((sql, params or []))
         self.sql = sql
+        # Store the result immediately, like psycopg does
+        self._result = self.reads.answer(sql)
         if sql.startswith("WITH renewed") or sql.startswith("UPDATE"):
             self.rowcount = self.reads.updated
 
     def fetchall(self) -> list[dict[str, object]]:
-        return self.reads.answer(self.sql)
+        # Return stored result, even after block closed
+        return self._result
 
     def close(self) -> None:
         pass
@@ -4454,3 +4461,82 @@ def test_confirm_on_retry_with_write_id_returns_without_calling_callable() -> No
     # The integration tests cover the full retry scenario. This unit test verifies
     # the key check: rows[0].get("write_id") == write_id causes early return.
     # Tested via integration: test_confirm_retried_after_a_lost_commit_counts_once
+
+
+def test_confirm_on_retry_skips_callable_when_record_has_write_id() -> None:
+    """On a retry, if the record has this write_id, return True without calling the callable."""
+    called = []
+
+    def track_callable(r: MemoryRecord) -> float:
+        called.append(True)
+        return 10.0
+
+    # Subclass to capture write_id and return it on retry
+    class RetryReads(ConfirmReads):
+        def __init__(self) -> None:
+            super().__init__(
+                record_row={
+                    "key": "k",
+                    "value": '{"text": "x"}',
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "version": 1,
+                    "valid_at": NOW,
+                    "provenance": None,
+                    "confirmed_at": None,
+                    "confirmations": 0,
+                    "write_id": None,
+                },
+                updated=1,
+                check_rows=[],
+                fail=True,
+            )
+            self.captured_write_id: str | None = None
+
+        def answer(self, sql: str) -> list[dict[str, object]]:
+            # On retry, return record with the captured write_id
+            if (
+                sql.startswith("SELECT key, value")
+                and len(self.attempts) > 1
+                and self.captured_write_id
+            ):
+                row = dict(self.record_row)  # type: ignore[arg-type]
+                row["write_id"] = self.captured_write_id
+                return [row]
+            return super().answer(sql)
+
+        @contextlib.contextmanager
+        def cursor(self, **kwargs: object) -> Iterator[ConfirmCursor]:
+            try:
+                with super().cursor(**kwargs) as cur:
+                    yield cur
+            finally:
+                # After first attempt, capture the write_id from UPDATE
+                if len(self.attempts) == 1 and not self.captured_write_id:
+                    for stmt_sql, params in self.attempts[0]:
+                        if ("UPDATE" in stmt_sql or "WITH renewed" in stmt_sql) and params:
+                            # Find UUID in params
+                            for p in params:
+                                if isinstance(p, str) and len(p) == 36 and p.count("-") == 4:
+                                    self.captured_write_id = p
+                                    break
+                            break
+
+    reads = RetryReads()
+    store = confirming_store(reads)
+
+    result = store.confirm(NS, "k", ttl=track_callable)
+
+    assert result is True
+    # Callable called only once (first attempt, not retry)
+    assert len(called) == 1
+    # Two attempts
+    assert len(reads.attempts) == 2
+    # First attempt has record read and UPDATE
+    first = reads.attempts[0]
+    assert any("SELECT key, value" in stmt[0] for stmt in first)
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in first)
+    # Second attempt has only record read, no UPDATE (early return on write_id match)
+    second = reads.attempts[1]
+    assert any("SELECT key, value" in stmt[0] for stmt in second)
+    assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in second)

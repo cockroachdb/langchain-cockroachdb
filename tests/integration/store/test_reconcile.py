@@ -1539,7 +1539,9 @@ def test_a_policy_that_calls_the_store_fails_at_once(store_factory, admin, mode)
     )
 
     assert isinstance(error, RuntimeError), error
-    assert str(error).startswith("A reconcile policy or a confirm TTL function must not call the store")
+    assert str(error).startswith(
+        "A reconcile policy or a confirm TTL function must not call the store"
+    )
     after = (item_rows(admin, store), history_rows(admin, store), vector_keys(admin, store))
     assert after == before
     # The transaction was rolled back and the connection given back
