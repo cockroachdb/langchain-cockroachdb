@@ -352,7 +352,7 @@ def test_put_plan_embeds_once_outside_retry() -> None:
     )
     # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     flaky = FlakyCursor()
 
     @contextlib.contextmanager
@@ -379,7 +379,7 @@ async def test_async_put_plan_embeds_once_outside_retry() -> None:
     )
     # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     flaky = FlakyCursor()
 
     @contextlib.asynccontextmanager
@@ -479,7 +479,7 @@ def test_nan_embedding_fails_before_any_statement() -> None:
     )
     # The schema check runs before embedding, and the fake cursor cannot
     # answer it: say it found migration 2
-    store._cache_columns([{"v": MIGRATION_RECONCILE}])
+    store._cache_columns([{"ready": True}])
     opened: list[object] = []
 
     @contextlib.contextmanager
@@ -502,7 +502,7 @@ def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
     )
     # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -531,7 +531,7 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
     )
     # The fake cursor cannot answer the schema check: say it found a table
     # that setup() has not given migration 2 yet
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -584,7 +584,7 @@ def test_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
         index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    store._cache_columns([{"v": MIGRATION_RECONCILE if ready else MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": ready}])
     attempts: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -607,7 +607,7 @@ async def test_async_put_batch_sends_one_write_id_in_every_attempt(ready: bool) 
         index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
-    store._cache_columns([{"v": MIGRATION_RECONCILE if ready else MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": ready}])
     attempts: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -1258,32 +1258,31 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             assert len(ttl_statements(cursor)) == 1
 
 
-def test_cache_columns_compares_the_latest_migration() -> None:
+def test_cache_columns_reads_whether_the_items_table_has_them() -> None:
     store = make_base()
     assert store._columns_ready is None
     assert store._cache_columns([]) is False
     assert store._columns_ready is False
-    assert store._cache_columns([{"v": MIGRATION_RECONCILE - 1}]) is False
-    assert store._cache_columns([{"v": MIGRATION_RECONCILE}]) is True
-    assert store._cache_columns([{"v": MIGRATION_RECONCILE + 1}]) is True
+    assert store._cache_columns([{"ready": False}]) is False
+    assert store._cache_columns([{"ready": True}]) is True
     assert store._columns_ready is True
 
 
 class SchemaReads:
     """A stand-in for a store's _read_all that answers the schema check.
 
-    It returns ``latest`` as the latest migration and, when asked,
-    ``history`` as whether the history table exists. It records every call.
+    It returns ``columns`` as whether migration 2's columns exist and, when
+    asked, ``history`` as whether the history table exists. It records every call.
     """
 
-    def __init__(self, latest: int, history: bool = False) -> None:
-        self.latest = latest
+    def __init__(self, columns: bool, history: bool = False) -> None:
+        self.columns = columns
         self.history = history
         self.calls: list[tuple[list[tuple[str, list]], str]] = []
 
     def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
         self.calls.append((statements, label))
-        found = [[{"v": self.latest}]]
+        found = [[{"ready": self.columns}]]
         if len(statements) > 1:
             found.append([{"ready": self.history}])
         return found
@@ -1304,7 +1303,7 @@ def test_cached_columns_keep_true_for_good_and_false_for_a_while(monkeypatch) ->
     monkeypatch.setattr(store_base, "time", clock)
     store = make_base()
     assert store._cached_columns(refresh=False) is None
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     assert store._cached_columns(refresh=False) is False
     # A method that needs migration 2 does not trust False at all
     assert store._cached_columns(refresh=True) is None
@@ -1315,11 +1314,11 @@ def test_cached_columns_keep_true_for_good_and_false_for_a_while(monkeypatch) ->
     clock.now += 1.0
     assert store._cached_columns(refresh=False) is None
     # The window starts again with each read that finds no migration 2
-    store._cache_columns([{"v": MIGRATION_RECONCILE - 1}])
+    store._cache_columns([{"ready": False}])
     clock.now += 59.0
     assert store._cached_columns(refresh=False) is False
     # Migrations are never undone, so True holds for good
-    store._cache_columns([{"v": MIGRATION_RECONCILE}])
+    store._cache_columns([{"ready": True}])
     clock.now += 365 * 86400.0
     assert store._cached_columns(refresh=False) is True
     assert store._cached_columns(refresh=True) is True
@@ -1327,7 +1326,7 @@ def test_cached_columns_keep_true_for_good_and_false_for_a_while(monkeypatch) ->
 
 def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
     store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
-    reads = SchemaReads(latest=1)
+    reads = SchemaReads(columns=False)
 
     def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None
@@ -1337,7 +1336,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
     store._read_all = read_all  # type: ignore[method-assign,assignment]
     assert store._reconcile_columns() is False
     assert store._reconcile_columns() is False
-    assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
+    assert reads.calls == [([store.sql.reconcile_columns_exist()], "store schema check")]
     with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
         store._require_columns(store._reconcile_columns())
     # A method that needs migration 2 reads again rather than trust the cached False
@@ -1359,7 +1358,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
     store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
     store.setup()
     assert store._columns_ready is None
-    reads.latest = MIGRATION_RECONCILE
+    reads.columns = True
     assert store._reconcile_columns() is True
     # True is kept for good, even with refresh and a window of 0
     assert store._reconcile_columns() is True
@@ -1370,7 +1369,7 @@ def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None
 
 async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
     store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
-    reads = SchemaReads(latest=1)
+    reads = SchemaReads(columns=False)
 
     async def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None
@@ -1380,7 +1379,7 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
     store._read_all = read_all  # type: ignore[method-assign,assignment]
     assert await store._areconcile_columns() is False
     assert await store._areconcile_columns() is False
-    assert reads.calls == [([(store.sql.migration_version(), [])], "store schema check")]
+    assert reads.calls == [([store.sql.reconcile_columns_exist()], "store schema check")]
     with pytest.raises(ValueError, match=r"run setup\(\)"):
         store._require_columns(await store._areconcile_columns())
     assert await store._areconcile_columns(refresh=True) is False
@@ -1398,7 +1397,7 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
     store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
     await store.setup()
     assert store._columns_ready is None
-    reads.latest = MIGRATION_RECONCILE
+    reads.columns = True
     assert await store._areconcile_columns() is True
     assert await store._areconcile_columns() is True
     assert await store._areconcile_columns(refresh=True) is True
@@ -1408,10 +1407,10 @@ async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypa
 
 def test_cache_columns_keeps_true_once_seen() -> None:
     store = make_base()
-    assert store._cache_columns([{"v": MIGRATION_RECONCILE}]) is True
+    assert store._cache_columns([{"ready": True}]) is True
     # A read that started before another process ran setup() can finish
     # after one that saw migration 2. It must not take the answer back
-    assert store._cache_columns([{"v": MIGRATION_RECONCILE - 1}]) is True
+    assert store._cache_columns([{"ready": False}]) is True
     assert store._cache_columns([]) is True
     assert store._columns_ready is True
 
@@ -1421,7 +1420,7 @@ def test_require_columns_acts_on_the_check_it_is_given() -> None:
     # setup() in another thread can clear the cache between the check and this call
     assert store._columns_ready is None
     store._require_columns(True)
-    store._cache_columns([{"v": MIGRATION_RECONCILE}])
+    store._cache_columns([{"ready": True}])
     with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
         store._require_columns(False)
 
@@ -1461,7 +1460,7 @@ def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) ->
 
 def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
     store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
-    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+    reads = SchemaReads(columns=True, history=False)
 
     def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None
@@ -1473,7 +1472,7 @@ def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
     with pytest.raises(ValueError, match=missing_table):
         store._history_schema()
     # One round trip reads both, once
-    statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
+    statements = [store.sql.reconcile_columns_exist(), store.sql.history_exists()]
     assert reads.calls == [(statements, "store schema check")]
     # A plain read of the columns trusts the answers for a while
     assert store._reconcile_columns() is True
@@ -1494,7 +1493,7 @@ def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
     # Without migration 2 there is no history either, and the message says
     # what is missing
     store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
-    reads = SchemaReads(latest=MIGRATION_RECONCILE - 1, history=True)
+    reads = SchemaReads(columns=False, history=True)
     store._read_all = read_all  # type: ignore[method-assign,assignment]
     with pytest.raises(
         ValueError,
@@ -1509,7 +1508,7 @@ async def test_async_history_check_reads_once_with_the_schema_before_refusing() 
     store = AsyncCockroachDBStore(
         AsyncConnectionPool("", open=False), history=True, retry_policy=FAST
     )
-    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+    reads = SchemaReads(columns=True, history=False)
 
     async def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None
@@ -1521,7 +1520,7 @@ async def test_async_history_check_reads_once_with_the_schema_before_refusing() 
         ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
     ):
         await store._ahistory_schema()
-    statements = [(store.sql.migration_version(), []), store.sql.history_exists()]
+    statements = [store.sql.reconcile_columns_exist(), store.sql.history_exists()]
     assert reads.calls == [(statements, "store schema check")]
     reads.history = True
     assert await store._ahistory_schema() == SchemaCheck(columns=True, history=True)
@@ -1708,7 +1707,7 @@ def test_delete_namespace_without_history_looks_for_a_history_table_each_time() 
     # The read leaves the schema check alone: its clock did not move, and
     # plain writes never look for the table
     assert store._schema_read_at == 0.0
-    assert store._schema_statements() == [(store.sql.migration_version(), [])]
+    assert store._schema_statements() == [store.sql.reconcile_columns_exist()]
 
 
 def test_delete_namespace_without_history_stops_looking_once_it_found_the_table() -> None:
@@ -1758,7 +1757,7 @@ def test_a_put_refused_for_a_missing_history_table_costs_no_embedding_call() -> 
         history=True,
         retry_policy=FAST,
     )
-    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+    reads = SchemaReads(columns=True, history=False)
 
     def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None
@@ -1782,7 +1781,7 @@ async def test_async_put_refused_for_a_missing_history_table_costs_no_embedding_
         history=True,
         retry_policy=FAST,
     )
-    reads = SchemaReads(latest=MIGRATION_RECONCILE, history=False)
+    reads = SchemaReads(columns=True, history=False)
 
     async def read_all(
         statements: list[tuple[str, list]], label: str, session: object = None

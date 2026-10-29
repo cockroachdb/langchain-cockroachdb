@@ -2,8 +2,9 @@
 
 These run StoreSQL statements directly on a store's tables, with a flat
 vectors table, to check each statement on its own: the refresh CTEs change
-only the rows a read returns, and delete_namespace removes the items and
-their vectors in one statement.
+only the rows a read returns, delete_namespace removes the items and their
+vectors in one statement, and the column check finds migration 2 only once
+all its columns exist.
 """
 
 from __future__ import annotations
@@ -124,3 +125,21 @@ def test_delete_namespace_removes_items_and_vectors_in_one_statement(admin, tabl
     assert sorted(row["key"] for row in rows) == ["k1", "k2", "k3"]
     assert set(expiries(admin, sql.items)) == {("ab", "k4")}
     assert set(expiries(admin, sql.vectors)) == {("ab", "k4")}
+
+
+def test_the_column_check_needs_every_column_of_migration_2(admin, table_name) -> None:
+    sql = make_sql(table_name)
+
+    def ready() -> bool:
+        row = admin.cursor(binary=True).execute(*sql.reconcile_columns_exist()).fetchone()
+        assert row is not None
+        return row["ready"]
+
+    # A missing items table reads as not ready, without an error
+    assert ready() is False
+    admin.execute(sql.migrations()[1])  # the items table as 0.5.x created it
+    assert ready() is False
+    admin.execute(f"ALTER TABLE {sql.items} ADD COLUMN version INT8 NOT NULL DEFAULT 1")
+    assert ready() is False
+    admin.execute(sql.migrations()[2])
+    assert ready() is True

@@ -1,5 +1,6 @@
 """Tests for store SQL statement building."""
 
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -223,6 +224,7 @@ def test_no_cast_shorthand():
         ),
         sql.history_versions("a", "k1", limit=1),
         sql.history_exists(),
+        sql.reconcile_columns_exist(),
         sql.purge("a", "k1"),
         sql.delete_namespace(["a"], history=True),
         sql.upsert_items([("a", "k1", "{}", None, None, None)], write_id="w", history=True),
@@ -337,6 +339,22 @@ def test_migration_2_adds_the_reconcile_columns_in_one_statement() -> None:
         "valid_at TIMESTAMPTZ",
     ):
         assert f"ADD COLUMN IF NOT EXISTS {column}" in migration
+
+
+def test_the_column_check_binds_the_items_table_and_migration_2_columns() -> None:
+    sql = StoreSQL("memory", "facts")
+    query, params = sql.reconcile_columns_exist()
+    assert query == (
+        "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
+        "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)"
+    )
+    columns = ["version", "provenance", "confirmed_at", "confirmations", "write_id", "valid_at"]
+    assert params == [6, "memory.facts", columns]
+    for value in ("memory", "facts", *columns):
+        assert value not in query
+    # The check requires exactly the columns migration 2 adds
+    migration = sql.migrations()[MIGRATION_RECONCILE]
+    assert re.findall(r"ADD COLUMN IF NOT EXISTS (\w+) ", migration) == columns
 
 
 def test_upsert_with_a_write_id_bumps_the_version_only_for_a_new_write() -> None:
@@ -714,6 +732,7 @@ def test_every_builder_has_one_param_per_placeholder():
     for query_sql, params in (
         sql.history_versions("a.b.c", "k1", limit=3),
         sql.history_exists(),
+        sql.reconcile_columns_exist(),
         sql.purge("a.b.c", "k1"),
         sql.upsert_items([("a.b.c", "k1", "{}", None, None, None)], write_id="w", history=True),
         *candidate_statements(sql),

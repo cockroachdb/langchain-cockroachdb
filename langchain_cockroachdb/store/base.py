@@ -60,7 +60,6 @@ from langchain_cockroachdb.store.reconcile import (
 )
 from langchain_cockroachdb.store.sql import (
     MAX_SEARCH_NAMESPACES,
-    MIGRATION_RECONCILE,
     NAMESPACES,
     ItemRow,
     ItemRowV2,
@@ -959,13 +958,13 @@ class BaseCockroachDBStore:
     def _cache_columns(self, rows: Sequence[Mapping[str, Any]]) -> bool:
         """Cache and return whether migration 2's columns exist.
 
-        ``rows`` are what StoreSQL.migration_version returned: the latest
-        migration recorded, or no row. A True cached before is kept: a read
-        that started before another process ran setup() can finish late.
+        ``rows`` are what StoreSQL.reconcile_columns_exist returned: whether
+        the items table has all of them, as ``ready``. A True cached before
+        is kept: a read that started before another process ran setup() can
+        finish late.
         """
-        version = int(rows[0]["v"]) if rows else -1
         with self._schema_lock:
-            ready = version >= MIGRATION_RECONCILE or self._columns_ready is True
+            ready = bool(rows and rows[0]["ready"]) or self._columns_ready is True
             self._schema_read_at = time.monotonic()
             self._columns_ready = ready
         return ready
@@ -989,10 +988,12 @@ class BaseCockroachDBStore:
     def _schema_statements(self) -> list[tuple[str, list]]:
         """The schema check's reads, sent as one round trip.
 
-        The latest migration, and on a store with history whether the
-        history table exists.
+        Whether the items table has migration 2's columns, and on a store
+        with history whether the history table exists. Neither read needs a
+        grant on the migrations table, so a role granted only the store's
+        tables can write once an admin role has run setup().
         """
-        statements: list[tuple[str, list]] = [(self.sql.migration_version(), [])]
+        statements = [self.sql.reconcile_columns_exist()]
         if self._history is not None:
             statements.append(self.sql.history_exists())
         return statements

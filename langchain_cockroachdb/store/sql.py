@@ -21,8 +21,18 @@ QUERY_VECTOR = object()
 NAMESPACES = object()
 
 # The migration that adds the columns reconcile, history and confirm use.
-# Until setup() records it, the store writes with the 0.5 statements.
+# Until setup() applies it, the store writes with the 0.5 statements.
 MIGRATION_RECONCILE = 2
+# The columns migration 2 adds. The schema check looks for all of them in the
+# items table.
+_RECONCILE_COLUMNS = (
+    "version",
+    "provenance",
+    "confirmed_at",
+    "confirmations",
+    "write_id",
+    "valid_at",
+)
 
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
@@ -144,8 +154,26 @@ class StoreSQL:
         ]
 
     def migration_version(self) -> str:
-        """The statement that reads the latest migration recorded, if any."""
+        """The statement that reads the latest migration recorded, if any.
+
+        Only setup() reads the migrations table. The schema check before
+        writes uses reconcile_columns_exist instead.
+        """
         return f"SELECT v FROM {self.migrations_table} ORDER BY v DESC LIMIT 1"
+
+    def reconcile_columns_exist(self) -> tuple[str, list]:
+        """The statement that tells whether the items table has migration 2's columns, as ``ready``.
+
+        It reads the table's own columns, not the migrations table, so a role
+        granted only the store's tables can run it. pg_attribute lists only
+        public columns, so columns that a schema change is still adding do
+        not count. A missing items table has none of them.
+        """
+        return (
+            "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
+            "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)",
+            [len(_RECONCILE_COLUMNS), self.items, list(_RECONCILE_COLUMNS)],
+        )
 
     def vector_statements(self) -> list[str]:
         """Return idempotent DDL statements for vectors table and index.

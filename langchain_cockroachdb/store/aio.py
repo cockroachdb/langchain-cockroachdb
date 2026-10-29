@@ -620,11 +620,11 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     async def _aschema(self, *, refresh: bool = False) -> SchemaCheck:
         """What the schema check knows: migration 2's columns and the history table.
 
-        It reads the latest migration, and on a store with history whether
-        the history table exists, in one round trip. It reads them the first
-        time, and again when an answer it found missing is older than
-        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. What it found present
-        it trusts for good.
+        It reads whether the items table has migration 2's columns, and on a
+        store with history whether the history table exists, in one round
+        trip. It reads them the first time, and again when an answer it found
+        missing is older than _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set.
+        What it found present it trusts for good.
         """
         schema = self._cached_schema(refresh=refresh)
         if schema is None:
@@ -636,12 +636,12 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
     async def _areconcile_columns(self, *, refresh: bool = False) -> bool:
         """Whether migration 2's columns exist, as the schema check last read it.
 
-        It reads the latest migration the first time, and again when it last
-        found none and that answer is older than _SCHEMA_RECHECK_SECONDS, or
-        ``refresh`` is set. Methods that need the columns pass ``refresh``, so
-        they see a setup() that another process ran since. Until setup()
-        records migration 2, puts write with the 0.5 statements and those
-        methods raise ValueError.
+        It reads the items table's columns the first time, and again when it
+        last found them missing and that answer is older than
+        _SCHEMA_RECHECK_SECONDS, or ``refresh`` is set. Methods that need the
+        columns pass ``refresh``, so they see a setup() that another process
+        ran since. Until setup() applies migration 2, puts write with the 0.5
+        statements and those methods raise ValueError.
         """
         return (await self._aschema(refresh=refresh)).columns
 
