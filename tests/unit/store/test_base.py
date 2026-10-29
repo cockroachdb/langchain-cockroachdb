@@ -2165,10 +2165,21 @@ NO_HIT: dict[str, object] = dict.fromkeys(
 
 
 def window_rows(
-    hits: list[dict[str, object]], *, size: int = 21, lowest: float | None = 0.0
+    hits: list[dict[str, object]],
+    *,
+    size: int = 21,
+    lowest: float | None = 0.0,
+    held: int | None = None,
 ) -> list[dict[str, object]]:
-    """The rows of an index scan: its hits, or one row without a candidate, with the window."""
-    window = {"window_size": size, "lowest_score": lowest}
+    """The rows of an index scan: its hits, or one row without a candidate, with the window.
+
+    ``held`` is the namespace's vectors counted up to over_fetch (default: the window's size).
+    """
+    window = {
+        "window_size": size,
+        "lowest_score": lowest,
+        "namespace_vectors": size if held is None else held,
+    }
     return [{**row, **window} for row in hits] or [{**NO_HIT, **window}]
 
 
@@ -2425,8 +2436,14 @@ def test_needs_exact_candidates() -> None:
     hit = candidate_row("a", score=0.9)
     other = candidate_row("b", score=0.88)
 
-    def needs(rows: list[dict[str, object]], *, threshold: float = 0.8, limit: int = 10) -> bool:
-        return needs_exact_candidates(rows, threshold=threshold, limit=limit)
+    def needs(
+        rows: list[dict[str, object]],
+        *,
+        threshold: float = 0.8,
+        limit: int = 10,
+        over_fetch: int = 21,
+    ) -> bool:
+        return needs_exact_candidates(rows, threshold=threshold, limit=limit, over_fetch=over_fetch)
 
     # The window's lowest score is below the threshold: every vector beyond it
     # scores lower still, up to the index's approximation, so nothing is missing
@@ -2445,6 +2462,16 @@ def test_needs_exact_candidates() -> None:
     # threshold: the exact scan runs
     assert needs(window_rows([hit], lowest=0.85), limit=2)
     assert needs(window_rows([hit, other], lowest=0.8), limit=3)
+    # A window the index cut short, with fewer rows than over_fetch while the
+    # namespace holds more: vectors it never reached may score higher than its
+    # lowest, so it runs again unless it filled the limit
+    assert needs(window_rows([], size=15, lowest=0.5, held=21))
+    assert needs(window_rows([hit], size=15, lowest=0.5, held=21), limit=2)
+    assert not needs(window_rows([hit], size=15, lowest=0.5, held=21), limit=1)
+    # A window smaller than over_fetch because the namespace holds no more is
+    # whole: the lowest score decides
+    assert not needs(window_rows([hit], size=5, lowest=0.5, held=5))
+    assert needs(window_rows([hit], size=5, lowest=0.85, held=5))
     # An empty window tells nothing about the namespace
     assert needs(window_rows([], size=0, lowest=None))
     assert needs([])
@@ -2570,3 +2597,143 @@ def test_conflicts_record_which_store_made_them() -> None:
     assert others[-1] == StoreIdentity(
         items="public.memories", dims=None, distance=None, fields=None
     )
+
+
+def test_conflicts_survive_a_checkpoint_round_trip() -> None:
+    # An interrupt while a person decides keeps the Conflicts in a LangGraph
+    # checkpoint. The serializer gives tuples back as lists; the types restore them
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=6,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95)],
+    )
+    store, _ = finding_store(reads, reconcile_scan_limit=5, ttl={"default_ttl": 30.0})
+    conflicts = store.find_conflicts(
+        NS,
+        "k",
+        {"seat": "x", "text": "aisle"},
+        slot="seat",
+        index=["text"],
+        provenance={"source": "chat"},
+        valid_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+
+    assert back == conflicts
+    assert back._state == conflicts._state
+    state, plan = back._state, back._state.plan
+    assert isinstance(back.candidates, tuple) and isinstance(back.proposal.namespace, tuple)
+    assert state.store == store._identity() and isinstance(state.store.fields, tuple)
+    assert state.target == (3, T0) and state.tokens["s"] == (1, T0)
+    assert state.vector_rows == (("user.alice", "k", "text", [5.0, 0.0, 0.0], 30.0),)
+    assert plan.namespace == NS and plan.index == ["text"]
+    assert plan.put.items == [("user.alice", "k", plan.value_json, 30.0)]
+    assert plan.put.embed_requests == [("user.alice", "k", "text", "aisle")]
+    # Nested values keep their types: aware datetimes, the write id and the TTL
+    assert plan.valid_at == datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert back.candidates[0].valid_at.tzinfo is not None
+    assert back.target_updated_at == T0
+    assert (
+        isinstance(plan.put.write_id, str)
+        and plan.put.write_id == conflicts._state.plan.put.write_id
+    )
+    assert isinstance(plan.ttl, float) and plan.ttl == 30.0
+    assert back.candidates[0].item.score == 0.2
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"reconcile_scan_limit": 0},
+        {"history": {"ttl_days": -1}},
+        {"index": {"dims": 0, "embed": CountingEmbeddings()}},
+    ],
+    ids=["scan-limit", "history", "index"],
+)
+@pytest.mark.parametrize("pool_config", [None, {"min_size": 1}], ids=["connection", "pool"])
+def test_from_conn_string_checks_settings_before_connecting(
+    bad: dict, pool_config: dict | None, monkeypatch
+) -> None:
+    from langchain_cockroachdb.store import store as store_module
+
+    def connect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string connected before checking its settings")
+
+    monkeypatch.setattr(store_module.Connection, "connect", connect)
+    monkeypatch.setattr(store_module, "ConnectionPool", connect)
+    with (
+        pytest.raises(ValueError),
+        CockroachDBStore.from_conn_string(
+            "postgresql://root@localhost:1/db", pool_config=pool_config, **bad
+        ),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"reconcile_scan_limit": 0},
+        {"history": {"ttl_days": -1}},
+        {"index": {"dims": 0, "embed": CountingEmbeddings()}},
+    ],
+    ids=["scan-limit", "history", "index"],
+)
+@pytest.mark.parametrize("pool_config", [None, {"min_size": 1}], ids=["connection", "pool"])
+async def test_async_from_conn_string_checks_settings_before_connecting(
+    bad: dict, pool_config: dict | None, monkeypatch
+) -> None:
+    from langchain_cockroachdb.store import aio as aio_module
+
+    async def connect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string connected before checking its settings")
+
+    def pool(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string opened a pool before checking its settings")
+
+    monkeypatch.setattr(aio_module.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(aio_module, "AsyncConnectionPool", pool)
+    with pytest.raises(ValueError):
+        async with AsyncCockroachDBStore.from_conn_string(
+            "postgresql://root@localhost:1/db", pool_config=pool_config, **bad
+        ):
+            pass
+
+
+def test_from_conn_string_builds_the_embedding_model_once(monkeypatch) -> None:
+    # The settings are checked before connecting, and the store reuses the
+    # model that check built, so a model named by a string is built once
+    from langchain_cockroachdb.store import config as config_module
+    from langchain_cockroachdb.store import store as store_module
+
+    built: list[object] = []
+
+    def ensure_embeddings(embed: object) -> Embeddings:
+        if isinstance(embed, Embeddings):
+            return embed
+        built.append(embed)
+        return CountingEmbeddings()
+
+    class FakeConnection:
+        closed = False
+
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr(config_module, "ensure_embeddings", ensure_embeddings)
+    monkeypatch.setattr(
+        store_module.Connection, "connect", lambda *args, **kwargs: FakeConnection()
+    )
+    with CockroachDBStore.from_conn_string(
+        "postgresql://root@localhost:1/db",
+        index={"dims": 3, "embed": "fake:model"},  # type: ignore[typeddict-item]
+    ) as store:
+        assert isinstance(store.index.embeddings, CountingEmbeddings)  # type: ignore[union-attr]
+    assert built == ["fake:model"]

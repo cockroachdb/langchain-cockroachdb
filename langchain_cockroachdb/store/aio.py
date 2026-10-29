@@ -57,6 +57,7 @@ from langchain_cockroachdb.store.config import (
     resolve_reconcile_scan_limit,
 )
 from langchain_cockroachdb.store.namespaces import validate_labels
+from langchain_cockroachdb.store.sql import VectorRow
 from langchain_cockroachdb.store.store import DEFAULT_SWEEP_INTERVAL_MINUTES
 
 logger = logging.getLogger(__name__)
@@ -259,7 +260,19 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
 
         With ``pool_config``, ``pipeline`` is ignored, as in AsyncPostgresStore:
         a pipeline needs a single connection.
+
+        Raises:
+            ValueError: If the index, history or reconcile_scan_limit settings
+                are invalid, before any connection is opened
         """
+        # Checked before connecting, so a bad setting costs no connection and
+        # no connect retries. The store reuses the embedding model this built
+        resolved_index = resolve_index_config(index)
+        resolve_history_config(history)
+        resolve_reconcile_scan_limit(reconcile_scan_limit)
+        if index is not None and resolved_index is not None:
+            index = index.copy()
+            index["embed"] = resolved_index.embeddings
         policy = retry_policy or RetryPolicy()
         url = to_libpq_url(conn_string)
         options = dict(connect_kwargs or {})
@@ -659,6 +672,20 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         [rows] = await self._read_all([self.sql.history_exists()], "store history check")
         return self._cache_history(rows)
 
+    async def _embed_put(self, plan: PutPlan) -> list[VectorRow]:
+        """Embed the texts a put plan writes, once, and pair the vectors with their rows.
+
+        Puts call it before their first attempt, so a retry reuses the
+        vectors. It embeds documents, with aembed_documents: the vectors are
+        the ones the write stores.
+        """
+        embeddings: list[list[float]] = []
+        if self.index is not None and plan.embed_requests:
+            embeddings = await self.index.embeddings.aembed_documents(
+                [text for _, _, _, text in plan.embed_requests]
+            )
+        return self._vector_rows(plan, embeddings)
+
     async def _run_puts(self, plan: PutPlan) -> None:
         # The schema check comes first. With history, a write refuses to run
         # until setup() has created the history table, since it could not
@@ -667,13 +694,7 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             schema = await self._ahistory_schema()
         else:
             schema = await self._aschema()
-        # Embed once, before the first attempt: a retry reuses the vectors
-        embeddings: list[list[float]] = []
-        if self.index is not None and plan.embed_requests:
-            embeddings = await self.index.embeddings.aembed_documents(
-                [text for _, _, _, text in plan.embed_requests]
-            )
-        vector_rows = self._vector_rows(plan, embeddings)
+        vector_rows = await self._embed_put(plan)
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
         if schema.columns:

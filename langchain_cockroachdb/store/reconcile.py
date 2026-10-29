@@ -12,14 +12,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from langgraph.store.base import Item, SearchItem
-
-if TYPE_CHECKING:
-    # base.py imports this module, so the store's private state is named for
-    # type checkers only
-    from langchain_cockroachdb.store.base import ConflictsState
 
 
 class Action(str, Enum):
@@ -52,6 +47,10 @@ class Proposal:
     slot_value: Any
     provenance: dict[str, Any] | None
     valid_at: datetime
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        object.__setattr__(self, "namespace", tuple(self.namespace))
 
 
 @dataclass(frozen=True)
@@ -208,9 +207,16 @@ class Conflicts:
     candidates: tuple[Candidate, ...]
     target_version: int | None
     target_updated_at: datetime | None
-    # The store's plan for the write: the item, its vectors and the versions
-    # resolve() checks. Left out of repr and comparison
-    _state: ConflictsState | None = field(default=None, repr=False, compare=False)
+    # The store's plan for the write, a ConflictsState from base.py: which
+    # store made it, the item, its vectors and the versions resolve() checks.
+    # Left out of repr and comparison. Typed Any because base.py imports this
+    # module, so typing.get_type_hints can still resolve every field
+    _state: Any = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists, as when a
+        # Conflicts waits in graph state for a person to decide
+        object.__setattr__(self, "candidates", tuple(self.candidates))
 
 
 class ConflictsChanged(Exception):

@@ -1123,7 +1123,8 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
 
     Both skip the excluded keys, filter, check expiry and keep the scores at
     or above the threshold, best first, up to the limit. The index form also
-    reports the window's size and lowest score, for needs_exact_candidates.
+    reports the window's size, its lowest score and the namespace's vectors,
+    for needs_exact_candidates.
     """
     sql = StoreSQL("public", "store", index=_make_index())
     kwargs = {"threshold": 0.8, "limit": 5, "filter": {"x": 1}, "over_fetch": 11}
@@ -1165,10 +1166,17 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
     assert nearest.endswith("ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s")
     assert "expires_at" not in nearest and "value" not in nearest and "ANY(" not in nearest
     # The window's size and lowest score, over every vector in it: before the
-    # filter, the expiry check and the excluded keys
+    # filter, the expiry check and the excluded keys. And the namespace's
+    # vectors, counted from the primary key up to over_fetch, which tells a
+    # window the index cut short
     stats, rest = rest.split("\n),\nbest AS (\n", 1)
     assert stats == (
-        "    SELECT count(*) AS window_size, min(1 - distance) AS lowest_score\n    FROM nearest"
+        "    SELECT count(*) AS window_size, min(1 - distance) AS lowest_score, (\n"
+        "        SELECT count(*) FROM (\n"
+        "            SELECT 1 FROM public.store_vectors WHERE prefix = %s LIMIT %s\n"
+        "        ) AS c\n"
+        "    ) AS namespace_vectors\n"
+        "    FROM nearest"
     )
     best, rest = rest.split("\n),\nhits AS (\n", 1)
     assert "JOIN public.store AS i ON r.prefix = i.prefix AND r.key = i.key" in best
@@ -1182,17 +1190,20 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
         "    FROM best\n    WHERE 1 - distance >= CAST(%s AS FLOAT8)\n"
         "    ORDER BY score DESC, key\n    LIMIT %s"
     )
-    # Every row carries the window's size and lowest score. Without a
-    # candidate one row still does, with NULL candidate columns
+    # Every row carries the window's figures. Without a candidate one row
+    # still does, with NULL candidate columns
     assert outer == (
         "h.key, h.value, h.created_at, h.updated_at, h.version, h.valid_at, h.provenance, "
-        "h.confirmed_at, h.confirmations, h.write_id, h.score, w.window_size, w.lowest_score\n"
+        "h.confirmed_at, h.confirmations, h.write_id, h.score, w.window_size, w.lowest_score, "
+        "w.namespace_vectors\n"
         "FROM window_stats AS w\nLEFT JOIN hits AS h ON TRUE\nORDER BY h.score DESC, h.key"
     )
     assert index_params == [
         QUERY_VECTOR,
         "user.alice",
         QUERY_VECTOR,
+        11,
+        "user.alice",
         11,
         ["k", "s"],
         "x",

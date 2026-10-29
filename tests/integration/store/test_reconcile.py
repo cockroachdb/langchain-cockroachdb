@@ -10,10 +10,12 @@ from the caller, the new memory is valid from the database's clock.
 from __future__ import annotations
 
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.store.base import PutOp
 from psycopg import Connection
 
@@ -22,8 +24,10 @@ from langchain_cockroachdb.store import Conflicts, MemoryRecord
 from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store import reconcile as store_reconcile
 from langchain_cockroachdb.store import store as store_module
+from langchain_cockroachdb.store.sql import StoreSQL
 from tests.integration.store.conftest import SEATS, FixedEmbeddings, seat_index
 from tests.integration.store.test_schema_upgrade import schema_0_5
+from tests.integration.store.test_semantic_filters import STATS_WAIT, explain
 
 NS = ("user", "alice")
 PREFIX = "user.alice"
@@ -67,6 +71,23 @@ def toward(base: list[float], cosine: float) -> list[float]:
     """
     norm = math.sqrt(sum(x * x for x in base))
     return [cosine * base[0] / norm, cosine * base[1] / norm, math.sqrt(1 - cosine**2), 0.0]
+
+
+def dense_store(store_factory: Any, mode: str) -> CockroachDBStore:
+    """A store whose index knows 29 texts nearer to AISLE than "match", which scores 0.85.
+
+    "near 0" to "near 28" score 0.99 down to 0.962, all above the default
+    threshold, so an index window of 21 holds none of "match". The scan
+    limit is 10, so 30 memories take the index path.
+    """
+    vectors = {AISLE: SEATS[AISLE], "match": toward(SEATS[AISLE], 0.85)}
+    for i in range(29):
+        vectors[f"near {i}"] = toward(SEATS[AISLE], 0.99 - 0.001 * i)
+    return store_factory(
+        mode,
+        index={"dims": 4, "embed": FixedEmbeddings(vectors), "fields": ["text"]},
+        reconcile_scan_limit=10,
+    )
 
 
 def spy_on_reads(store: CockroachDBStore, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
@@ -271,16 +292,9 @@ def test_find_conflicts_looks_past_a_window_the_filter_emptied(
     # the only match, all above the threshold. The index's window of 21 holds
     # none of the match's kind and still ends above the threshold, so matches
     # may lie beyond it, and the store ranks the namespace exactly
-    vectors = {AISLE: SEATS[AISLE], "match": toward(SEATS[AISLE], 0.85)}
-    for i in range(29):
-        vectors[f"other {i}"] = toward(SEATS[AISLE], 0.99 - 0.001 * i)
-    store = store_factory(
-        mode,
-        index={"dims": 4, "embed": FixedEmbeddings(vectors), "fields": ["text"]},
-        reconcile_scan_limit=10,
-    )
+    store = dense_store(store_factory, mode)
     store.batch(
-        [PutOp(NS, f"o{i}", {"text": f"other {i}", "kind": "other"}) for i in range(29)]
+        [PutOp(NS, f"o{i}", {"text": f"near {i}", "kind": "other"}) for i in range(29)]
         + [PutOp(NS, "m", {"text": "match", "kind": "seat"})]
     )
     sent = spy_on_reads(store, monkeypatch)
@@ -297,6 +311,157 @@ def test_find_conflicts_looks_past_a_window_the_filter_emptied(
     [(_, [indexed], _), (_, [exact], session)] = sent[1:]
     assert "window_stats" in indexed
     assert "GROUP BY i.prefix, i.key" in exact and session is None
+
+
+def test_find_conflicts_looks_past_a_window_of_excluded_slot_matches(
+    store_factory, mode, monkeypatch
+) -> None:
+    # Twenty-nine memories in the new memory's slot lie nearer to it than a
+    # similar memory outside the slot. The similar statement leaves the slot
+    # matches out, since they are candidates already, but they still fill the
+    # index's window
+    store = dense_store(store_factory, mode)
+    store.batch(
+        [PutOp(NS, f"s{i:02}", {"text": f"near {i}", "seat": "x"}) for i in range(29)]
+        + [PutOp(NS, "m", {"text": "match"})]
+    )
+    sent = spy_on_reads(store, monkeypatch)
+
+    conflicts = store.find_conflicts(NS, None, text(AISLE, seat="x"), slot="seat")
+
+    found = reasons(conflicts)
+    assert found[:29] == [(f"s{i:02}", "slot") for i in range(29)]
+    assert found[29:] == [("m", "similar")]
+    assert [label for label, _, _ in sent][-1] == "store find conflicts exact"
+
+
+def test_find_conflicts_looks_past_a_window_of_expired_memories(
+    store_factory, admin, mode, monkeypatch
+) -> None:
+    # Twenty-nine expired memories lie nearer than a live match. Their vectors
+    # still fill the index's window until the TTL job deletes them
+    store = dense_store(store_factory, mode)
+    store.batch(
+        [PutOp(NS, f"e{i:02}", {"text": f"near {i}"}, ttl=60) for i in range(29)]
+        + [PutOp(NS, "m", {"text": "match"})]
+    )
+    admin.execute(
+        f"UPDATE {store.sql.items} SET expires_at = now() - INTERVAL '1 minute' "
+        "WHERE prefix = %s AND key <> 'm'",
+        (PREFIX,),
+    )
+    sent = spy_on_reads(store, monkeypatch)
+
+    conflicts = store.find_conflicts(NS, None, text(AISLE))
+
+    assert reasons(conflicts) == [("m", "similar")]
+    assert [label for label, _, _ in sent][-1] == "store find conflicts exact"
+
+
+def test_only_the_index_form_uses_the_vector_index(store_factory, admin) -> None:
+    """EXPLAIN: the index form takes its window from a vector search, the exact form never does.
+
+    nearest has two readers, the window's figures and the hits, so
+    CockroachDB computes it once into a buffer; a vector search on the
+    C-SPANN index fills that buffer. The namespace's vectors are counted from
+    the primary key, up to over_fetch. As in test_semantic_filters, the index
+    wins on cost with a few thousand vectors in the namespace.
+    """
+    model = DeterministicFakeEmbedding(size=4)
+    store = store_factory("pool", index={"dims": 4, "embed": model, "fields": ["text"]})
+    store.batch(
+        [
+            PutOp(NS, f"k{i:04}", {"text": f"memory {i}", "kind": "rare" if i % 25 == 3 else "c"})
+            for i in range(3000)
+        ]
+    )
+    admin.execute(f"ANALYZE {store.sql.items}")
+    admin.execute(f"ANALYZE {store.sql.vectors}")
+    query = model.embed_query("a memory")
+    common: dict[str, Any] = {
+        "threshold": 0.8,
+        "limit": 3,
+        "filter": {"kind": "rare"},
+        "over_fetch": 7,
+        "exclude": ["k0003"],
+    }
+
+    def bound(scan: str) -> tuple[str, list]:
+        statement = store.sql.similar_candidates(PREFIX, scan=scan, **common)  # type: ignore[arg-type]
+        return StoreSQL.bind_query_vector(statement, query)
+
+    # Each node picks up new statistics a few seconds after ANALYZE, so plan
+    # again until the optimizer sees them, as test_semantic_filters does
+    statement = bound("index")
+    deadline = time.monotonic() + STATS_WAIT
+    while "vector search" not in (indexed := explain(admin, statement)):
+        if time.monotonic() > deadline:
+            break
+        time.sleep(1)
+    assert "vector search" in indexed, (
+        f"no vector search after {STATS_WAIT} s of planning again:\n{indexed}"
+    )
+    assert store.sql.vector_index_name in indexed, indexed
+    assert "label: buffer 1 (nearest)" in indexed, indexed
+    count = indexed[indexed.index("original sql: (SELECT count(*)") :]
+    vectors = store.sql.vectors.split(".", 1)[1]
+    assert f"table: {vectors}@{vectors}_pkey" in count, indexed
+    assert f"spans: [/'{PREFIX}' - /'{PREFIX}']" in count, indexed
+    assert "limit: 7" in count, indexed
+    exact = explain(admin, bound("exact"))
+    assert "vector search" not in exact, exact
+
+
+def test_slot_matches_come_best_score_first(store_factory, mode) -> None:
+    store = store_factory(mode, index=seat_index())
+    store.put(NS, "s0", text(VEGETARIAN, seat="x"))
+    store.put(NS, "s1", text(LONG_FLIGHTS, seat="x"))
+    store.put(NS, "s2", text(WINDOW, seat="x"))
+    store.put(NS, "s3", text(PEANUTS, seat="x"), index=False)
+
+    conflicts = store.find_conflicts(NS, None, text(AISLE, seat="x"), slot="seat")
+
+    # Key order alone would give s0, s1, s2, s3; a match without a vector comes last
+    assert reasons(conflicts) == [("s1", "slot"), ("s2", "slot"), ("s0", "slot"), ("s3", "slot")]
+    scores = [c.score for c in conflicts.candidates]
+    assert scores[:3] == pytest.approx([0.938, 0.85, 0.0], abs=1e-3)
+    assert scores[3] is None
+
+
+def test_inner_product_store_finds_candidates_with_a_threshold(store_factory, mode) -> None:
+    store = store_factory(mode, index=seat_index(distance_type="inner_product"))
+    store.put(NS, "w", text(WINDOW))
+    store.put(NS, "lf", text(LONG_FLIGHTS))
+    store.put(NS, "v", text(VEGETARIAN))
+    with pytest.raises(ValueError, match="threshold"):
+        store.find_conflicts(NS, None, text(AISLE))
+
+    # The score is the negated distance, which is the inner product here
+    conflicts = store.find_conflicts(NS, None, text(AISLE), threshold=0.5)
+    assert reasons(conflicts) == [("lf", "similar"), ("w", "similar")]
+    assert [c.score for c in conflicts.candidates] == pytest.approx([0.938, 0.85], abs=1e-3)
+    searched = {item.key: item.score for item in store.search(NS, query=AISLE)}
+    assert [c.score for c in conflicts.candidates] == pytest.approx([searched["lf"], searched["w"]])
+
+
+def test_cosine_candidate_scores_equal_search_scores_for_the_same_vectors(
+    store_factory, mode
+) -> None:
+    # FixedEmbeddings gives queries and documents the same vectors, so the
+    # store's score function must give find_conflicts and search the same scores:
+    # for a slot match, scored by its vectors alone, and for similar memories
+    store = store_factory(mode, index=seat_index())
+    store.put(NS, "s", text(WINDOW, seat="x"))
+    store.put(NS, "lf", text(LONG_FLIGHTS))
+    store.put(NS, "v", text(VEGETARIAN))
+
+    conflicts = store.find_conflicts(NS, None, text(AISLE, seat="x"), slot="seat")
+
+    assert reasons(conflicts) == [("s", "slot"), ("lf", "similar")]
+    searched = {item.key: item.score for item in store.search(NS, query=AISLE)}
+    assert {c.key: c.score for c in conflicts.candidates} == pytest.approx(
+        {"s": searched["s"], "lf": searched["lf"]}
+    )
 
 
 def test_store_without_index_finds_key_and_slot_candidates(store_factory, mode) -> None:

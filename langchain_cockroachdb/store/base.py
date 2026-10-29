@@ -216,35 +216,45 @@ def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fe
 
 
 def needs_exact_candidates(
-    rows: Sequence[Mapping[str, Any]], *, threshold: float, limit: int
+    rows: Sequence[Mapping[str, Any]], *, threshold: float, limit: int, over_fetch: int
 ) -> bool:
     """Whether an index scan for similar candidates must run again in its exact form.
 
     ``rows`` are what the index form of StoreSQL.similar_candidates returned
-    for one vector of a new memory, with ``limit`` its LIMIT. Each carries
-    ``window_size``, the vectors the C-SPANN index returned into the window,
-    and ``lowest_score``, the lowest score among them, counted before the
-    filter, the expiry check and the excluded keys removed any.
+    for one vector of a new memory, with ``limit`` its LIMIT and
+    ``over_fetch`` its window. Each carries ``window_size``, the vectors the
+    C-SPANN index returned into the window, ``lowest_score``, the lowest
+    score among them, counted before the filter, the expiry check and the
+    excluded keys removed any, and ``namespace_vectors``, the namespace's
+    vectors counted up to ``over_fetch``.
 
     A scan that returned ``limit`` hits is complete: a vector beyond the
     window scores no higher than the window's lowest, so it cannot outrank
-    any hit. A window whose lowest score is below ``threshold`` held every
-    vector at or above it, up to the index's approximation: the vectors
-    beyond it score lower still. So that result stands too, however few
-    rows passed. When fewer than ``limit`` rows passed and the lowest score
-    is at or above the threshold, the rows the filter, the expiry check or
-    the excluded keys removed may have taken every place in the window,
-    and matches may lie beyond it. An empty window tells nothing about the
-    namespace. Both run again. Unlike needs_exact_search, a short result
-    alone never does: short results are the normal case here.
+    any hit. Otherwise the window must be whole for its result to stand: it
+    holds ``over_fetch`` vectors, or every vector of the namespace. A window
+    with fewer while the namespace holds more was cut short by the index, as
+    a small beam size or small partitions can, and a vector it never reached
+    may score higher than its lowest. A whole window whose lowest score is
+    below ``threshold`` held every vector at or above it, up to the index's
+    approximation, so its result stands however few rows passed. When its
+    lowest score is at or above the threshold, the rows the filter, the
+    expiry check or the excluded keys removed may have taken every place in
+    it, and matches may lie beyond it. An empty window tells nothing about
+    the namespace. All of these run again. Unlike needs_exact_search, a
+    short result alone never does: short results are the normal case here.
     """
     hits = sum(1 for row in rows if row["key"] is not None)
     if hits >= limit:
         return False
     if not rows:
         return True
+    window = int(rows[0]["window_size"])
     lowest = rows[0]["lowest_score"]
-    return int(rows[0]["window_size"]) == 0 or lowest is None or float(lowest) >= threshold
+    if window == 0 or lowest is None:
+        return True
+    if window < over_fetch and window < int(rows[0]["namespace_vectors"]):
+        return True
+    return float(lowest) >= threshold
 
 
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
@@ -302,6 +312,14 @@ class PutPlan:
     embed_requests: list[tuple[str, str, str, str]] = field(default_factory=list)
     reindexed: dict[str, list[str]] = field(default_factory=dict)
     write_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists, as when a
+        # Conflicts waits in graph state for a person to decide
+        self.items = [(prefix, key, value, ttl) for prefix, key, value, ttl in self.items]
+        self.embed_requests = [
+            (prefix, key, name, text) for prefix, key, name, text in self.embed_requests
+        ]
 
 
 @dataclass(frozen=True)
@@ -533,6 +551,12 @@ class ProposalPlan:
     valid_at: datetime | None
     put: PutPlan
 
+    def __post_init__(self) -> None:
+        # Tuples come back from a LangGraph checkpoint as lists
+        object.__setattr__(self, "namespace", tuple(self.namespace))
+        if isinstance(self.index, tuple):
+            object.__setattr__(self, "index", list(self.index))
+
     @property
     def embed_requests(self) -> list[tuple[str, str, str, str]]:
         """(prefix, key, field_name, text) for every vector the memory gets."""
@@ -578,6 +602,7 @@ class SimilarRead:
         threshold: The lowest score of a similar candidate, or None when
             ``similar`` is empty.
         limit: The LIMIT of each statement in ``similar``.
+        over_fetch: The window of each index scan in ``similar``.
     """
 
     scores: list[tuple[str, list]]
@@ -586,6 +611,7 @@ class SimilarRead:
     exact: list[tuple[str, list]] = field(default_factory=list)
     threshold: float | None = None
     limit: int = 0
+    over_fetch: int = 0
 
     def statements(self) -> list[tuple[str, list]]:
         """The statements to send as one round trip: the scores, then the similar reads."""
@@ -622,7 +648,9 @@ class SimilarRead:
         return [
             i
             for i, rows in enumerate(found[len(self.scores) :])
-            if needs_exact_candidates(rows, threshold=threshold, limit=self.limit)
+            if needs_exact_candidates(
+                rows, threshold=threshold, limit=self.limit, over_fetch=self.over_fetch
+            )
         ]
 
 
@@ -645,6 +673,11 @@ class StoreIdentity:
     distance: str | None
     fields: tuple[str, ...] | None
 
+    def __post_init__(self) -> None:
+        # Tuples come back from a LangGraph checkpoint as lists
+        if self.fields is not None:
+            object.__setattr__(self, "fields", tuple(self.fields))
+
 
 @dataclass(frozen=True)
 class ConflictsState:
@@ -664,6 +697,16 @@ class ConflictsState:
     vector_rows: tuple[VectorRow, ...]
     target: tuple[int, datetime] | None
     tokens: dict[str, tuple[int, datetime]]
+
+    def __post_init__(self) -> None:
+        # Tuples come back from a LangGraph checkpoint as lists. Each vector
+        # row keeps its embedding a list, as VectorRow has it
+        object.__setattr__(self, "vector_rows", tuple(tuple(row) for row in self.vector_rows))
+        if self.target is not None:
+            object.__setattr__(self, "target", tuple(self.target))
+        object.__setattr__(
+            self, "tokens", {key: tuple(token) for key, token in self.tokens.items()}
+        )
 
 
 def _row_to_item(namespace: tuple[str, ...], row: dict[str, Any]) -> Item:
@@ -1526,7 +1569,9 @@ class BaseCockroachDBStore:
         """The lowest score of a similar candidate, or None when none are searched.
 
         A store without an index, or a call with index=False, searches none,
-        and then the threshold is ignored. Scores are those search returns.
+        and then the threshold is ignored. Scores come from the store's
+        score function: 1 minus the distance on a cosine store, the negated
+        distance on an l2 or inner_product store.
 
         Raises:
             ValueError: If the threshold is missing on an l2 or inner_product
@@ -1639,6 +1684,7 @@ class BaseCockroachDBStore:
             return SimilarRead(scores=scores, similar=[], session=[])
         above = read.vectors is not None and read.vectors > self.reconcile_scan_limit
         scans: list[Literal["exact", "index"]] = ["exact", "index"] if above else ["exact"]
+        over_fetch = plan.limit * index.estimated_vectors * 2 + 1
         built: dict[str, list[tuple[str, list]]] = {}
         for scan in scans:
             statement = self.sql.similar_candidates(
@@ -1647,7 +1693,7 @@ class BaseCockroachDBStore:
                 limit=plan.limit,
                 filter=plan.filter,
                 scan=scan,
-                over_fetch=plan.limit * index.estimated_vectors * 2 + 1,
+                over_fetch=over_fetch,
                 exclude=list(dict.fromkeys([plan.key, *keys])),
             )
             built[scan] = [StoreSQL.bind_query_vector(statement, row[3]) for row in vector_rows]
@@ -1667,6 +1713,7 @@ class BaseCockroachDBStore:
             exact=built["exact"],
             threshold=threshold,
             limit=plan.limit,
+            over_fetch=over_fetch,
         )
 
     def _conflicts(

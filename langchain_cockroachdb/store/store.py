@@ -39,7 +39,6 @@ from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 from langchain_cockroachdb.store.base import (
     BaseCockroachDBStore,
     BatchPlan,
-    ProposalPlan,
     PutPlan,
     SchemaCheck,
     _check_paging,
@@ -222,7 +221,19 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         With ``pool_config``, ``pipeline`` is ignored, as in PostgresStore: a
         pipeline needs a single connection.
+
+        Raises:
+            ValueError: If the index, history or reconcile_scan_limit settings
+                are invalid, before any connection is opened
         """
+        # Checked before connecting, so a bad setting costs no connection and
+        # no connect retries. The store reuses the embedding model this built
+        resolved_index = resolve_index_config(index)
+        resolve_history_config(history)
+        resolve_reconcile_scan_limit(reconcile_scan_limit)
+        if index is not None and resolved_index is not None:
+            index = index.copy()
+            index["embed"] = resolved_index.embeddings
         policy = retry_policy or RetryPolicy()
         url = to_libpq_url(conn_string)
         options = dict(connect_kwargs or {})
@@ -508,18 +519,26 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         [rows] = self._read_all([self.sql.history_exists()], "store history check")
         return self._cache_history(rows)
 
-    def _run_puts(self, plan: PutPlan) -> None:
-        # The schema check comes first. With history, a write refuses to run
-        # until setup() has created the history table, since it could not
-        # keep what it replaces, and a refused batch costs no embedding call
-        schema = self._history_schema() if self._history is not None else self._schema()
-        # Embed once, before the first attempt: a retry reuses the vectors
+    def _embed_put(self, plan: PutPlan) -> list[VectorRow]:
+        """Embed the texts a put plan writes, once, and pair the vectors with their rows.
+
+        Puts and find_conflicts call it before their first attempt, so a
+        retry reuses the vectors. Both embed documents, with embed_documents:
+        the vectors are the ones the write stores.
+        """
         embeddings: list[list[float]] = []
         if self.index is not None and plan.embed_requests:
             embeddings = self.index.embeddings.embed_documents(
                 [text for _, _, _, text in plan.embed_requests]
             )
-        vector_rows = self._vector_rows(plan, embeddings)
+        return self._vector_rows(plan, embeddings)
+
+    def _run_puts(self, plan: PutPlan) -> None:
+        # The schema check comes first. With history, a write refuses to run
+        # until setup() has created the history table, since it could not
+        # keep what it replaces, and a refused batch costs no embedding call
+        schema = self._history_schema() if self._history is not None else self._schema()
+        vector_rows = self._embed_put(plan)
         # The write id too: a retry after a commit whose result was lost
         # finds it on the rows and changes nothing
         if schema.columns:
@@ -685,7 +704,11 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
           value in that field, compared as JSON.
         - ``"similar"``: on a store with an index, the memories whose vectors
           score at or above ``threshold`` against the new memory's, with the
-          scores search returns.
+          store's score function: 1 minus the distance on a cosine store,
+          the negated distance on an l2 or inner_product store. The new
+          memory is embedded as a document (``embed_documents``), while
+          search embeds its query (``embed_query``), so with a model that
+          embeds the two differently the scores differ from search's.
 
         Key and slot matches carry their best score when they have vectors,
         and similar ones always do. Candidates come strongest reason first,
@@ -752,7 +775,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             method="find_conflicts",
         )
         self._require_columns(self._reconcile_columns(refresh=True))
-        vector_rows = self._embed_proposal(plan)
+        vector_rows = self._embed_put(plan.put)
         read = self._key_slot_read(
             plan, self._read_all(self._key_slot_statements(plan), "store find conflicts")
         )
@@ -789,20 +812,6 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         self._require_columns(self._reconcile_columns(refresh=True))
         [rows] = self._read_all([self.sql.record(prefix, str(key))], "store record")
         return _row_to_record(tuple(namespace), rows[0]) if rows else None
-
-    def _embed_proposal(self, plan: ProposalPlan) -> list[VectorRow]:
-        """Embed the new memory's index fields once, and pair the vectors with their rows.
-
-        Runs before the first attempt of any read, so a retry reuses the
-        vectors. embed_documents, not embed_query: the vectors are also the
-        ones its write stores.
-        """
-        embeddings: list[list[float]] = []
-        if self.index is not None and plan.embed_requests:
-            embeddings = self.index.embeddings.embed_documents(
-                [text for _, _, _, text in plan.embed_requests]
-            )
-        return self._vector_rows(plan.put, embeddings)
 
     def reconcile(
         self,

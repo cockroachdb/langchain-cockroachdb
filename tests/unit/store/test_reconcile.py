@@ -284,3 +284,23 @@ def test_conflicts_keeps_its_state_out_of_repr_and_comparison() -> None:
     assert store_package.Conflicts is Conflicts
     assert "Conflicts" in store_package.__all__
     assert not hasattr(langchain_cockroachdb, "Conflicts")
+
+
+def test_the_reconcile_types_resolve_their_type_hints() -> None:
+    # Tools that read type hints at runtime, such as schema builders, must not
+    # meet a name that only type checkers can see
+    import typing
+
+    from langchain_cockroachdb.store.reconcile import MemoryRecord, MemoryVersion, ReconcileResult
+
+    for kind in (
+        Conflicts,
+        Proposal,
+        Candidate,
+        Decision,
+        ReconcileResult,
+        MemoryRecord,
+        MemoryVersion,
+    ):
+        assert typing.get_type_hints(kind)
+    assert "_state" in typing.get_type_hints(Conflicts)

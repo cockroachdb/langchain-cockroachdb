@@ -957,23 +957,29 @@ LIMIT %s OFFSET %s"""
     # the join, filter and expiry check. Rows that the filter, the expiry
     # check or the excluded keys remove still take places in the window, so
     # a match beyond it would be missed. The index form therefore reports
-    # the window's size and lowest score, over every vector in it. When it
-    # returned limit rows, or the lowest score is below the threshold, no
-    # vector beyond the window can change the result, up to the index's
-    # approximation, and the result stands. Otherwise matches may lie
-    # beyond the window, and the store runs the exact form for that vector
-    # (needs_exact_candidates in base.py). That costs one more round trip,
-    # and only when the namespace holds at least over_fetch vectors at or
-    # above the threshold but fewer than limit of them pass.
+    # the window's size and lowest score, over every vector in it, and the
+    # namespace's vectors counted up to over_fetch, as semantic_search_in
+    # does. When it returned limit rows, or the window is whole and its
+    # lowest score is below the threshold, no vector beyond the window can
+    # change the result, up to the index's approximation, and the result
+    # stands. Otherwise matches may lie beyond the window: the store runs
+    # the exact form for that vector (needs_exact_candidates in base.py).
+    # The window is not whole when it holds fewer than over_fetch vectors
+    # while the namespace holds more: C-SPANN cut it short, as a small
+    # beam size or small partitions can. The exact form costs one more
+    # round trip, and only when fewer than limit rows pass.
     #
     # Measured with EXPLAIN on v26.3.3, with 3,000 vectors in one namespace
     # and a C-SPANN index: the index form computes nearest once, as a buffer,
     # with a vector search on the vector index over the namespace's prefix
     # span under a top-k of over_fetch; the window's count and lowest score
     # read that buffer, and so do the excluded keys' filter and the items
-    # lookup join. The exact form is a merge join of the items and vectors
-    # primary keys over the namespace's span. candidate_scores reads its
-    # keys from the vectors primary key.
+    # lookup join; the namespace's count is a scan of the vectors primary
+    # key over the namespace's span, with limit over_fetch. The exact form
+    # is a merge join of the items and vectors primary keys over the
+    # namespace's span. candidate_scores reads its keys from the vectors
+    # primary key. test_only_the_index_form_uses_the_vector_index checks
+    # the index form's plan.
 
     @staticmethod
     def _candidate_columns(alias: str = "") -> str:
@@ -1059,11 +1065,12 @@ WHERE prefix = %s AND {match}
         target and the slot matches, which candidate_scores scores.
 
         The index form also reports the window it ranked: ``window_size``,
-        the vectors the C-SPANN index returned, and ``lowest_score``, the
-        lowest score among them, before the filter, the expiry check and
-        the excluded keys. Every row carries both, and when no row passes,
-        one row still does, with NULL candidate columns. See
-        needs_exact_candidates in base.py.
+        the vectors the C-SPANN index returned, ``lowest_score``, the lowest
+        score among them, before the filter, the expiry check and the
+        excluded keys, and ``namespace_vectors``, the namespace's vectors
+        counted from the primary key up to ``over_fetch``. Every row carries
+        all three, and when no row passes, one row still does, with NULL
+        candidate columns. See needs_exact_candidates in base.py.
 
         Args:
             prefix: Namespace text. Its descendants are not read.
@@ -1078,8 +1085,9 @@ WHERE prefix = %s AND {match}
 
         Returns:
             Tuple of (SQL, parameters). Each row has the candidate columns
-            and ``score``, and with the index scan ``window_size`` and
-            ``lowest_score``. Bind the query vector in place of QUERY_VECTOR.
+            and ``score``, and with the index scan ``window_size``,
+            ``lowest_score`` and ``namespace_vectors``. Bind the query vector
+            in place of QUERY_VECTOR.
 
         Raises:
             ValueError: If limit is negative, the scan is unknown, there is no
@@ -1134,7 +1142,11 @@ LIMIT %s"""
     LIMIT %s
 ),
 window_stats AS (
-    SELECT count(*) AS window_size, min({score}) AS lowest_score
+    SELECT count(*) AS window_size, min({score}) AS lowest_score, (
+        SELECT count(*) FROM (
+            SELECT 1 FROM {self.vectors} WHERE prefix = %s LIMIT %s
+        ) AS c
+    ) AS namespace_vectors
     FROM nearest
 ),
 best AS (
@@ -1152,7 +1164,7 @@ hits AS (
     ORDER BY score DESC, key
     LIMIT %s
 )
-SELECT {hit_columns}, h.score, w.window_size, w.lowest_score
+SELECT {hit_columns}, h.score, w.window_size, w.lowest_score, w.namespace_vectors
 FROM window_stats AS w
 LEFT JOIN hits AS h ON TRUE
 ORDER BY h.score DESC, h.key"""
@@ -1160,6 +1172,8 @@ ORDER BY h.score DESC, h.key"""
             QUERY_VECTOR,
             prefix,
             QUERY_VECTOR,
+            over_fetch,
+            prefix,
             over_fetch,
             list(exclude),
             *filter_params,
