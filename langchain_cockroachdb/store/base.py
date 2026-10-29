@@ -2402,13 +2402,13 @@ class BaseCockroachDBStore:
         key, so without that row a superseded row under another key proves
         the write as well. When another writer replaced the new memory
         before the retry, such rows are all that is left: the memory was
-        written, and its version is None. Every
-        item that carries the write id as its confirm id was confirmed. The
-        history rows give the keys superseded and deleted, and a row of the
-        new key that ended as superseded is the new memory, recorded
-        straight into history. Nothing records which candidates were kept,
-        so ``kept`` is empty, and without history so are ``superseded`` and
-        ``deleted``. Keys come in key order.
+        written, and its version is None. Every item that carries the write
+        id as its confirm id was confirmed. The history rows give the keys
+        superseded and deleted, and a row of the new key that ended as
+        superseded is the new memory, recorded straight into history.
+        Nothing records which candidates were kept, so ``kept`` is empty, and
+        without history so are ``superseded`` and ``deleted``. Keys come in
+        key order.
         """
         items = found[0]
         history = found[1] if len(found) > 1 else []

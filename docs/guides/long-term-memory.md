@@ -348,6 +348,8 @@ deleted = store.delete_namespace(("user", "alice"))  # async: await store.adelet
 
 `delete_namespace` deletes every item in a namespace and its descendants, with their vectors and any history they have, and returns the number of items deleted. `("user", "alice")` covers `("user", "alice", "memories")` but not `("user", "alice2")`. It runs as one statement, so it commits completely or not at all. If a retry follows a commit whose result was lost, the count is that of the retry, usually 0. An empty prefix raises `InvalidNamespaceError`. `BaseStore` has no such method; it is specific to this store.
 
+A store created without history also deletes the namespace's rows in a history table left from when history was on, as [Forgetting](#forgetting) explains. A role that did not run `setup()` then needs SELECT and DELETE on that table. Without them the whole call fails with a permission error and deletes nothing, rather than forget only part of the namespace.
+
 ## Tables
 
 | Table | Holds |
@@ -842,7 +844,7 @@ for version in store.history(memories, "seat-1"):
 
 Each version has its `value` and `provenance`; `valid_at` and `invalid_at`, when its fact was true; `written_at` and `ended_at`, when the store held it; its `reason`; `superseded_by`; and `confirmations` and `confirmed_at`, the confirmations it had when it ended. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. `history` raises `ValueError` on a store without history.
 
-Turn history on for every store that writes the same table. A store with history off numbers a key it creates from 1, without looking at the key's history. If history already holds a version 1 of that key, the next archive of the new version 1 is dropped, since history keeps one row per version.
+Turn history on for every store that writes the same table, and only once every writer runs 0.6.0. A store with history off numbers a key it creates from 1, without looking at the key's history, and so does a 0.5 writer. If history already holds a version 1 of that key, the next archive of the new version 1 is dropped, since history keeps one row per version. A 0.5 writer also never archives, so the versions it overwrites or deletes are not kept.
 
 `ttl_days` dates each version when it is archived. Versions archived without it never expire, and changing it does not re-date versions already archived. `history` leaves out versions past their TTL, even before CockroachDB's TTL job deletes them.
 
@@ -860,7 +862,7 @@ store.purge(memories, "passport")  # True: the item, its vectors and its history
 store.delete_namespace(("user", "bob"))  # bob's items, vectors and history
 ```
 
-`delete_namespace` also deletes history on a store created without history, when the history table exists, so a store that kept history before leaves nothing of the namespace behind. `purge` raises `ValueError` on a store without history, where `delete` already removes a memory and its vectors. To purge one key's leftover history after turning history off, call `purge` on a store created with `history=True` for the same table.
+`delete_namespace` also deletes history on a store created without history, when the history table exists, so a store that kept history before leaves nothing of the namespace behind. A role that did not run `setup()` needs SELECT and DELETE on that table for this, even with history off. `purge` raises `ValueError` on a store without history, where `delete` already removes a memory and its vectors. To purge one key's leftover history after turning history off, call `purge` on a store created with `history=True` for the same table.
 
 ### Provenance and Valid Time
 
@@ -928,6 +930,8 @@ The candidate read and the writes of a reconcile share one serializable transact
 
 `reconcile_scan_limit` is a store setting, 2000 by default, passed to the constructor or to `from_conn_string`. A namespace with at most that many vectors has every one of them ranked exactly, read by primary key. Serializable isolation covers that whole read, so a concurrent insert into the namespace makes one of the two transactions retry.
 
+The slot read is not bounded by the scan limit. With a `slot`, the store finds the slot matches by scanning the namespace's live items, since no index covers slot values, so that read grows with the namespace whatever the limit says.
+
 A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. The window makes room for the vectors of the key and slot matches, which are candidates already. A selective `filter`, or expired memories, can still fill it and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.
 
 ### Conditional Writes
@@ -954,7 +958,7 @@ A conflict is an expected outcome here, so it is returned, not raised. `expected
 
 `delete_if(namespace, key, expected=record)` deletes the same way. Its `applied=True` means the memory matched `expected` and this call deleted it, or, after an attempt of the call that may have committed, that the memory is gone and was this call's to delete.
 
-Both are safe to retry, and a retry never reports a false conflict. If an attempt commits and its result is lost, the next attempt reports `applied=True`. `put_if` finds its own write id on the memory and sets `already_applied`. `delete_if` finds the memory gone, and sets `already_applied` when its own history row proves the delete, which needs history on. If another writer replaced the memory between the lost commit and the retry, the retry reports a conflict, with that writer's memory as `current`: that is the current state. Both are single-key calls, outside `batch`, since LangGraph's batch operations cannot carry a precondition.
+Both are safe to retry, and a retry never reports a false conflict. If an attempt commits and its result is lost, the next attempt reports `applied=True`. `put_if` finds its own write id on the memory, which a confirmation in between leaves in place, and sets `already_applied`. `delete_if` finds the memory gone, and sets `already_applied` when its own history row proves the delete, which needs history on. If another writer changed the memory between the lost commit and the retry, the retry reports a conflict, with that writer's memory, or None, as `current`: that is the current state. Both are single-key calls, outside `batch`, since LangGraph's batch operations cannot carry a precondition.
 
 ### Retries and Rebuilt Results
 
@@ -1009,6 +1013,10 @@ def recall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
 
 `setup()` applies migration 2, which adds the columns these methods use to the items table in one statement: `version`, `provenance`, `confirmed_at`, `confirmations`, `write_id`, `valid_at` and `confirm_id`. Until it runs, the store works as 0.5 did, and the new methods raise `ValueError` asking for `setup()`. With history off and these methods unused, the store behaves as in 0.5 apart from the new columns. During a rolling upgrade, 0.5 writers do not bump the version but do set `updated_at`, which is why `resolve`, `put_if` and `delete_if` check both.
 
+0.5 writers know nothing of history or confirmations. They never archive what they overwrite or delete. One that re-creates a deleted key starts it again at version 1, which history then cannot keep, since it already holds a version 1 of that key. So turn history on only once every writer runs 0.6.0. A 0.5 write that changes a value also leaves its confirmations as they were.
+
+A 0.5 writer leaves a row's write id alone too. If a plain `put` commits and its result is lost, and a 0.5 writer writes the same key before the put's retry, the retry finds its own write id on the row and leaves the 0.5 value, but writes its own vectors over the 0.5 writer's. That needs both the rolling-upgrade window and a lost commit. The next write of the key replaces both.
+
 An application role that did not run `setup()` needs SELECT, INSERT, UPDATE and DELETE on the items and vectors tables, and on the history table when history is on:
 
 ```sql
@@ -1016,6 +1024,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE store, store_vectors TO app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE store_history TO app;  -- with history
 GRANT SELECT ON TABLE store_migrations TO app;
 ```
+
+With history off, the role still needs SELECT and DELETE on a history table that exists, left from when history was on: `delete_namespace` deletes the namespace's rows there, and without those grants it fails as a whole rather than forget only part of the namespace.
 
 The store reads the migrations table to learn whether migration 2 is in place. Without SELECT on it, or without a migrations table, as when the tables were created without `setup()`, the store looks for migration 2's columns on the items table instead. Those can show up a moment before every node uses them, so on a multi-node cluster one write can fail in the seconds after `setup()` applies migration 2. Run `setup()` before rolling out 0.6.0, or grant SELECT on the migrations table, to avoid that. Without that grant, the first store call that runs inside a transaction the caller opened also gets the permission error, once per store. Only the grant avoids it.
 

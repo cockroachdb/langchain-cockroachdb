@@ -1050,10 +1050,9 @@ LIMIT %s OFFSET %s"""
     # index's estimated vectors per item. Rows that the filter or the expiry
     # check remove, or excluded keys with more vectors than estimated, still
     # take places in it, so a match beyond it would be missed. The index form
-    # therefore reports
-    # the window's size and lowest score, over every vector in it, and the
-    # namespace's vectors counted up to over_fetch, as semantic_search_in
-    # does. When it returned limit rows, or the window is whole and its
+    # therefore reports the window's size and lowest score, over every vector
+    # in it, and the namespace's vectors counted up to over_fetch, as
+    # semantic_search_in does. When it returned limit rows, or the window is whole and its
     # lowest score is below the threshold, no vector beyond the window can
     # change the result, up to the index's approximation, and the result
     # stands. Otherwise matches may lie beyond the window: the store runs
@@ -1415,11 +1414,10 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
         with its version, value, provenance, valid time (``updated_at`` when
         the row has none), confirmations and confirmed_at, and records when
         the store wrote it, when the version ended (now), why, and what
-        replaced it. Rows that
-        already carry ``write_id`` were written by this batch, in an attempt
-        that committed before its result was lost, so they are not old
-        versions and are left out. A version already in history is left as
-        it is, so a retried attempt never adds a row twice.
+        replaced it. Rows that already carry ``write_id`` were written by this
+        batch, in an attempt that committed before its result was lost, so
+        they are not old versions and are left out. A version already in
+        history is left as it is, so a retried attempt never adds a row twice.
 
         Args:
             prefix: Namespace text.
@@ -1481,12 +1479,12 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         version the key has or gets later. It is valid from ``valid_at``
         until ``invalid_at``, never earlier, and the store held it for no
         time: written_at and ended_at are both now, and it has no
-        confirmations. If a superseded row of
-        the key already carries ``write_id``, this write inserted it in an
-        attempt that committed before its result was lost, and nothing is
-        inserted. The same write's archive of the memory under the key, as
-        when it deletes that memory, has another reason and never counts,
-        whatever order the statements run in.
+        confirmations. If a superseded row of the key already carries
+        ``write_id``, this write inserted it in an attempt that committed
+        before its result was lost, and nothing is inserted. The same
+        write's archive of the memory under the key, as when it deletes that
+        memory, has another reason and never counts, whatever order the
+        statements run in.
 
         Args:
             prefix: Namespace text.

@@ -313,14 +313,17 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         An application role that did not run setup() needs SELECT, INSERT,
         UPDATE and DELETE on the store's items and vectors tables, and on
-        the history table when history is on. Without SELECT on the migrations
-        table, or without a migrations table, as when the tables were created
-        without setup(), the store finds migration 2 through the items table's
-        columns instead. On a multi-node cluster, one write can then fail in the
-        seconds after setup() applies migration 2. Running setup() before
-        rolling out 0.6.0, or granting SELECT on the migrations table, avoids
-        that. The first store call inside a transaction the caller opened gets
-        the permission error once. Only the SELECT grant avoids it.
+        the history table when history is on. With history off, it still
+        needs SELECT and DELETE on a history table that exists, left from
+        when history was on, for delete_namespace. Without SELECT on the
+        migrations table, or without a migrations table, as when the tables
+        were created without setup(), the store finds migration 2 through the
+        items table's columns instead. On a multi-node cluster, one write can
+        then fail in the seconds after setup() applies migration 2. Running
+        setup() before rolling out 0.6.0, or granting SELECT on the migrations
+        table, avoids that. The first store call inside a transaction the
+        caller opened gets the permission error once. Only the SELECT grant
+        avoids it.
 
         Raises:
             ValueError: If the vectors table exists with other dims, or its
@@ -654,7 +657,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         not ``("user", "ab")``. One statement deletes the items, their
         vectors and their history. A store without history deletes history
         too when the history table exists, as when the store kept history
-        before, so nothing of the namespace is left.
+        before, so nothing of the namespace is left. Its role then needs
+        SELECT and DELETE on that table: without them the whole call fails
+        with a permission error and deletes nothing, rather than forget only
+        part of the namespace.
 
         Args:
             namespace_prefix: The namespace to delete. It cannot be empty.
