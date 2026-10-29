@@ -1155,9 +1155,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             ValueError: Before any I/O: if ``conflicts`` holds no plan from
                 find_conflicts, as when it was built by hand; if a store
                 with another table or index made it; if its proposal's
-                namespace, key, value, slot, slot value or provenance, or its
-                valid time when find_conflicts was given one, changed since
-                find_conflicts; if its candidates' keys, versions or
+                namespace, key, value, slot, slot value, provenance or valid
+                time changed since find_conflicts, the default valid time it
+                worked out included; if its candidates' keys, versions or
                 updated_at changed; or if ``decision`` is not a valid
                 Decision for its proposal and candidates. After a schema
                 read: if setup() has not added the columns this method needs

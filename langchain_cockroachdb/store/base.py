@@ -713,6 +713,9 @@ class ConflictsState:
     Attributes:
         store: Which store made it.
         plan: The new memory's plan, with its write id.
+        valid_at: The valid time find_conflicts gave the proposal: the one
+            the caller passed, or else the default it worked out, which the
+            plan does not keep. resolve compares the proposal's with it.
         vector_rows: Its vectors, embedded once.
         target: The (version, updated_at) of the live memory under its key,
             or None if there was none or it had expired.
@@ -721,6 +724,7 @@ class ConflictsState:
 
     store: StoreIdentity
     plan: ProposalPlan
+    valid_at: datetime
     vector_rows: tuple[VectorRow, ...]
     target: tuple[int, datetime] | None
     tokens: dict[str, tuple[int, datetime]]
@@ -984,17 +988,18 @@ def _matches_json(value: object, text: str | None) -> bool:
         return False
 
 
-def _edited_fields(proposal: Proposal, plan: ProposalPlan) -> list[str]:
-    """The fields of ``proposal`` that no longer describe the memory ``plan`` writes.
+def _edited_fields(proposal: Proposal, state: ConflictsState) -> list[str]:
+    """The fields of ``proposal`` that no longer describe the memory ``state`` plans.
 
     These are the proposal's namespace, key, value, slot, slot value and
-    provenance, and its valid time when find_conflicts was given one.
-    Without one, the proposal holds the default that find_conflicts worked
-    out and the write stores none, so there is nothing to compare. The
-    value, slot value and provenance are compared with the JSON the plan
-    writes, so an edit made in place, to a dict that the proposal shares
-    with the plan, counts too.
+    provenance, compared with the plan, and its valid time, compared with
+    the one find_conflicts gave it: the caller's, or the default it worked
+    out. Aware datetimes compare by instant, so another time zone for the
+    same instant is no edit. The value, slot value and provenance are
+    compared with the JSON the plan writes, so an edit made in place, to a
+    dict that the proposal shares with the plan, counts too.
     """
+    plan = state.plan
     edited = [
         name
         for name, same in (
@@ -1007,7 +1012,7 @@ def _edited_fields(proposal: Proposal, plan: ProposalPlan) -> list[str]:
         )
         if not same
     ]
-    if plan.valid_at is not None and proposal.valid_at != plan.valid_at:
+    if proposal.valid_at != state.valid_at:
         edited.append("valid_at")
     return edited
 
@@ -1963,6 +1968,7 @@ class BaseCockroachDBStore:
         state = ConflictsState(
             store=self._identity(),
             plan=plan,
+            valid_at=valid_at,
             vector_rows=tuple(vector_rows),
             target=token,
             tokens={c.key: (c.version, c.item.updated_at) for c in candidates},
@@ -2291,9 +2297,9 @@ class BaseCockroachDBStore:
             ValueError: If ``conflicts`` holds no plan from find_conflicts,
                 as when it was built by hand; if a store with another items
                 table or index made it; if its proposal's namespace, key,
-                value, slot, slot value or provenance, or its valid time when
-                find_conflicts was given one, differ from the memory
-                find_conflicts planned (_edited_fields); if its candidates'
+                value, slot, slot value, provenance or valid time differ from
+                the memory find_conflicts planned (_edited_fields); if its
+                candidates'
                 keys, versions or updated_at differ from what find_conflicts
                 read; or if ``decision`` is not a valid Decision for its
                 proposal and candidates.
@@ -2311,7 +2317,7 @@ class BaseCockroachDBStore:
                 f"This Conflicts was found by another store, {state.store}, while this store "
                 f"is {identity}. Resolve it on a store with the same table and index."
             )
-        edited = _edited_fields(conflicts.proposal, state.plan)
+        edited = _edited_fields(conflicts.proposal, state)
         if edited:
             raise ValueError(
                 "The proposal changed after find_conflicts returned it, in these fields: "

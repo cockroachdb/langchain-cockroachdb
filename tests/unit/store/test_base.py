@@ -4164,13 +4164,22 @@ def test_resolve_refuses_an_edited_proposal_before_any_io() -> None:
     )
     store._plan_resolve(same, decision)
     # Without a valid time given to find_conflicts, the proposal holds the
-    # default it worked out, and the write stores none: nothing to compare
+    # default it worked out, and the state keeps it. A person who set when
+    # the fact became true would lose that edit too
     found = finder.find_conflicts(NS, "k", value, slot="seat")
-    later = found.proposal.valid_at + timedelta(hours=1)
-    store._plan_resolve(
-        dataclasses.replace(found, proposal=dataclasses.replace(found.proposal, valid_at=later)),
-        decision,
-    )
+    assert found._state.valid_at == found.proposal.valid_at == NOW
+
+    def timed(given: Conflicts, valid_at: datetime) -> Conflicts:
+        return dataclasses.replace(
+            given, proposal=dataclasses.replace(given.proposal, valid_at=valid_at)
+        )
+
+    with pytest.raises(ValueError, match=r"in these fields: valid_at\."):
+        store.resolve(timed(found, NOW - timedelta(days=7)), decision)
+    # The same instant in another time zone is no edit, default or given
+    east = timezone(timedelta(hours=9))
+    for given in (found, conflicts):
+        store._plan_resolve(timed(given, given.proposal.valid_at.astimezone(east)), decision)
     # An edit in place counts too: the proposal and the plan share the value
     # dict, but the plan writes the JSON find_conflicts serialized
     back.proposal.value["text"] = "window"
