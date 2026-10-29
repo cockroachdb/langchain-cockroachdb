@@ -34,6 +34,7 @@ RECONCILE_COLUMNS = {
     "confirmations": ("bigint", "NO"),
     "write_id": ("uuid", "YES"),
     "valid_at": ("timestamp with time zone", "YES"),
+    "confirm_id": ("uuid", "YES"),
 }
 COLUMNS_SQL = (
     "SELECT column_name, data_type, is_nullable FROM information_schema.columns "

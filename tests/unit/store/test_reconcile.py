@@ -573,6 +573,8 @@ ROUND_TRIPS = {
         ended_at=AWARE + timedelta(days=2),
         reason="superseded",
         superseded_by="new",
+        confirmed_at=AWARE + timedelta(hours=5),
+        confirmations=3,
     ),
     "open version": MemoryVersion(
         namespace=("user", "123"),
@@ -586,6 +588,8 @@ ROUND_TRIPS = {
         ended_at=AWARE,
         reason="deleted",
         superseded_by=None,
+        confirmed_at=None,
+        confirmations=0,
     ),
     "record": MemoryRecord(
         item=Item(

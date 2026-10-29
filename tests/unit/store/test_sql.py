@@ -85,9 +85,10 @@ def reconcile_statements(sql: StoreSQL) -> list[tuple[str, list]]:
             write_id="w",
             ttl_days=30.0,
         ),
-        sql.confirm("a.b", "k1", write_id="w"),
-        sql.confirm("a.b", "k1", write_id="w", ttl=60.0),
-        sql.confirm("a.b", "k1", write_id="w", ttl=None),
+        sql.confirm("a.b", "k1", confirm_id="w"),
+        sql.confirm("a.b", "k1", confirm_id="w", ttl=60.0),
+        sql.confirm("a.b", "k1", confirm_id="w", ttl=None),
+        sql.confirm_check("a.b", "k1", confirm_id="w"),
         sql.applied_items("a.b", ["k1", "k2"], write_id="w"),
         sql.applied_history("a.b", ["k1", "k2"], write_id="w"),
         sql.tokens("a.b", ["k1", "k2"]),
@@ -368,8 +369,11 @@ def test_migration_2_adds_the_reconcile_columns_in_one_statement() -> None:
         "confirmations INT8 NOT NULL DEFAULT 0",
         "write_id UUID",
         "valid_at TIMESTAMPTZ",
+        "confirm_id UUID",
     ):
         assert f"ADD COLUMN IF NOT EXISTS {column}" in migration
+    # One statement, so it is one schema change
+    assert migration.count(";") == 1 and migration.endswith(";")
 
 
 def test_the_column_check_binds_the_items_table_and_migration_2_columns() -> None:
@@ -379,8 +383,16 @@ def test_the_column_check_binds_the_items_table_and_migration_2_columns() -> Non
         "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
         "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)"
     )
-    columns = ["version", "provenance", "confirmed_at", "confirmations", "write_id", "valid_at"]
-    assert params == [6, "memory.facts", columns]
+    columns = [
+        "version",
+        "provenance",
+        "confirmed_at",
+        "confirmations",
+        "write_id",
+        "valid_at",
+        "confirm_id",
+    ]
+    assert params == [7, "memory.facts", columns]
     for value in ("memory", "facts", *columns):
         assert value not in query
     # The check requires exactly the columns migration 2 adds
@@ -429,6 +441,30 @@ def test_upsert_with_a_write_id_binds_every_value() -> None:
         builder.upsert_items([("a", "k", "{}", None)], write_id="w-3")  # type: ignore[list-item]
     with pytest.raises(ValueError, match="4 fields without a write id, got 6"):
         builder.upsert_items([("a", "k", "{}", None, None, None)])
+
+
+def test_an_upsert_that_changes_the_value_starts_its_confirmations_again() -> None:
+    # Confirmations belong to the fact, not the key. A write of another value
+    # resets them, and an exact re-save of the live value keeps them. A memory
+    # that expired counts as gone, so a write over it starts from none too
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    same = (
+        "public.store.value = EXCLUDED.value AND "
+        "(public.store.expires_at IS NULL OR public.store.expires_at > now())"
+    )
+    for history in (False, True):
+        query, params = sql.upsert_items(rows, write_id="w-1", history=history)
+        assert (
+            f"    confirmations = CASE WHEN {same} THEN public.store.confirmations ELSE 0 END,\n"
+            f"    confirmed_at = CASE WHEN {same} THEN public.store.confirmed_at ELSE NULL END\n"
+            "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id"
+        ) in query
+        # The last confirmation's id stays, so a confirm retried after it
+        # committed still finds it and counts nothing again
+        assert "confirm_id" not in query
+        assert params == ["w-1", *rows[0]]
+        assert query.count("%s") == len(params)
 
 
 def test_upsert_without_a_write_id_is_the_0_5_statement() -> None:
@@ -971,6 +1007,8 @@ HISTORY_COLUMNS = [
     "ended_at TIMESTAMPTZ NOT NULL",
     "reason TEXT NOT NULL",
     "superseded_by TEXT",
+    "confirmations INT8 NOT NULL DEFAULT 0",
+    "confirmed_at TIMESTAMPTZ",
     "write_id UUID",
     "expires_at TIMESTAMPTZ",
 ]
@@ -1017,7 +1055,14 @@ def test_archive_statement_binds_everything() -> None:
     )
     for value in ("user.alice", "seat-key", "food-key", "overwritten", "newer-key", write_id):
         assert value not in query
-    assert query.startswith("INSERT INTO public.store_history (")
+    assert query.startswith(
+        "INSERT INTO public.store_history (prefix, key, version, value, provenance, valid_at, "
+        "invalid_at, written_at, ended_at, reason, superseded_by, confirmations, confirmed_at, "
+        "write_id, expires_at)\n"
+    )
+    # The version ends with the confirmations it had, which a write that
+    # changes the value takes from the live row
+    assert "CAST(%s AS STRING), CAST(%s AS STRING), confirmations, confirmed_at," in query
     assert "\nFROM public.store\n" in query
     assert "ON CONFLICT (prefix, key, version) DO NOTHING" in query
     # Only live rows, and not the rows this batch already wrote
@@ -1053,6 +1098,10 @@ def test_archive_statement_binds_everything() -> None:
 def test_history_reads_bind_the_key_and_skip_expired_versions() -> None:
     sql = StoreSQL("public", "store")
     query, params = sql.history_versions("user.alice", "seat-key", limit=5)
+    assert query.startswith(
+        "SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, "
+        "superseded_by, confirmed_at, confirmations\n"
+    )
     assert "FROM public.store_history\n" in query
     assert "prefix = %s AND key = %s" in query
     assert "(expires_at IS NULL OR expires_at > now())" in query
@@ -1229,48 +1278,51 @@ def test_history_insert_superseded_binds_everything() -> None:
 
 CONFIRM_ITEM = (
     "UPDATE public.store SET confirmed_at = now(), confirmations = confirmations + 1,\n"
-    "    write_id = CAST(%s AS UUID),\n"
+    "    confirm_id = CAST(%s AS UUID),\n"
     "    expires_at = COALESCE(now() + ttl_minutes * INTERVAL '1 minute', expires_at)\n"
     "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
-    "    AND write_id IS DISTINCT FROM CAST(%s AS UUID)"
+    "    AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
 )
 
 
 def test_confirm_binds_everything_and_keeps_version_and_updated_at() -> None:
-    write_id = "8d6f1c9e-0000-4000-8000-000000000003"
+    confirm_id = "8d6f1c9e-0000-4000-8000-000000000003"
     # Without an index only the item changes. Its expiry is renewed from its
-    # own TTL, and a memory without one keeps none
-    query, params = StoreSQL("public", "store").confirm("user.alice", "k", write_id=write_id)
+    # own TTL, and a memory without one keeps none. The confirmation sets and
+    # checks its own id, and leaves the write id of the write that put the
+    # value there alone
+    query, params = StoreSQL("public", "store").confirm("user.alice", "k", confirm_id=confirm_id)
     assert query == CONFIRM_ITEM
-    assert params == [write_id, "user.alice", "k", write_id]
-    for column in ("version", "updated_at", "value"):
+    assert params == [confirm_id, "user.alice", "k", confirm_id]
+    for column in ("version", "updated_at", "value", "write_id"):
         assert f"{column} =" not in query
+    assert "write_id" not in query
 
     # With an index the vectors' expiry is renewed in the same statement, and
     # only when the item is confirmed: the CTE reads the item as it was
     sql = StoreSQL("public", "store", index=_make_index())
-    query, params = sql.confirm("user.alice", "k", write_id=write_id)
+    query, params = sql.confirm("user.alice", "k", confirm_id=confirm_id)
     assert query == (
         "WITH renewed AS (\n"
         "    UPDATE public.store_vectors SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'\n"
         "    WHERE prefix = %s AND key = %s AND ttl_minutes IS NOT NULL AND EXISTS (\n"
         "        SELECT 1 FROM public.store\n"
         "        WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
-        "            AND write_id IS DISTINCT FROM CAST(%s AS UUID)\n"
+        "            AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)\n"
         "    )\n"
         "    RETURNING key\n"
         ")\n" + CONFIRM_ITEM
     )
-    assert params == ["user.alice", "k", "user.alice", "k", write_id] + [
-        write_id,
+    assert params == ["user.alice", "k", "user.alice", "k", confirm_id] + [
+        confirm_id,
         "user.alice",
         "k",
-        write_id,
+        confirm_id,
     ]
 
     # A new TTL is set on the item and its vectors, and None removes the expiry
     for ttl in (60.0, None):
-        query, params = sql.confirm("user.alice", "k", write_id=write_id, ttl=ttl)
+        query, params = sql.confirm("user.alice", "k", confirm_id=confirm_id, ttl=ttl)
         assert query.startswith(
             "WITH renewed AS (\n"
             "    UPDATE public.store_vectors SET ttl_minutes = CAST(%s AS DECIMAL),\n"
@@ -1278,30 +1330,34 @@ def test_confirm_binds_everything_and_keeps_version_and_updated_at() -> None:
             "    WHERE prefix = %s AND key = %s AND EXISTS (\n"
         )
         assert query.endswith(
-            "    write_id = CAST(%s AS UUID),\n"
+            "    confirm_id = CAST(%s AS UUID),\n"
             "    ttl_minutes = CAST(%s AS DECIMAL),\n"
             "    expires_at = now() + CAST(%s AS DECIMAL) * INTERVAL '1 minute'\n"
             "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
-            "    AND write_id IS DISTINCT FROM CAST(%s AS UUID)"
+            "    AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
         )
-        assert params == [ttl, ttl, "user.alice", "k", "user.alice", "k", write_id] + [
-            write_id,
+        assert params == [ttl, ttl, "user.alice", "k", "user.alice", "k", confirm_id] + [
+            confirm_id,
             ttl,
             ttl,
             "user.alice",
             "k",
-            write_id,
+            confirm_id,
         ]
 
 
 def test_applied_reads_look_up_only_the_named_keys() -> None:
     sql = StoreSQL("public", "store")
     # Primary key lookups of the keys a retry names, never a scan of the
-    # namespace, and only rows that carry the write id, live or not
+    # namespace, and only rows that carry the call's id as their write id,
+    # written by it, or as their confirm id, confirmed by it, live or not
     assert sql.applied_items("user.alice", ["k", "old"], write_id="w-1") == (
-        "SELECT key, version, updated_at, confirmed_at FROM public.store\n"
-        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)",
-        ["user.alice", ["k", "old"], "w-1"],
+        "SELECT key, version, write_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS written,\n"
+        "    confirm_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS confirmed\n"
+        "FROM public.store\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+        "    AND (write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))",
+        ["w-1", "w-1", "user.alice", ["k", "old"], "w-1", "w-1"],
     )
     # History's primary key is (prefix, key, version): each key's versions only
     assert sql.applied_history("user.alice", ["k", "old"], write_id="w-1") == (
@@ -1342,7 +1398,7 @@ def test_delete_namespace_without_history_keeps_the_0_5_1_text() -> None:
 
 CANDIDATE_COLUMNS = (
     "key, value, created_at, updated_at, version, COALESCE(valid_at, updated_at) AS valid_at, "
-    "provenance, confirmed_at, confirmations, write_id"
+    "provenance, confirmed_at, confirmations, confirm_id"
 )
 
 
@@ -1460,7 +1516,7 @@ def test_similar_candidates_exact_and_index_shapes() -> None:
     # still does, with NULL candidate columns
     assert outer == (
         "h.key, h.value, h.created_at, h.updated_at, h.version, h.valid_at, h.provenance, "
-        "h.confirmed_at, h.confirmations, h.write_id, h.score, w.window_size, w.lowest_score, "
+        "h.confirmed_at, h.confirmations, h.confirm_id, h.score, w.window_size, w.lowest_score, "
         "w.namespace_vectors\n"
         "FROM window_stats AS w\nLEFT JOIN hits AS h ON TRUE\nORDER BY h.score DESC, h.key"
     )
@@ -1546,12 +1602,10 @@ def test_candidate_scores_count_record_and_now_bind_everything() -> None:
             builder(StoreSQL("public", "store"))
 
 
-def test_confirm_write_id_check_filters_for_live_rows_with_write_id() -> None:
+def test_confirm_check_finds_a_live_row_that_carries_the_confirm_id() -> None:
     sql = StoreSQL("public", "store", index=None)
-    statement, params = sql.confirm_write_id_check("user.alice", "key-1", write_id="write-id-123")
-    # Checks prefix, key, live row, and write_id
-    assert "prefix = %s" in statement
-    assert "key = %s" in statement
-    assert "expires_at IS NULL OR expires_at > now()" in statement
-    assert "write_id = CAST(%s AS UUID)" in statement
-    assert params == ["user.alice", "key-1", "write-id-123"]
+    assert sql.confirm_check("user.alice", "key-1", confirm_id="confirm-id-123") == (
+        "SELECT 1 FROM public.store WHERE prefix = %s AND key = %s "
+        "AND (expires_at IS NULL OR expires_at > now()) AND confirm_id = CAST(%s AS UUID)",
+        ["user.alice", "key-1", "confirm-id-123"],
+    )

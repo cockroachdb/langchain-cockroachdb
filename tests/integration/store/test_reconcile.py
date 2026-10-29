@@ -20,13 +20,14 @@ decision names still have the version and updated_at find_conflicts read.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -41,6 +42,7 @@ from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore, Retry
 from langchain_cockroachdb._sql import parse_vector
 from langchain_cockroachdb.store import (
     Action,
+    ConditionalWrite,
     Conflicts,
     ConflictsChanged,
     Decision,
@@ -1296,7 +1298,8 @@ def test_a_confirmation_retried_after_a_lost_commit_is_already_applied(
     again = store.reconcile(NS, "w", text(WINDOW), policy=skip_duplicates())
 
     assert fault.fired == 1
-    # Its confirmation is later than its update, so the rows prove a confirmation
+    # The memory carries the reconcile's write id as its confirm id, which
+    # proves a confirmation
     assert again == ReconcileResult(
         key="w",
         new="skipped",
@@ -2351,7 +2354,7 @@ def test_a_ttl_function_runs_once_when_a_confirm_retries_after_a_lost_commit(
     store_factory, admin, unsafe_internals, caplog, mode
 ) -> None:
     # The confirm commits and its result is lost. The retry reads the memory,
-    # finds its own write id on it, and returns without calling the function again
+    # finds its own confirm id on it, and returns without calling the function again
     fault = FailAfterCommit(unsafe_internals)
     store = store_factory(mode, connect_kwargs={"cursor_factory": fault.cursor_class()})
     store.put(NS, "w", text(WINDOW), ttl=10.0)
@@ -2393,3 +2396,136 @@ def test_confirm_between_find_and_resolve_does_not_invalidate(store_factory, adm
     result = store.resolve(conflicts, decision)
     assert result.new == "written"
     assert result.confirmed == ("w",)
+
+
+# Confirmations belong to the fact, not the key, and a confirmation has an id
+# of its own
+
+
+def write_with(writer: str, store: Any, value: dict[str, Any]) -> None:
+    """Write ``value`` under "k" as ``writer`` does: put, reconcile or put_if."""
+    if writer == "put":
+        store.put(NS, "k", value)
+    elif writer == "reconcile":
+        result = store.reconcile(NS, "k", value, policy=keep_all())
+        assert result.new == "written"
+    else:
+        assert store.put_if(NS, "k", value, expected=store.record(NS, "k")).applied
+
+
+@pytest.mark.parametrize("writer", ["put", "reconcile", "put_if"])
+def test_a_write_that_changes_the_value_starts_its_confirmations_again(
+    store_factory, admin, mode, writer
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", text(WINDOW))
+    assert store.confirm(NS, "k") and store.confirm(NS, "k")
+    confirmed = store.record(NS, "k")
+    assert confirmed is not None and confirmed.confirmations == 2
+    assert confirmed.confirmed_at is not None
+
+    # Saving the same value again keeps them: it is the same fact
+    write_with(writer, store, text(WINDOW))
+    resaved = store.record(NS, "k")
+    assert resaved is not None and resaved.version == 2
+    assert (resaved.confirmations, resaved.confirmed_at) == (2, confirmed.confirmed_at)
+
+    # Another value is another fact: it starts from none
+    write_with(writer, store, text(AISLE))
+    changed = store.record(NS, "k")
+    assert changed is not None and changed.version == 3
+    assert (changed.confirmations, changed.confirmed_at) == (0, None)
+
+    # Each version in history keeps the confirmations it had when it ended
+    assert [(v.version, v.confirmations, v.confirmed_at) for v in store.history(NS, "k")] == [
+        (2, 2, confirmed.confirmed_at),
+        (1, 2, confirmed.confirmed_at),
+    ]
+    assert store.confirm(NS, "k")
+    store.delete(NS, "k")
+    deleted = store.history(NS, "k")[0]
+    assert (deleted.version, deleted.reason, deleted.confirmations) == (3, "deleted", 1)
+    assert deleted.confirmed_at is not None
+
+
+def test_a_write_over_an_expired_memory_starts_its_confirmations_again(
+    store_factory, admin, mode
+) -> None:
+    # An expired memory is gone, even before the TTL job deletes its row
+    store = store_factory(mode, index=seat_index())
+    store.put(NS, "k", text(WINDOW), ttl=10.0)
+    assert store.confirm(NS, "k")
+    admin.execute(
+        f"UPDATE {store.sql.items} SET expires_at = now() - INTERVAL '1 minute' "
+        "WHERE prefix = %s AND key = 'k'",
+        (PREFIX,),
+    )
+
+    store.put(NS, "k", text(WINDOW), ttl=10.0)
+
+    record = store.record(NS, "k")
+    assert record is not None and (record.confirmations, record.confirmed_at) == (0, None)
+
+
+@pytest.mark.parametrize("mode", ["pipeline", "pool"])
+@pytest.mark.parametrize("writer", ["put", "put_if", "reconcile"])
+def test_a_confirm_between_a_lost_commit_and_its_retry_changes_nothing_for_the_write(
+    store_factory, admin, unsafe_internals, monkeypatch, mode, writer
+) -> None:
+    # The write commits and its result is lost. Before the retry, another
+    # store confirms the memory it wrote. The confirmation sets its own id and
+    # leaves the write id, so the retry still finds its write: no second
+    # archive of its own value, no second version, no false conflict
+    fault = FailAfterCommit(unsafe_internals)
+    store = store_factory(
+        mode,
+        history=True,
+        index=seat_index(),
+        connect_kwargs={"cursor_factory": fault.cursor_class()},
+    )
+    other = store_factory("pool", history=True, index=seat_index())
+    store.put(NS, "k", text(WINDOW))
+    record = store.record(NS, "k")
+    real = store._cursor
+    attempts = 0
+
+    @contextlib.contextmanager
+    def cursor(**kwargs: Any) -> Iterator[Any]:
+        nonlocal attempts
+        if kwargs.get("label") == f"store {writer}":
+            attempts += 1
+            if attempts == 2:
+                assert other.confirm(NS, "k") is True
+        with real(**kwargs) as cur:
+            yield cur
+
+    monkeypatch.setattr(store, "_cursor", cursor)
+    fault.armed = True
+
+    if writer == "put":
+        store.put(NS, "k", text(AISLE))
+    elif writer == "put_if":
+        result = store.put_if(NS, "k", text(AISLE), expected=record)
+        assert result == ConditionalWrite(
+            applied=True, key="k", version=2, current=None, already_applied=True
+        )
+    else:
+        rebuilt = store.reconcile(NS, "k", text(AISLE), policy=keep_all())
+        assert rebuilt == ReconcileResult(
+            key="k",
+            new="written",
+            version=2,
+            superseded=(),
+            deleted=(),
+            confirmed=(),
+            kept=(),
+            already_applied=True,
+        )
+
+    assert fault.fired == 1 and attempts == 2
+    current = store.record(NS, "k")
+    assert current is not None
+    assert (current.version, current.item.value, current.confirmations) == (2, text(AISLE), 1)
+    assert [(row["version"], row["reason"]) for row in history_rows(admin, store)] == [
+        (1, "overwritten")
+    ]

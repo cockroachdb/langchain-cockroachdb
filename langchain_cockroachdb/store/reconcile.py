@@ -63,8 +63,8 @@ class Candidate:
         version: Version number of this memory.
         valid_at: When the fact became true.
         provenance: Provenance metadata, or None.
-        confirmed_at: When last confirmed, or None.
-        confirmations: Number of confirmations.
+        confirmed_at: When its current value was last confirmed, or None.
+        confirmations: Number of confirmations of its current value.
     """
 
     item: SearchItem
@@ -146,8 +146,9 @@ class ReconcileResult:
     A rebuilt result lists only what the rows prove: ``kept`` is empty, and
     ``superseded`` and ``deleted`` come from the history rows the write
     created, so a store without history, which keeps no trace of what it
-    removed, reports them empty too. If another writer replaced or
-    confirmed the new memory before the retry, the history row of the
+    removed, reports them empty too. A confirmation of the new memory
+    before the retry leaves the write's proof on it. If another writer
+    replaced the new memory before the retry, the history row of the
     version the write overwrote still proves the write: the result says
     "written", but its version is None. A rebuilt result lists keys in key
     order; a normal one in the order of the candidates.
@@ -160,7 +161,7 @@ class ReconcileResult:
             memory, and the result says "skipped".
         version: The version written, or None when nothing was written. A
             rebuilt result also has None for a written memory that another
-            writer replaced or confirmed before the retry.
+            writer replaced before the retry.
         superseded: Keys of the candidates the new memory superseded.
         deleted: Keys of the candidates deleted.
         confirmed: Keys of the candidates confirmed.
@@ -201,6 +202,10 @@ class MemoryVersion:
         ended_at: When the store replaced this version.
         reason: Why this version ended (overwritten, superseded, deleted).
         superseded_by: Key that superseded this version, or None.
+        confirmed_at: When this version was last confirmed, or None.
+        confirmations: How many times this version was confirmed. They
+            belong to the version's fact: a write that changes the value
+            starts the next version from none.
     """
 
     namespace: tuple[str, ...]
@@ -214,6 +219,8 @@ class MemoryVersion:
     ended_at: datetime
     reason: Literal["overwritten", "superseded", "deleted"]
     superseded_by: str | None
+    confirmed_at: datetime | None
+    confirmations: int
 
     def __post_init__(self) -> None:
         # A LangGraph checkpoint gives tuples back as lists
@@ -229,8 +236,9 @@ class MemoryRecord:
         version: Version number.
         provenance: Provenance metadata, or None.
         valid_at: When the fact became true.
-        confirmed_at: When last confirmed, or None.
-        confirmations: Number of confirmations.
+        confirmed_at: When its current value was last confirmed, or None.
+        confirmations: Number of confirmations of its current value. A write
+            that changes the value starts them again from none.
     """
 
     item: Item

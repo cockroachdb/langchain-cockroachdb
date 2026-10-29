@@ -242,14 +242,16 @@ def _resolve_confirm_ttl(
     return resolved
 
 
-def _carries_write_id(row: Mapping[str, Any], write_id: str) -> bool:
-    """Whether ``row``, read back from the items table, carries ``write_id``.
+def _carries_confirm_id(row: Mapping[str, Any], confirm_id: str) -> bool:
+    """Whether ``row``, a memory read back from the items table, carries ``confirm_id``.
 
-    psycopg reads a UUID column as a uuid.UUID, while a call chooses its
-    write id as a string, so both sides are compared as UUIDs.
+    confirm stores its id as the memory's confirm id, so a retry after a
+    commit whose result was lost finds it there. psycopg reads a UUID column
+    as a uuid.UUID, while a call chooses its id as a string, so both sides
+    are compared as UUIDs.
     """
-    found = row.get("write_id")
-    return found is not None and uuid.UUID(str(found)) == uuid.UUID(write_id)
+    found = row.get("confirm_id")
+    return found is not None and uuid.UUID(str(found)) == uuid.UUID(confirm_id)
 
 
 def _check_valid_at(valid_at: object) -> None:
@@ -1005,6 +1007,8 @@ def _row_to_version(namespace: tuple[str, ...], key: str, row: Mapping[str, Any]
         ended_at=row["ended_at"],
         reason=row["reason"],
         superseded_by=row["superseded_by"],
+        confirmed_at=row["confirmed_at"],
+        confirmations=int(row["confirmations"]),
     )
 
 
@@ -2351,15 +2355,14 @@ class BaseCockroachDBStore:
         committed without writing, and the attempt runs from the start.
 
         The result lists only what the rows prove. The memory under the new
-        key carries the write id when this write wrote it or confirmed it.
-        Confirming changes neither the version nor updated_at, so a
-        confirmed_at later than its updated_at means it was confirmed;
-        otherwise it was written, and the row has the version. Only a write
-        archives the memory it replaces under the new key as overwritten,
-        so that history row proves the write too. When another writer
-        replaced or confirmed the new memory before the retry, that row is
-        all that is left: the memory was written, and its version is None.
-        Every other item that carries the write id was confirmed. The
+        key that carries the write id as its write id was written, and the
+        row has the version. A confirmation sets only a memory's confirm id,
+        so one that lands after the write leaves that proof alone. Only a
+        write archives the memory it replaces under the new key as
+        overwritten, so that history row proves the write too. When another
+        writer replaced the new memory before the retry, that row is all
+        that is left: the memory was written, and its version is None. Every
+        item that carries the write id as its confirm id was confirmed. The
         history rows give the keys superseded and deleted, and a row of the
         new key that ended as superseded is the new memory, recorded
         straight into history. Nothing records which candidates were kept,
@@ -2374,34 +2377,25 @@ class BaseCockroachDBStore:
         def ended_as(reason: str) -> bool:
             return any(row["key"] == plan.key and row["reason"] == reason for row in history)
 
-        overwrote = ended_as("overwritten")
-        target = next((row for row in items if row["key"] == plan.key), None)
-        # A write never confirms the memory under its own key
-        confirmed_target = (
-            target is not None
-            and not overwrote
-            and target["confirmed_at"] is not None
-            and target["confirmed_at"] > target["updated_at"]
-        )
-        written = target is not None and not confirmed_target
-
         def keys(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
             return tuple(sorted({row["key"] for row in rows}))
 
+        # A decision never both writes and confirms the memory under its own key
+        target = next((row for row in items if row["key"] == plan.key and row["written"]), None)
         new: Literal["written", "skipped", "superseded"] = "skipped"
-        if written or overwrote:
+        if target is not None or ended_as("overwritten"):
             new = "written"
         elif ended_as("superseded"):
             new = "superseded"
         return ReconcileResult(
             key=plan.key,
             new=new,
-            version=int(target["version"]) if written and target is not None else None,
+            version=None if target is None else int(target["version"]),
             superseded=keys(
                 row for row in history if row["reason"] == "superseded" and row["key"] != plan.key
             ),
             deleted=keys(row for row in history if row["reason"] == "deleted"),
-            confirmed=keys(row for row in items if not (written and row["key"] == plan.key)),
+            confirmed=keys(row for row in items if row["confirmed"]),
             kept=(),
             already_applied=True,
         )
@@ -2491,8 +2485,10 @@ class BaseCockroachDBStore:
         removed = superseded + deleted
         if removed:
             statements.extend(self._delete_statements(plan.prefix, removed))
+        # A confirmed memory carries the write id as its confirm id, and
+        # keeps the write id of the write that put its value there
         statements.extend(
-            self.sql.confirm(plan.prefix, key, write_id=write_id)
+            self.sql.confirm(plan.prefix, key, confirm_id=write_id)
             for key in _acted(candidates, decision, Action.CONFIRM)
         )
         return statements
@@ -2691,13 +2687,13 @@ class BaseCockroachDBStore:
 
         Args:
             rowcount: The confirm UPDATE's rowcount.
-            check_rows: The rows from the write_id check, sent in the same
-                transaction.
+            check_rows: The rows of the confirm id check
+                (StoreSQL.confirm_check), sent in the same transaction.
 
         Returns:
-            True if the memory was confirmed (rows updated or the memory
-            already has this write_id from a lost commit), False if no live
-            memory has the key.
+            True if the memory was confirmed (rows updated, or the memory
+            already carries this confirm id from an attempt whose commit was
+            lost), False if no live memory has the key.
         """
         return rowcount > 0 or bool(check_rows)
 

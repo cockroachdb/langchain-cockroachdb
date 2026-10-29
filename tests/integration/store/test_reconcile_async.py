@@ -837,7 +837,7 @@ async def test_a_ttl_function_runs_once_when_an_aconfirm_retries_after_a_lost_co
     astore_factory, aadmin, unsafe_internals, caplog, mode
 ) -> None:
     # The confirm commits and its result is lost. The retry reads the memory,
-    # finds its own write id on it, and returns without calling the function again
+    # finds its own confirm id on it, and returns without calling the function again
     fault = FailAfterCommit(unsafe_internals)
     store = await astore_factory(
         mode, connect_kwargs={"cursor_factory": fault.async_cursor_class()}

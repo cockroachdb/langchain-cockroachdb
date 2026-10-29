@@ -26,7 +26,8 @@ NAMESPACES = object()
 # Until setup() applies it, the store writes with the 0.5 statements.
 MIGRATION_RECONCILE = 2
 # The columns migration 2 adds. A store whose role cannot read the migrations
-# table looks for all of them in the items table instead.
+# table, or that finds no migrations table, looks for all of them in the
+# items table instead.
 _RECONCILE_COLUMNS = (
     "version",
     "provenance",
@@ -34,6 +35,7 @@ _RECONCILE_COLUMNS = (
     "confirmations",
     "write_id",
     "valid_at",
+    "confirm_id",
 )
 
 # Most namespaces a semantic search sends to the vector index in one array.
@@ -62,7 +64,7 @@ _CANDIDATE_NAMES = (
     "provenance",
     "confirmed_at",
     "confirmations",
-    "write_id",
+    "confirm_id",
 )
 _CANDIDATE_OUTPUT = ", ".join(_CANDIDATE_NAMES)
 
@@ -147,12 +149,15 @@ class StoreSQL:
             # Migration 2 (MIGRATION_RECONCILE): one statement, so it is one
             # schema change in its own implicit transaction, as a schema_locked
             # table needs. Existing rows get version 1 and no confirmations.
+            # write_id marks the rows a write wrote and confirm_id the rows a
+            # confirmation confirmed, so a retry of either finds its own work.
             f"""ALTER TABLE {self.items} ADD COLUMN IF NOT EXISTS version INT8 NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS provenance JSONB,
     ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS confirmations INT8 NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS write_id UUID,
-    ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ;""",
+    ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirm_id UUID;""",
         ]
 
     def migration_version(self) -> str:
@@ -256,6 +261,8 @@ class StoreSQL:
     ended_at TIMESTAMPTZ NOT NULL,
     reason TEXT NOT NULL,
     superseded_by TEXT,
+    confirmations INT8 NOT NULL DEFAULT 0,
+    confirmed_at TIMESTAMPTZ,
     write_id UUID,
     expires_at TIMESTAMPTZ,
     PRIMARY KEY (prefix, key, version)
@@ -434,6 +441,13 @@ WHERE {where}"""
         update bumps the row's version. A row that already carries the write
         id is left as it is, so a batch retried after its commit changes nothing.
 
+        Confirmations belong to the fact, not the key: an update that changes
+        the value starts confirmations and confirmed_at again from none,
+        while an exact re-save of the live value keeps them. A memory that
+        expired counts as gone, so a write over it starts from none as well.
+        The id of the last confirmation stays on the row, so a confirmation
+        retried after it committed still finds it and counts nothing again.
+
         Args:
             rows: (prefix, key, value_json, ttl_minutes) tuples without
                 ``write_id``, (prefix, key, value_json, ttl_minutes,
@@ -511,6 +525,11 @@ ON CONFLICT (prefix, key) DO UPDATE SET
             version_column = ", version"
             version_value = ",\n    " + self._next_version("rows_to_insert")
             version_update = "EXCLUDED.version"
+        # The SET expressions read the row as it was before the update
+        same_fact = (
+            f"{self.items}.value = EXCLUDED.value AND "
+            f"({self.items}.expires_at IS NULL OR {self.items}.expires_at > now())"
+        )
         sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{version_column})
 SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){version_value}
 FROM ({union_sql}) AS rows_to_insert
@@ -522,7 +541,9 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     provenance = EXCLUDED.provenance,
     valid_at = EXCLUDED.valid_at,
     write_id = EXCLUDED.write_id,
-    version = {version_update}
+    version = {version_update},
+    confirmations = CASE WHEN {same_fact} THEN {self.items}.confirmations ELSE 0 END,
+    confirmed_at = CASE WHEN {same_fact} THEN {self.items}.confirmed_at ELSE NULL END
 WHERE {self.items}.write_id IS DISTINCT FROM EXCLUDED.write_id"""
         if return_version:
             sql += "\nRETURNING version"
@@ -1056,13 +1077,15 @@ LIMIT %s OFFSET %s"""
         """The columns of a candidate row, read from the items table under ``alias``.
 
         A row without a valid time, from 0.5.x or a plain put, reads as valid
-        from its updated_at.
+        from its updated_at. confirm_id, the id of the memory's last
+        confirmation, tells a confirm retried after a lost commit that its
+        earlier attempt confirmed the memory.
         """
         a = f"{alias}." if alias else ""
         return (
             f"{a}key, {a}value, {a}created_at, {a}updated_at, {a}version, "
             f"COALESCE({a}valid_at, {a}updated_at) AS valid_at, {a}provenance, "
-            f"{a}confirmed_at, {a}confirmations, {a}write_id"
+            f"{a}confirmed_at, {a}confirmations, {a}confirm_id"
         )
 
     @staticmethod
@@ -1386,9 +1409,10 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
 
         A write runs it first, in the write's transaction, before it
         overwrites or deletes the items. It copies each live item of ``keys``
-        with its version, value, provenance and valid time (``updated_at``
-        when the row has none), and records when the store wrote it, when
-        the version ended (now), why, and what replaced it. Rows that
+        with its version, value, provenance, valid time (``updated_at`` when
+        the row has none), confirmations and confirmed_at, and records when
+        the store wrote it, when the version ended (now), why, and what
+        replaced it. Rows that
         already carry ``write_id`` were written by this batch, in an attempt
         that committed before its result was lost, so they are not old
         versions and are left out. A version already in history is left as
@@ -1409,11 +1433,11 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
         Returns:
             Tuple of (SQL, parameters).
         """
-        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
+        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmations, confirmed_at, write_id, expires_at)
 SELECT prefix, key, version, value, provenance, COALESCE(valid_at, updated_at),
     GREATEST(COALESCE(CAST(%s AS TIMESTAMPTZ), now()), COALESCE(valid_at, updated_at)),
     updated_at, now(),
-    CAST(%s AS STRING), CAST(%s AS STRING), CAST(%s AS UUID),
+    CAST(%s AS STRING), CAST(%s AS STRING), confirmations, confirmed_at, CAST(%s AS UUID),
     now() + CAST(%s AS DECIMAL) * INTERVAL '1 day'
 FROM {self.items}
 WHERE prefix = %s AND key = ANY(%s)
@@ -1453,7 +1477,8 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         upsert numbers them on a store with history, so it never takes a
         version the key has or gets later. It is valid from ``valid_at``
         until ``invalid_at``, never earlier, and the store held it for no
-        time: written_at and ended_at are both now. If a superseded row of
+        time: written_at and ended_at are both now, and it has no
+        confirmations. If a superseded row of
         the key already carries ``write_id``, this write inserted it in an
         attempt that committed before its result was lost, and nothing is
         inserted. The same write's archive of the memory under the key, as
@@ -1511,32 +1536,36 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         prefix: str,
         key: str,
         *,
-        write_id: str,
+        confirm_id: str,
         ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> tuple[str, list]:
         """Build the UPDATE that confirms one live memory.
 
         It sets confirmed_at to now(), adds one to confirmations and stores
-        ``write_id``. Without ``ttl`` the memory's expiry is renewed from its
-        own TTL, and a memory without a TTL keeps none. A number of minutes
-        becomes its TTL, and None removes its expiry. Its vectors get the
-        same expiry, in the same statement and only when the memory is
-        confirmed: the CTE reads the item as it was before the update. The
-        version and updated_at stay as they are, so confirming never
-        invalidates a pending find_conflicts. A memory that already carries
-        ``write_id`` was confirmed by this write, in an attempt that committed
-        before its result was lost, and is left as it is, with its vectors.
+        ``confirm_id``, the id of the confirmation: confirm's own, or the
+        write id of the reconcile or resolve that confirms. Without ``ttl``
+        the memory's expiry is renewed from its own TTL, and a memory without
+        a TTL keeps none. A number of minutes becomes its TTL, and None
+        removes its expiry. Its vectors get the same expiry, in the same
+        statement and only when the memory is confirmed: the CTE reads the
+        item as it was before the update. The version, updated_at and the
+        write id stay as they are, so confirming never invalidates a pending
+        find_conflicts, and a write retried after a lost commit still finds
+        its write id on the memory. A memory that already carries
+        ``confirm_id`` was confirmed by this confirmation, in an attempt that
+        committed before its result was lost, and is left as it is, with
+        its vectors.
 
         Returns:
             Tuple of (SQL, parameters). The statement updates one row when it
             confirms the memory, and none when no live memory has the key or
-            the memory already carries ``write_id``.
+            the memory already carries ``confirm_id``.
         """
         match = (
             "prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
-            "{indent}AND write_id IS DISTINCT FROM CAST(%s AS UUID)"
+            "{indent}AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
         )
-        match_params: list[Any] = [prefix, key, write_id]
+        match_params: list[Any] = [prefix, key, confirm_id]
         ttl_params: list[Any] = []
         if isinstance(ttl, NotProvided):
             item_expiry = (
@@ -1555,10 +1584,10 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
             ttl_params = [ttl, ttl]
         sql = (
             f"UPDATE {self.items} SET confirmed_at = now(), confirmations = confirmations + 1,\n"
-            f"    write_id = CAST(%s AS UUID),\n    {item_expiry}\n"
+            f"    confirm_id = CAST(%s AS UUID),\n    {item_expiry}\n"
             f"WHERE {match.format(indent='    ')}"
         )
-        params: list[Any] = [write_id, *ttl_params, *match_params]
+        params: list[Any] = [confirm_id, *ttl_params, *match_params]
         if self._index is None:
             return (sql, params)
         renewed = (
@@ -1573,49 +1602,50 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         )
         return (renewed + sql, [*ttl_params, prefix, key, *match_params, *params])
 
-    def confirm_write_id_check(self, prefix: str, key: str, *, write_id: str) -> tuple[str, list]:
-        """Build the statement that checks if a live memory has a write_id.
+    def confirm_check(self, prefix: str, key: str, *, confirm_id: str) -> tuple[str, list]:
+        """Build the read of the live memory under ``key`` if it carries ``confirm_id``.
 
-        This is used on a retry after a lost commit when the UPDATE's
-        rowcount is 0. It checks whether the memory already has this
-        write_id, which means the earlier attempt committed.
-
-        Args:
-            prefix: The memory's prefix.
-            key: The memory's key.
-            write_id: This confirm's write id.
+        confirm sends it with its UPDATE. An UPDATE that changed no row
+        either found no live memory, or found one that an earlier attempt of
+        the same confirm already confirmed, in an attempt that committed
+        before its result was lost. Only then does this find the memory.
 
         Returns:
             Tuple of (SQL, parameters). The statement returns a row if the
-            live memory has this write_id, or no rows otherwise.
+            live memory carries ``confirm_id``, or no rows otherwise.
         """
         sql = (
             f"SELECT 1 FROM {self.items} WHERE prefix = %s AND key = %s "
             "AND (expires_at IS NULL OR expires_at > now()) "
-            "AND write_id = CAST(%s AS UUID)"
+            "AND confirm_id = CAST(%s AS UUID)"
         )
-        return (sql, [prefix, key, write_id])
+        return (sql, [prefix, key, confirm_id])
 
     def applied_items(self, prefix: str, keys: Sequence[str], *, write_id: str) -> tuple[str, list]:
-        """Build the read of the items under ``keys`` that carry a write id.
+        """Build the read of the items under ``keys`` that carry a call's id.
 
-        A reconcile retried after a commit whose result was lost reads them,
-        with applied_history, to tell what its earlier attempt did: the
-        memory it wrote or confirmed, and the others it confirmed. ``keys``
-        are the keys that the decisions of earlier attempts named, looked up
-        by primary key, so the retry's transaction reads only their rows,
-        not the whole namespace. Expired rows count, since they were
-        written all the same.
+        A reconcile or resolve retried after a commit whose result was lost
+        reads them, with applied_history, to tell what its earlier attempt
+        did: the memory it wrote carries ``write_id`` as its write id, and the
+        memories it confirmed carry it as their confirm id. put_if reads them
+        for the memory it wrote. ``keys`` are the keys that the decisions of
+        earlier attempts named, looked up by primary key, so the retry's
+        transaction reads only their rows, not the whole namespace. Expired
+        rows count, since they were written all the same.
 
         Returns:
             Tuple of (SQL, parameters). Each row has ``key``, ``version``,
-            ``updated_at`` and ``confirmed_at``.
+            ``written``, whether it carries the id as its write id, and
+            ``confirmed``, whether it carries it as its confirm id.
         """
         sql = (
-            f"SELECT key, version, updated_at, confirmed_at FROM {self.items}\n"
-            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)"
+            "SELECT key, version, write_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS written,\n"
+            "    confirm_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS confirmed\n"
+            f"FROM {self.items}\n"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+            "    AND (write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))"
         )
-        return (sql, [prefix, list(keys), write_id])
+        return (sql, [write_id, write_id, prefix, list(keys), write_id, write_id])
 
     def applied_history(
         self, prefix: str, keys: Sequence[str], *, write_id: str
@@ -1666,7 +1696,7 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         Returns:
             Tuple of (SQL, parameters).
         """
-        sql = f"""SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by
+        sql = f"""SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmed_at, confirmations
 FROM {self.history}
 WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())
 ORDER BY version DESC

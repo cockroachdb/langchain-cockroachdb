@@ -44,7 +44,7 @@ from langchain_cockroachdb.store.base import (
     PutPlan,
     SchemaCheck,
     StoreIdentity,
-    _carries_write_id,
+    _carries_confirm_id,
     _group_ops,
     _resolve_confirm_ttl,
     _validate_confirm_ttl,
@@ -64,6 +64,7 @@ from langchain_cockroachdb.store.reconcile import (
     ConflictsChanged,
     Decision,
     MemoryRecord,
+    MemoryVersion,
     Proposal,
     ReconcileResult,
     keep_all,
@@ -2455,11 +2456,21 @@ def candidate_row(
         "provenance": {"source": key},
         "confirmed_at": None,
         "confirmations": version - 1,
-        "write_id": None,
+        "confirm_id": None,
     }
     if score is not None:
         row["score"] = score
     return row
+
+
+def written_row(key: str, version: int) -> dict[str, object]:
+    """A row of StoreSQL.applied_items: an item that carries the call's write id, written by it."""
+    return {"key": key, "version": version, "written": True, "confirmed": False}
+
+
+def confirmed_row(key: str, version: int = 1) -> dict[str, object]:
+    """A row of StoreSQL.applied_items: an item that carries the call's id as its confirm id."""
+    return {"key": key, "version": version, "written": False, "confirmed": True}
 
 
 def test_merge_candidates_orders_and_caps() -> None:
@@ -2560,7 +2571,7 @@ NO_HIT: dict[str, object] = dict.fromkeys(
         "provenance",
         "confirmed_at",
         "confirmations",
-        "write_id",
+        "confirm_id",
         "score",
     ]
 )
@@ -3332,7 +3343,7 @@ def test_decision_statements_write_archive_first_then_upsert_then_delete_and_con
         sql.upsert_vectors(rows),
         sql.delete_items("user.alice", ["old", "gone"]),
         sql.delete_vectors("user.alice", ["old", "gone"]),
-        sql.confirm("user.alice", "dup", write_id=w),
+        sql.confirm("user.alice", "dup", confirm_id=w),
     ]
     # Only the item upsert returns rows: the version it wrote
     returning = [s for s, _ in statements if s.splitlines()[-1].startswith("RETURNING")]
@@ -3403,7 +3414,7 @@ def test_decision_statements_skip_and_record_a_late_fact() -> None:
         ),
         sql.delete_items("user.alice", ["gone"]),
         sql.delete_vectors("user.alice", ["gone"]),
-        sql.confirm("user.alice", "dup", write_id=w),
+        sql.confirm("user.alice", "dup", confirm_id=w),
     ]
     actions = {"gone": Action.DELETE, "dup": Action.CONFIRM}
 
@@ -3454,12 +3465,12 @@ def test_decision_statements_without_history_delete_and_record_nothing() -> None
         sql.upsert_vectors(rows),
         sql.delete_items("user.alice", ["old"]),
         sql.delete_vectors("user.alice", ["old"]),
-        sql.confirm("user.alice", "dup", write_id=w),
+        sql.confirm("user.alice", "dup", confirm_id=w),
     ]
     # A late fact without history is not kept anywhere
     late = Decision(new="superseded", superseded_by="old", actions={"dup": Action.CONFIRM})
     assert store._decision_statements(plan, candidates, late, vector_rows=rows, valid_at=VALID) == [
-        sql.confirm("user.alice", "dup", write_id=w)
+        sql.confirm("user.alice", "dup", confirm_id=w)
     ]
 
     # Without an index there are no vectors to replace or delete
@@ -3544,10 +3555,15 @@ def test_applied_statements_look_up_only_the_named_keys() -> None:
         store.sql.applied_history("user.alice", ["dup", "k", "old"], write_id=w),
     ]
     # Each binds the namespace, the keys and the write id, and names the
-    # keys in its WHERE clause: no read of the whole namespace
+    # keys in its WHERE clause: no read of the whole namespace. The items
+    # carry the id as the write id of what the call wrote, or as the confirm
+    # id of what it confirmed
     for sql, params in statements:
-        assert "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id" in sql
-        assert params == ["user.alice", ["dup", "k", "old"], w]
+        assert "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))" in sql
+        assert [param for param in params if param != w] == ["user.alice", ["dup", "k", "old"]]
+    items, history = statements
+    assert "(write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))" in items[0]
+    assert items[1].count(w) == 4 and history[1].count(w) == 1
     # Without history only the items are read, and with no keys nothing is
     plain = history_store()
     assert plain._applied_statements(plan, {"k"}) == [
@@ -3557,10 +3573,10 @@ def test_applied_statements_look_up_only_the_named_keys() -> None:
 
 
 def test_a_write_replaced_before_the_retry_is_still_reported_written() -> None:
-    # Another writer replaced or confirmed the new memory between the lost
-    # commit and the retry, so the item no longer carries the write id. Only
-    # a write archives the memory under the new key as overwritten, so that
-    # row proves the write; the version it wrote is gone from the item
+    # Another writer replaced the new memory between the lost commit and the
+    # retry, so the item no longer carries the write id. Only a write archives
+    # the memory under the new key as overwritten, so that row proves the
+    # write; the version it wrote is gone from the item
     store = history_store(history=True)
     plan = plan_proposal(store, {"text": "aisle"})
     history = [{"key": "k", "reason": "overwritten"}, {"key": "old", "reason": "superseded"}]
@@ -3574,10 +3590,9 @@ def test_a_write_replaced_before_the_retry_is_still_reported_written() -> None:
         kept=(),
         already_applied=True,
     )
-    # With the archive, a target that carries the write id was written, whatever
-    # its timestamps say: a write never confirms the memory under its own key
-    target = {"key": "k", "version": 4, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)}
-    rebuilt = store._applied_result(plan, [[target], history])
+    # A confirmation in between sets the memory's confirm id and leaves its
+    # write id: the target still proves the write, with its version
+    rebuilt = store._applied_result(plan, [[written_row("k", 4)], history])
     assert rebuilt is not None
     assert (rebuilt.new, rebuilt.version, rebuilt.confirmed) == ("written", 4, ())
 
@@ -3588,11 +3603,9 @@ def test_applied_result_lists_only_what_the_rows_prove() -> None:
     # Nothing carries the write id: no earlier attempt committed
     assert store._applied_result(plan, [[], []]) is None
 
-    # The target carries it with a later update than confirmation: it was written
-    items = [
-        {"key": "k", "version": 3, "updated_at": T0 + timedelta(hours=1), "confirmed_at": T0},
-        {"key": "dup", "version": 1, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)},
-    ]
+    # The target carries it as its write id: it was written, at the row's
+    # version. An item that carries it as its confirm id was confirmed
+    items = [written_row("k", 3), confirmed_row("dup")]
     history = [
         {"key": "k", "reason": "overwritten"},
         {"key": "old", "reason": "superseded"},
@@ -3610,10 +3623,8 @@ def test_applied_result_lists_only_what_the_rows_prove() -> None:
         already_applied=True,
     )
 
-    # Confirmed later than updated: confirming changes neither, so it was confirmed
-    confirmed = [
-        {"key": "k", "version": 2, "updated_at": T0, "confirmed_at": T0 + timedelta(hours=1)}
-    ]
+    # The target carries it as its confirm id: it was confirmed, not written
+    confirmed = [confirmed_row("k", 2)]
     assert store._applied_result(plan, [confirmed, []]) == ReconcileResult(
         key="k",
         new="skipped",
@@ -3646,6 +3657,50 @@ def test_applied_result_lists_only_what_the_rows_prove() -> None:
         confirmed=("k",),
         kept=(),
         already_applied=True,
+    )
+    assert plain._applied_result(plan, [[written_row("k", 1), confirmed_row("dup")]]) == (
+        ReconcileResult(
+            key="k",
+            new="written",
+            version=1,
+            superseded=(),
+            deleted=(),
+            confirmed=("dup",),
+            kept=(),
+            already_applied=True,
+        )
+    )
+
+
+def test_a_history_row_gives_the_version_with_its_confirmations() -> None:
+    # A version ends with the confirmations it had while it was live
+    row = {
+        "version": 2,
+        "value": {"text": "window"},
+        "provenance": {"source": "chat"},
+        "valid_at": T0,
+        "invalid_at": NOW,
+        "written_at": T0,
+        "ended_at": NOW,
+        "reason": "overwritten",
+        "superseded_by": None,
+        "confirmed_at": T0 + timedelta(hours=1),
+        "confirmations": 3,
+    }
+    assert store_base._row_to_version(NS, "k", row) == MemoryVersion(
+        namespace=NS,
+        key="k",
+        version=2,
+        value={"text": "window"},
+        provenance={"source": "chat"},
+        valid_at=T0,
+        invalid_at=NOW,
+        written_at=T0,
+        ended_at=NOW,
+        reason="overwritten",
+        superseded_by=None,
+        confirmed_at=T0 + timedelta(hours=1),
+        confirmations=3,
     )
 
 
@@ -3723,7 +3778,10 @@ async def test_reconcile_checks_everything_before_any_io(make: str) -> None:
     assert embedded(embeddings, make) == 0
 
 
-APPLIED_READS = ("SELECT key, version, updated_at, confirmed_at FROM", "SELECT key, reason FROM")
+APPLIED_READS = (
+    "SELECT key, version, write_id IS NOT DISTINCT FROM",
+    "SELECT key, reason FROM",
+)
 TOKEN_READ = "SELECT key, version, updated_at FROM"
 
 
@@ -3833,7 +3891,7 @@ async def test_a_retried_reconcile_looks_up_only_the_keys_its_earlier_decision_n
     committed: bool, make: str
 ) -> None:
     rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup"), candidate_row("kept")]
-    target = {"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}
+    target = written_row("k", 2)
     applied = ([target], [{"key": "old", "reason": "superseded"}]) if committed else ([], [])
     # The first attempt fails after its writes and COMMIT went out: with a
     # 40003 when it committed and its result was lost, with a 40001 when it
@@ -4546,7 +4604,7 @@ async def test_resolving_the_same_conflicts_again_returns_the_first_result(make:
     # Rows under the new key carry the Conflicts' write id: an earlier
     # resolve committed. The tokens changed with it, which is no conflict
     applied = (
-        [{"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}],
+        [written_row("k", 2)],
         [{"key": "old", "reason": "superseded"}],
     )
     store, reads, conflicts = resolving_store(fail="none", applied=applied, tokens=[], make=make)
@@ -4566,7 +4624,7 @@ async def test_a_retried_resolve_looks_for_its_write_id_again(committed: bool, m
     # went out: with a 40003 when it committed and its result was lost, with
     # a 40001 when it rolled back
     applied = (
-        [{"key": "k", "version": 2, "updated_at": NOW, "confirmed_at": None}],
+        [written_row("k", 2)],
         [{"key": "old", "reason": "superseded"}],
     )
     store, reads, conflicts = resolving_store(
@@ -4870,7 +4928,7 @@ def test_validate_and_resolve_confirm_ttl() -> None:
 
 
 def test_confirm_result_interprets_rowcount_and_check_rows() -> None:
-    """_confirm_result returns True for updated or found write_id, False otherwise."""
+    """_confirm_result returns True for an update or a found confirm id, False otherwise."""
     store = CockroachDBStore(object())  # type: ignore[arg-type]
     # Updated row means confirmed
     assert store._confirm_result(rowcount=1, check_rows=[]) is True
@@ -4880,30 +4938,33 @@ def test_confirm_result_interprets_rowcount_and_check_rows() -> None:
     assert store._confirm_result(rowcount=0, check_rows=[]) is False
 
 
-def test_carries_write_id_matches_the_uuid_psycopg_reads_with_the_string_a_call_chose() -> None:
-    write_id = str(uuid.uuid4())
+def test_carries_confirm_id_matches_the_uuid_psycopg_reads_with_the_string_a_call_chose() -> None:
+    confirm_id = str(uuid.uuid4())
     # psycopg reads a UUID column as a uuid.UUID, which never equals a str
-    assert uuid.UUID(write_id) != write_id
-    assert _carries_write_id({"write_id": uuid.UUID(write_id)}, write_id)
-    assert _carries_write_id({"write_id": write_id.upper()}, write_id)
-    assert not _carries_write_id({"write_id": uuid.uuid4()}, write_id)
-    assert not _carries_write_id({"write_id": None}, write_id)
-    assert not _carries_write_id({}, write_id)
+    assert uuid.UUID(confirm_id) != confirm_id
+    assert _carries_confirm_id({"confirm_id": uuid.UUID(confirm_id)}, confirm_id)
+    assert _carries_confirm_id({"confirm_id": confirm_id.upper()}, confirm_id)
+    assert not _carries_confirm_id({"confirm_id": uuid.uuid4()}, confirm_id)
+    assert not _carries_confirm_id({"confirm_id": None}, confirm_id)
+    assert not _carries_confirm_id({}, confirm_id)
+    # The write id of the write that put the value there is not the confirm id
+    assert not _carries_confirm_id({"write_id": uuid.UUID(confirm_id)}, confirm_id)
 
 
 def as_read(row: dict[str, object]) -> dict[str, object]:
-    """``row`` as psycopg reads it back: a UUID column, such as write_id, comes as a uuid.UUID."""
-    if isinstance(row.get("write_id"), str):
-        return {**row, "write_id": uuid.UUID(str(row["write_id"]))}
-    return row
+    """``row`` as psycopg reads it back: a UUID column, such as confirm_id, comes as a uuid.UUID."""
+    return {
+        name: uuid.UUID(value) if name.endswith("_id") and isinstance(value, str) else value
+        for name, value in row.items()
+    }
 
 
 class ConfirmReads:
     """Stands in for a store's _cursor in confirm, and answers its statements.
 
     Every attempt logs its statements. The record read returns ``record_row``
-    (or no rows if None), with its write id as a uuid.UUID, as psycopg reads
-    it. The UPDATE returns ``updated`` rows, and the write_id check returns
+    (or no rows if None), with its confirm id as a uuid.UUID, as psycopg reads
+    it. The UPDATE returns ``updated`` rows, and the confirm id check returns
     ``check_rows``. ``fail`` makes the first attempt fail with a retryable
     40003 as its block ends.
     """
@@ -4987,7 +5048,7 @@ def confirming_store(reads: ConfirmReads, make: str = "sync") -> Any:
 @pytest.mark.parametrize("make", ["sync", "async"])
 async def test_confirm_sends_all_statements_inside_the_attempt(make: str) -> None:
     """Every statement is sent inside the _cursor block, nothing after it exits."""
-    # With a number TTL: UPDATE and write_id check
+    # With a number TTL: UPDATE and confirm id check
     reads = ConfirmReads(updated=1, check_rows=[])
     store = confirming_store(reads, make)
 
@@ -4996,13 +5057,13 @@ async def test_confirm_sends_all_statements_inside_the_attempt(make: str) -> Non
     assert result is True
     assert len(reads.attempts) == 1
     statements = reads.attempts[0]
-    # UPDATE (may include CTE for vectors) and write_id check
+    # UPDATE (may include CTE for vectors) and confirm id check
     assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
     assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
     # Nothing sent after the block closed
     # (The ConfirmCursor raises if a statement arrives while closed)
 
-    # With a callable TTL: record read, UPDATE, and write_id check
+    # With a callable TTL: record read, UPDATE, and confirm id check
     record_row = {
         "key": "k",
         "value": '{"text": "x"}',
@@ -5013,7 +5074,7 @@ async def test_confirm_sends_all_statements_inside_the_attempt(make: str) -> Non
         "provenance": None,
         "confirmed_at": None,
         "confirmations": 0,
-        "write_id": None,
+        "confirm_id": None,
     }
     reads = ConfirmReads(record_row=record_row, updated=1, check_rows=[])
     store = confirming_store(reads, make)
@@ -5023,7 +5084,7 @@ async def test_confirm_sends_all_statements_inside_the_attempt(make: str) -> Non
     assert result is True
     assert len(reads.attempts) == 1
     statements = reads.attempts[0]
-    # Record read, UPDATE, and write_id check
+    # Record read, UPDATE, and confirm id check
     assert any("SELECT key, value" in stmt[0] for stmt in statements)
     assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
     assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
@@ -5042,7 +5103,7 @@ async def test_confirm_with_invalid_callable_return_raises_and_sends_no_update(m
         "provenance": None,
         "confirmed_at": None,
         "confirmations": 0,
-        "write_id": None,
+        "confirm_id": None,
     }
 
     for invalid, pattern in [
@@ -5068,15 +5129,15 @@ async def test_confirm_with_invalid_callable_return_raises_and_sends_no_update(m
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_confirm_on_retry_skips_callable_when_record_has_write_id(make: str) -> None:
-    """On a retry, if the record has this write_id, return True without calling the callable."""
+async def test_confirm_on_retry_skips_callable_when_record_has_its_confirm_id(make: str) -> None:
+    """On a retry, if the record has this confirm id, return True without calling the callable."""
     called = []
 
     def track_callable(r: MemoryRecord) -> float:
         called.append(True)
         return 10.0
 
-    # Subclass to capture write_id and return it on retry
+    # Subclass to capture the confirm id and return it on retry
     class RetryReads(ConfirmReads):
         def __init__(self) -> None:
             super().__init__(
@@ -5090,24 +5151,24 @@ async def test_confirm_on_retry_skips_callable_when_record_has_write_id(make: st
                     "provenance": None,
                     "confirmed_at": None,
                     "confirmations": 0,
-                    "write_id": None,
+                    "confirm_id": None,
                 },
                 updated=1,
                 check_rows=[],
                 fail=True,
             )
-            self.captured_write_id: str | None = None
+            self.captured_confirm_id: str | None = None
 
         def answer(self, sql: str) -> list[dict[str, object]]:
-            # On retry, return the record with the captured write_id, as
+            # On retry, return the record with the captured confirm id, as
             # psycopg reads a UUID column back: a uuid.UUID, not a str
             if (
                 sql.startswith("SELECT key, value")
                 and len(self.attempts) > 1
-                and self.captured_write_id
+                and self.captured_confirm_id
             ):
                 row = dict(self.record_row)  # type: ignore[arg-type]
-                row["write_id"] = uuid.UUID(self.captured_write_id)
+                row["confirm_id"] = uuid.UUID(self.captured_confirm_id)
                 return [row]
             return super().answer(sql)
 
@@ -5117,14 +5178,14 @@ async def test_confirm_on_retry_skips_callable_when_record_has_write_id(make: st
                 with super().cursor(**kwargs) as cur:
                     yield cur
             finally:
-                # After first attempt, capture the write_id from UPDATE
-                if len(self.attempts) == 1 and not self.captured_write_id:
+                # After first attempt, capture the confirm id from UPDATE
+                if len(self.attempts) == 1 and not self.captured_confirm_id:
                     for stmt_sql, params in self.attempts[0]:
                         if ("UPDATE" in stmt_sql or "WITH renewed" in stmt_sql) and params:
                             # Find UUID in params
                             for p in params:
                                 if isinstance(p, str) and len(p) == 36 and p.count("-") == 4:
-                                    self.captured_write_id = p
+                                    self.captured_confirm_id = p
                                     break
                             break
 
@@ -5142,7 +5203,7 @@ async def test_confirm_on_retry_skips_callable_when_record_has_write_id(make: st
     first = reads.attempts[0]
     assert any("SELECT key, value" in stmt[0] for stmt in first)
     assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in first)
-    # Second attempt has only record read, no UPDATE (early return on write_id match)
+    # Second attempt has only record read, no UPDATE (early return on confirm id match)
     second = reads.attempts[1]
     assert any("SELECT key, value" in stmt[0] for stmt in second)
     assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in second)
@@ -5391,7 +5452,7 @@ def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
     )
     # After an attempt that may have committed, the item that carries the
     # write id proves that it wrote, which moved the token itself
-    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    proof = [written_row("k", 3)]
     written = [{**candidate_row("k", version=3, updated_at=LATER), "value": TEXT}]
     for plan in (put, create):
         assert store._check_conditional(
@@ -5483,9 +5544,10 @@ class ConditionalReads:
 
     Every attempt logs its statements and the arguments of its _cursor. The
     record read returns ``row`` on the first attempt and ``retry_row`` on
-    the others, or no row for None, with its write id as a uuid.UUID, as
+    the others, or no row for None, with its confirm id as a uuid.UUID, as
     psycopg reads it. The reads of the rows that carry the write id return
-    ``proof``; like the real reads, they have no write id column. The item
+    ``proof``, rows of written_row; like the real reads, they have no write
+    id column. The item
     upsert returns version 2. ``failures`` are the errors that attempts
     raise, the first attempt's first, each with where it raises: "read" at
     the record read, before anything was written; "write" as the first
@@ -5638,15 +5700,11 @@ async def test_a_retried_put_if_looks_for_its_write_id(
     # The first attempt fails with a 40003 as its block ends, after its writes went out
     mine = uuid.UUID(int=7)
     monkeypatch.setattr(store_base.uuid, "uuid4", lambda: mine)
-    # The live row carries the write id of the put that wrote it, and the
-    # row the first attempt wrote carries this call's, and its value
-    row = {**candidate_row("k", version=2), "write_id": str(uuid.UUID(int=1))}
-    written = {
-        **candidate_row("k", version=3, updated_at=LATER),
-        "value": {"text": "aisle"},
-        "write_id": str(mine),
-    }
-    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    # The row the first attempt wrote has its value, and the read of the
+    # rows that carry its write id finds it
+    row = candidate_row("k", version=2)
+    written = {**candidate_row("k", version=3, updated_at=LATER), "value": {"text": "aisle"}}
+    proof = [written_row("k", 3)]
     reads = ConditionalReads(
         row,
         retry_row=written if committed else row,
@@ -5806,7 +5864,7 @@ async def test_a_put_if_stays_lenient_once_an_attempt_may_have_committed(make: s
     # fails with a 40001 at its first read, which proves nothing about the
     # first. The third still looks for the write id, and finds it on the row
     written = {**candidate_row("k", version=3, updated_at=LATER), "value": {"text": "aisle"}}
-    proof = [{"key": "k", "version": 3, "updated_at": LATER, "confirmed_at": None}]
+    proof = [written_row("k", 3)]
     reads = ConditionalReads(
         candidate_row("k", version=2),
         retry_row=written,

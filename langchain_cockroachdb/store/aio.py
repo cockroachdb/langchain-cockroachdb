@@ -5,9 +5,9 @@ on CockroachDB. It plans batches, reconciliations and conditional writes
 with the same code as CockroachDBStore and runs the same SQL. Every
 operation retries transient errors under the store's RetryPolicy. Every
 write is an UPSERT, a DELETE, an UPDATE that pushes back an expiry or
-confirms a memory once per write id, or an INSERT into history that skips
-versions and write ids already there, so a retry after an ambiguous result
-is safe.
+confirms a memory once per confirmation id, or an INSERT into history that
+skips versions and write ids already there, so a retry after an ambiguous
+result is safe.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ from langchain_cockroachdb.store.base import (
     ConditionalPlan,
     PutPlan,
     SchemaCheck,
-    _carries_write_id,
+    _carries_confirm_id,
     _check_paging,
     _check_policy,
     _memory_prefix,
@@ -920,8 +920,9 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             limit: Most versions to return (default 20).
 
         Returns:
-            Up to ``limit`` versions, highest version first. Versions past
-            the history's ``ttl_days`` are left out.
+            Up to ``limit`` versions, highest version first, each with the
+            confirmations it had when it ended. Versions past the history's
+            ``ttl_days`` are left out.
 
         Raises:
             ValueError: If the store keeps no history (create it with
@@ -1110,7 +1111,10 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         confirmation and renews the expiry. That way expiry can follow how
         often a fact is confirmed, not how often it is read. Confirming does
         not change the version or updated_at, so it never invalidates a
-        pending afind_conflicts.
+        pending afind_conflicts. Confirmations belong to the memory's value:
+        a write that changes it starts them again from none. Each call picks
+        a confirmation id of its own, so a retry after a lost commit counts
+        nothing again, and the memory's write id stays as it is.
 
         Args:
             namespace: The memory's namespace.
@@ -1140,8 +1144,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         _validate_confirm_ttl(ttl)
         self._require_columns(await self._areconcile_columns(refresh=True))
 
-        # Choose the write id before the first attempt
-        write_id = str(uuid.uuid4())
+        # Choose the confirm id before the first attempt
+        confirm_id = str(uuid.uuid4())
         key_str = str(key)
 
         async def attempt() -> bool:
@@ -1166,20 +1170,22 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
                             # No live memory to confirm
                             return False
                         record = _row_to_record(tuple(namespace), rows[0])
-                        # If the record already has this write_id, an earlier attempt
-                        # committed. Return True without calling the callable again
-                        if _carries_write_id(rows[0], write_id):
+                        # If the record already carries this confirm id, an earlier
+                        # attempt committed. Return True without calling the callable again
+                        if _carries_confirm_id(rows[0], confirm_id):
                             return True
                         resolved_ttl = self._run_user_callable(_resolve_confirm_ttl, ttl, record)  # type: ignore[assignment]
                     else:
                         resolved_ttl = ttl
 
-                    # Execute the confirm and the write_id check in the same transaction
+                    # Execute the confirm and the confirm id check in the same transaction
                     sent = await self._send(
                         conn,
                         [
-                            self.sql.confirm(prefix, key_str, write_id=write_id, ttl=resolved_ttl),
-                            self.sql.confirm_write_id_check(prefix, key_str, write_id=write_id),
+                            self.sql.confirm(
+                                prefix, key_str, confirm_id=confirm_id, ttl=resolved_ttl
+                            ),
+                            self.sql.confirm_check(prefix, key_str, confirm_id=confirm_id),
                         ],
                         cursors,
                     )

@@ -352,9 +352,9 @@ deleted = store.delete_namespace(("user", "alice"))  # async: await store.adelet
 
 | Table | Holds |
 |---|---|
-| `store` | Items: `prefix` (the namespace), `key`, `value` (JSONB), `created_at`, `updated_at`, `expires_at` and `ttl_minutes`, and from migration 2 `version`, `provenance`, `confirmed_at`, `confirmations`, `write_id` and `valid_at` |
+| `store` | Items: `prefix` (the namespace), `key`, `value` (JSONB), `created_at`, `updated_at`, `expires_at` and `ttl_minutes`, and from migration 2 `version`, `provenance`, `confirmed_at`, `confirmations`, `write_id`, `valid_at` and `confirm_id` |
 | `store_vectors` | One row per embedded text, with the item's expiry. Created only with `index` |
-| `store_history` | Old versions of items: `prefix`, `key`, `version`, `value`, `provenance`, `valid_at`, `invalid_at`, `written_at`, `ended_at`, `reason`, `superseded_by`, `write_id` and `expires_at`. Created only with `history` |
+| `store_history` | Old versions of items: `prefix`, `key`, `version`, `value`, `provenance`, `valid_at`, `invalid_at`, `written_at`, `ended_at`, `reason`, `superseded_by`, `confirmations`, `confirmed_at`, `write_id` and `expires_at`. Created only with `history` |
 | `store_migrations` | The migration versions applied |
 
 `table_name="memories"` names the tables `memories`, `memories_vectors`, `memories_history` and `memories_migrations`, so several stores can share a database. `schema=` puts them in another schema, which must exist. The default schema is `public`.
@@ -840,7 +840,7 @@ for version in store.history(memories, "seat-1"):
     print("  stored from", version.written_at, "to", version.ended_at)
 ```
 
-Each version has its `value` and `provenance`; `valid_at` and `invalid_at`, when its fact was true; `written_at` and `ended_at`, when the store held it; its `reason`; and `superseded_by`. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. `history` raises `ValueError` on a store without history.
+Each version has its `value` and `provenance`; `valid_at` and `invalid_at`, when its fact was true; `written_at` and `ended_at`, when the store held it; its `reason`; `superseded_by`; and `confirmations` and `confirmed_at`, the confirmations it had when it ended. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. `history` raises `ValueError` on a store without history.
 
 Turn history on for every store that writes the same table. A store with history off numbers a key it creates from 1, without looking at the key's history. If history already holds a version 1 of that key, the next archive of the new version 1 is dropped, since history keeps one row per version.
 
@@ -900,6 +900,8 @@ Only these two policies compare valid times. A late fact under a key whose live 
 
 `confirm(namespace, key)` marks a live memory as confirmed: `confirmed_at` becomes now, `confirmations` goes up by one, and the memory's expiry, with its vectors', is renewed from its own TTL. It returns False when no live memory has the key. Confirming changes neither the version nor `updated_at`, so it never invalidates a pending `find_conflicts`, and it adds no history.
 
+Confirmations belong to the fact, not the key. A write that changes a memory's value, through `put`, `reconcile`, `resolve` or `put_if`, starts `confirmations` and `confirmed_at` again from none, while saving the same value again keeps them. With history on, the version it ends keeps its count. A memory that expired counts as gone, so a write over it starts from none too.
+
 `ttl` sets the expiry instead: a number of minutes, None for no expiry, or a function of the `MemoryRecord` that returns either. The function gets the memory as the confirm's transaction read it, before this confirmation counts:
 
 ```python
@@ -956,7 +958,7 @@ Both are safe to retry, and a retry never reports a false conflict. If an attemp
 
 ### Retries and Rebuilt Results
 
-Every method here retries transient errors under the store's `RetryPolicy`, like every other store call. Each `reconcile` and `resolve` picks a write id before its first attempt and marks the rows it writes with it. An attempt can commit and still lose its result on the way back, as when the connection drops while the COMMIT's answer travels. The retry then finds the rows with its write id, writes nothing, and returns the result rebuilt from those rows, with `already_applied=True`. A rebuilt result lists only what the stored rows prove:
+Every method here retries transient errors under the store's `RetryPolicy`, like every other store call. Each `reconcile` and `resolve` picks a write id before its first attempt and marks the rows it writes with it, and the memories it confirms with it as their confirmation id. `confirm` marks a memory with a confirmation id of its own and leaves its write id alone, so a confirmation that lands between a lost commit and the retry of a write does not disturb the retry. An attempt can commit and still lose its result on the way back, as when the connection drops while the COMMIT's answer travels. The retry then finds the rows with its write id, writes nothing, and returns the result rebuilt from those rows, with `already_applied=True`. A rebuilt result lists only what the stored rows prove:
 
 - `kept` is empty, and on a store without history so are `superseded` and `deleted`, since such a store keeps no trace of what it removed.
 - A written memory that another writer replaced before the retry gives `new="written"` with `version=None`.
@@ -1005,7 +1007,7 @@ def recall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
 
 ### Upgrading From 0.5
 
-`setup()` applies migration 2, which adds the columns these methods use to the items table in one statement: `version`, `provenance`, `confirmed_at`, `confirmations`, `write_id` and `valid_at`. Until it runs, the store works as 0.5 did, and the new methods raise `ValueError` asking for `setup()`. With history off and these methods unused, the store behaves as in 0.5 apart from the new columns. During a rolling upgrade, 0.5 writers do not bump the version but do set `updated_at`, which is why `resolve`, `put_if` and `delete_if` check both.
+`setup()` applies migration 2, which adds the columns these methods use to the items table in one statement: `version`, `provenance`, `confirmed_at`, `confirmations`, `write_id`, `valid_at` and `confirm_id`. Until it runs, the store works as 0.5 did, and the new methods raise `ValueError` asking for `setup()`. With history off and these methods unused, the store behaves as in 0.5 apart from the new columns. During a rolling upgrade, 0.5 writers do not bump the version but do set `updated_at`, which is why `resolve`, `put_if` and `delete_if` check both.
 
 An application role that did not run `setup()` needs SELECT, INSERT, UPDATE and DELETE on the items and vectors tables, and on the history table when history is on:
 
