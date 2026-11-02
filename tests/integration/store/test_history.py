@@ -4,6 +4,8 @@ With history on, setup() creates the history table, and every put batch
 first copies the live versions it overwrites or deletes there, in the same
 transaction. delete becomes a soft delete; purge() and delete_namespace()
 remove history too. A batch retried after its commit archives nothing twice.
+A version never ends before it was written, and a key's updated_at never
+goes back, even for a transaction whose now() is behind the version it ends.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from langgraph.store.base import PutOp
 from psycopg import Connection
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
-from langchain_cockroachdb.store import MemoryVersion
+from langchain_cockroachdb.store import ConditionalWrite, MemoryRecord, MemoryVersion, keep_all
 from tests.integration.faults import FailAfterCommit
 from tests.integration.store.conftest import seat_index
 
@@ -63,6 +65,40 @@ def history_rows(admin: Connection[Any], store: Any, key: str) -> list[dict[str,
 def retries(caplog: pytest.LogCaptureFixture, label: str) -> list[str]:
     prefix = f"Retrying {label} after "
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+WRITERS = pytest.mark.parametrize("writer", ["put", "reconcile", "put_if"])
+
+
+def move_ahead(store: Any, key: str) -> tuple[str, tuple[str, str]]:
+    """The statement that moves a live memory's updated_at and valid_at an hour ahead.
+
+    CockroachDB fixes now() when a transaction starts. A transaction that is
+    pushed past a later writer, and refreshes its reads, can end that
+    writer's version with a now() earlier than the version's updated_at.
+    A version an hour ahead of the clock stands in for it. A memory with no
+    valid time keeps none.
+    """
+    return (
+        f"UPDATE {store.sql.items} SET updated_at = updated_at + INTERVAL '1 hour', "
+        "valid_at = valid_at + INTERVAL '1 hour' WHERE prefix = %s AND key = %s",
+        (PREFIX, key),
+    )
+
+
+def check_never_back_in_time(
+    old: MemoryVersion, before: MemoryRecord, new: MemoryRecord | None
+) -> None:
+    """Check the history row and live memory a write left after replacing ``before``."""
+    assert (old.version, old.value, old.reason) == (1, WINDOW, "overwritten")
+    assert old.written_at == before.item.updated_at
+    assert old.ended_at >= old.written_at
+    assert old.invalid_at is not None and old.invalid_at >= old.valid_at
+    assert new is not None and (new.version, new.item.value) == (2, AISLE)
+    assert new.item.updated_at >= before.item.updated_at
+    # The archive and the write ran in one transaction, and the old memory
+    # had no valid time of its own, so its fact ended when the store replaced it
+    assert old.ended_at == new.item.updated_at == old.invalid_at
 
 
 def test_put_over_an_existing_key_keeps_the_old_version(store_factory, admin, mode) -> None:
@@ -372,6 +408,32 @@ def test_a_batch_archives_every_key_it_overwrites_or_deletes(store_factory, admi
     assert a["write_id"] is not None and a["write_id"] == b["write_id"]
 
 
+@WRITERS
+def test_a_write_whose_clock_is_behind_never_goes_back_in_time(
+    store_factory, admin, mode, writer
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", WINDOW)
+    assert admin.execute(*move_ahead(store, "k")).rowcount == 1
+    before = store.record(NS, "k")
+    assert before is not None
+
+    if writer == "put":
+        store.put(NS, "k", AISLE)
+    elif writer == "reconcile":
+        assert store.reconcile(NS, "k", AISLE, policy=keep_all()).new == "written"
+    else:
+        assert store.put_if(NS, "k", AISLE, expected=before).applied
+
+    [old] = store.history(NS, "k")
+    new = store.record(NS, "k")
+    check_never_back_in_time(old, before, new)
+    # The version moved, so a put_if from the record read before the write is
+    # refused, even where updated_at stayed where it was
+    stale = store.put_if(NS, "k", VEGETARIAN, expected=before)
+    assert stale == ConditionalWrite(applied=False, key="k", version=None, current=new)
+
+
 @pytest.mark.timeout(240)
 def test_parallel_setup_with_history_converges(libpq_url, table_name, admin) -> None:
     # Four processes starting together create the history table and change
@@ -484,3 +546,27 @@ async def test_async_from_conn_string_takes_history(libpq_url, table_name, aadmi
         )
         [row] = await cur.fetchall()
         assert 7 * 86400 - 600 < float(row["left_seconds"]) <= 7 * 86400
+
+
+@WRITERS
+async def test_an_async_write_whose_clock_is_behind_never_goes_back_in_time(
+    astore_factory, aadmin, mode, writer
+) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())
+    await store.aput(NS, "k", WINDOW)
+    assert (await aadmin.execute(*move_ahead(store, "k"))).rowcount == 1
+    before = await store.arecord(NS, "k")
+    assert before is not None
+
+    if writer == "put":
+        await store.aput(NS, "k", AISLE)
+    elif writer == "reconcile":
+        assert (await store.areconcile(NS, "k", AISLE, policy=keep_all())).new == "written"
+    else:
+        assert (await store.aput_if(NS, "k", AISLE, expected=before)).applied
+
+    [old] = await store.ahistory(NS, "k")
+    new = await store.arecord(NS, "k")
+    check_never_back_in_time(old, before, new)
+    stale = await store.aput_if(NS, "k", VEGETARIAN, expected=before)
+    assert stale == ConditionalWrite(applied=False, key="k", version=None, current=new)

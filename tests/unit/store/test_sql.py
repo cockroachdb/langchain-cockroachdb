@@ -491,6 +491,23 @@ def test_upsert_without_a_write_id_keeps_the_0_5_1_text() -> None:
     assert params == ["user.a", "k", "{}", None, "user.a", "j", "{}", 5.0]
 
 
+def test_an_update_never_moves_updated_at_back() -> None:
+    # now() is fixed when a transaction starts. A transaction pushed past a
+    # later writer could give the key an updated_at older than the version
+    # it replaces, so the update keeps the later of the two
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    for history in (False, True):
+        query, params = sql.upsert_items(rows, write_id="w-1", history=history)
+        assert "\n    updated_at = GREATEST(now(), public.store.updated_at),\n" in query
+        assert "updated_at = now()" not in query
+        assert params == ["w-1", *rows[0]]
+    # Until setup() applies migration 2, puts still send the 0.5.1 statement
+    plain, _ = sql.upsert_items([("user.a", "k", "{}", None)])
+    assert "\n    updated_at = now(),\n" in plain
+    assert "GREATEST" not in plain
+
+
 def test_delete_items():
     """delete_items() builds DELETE with prefix and key list."""
     sql = StoreSQL("public", "store", index=None)
@@ -1209,6 +1226,36 @@ def test_archive_never_ends_a_version_before_it_began() -> None:
         in query
     )
     assert params[0] == WHEN
+
+
+def test_no_history_row_ends_before_it_was_written() -> None:
+    sql = StoreSQL("public", "store")
+    query, _ = sql.archive(
+        "user.alice",
+        ["k"],
+        reason="overwritten",
+        superseded_by=None,
+        invalid_at=None,
+        write_id="w-1",
+        ttl_days=None,
+    )
+    # written_at is the version's updated_at. A transaction pushed past the
+    # writer of that version still has the now() it started with, which can
+    # be earlier, so ended_at is the later of the two
+    assert "\n    updated_at, GREATEST(now(), updated_at),\n" in query
+    # A late fact recorded straight into history is written and ended at one now()
+    late, _ = sql.history_insert_superseded(
+        "user.alice",
+        "late-key",
+        value_json="{}",
+        provenance_json=None,
+        valid_at=WHEN,
+        invalid_at=WHEN,
+        superseded_by="newer-key",
+        write_id="w-1",
+        ttl_days=None,
+    )
+    assert "GREATEST(p.invalid_at, p.valid_at), now(), now()," in late
 
 
 def test_history_insert_superseded_binds_everything() -> None:

@@ -441,6 +441,12 @@ WHERE {where}"""
         update bumps the row's version. A row that already carries the write
         id is left as it is, so a batch retried after its commit changes nothing.
 
+        With a write id, an update keeps the row's updated_at when it is
+        later than now(), so a key's updated_at never goes back. now() is
+        fixed when a transaction starts, and a transaction pushed past a
+        later writer can still overwrite that writer's row. The 0.5
+        statement sets now(), as 0.5 did.
+
         Confirmations belong to the fact, not the key: an update that changes
         the value starts confirmations and confirmed_at again from none,
         while an exact re-save of the live value keeps them. A memory that
@@ -535,7 +541,7 @@ SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 mi
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key) DO UPDATE SET
     value = EXCLUDED.value,
-    updated_at = now(),
+    updated_at = GREATEST(now(), {self.items}.updated_at),
     expires_at = EXCLUDED.expires_at,
     ttl_minutes = EXCLUDED.ttl_minutes,
     provenance = EXCLUDED.provenance,
@@ -1094,8 +1100,9 @@ LIMIT %s OFFSET %s"""
     def now() -> tuple[str, list]:
         """The statement that reads the database's clock, as ``now``.
 
-        In a transaction it reads the transaction's timestamp, which is also
-        the updated_at of every row the transaction writes.
+        In a transaction it reads the transaction's timestamp. That is also
+        the updated_at of every row the transaction writes, unless it
+        overwrites a row whose updated_at is later, which the row keeps.
         """
         return ("SELECT now() AS now", [])
 
@@ -1413,8 +1420,11 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
         overwrites or deletes the items. It copies each live item of ``keys``
         with its version, value, provenance, valid time (``updated_at`` when
         the row has none), confirmations and confirmed_at, and records when
-        the store wrote it, when the version ended (now), why, and what
-        replaced it. Rows that already carry ``write_id`` were written by this
+        the store wrote it (its updated_at), when the version ended, why, and
+        what replaced it. The version ends now, but never before it was
+        written: now() is fixed when the transaction starts, and a
+        transaction pushed past the version's writer can have an earlier
+        one. Rows that already carry ``write_id`` were written by this
         batch, in an attempt that committed before its result was lost, so
         they are not old versions and are left out. A version already in
         history is left as it is, so a retried attempt never adds a row twice.
@@ -1437,7 +1447,7 @@ WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
         sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmations, confirmed_at, write_id, expires_at)
 SELECT prefix, key, version, value, provenance, COALESCE(valid_at, updated_at),
     GREATEST(COALESCE(CAST(%s AS TIMESTAMPTZ), now()), COALESCE(valid_at, updated_at)),
-    updated_at, now(),
+    updated_at, GREATEST(now(), updated_at),
     CAST(%s AS STRING), CAST(%s AS STRING), confirmations, confirmed_at, CAST(%s AS UUID),
     now() + CAST(%s AS DECIMAL) * INTERVAL '1 day'
 FROM {self.items}
