@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Document virtual-cluster connection URLs for engines, chat history and checkpointers, including percent-encoding startup options shared by SQLAlchemy and libpq.
+
 ## [0.5.1] - 2026-10-28
 
 ### Fixed

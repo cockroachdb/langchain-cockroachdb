@@ -2,6 +2,10 @@
 
 Isolate documents by namespace within a single table for multi-tenant applications.
 
+Namespaces scope vector-store operations inside a database. To select an
+application virtual cluster through the connection URL, see
+[Virtual-cluster connections](virtual-clusters.md).
+
 ## Overview
 
 Multi-tenancy lets multiple tenants share the same vector store table while keeping their data completely isolated. Each tenant's documents are invisible to other tenants during search, retrieval, and deletion.

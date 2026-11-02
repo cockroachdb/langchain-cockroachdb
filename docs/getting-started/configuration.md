@@ -2,6 +2,9 @@
 
 Learn how to configure langchain-cockroachdb for different workloads.
 
+For an existing virtualized deployment, see [Virtual-cluster connections](../guides/virtual-clusters.md)
+for URL routing with `options=-ccluster=main`.
+
 ## Engine Configuration
 
 ### Basic Configuration

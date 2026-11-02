@@ -8,6 +8,15 @@ REST = "root@localhost:26257/defaultdb?sslmode=disable"
 
 
 @pytest.mark.parametrize(
+    "rest",
+    [
+        REST,
+        "app:p%40ss%2Bword@localhost:26257/agents?sslmode=verify-full&options=-ccluster%3Dmain",
+        "app@localhost:26257/agents?options=-ccluster%3Dmain%20-cstatement_timeout%3D5000"
+        "&sslmode=verify-full&application_name=agent%2Bresearch",
+    ],
+)
+@pytest.mark.parametrize(
     "scheme",
     [
         "cockroachdb",
@@ -21,9 +30,9 @@ REST = "root@localhost:26257/defaultdb?sslmode=disable"
         "postgres+psycopg2",
     ],
 )
-def test_every_spelling_maps_to_the_psycopg3_dialect(scheme: str) -> None:
-    assert to_sqlalchemy_url(f"{scheme}://{REST}") == f"cockroachdb+psycopg://{REST}"
-    assert to_libpq_url(f"{scheme}://{REST}") == f"postgresql://{REST}"
+def test_every_spelling_maps_to_the_psycopg3_dialect(scheme: str, rest: str) -> None:
+    assert to_sqlalchemy_url(f"{scheme}://{rest}") == f"cockroachdb+psycopg://{rest}"
+    assert to_libpq_url(f"{scheme}://{rest}") == f"postgresql://{rest}"
 
 
 def test_asyncpg_and_unknown_schemes_pass_through() -> None:
