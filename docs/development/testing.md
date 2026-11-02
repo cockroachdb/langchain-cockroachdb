@@ -42,6 +42,39 @@ These let tests verify that the retry policy handles real CockroachDB errors exa
 
 ## Running Tests
 
+### Provisioned Virtual Clusters
+
+`tests/integration/test_virtual_cluster_deployment.py` is an opt-in suite for
+two disposable application virtual clusters. It accepts their complete SQL
+URLs, including the supplied TLS and routing parameters. It does not start a
+testcontainer, provision resources, change users, or alter network access.
+
+The tests write different values under identical table names, document IDs,
+session IDs, and checkpoint IDs on both targets. They check vector insert,
+lookup, search and deletion, chat persistence and clearing, and sync/async
+checkpoint and pending-write round trips. Removing data from the first
+target must leave the peer's data intact. Randomly named tables and threads
+are cleaned up after the run; existing application data is not targeted.
+Checkpointer setup leaves its normal tables and migrations in place.
+
+Set `COCKROACHDB_VIRTUAL_CLUSTER_URL` and
+`COCKROACHDB_VIRTUAL_CLUSTER_PEER_URL` to two separate test virtual clusters.
+For managed Cloud deployments, obtain each virtual cluster's SQL URL from
+its own Connect dialog. A dedicated host's console URL is not a SQL endpoint.
+For self-hosted virtualization, retain the URL's cluster-routing options.
+The SQL users need permission to create and drop the test tables and set up
+checkpoint tables in the chosen databases.
+
+Keep credentials in a local, ignored `.env.local` file, then run:
+
+```bash
+uv run --no-sync --env-file .env.local pytest tests/integration/test_virtual_cluster_deployment.py -v
+```
+
+Without both variables the four tests skip, including in regular CI. Never
+commit URLs containing passwords. No model API keys are used. Run this suite
+against designated test targets because it creates and removes its own data.
+
 ### All Tests
 
 ```bash
