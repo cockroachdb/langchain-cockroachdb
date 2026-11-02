@@ -24,6 +24,7 @@ tests/
 │   ├── test_checkpointer_faults.py # Checkpointer resilience
 │   ├── test_checkpointer_conformance.py # LangGraph standard tests
 │   ├── test_graph_process_recovery.py # Full graph recovery after process loss
+│   ├── test_graph_connection_recovery.py # Connection replacement and explicit resume
 │   ├── graph_recovery_worker.py      # Spawned sync and async applications
 │   └── faults.py                   # Fault injection mechanisms
 └── e2e/
@@ -98,6 +99,53 @@ installed, including CI's minimum runtime dependency job. No model API keys
 are needed. The database stays online throughout: database restarts, physical
 cluster replication, failover, and recovery-time measurements require
 separate infrastructure and are not covered here.
+
+## Graph Recovery After Connection Loss
+
+`test_graph_connection_recovery.py` runs a deterministic two-node LangGraph
+workflow with sync and async pooled checkpointers. A completed preparation node
+arms the test cursor to close its own checked-out connection immediately before
+the next checkpoint INSERT. Psycopg raises the closed-connection error during
+normal execution. This fault uses client-side connection closure: it does not
+simulate a network partition, terminate server sessions, or restart a database.
+It needs no unsafe CockroachDB internals or server administration privileges.
+
+Each Python API has two cases:
+
+- One closed connection is replaced by the pool, and the saver retries the
+  checkpoint without failing the graph invocation.
+- Three consecutive closed connections exhaust a policy of three total attempts.
+  The graph invocation raises the driver error. The test verifies the exact
+  number of closed connections, two retry warnings, and one exhaustion warning.
+  It then reads the durable input checkpoint and the preparation node's pending
+  writes before explicitly resuming the graph with `invoke(None, config)` or
+  `ainvoke(None, config)`.
+
+Both cases verify the final persisted state and exactly one execution of each
+node. The pool is capped at one connection to make replacement observable;
+concurrent pool usage is covered separately by the process-recovery tests.
+Each test uses `durability="sync"`, an independent random thread ID, and only
+deletes its own thread's data. No model calls or fixed sleeps select the failure
+boundary.
+
+The no-replay assertion applies to a node whose pending writes already committed.
+If an external tool succeeds before its pending writes commit, an application
+failure can still cause that tool to run again. Applications need idempotency
+keys or reconciliation for those effects. These tests also do not establish
+recovery guarantees for ambiguous commits, real network outages, or database
+failover.
+
+Run the four cases on a disposable CockroachDB instance:
+
+```bash
+USE_TESTCONTAINER=false \
+COCKROACHDB_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' \
+.venv/bin/pytest tests/integration/test_graph_connection_recovery.py -v
+```
+
+The tests require the development `langgraph` dependency and skip when it is
+absent. They use the normal integration fixtures and work without paid model
+credentials.
 
 ## Running Tests
 
