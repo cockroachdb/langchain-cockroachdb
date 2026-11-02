@@ -42,6 +42,18 @@ _RECONCILE_COLUMNS = (
 # past their history TTL
 HISTORY_TTL_CRON = "@hourly"
 
+# The job types of a schema change on a table, and the states of such a job
+# that is not done yet, as SHOW JOBS reports them
+SCHEMA_CHANGE_JOB_TYPES = ("SCHEMA CHANGE", "NEW SCHEMA CHANGE")
+UNFINISHED_JOB_STATES = (
+    "pending",
+    "running",
+    "paused",
+    "pause-requested",
+    "cancel-requested",
+    "reverting",
+)
+
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
 # more uses the exact one-statement form instead, so the lookup, the array
@@ -207,6 +219,31 @@ class StoreSQL:
             "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
             "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)",
             [len(_RECONCILE_COLUMNS), self.items, list(_RECONCILE_COLUMNS)],
+        )
+
+    def schema_changes_running(self) -> tuple[str, list]:
+        """The statement that counts the schema change jobs on the items table not done yet, as ``running``.
+
+        setup() reads it once migration 2's columns are public, before it
+        records the migration. SHOW JOBS lists no descriptor ids on v25.4,
+        so a job is matched by the start of its description, which is its
+        statement: ALTER TABLE and the table's qualified name, the values
+        bound. SHOW JOBS shortens a description to about its first 60
+        characters, so a long qualified name may be cut from it, and a role
+        without admin sees only its own jobs. Then no job is found, and
+        setup()'s column check alone guards.
+        """
+        return (
+            "SELECT count(*) AS running FROM [SHOW JOBS]\n"
+            "WHERE job_type = ANY(CAST(%s AS STRING[])) AND status = ANY(CAST(%s AS STRING[]))\n"
+            "AND strpos(description, "
+            "CAST(%s AS STRING) || quote_ident(current_database()) || CAST(%s AS STRING)) = 1",
+            [
+                list(SCHEMA_CHANGE_JOB_TYPES),
+                list(UNFINISHED_JOB_STATES),
+                "ALTER TABLE ",
+                f".{self.items.lower()} ",
+            ],
         )
 
     def vector_statements(self) -> list[str]:

@@ -40,6 +40,11 @@ from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
 from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
+from langchain_cockroachdb.retry import (
+    SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_SETTLE_SECONDS,
+    RetryPolicy,
+)
 from langchain_cockroachdb.store.config import (
     DEFAULT_RECONCILE_SCAN_LIMIT,
     ResolvedHistory,
@@ -96,6 +101,10 @@ DEFAULT_COSINE_THRESHOLD = 0.8
 
 # Why a memory is a candidate, strongest reason first
 _REASON_RANK = {"key": 0, "slot": 1, "similar": 2}
+
+# How setup() paces its checks while it waits for another process's
+# migration: RetryPolicy's default backoff, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+_SETTLE_PACE = RetryPolicy(max_backoff=SCHEMA_CHANGE_BUSY_MAX_BACKOFF)
 
 
 def _check_paging(limit: int, offset: int) -> None:
@@ -1272,6 +1281,9 @@ class BaseCockroachDBStore:
     # after that the next write reads the schema again. What was found is
     # trusted for good.
     _SCHEMA_RECHECK_SECONDS: ClassVar[float] = 60.0
+    # Seconds setup() waits for another process to finish migration 2
+    # before it gives up
+    _MIGRATION_SETTLE_SECONDS: ClassVar[float] = SCHEMA_CHANGE_SETTLE_SECONDS
 
     sql: StoreSQL
     index: ResolvedIndex | None
@@ -1787,6 +1799,43 @@ class BaseCockroachDBStore:
                 )
             )
         return statements, to_embed, lookups
+
+    @staticmethod
+    def _columns_public(found: list[list[Any]]) -> bool:
+        """Whether the column check, as _read_all returns it, found migration 2's columns."""
+        [[columns]] = found
+        return bool(columns["ready"])
+
+    @staticmethod
+    def _schema_changes_done(found: list[list[Any]]) -> bool:
+        """Whether the job check, as _read_all returns it, found no schema change job left."""
+        [[jobs]] = found
+        return bool(jobs["running"] == 0)
+
+    def _start_migration_wait(self) -> float:
+        """Log that setup() waits for another process's migration 2, and return its deadline."""
+        self._log.info(
+            "Another process is still applying migration 2 to %s. setup() waits for it, "
+            "for up to %g seconds, before it records the migration.",
+            self.sql.items,
+            self._MIGRATION_SETTLE_SECONDS,
+        )
+        return time.monotonic() + self._MIGRATION_SETTLE_SECONDS
+
+    def _settle_pause(self, check: int, deadline: float) -> float:
+        """Seconds to wait before checking again whether migration 2 is in place.
+
+        Raises:
+            TimeoutError: Once ``deadline`` has passed
+        """
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(
+                f"Another process is still applying migration 2 to {self.sql.items}: "
+                f"setup() waited {self._MIGRATION_SETTLE_SECONDS:g} seconds for it. "
+                "Run setup() again."
+            )
+        return min(_SETTLE_PACE.delay(check), left)
 
     def _check_vector_index(self, create_statement: str) -> None:
         """Compare the vectors table and its index with the store's configuration.

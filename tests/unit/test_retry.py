@@ -17,9 +17,10 @@ from langchain_cockroachdb.retry import (
     DEFAULT_RETRY_POLICY,
     DEFINITE_ABORT_SQLSTATES,
     RETRYABLE_SQLSTATES,
-    SCHEMA_CHANGE_BUSY_ATTEMPTS,
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_BUSY_SECONDS,
     SCHEMA_CHANGE_BUSY_SQLSTATE,
+    SCHEMA_CHANGE_SETTLE_SECONDS,
     RetryPolicy,
     async_retry_with_backoff,
     get_sqlstate,
@@ -858,23 +859,27 @@ class TestSchemaChangePolicy:
 
     def test_the_busy_error_has_a_budget_of_its_own(self) -> None:
         # Waiting for another schema change outlasts a transient error, so the
-        # busy error is retried past the policy's own max_attempts
-        assert RetryPolicy().max_attempts < SCHEMA_CHANGE_BUSY_ATTEMPTS
+        # busy error is retried past the policy's own max_attempts, until its
+        # pauses add up to SCHEMA_CHANGE_BUSY_SECONDS
         policy = schema_change_policy(RetryPolicy(max_attempts=3, initial_backoff=0.1, jitter=0.0))
         calls, pauses, _ = failing_run(policy, [busy()])
-        assert calls == SCHEMA_CHANGE_BUSY_ATTEMPTS
-        # Its backoff grows as the policy's does, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+        assert calls == len(pauses) + 1 > 3
+        assert sum(pauses) == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+        # Its backoff grows as the policy's does, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+        # and the last pause ends with the budget
         assert pauses[:5] == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6])
-        assert max(pauses) == SCHEMA_CHANGE_BUSY_MAX_BACKOFF
-        assert pauses == sorted(pauses)
+        assert set(pauses[5:-1]) == {SCHEMA_CHANGE_BUSY_MAX_BACKOFF}
+        assert 0 < pauses[-1] <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF
 
-    def test_the_busy_budget_lasts_about_a_minute_under_the_default_policy(self) -> None:
-        # Without jitter each pause is the longest it can be. Jitter takes up
-        # to half of each one
-        calls, pauses, _ = failing_run(schema_change_policy(RetryPolicy(jitter=0.0)), [busy()])
-        assert calls == SCHEMA_CHANGE_BUSY_ATTEMPTS
-        longest = sum(pauses)
-        assert longest / 2 >= 30 and longest <= 120
+    def test_the_busy_budget_matches_the_settle_wait(self) -> None:
+        # A TTL change waits out a schema change as long as setup() waits for
+        # another process's migration: about ten minutes. Jitter changes the
+        # pauses, not how long they last in all
+        assert SCHEMA_CHANGE_BUSY_SECONDS == SCHEMA_CHANGE_SETTLE_SECONDS == 600
+        assert SCHEMA_CHANGE_BUSY_MAX_BACKOFF == 3
+        calls, pauses, _ = failing_run(schema_change_policy(RetryPolicy()), [busy()])
+        assert sum(pauses) == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+        assert max(pauses) <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF
 
     def test_other_errors_keep_the_policys_own_attempts_and_backoff(self) -> None:
         policy = schema_change_policy(
@@ -888,9 +893,10 @@ class TestSchemaChangePolicy:
         assert (calls, raised) == (8, transient)
         assert pauses == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 0.1, 0.15])
         # Transient errors first do not use up the busy error's budget either
-        calls, _, raised = failing_run(policy, [transient] * 2 + [busy()])
-        assert calls == 2 + SCHEMA_CHANGE_BUSY_ATTEMPTS
+        calls, pauses, raised = failing_run(policy, [transient] * 2 + [busy()])
         assert is_schema_change_busy(raised)
+        assert pauses[:2] == [0.1, 0.15]
+        assert sum(pauses[2:]) == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
         # An error the policy does not retry is raised at once, after busy errors too
         syntax = server_error("42601")
         calls, _, raised = failing_run(policy, [busy(), syntax])
@@ -898,52 +904,62 @@ class TestSchemaChangePolicy:
 
     def test_the_busy_budget_can_be_set(self) -> None:
         policy = schema_change_policy(
-            RetryPolicy(initial_backoff=0.1, jitter=0.0), attempts=6, max_backoff=0.5
+            RetryPolicy(initial_backoff=0.1, jitter=0.0), seconds=2.0, max_backoff=0.5
         )
         calls, pauses, _ = failing_run(policy, [busy()])
-        assert (calls, pauses) == (6, pytest.approx([0.1, 0.2, 0.4, 0.5, 0.5]))
-        # A policy with more attempts than the budget keeps them for the busy error
-        roomy = schema_change_policy(RetryPolicy(max_attempts=40, initial_backoff=0.0))
-        assert failing_run(roomy, [busy()])[0] == 40
+        assert (calls, pauses) == (7, pytest.approx([0.1, 0.2, 0.4, 0.5, 0.5, 0.3]))
+        # A policy without backoff still pauses for a busy schema change, from
+        # RetryPolicy's default initial backoff
+        eager = schema_change_policy(RetryPolicy(initial_backoff=0.0, jitter=0.0), seconds=1.0)
+        assert failing_run(eager, [busy()])[1] == pytest.approx([0.1, 0.2, 0.4, 0.3])
         # A backoff cap below the policy's initial backoff gives way to it
         slow = schema_change_policy(RetryPolicy(initial_backoff=2.0, jitter=0.0), max_backoff=0.5)
         assert set(failing_run(slow, [busy()])[1]) == {2.0}
-        for attempts in (0, -1, 1.5, True):
-            with pytest.raises(ValueError, match="attempts"):
-                schema_change_policy(RetryPolicy(), attempts=attempts)  # type: ignore[arg-type]
+        # No seconds, no busy retries
+        none = schema_change_policy(RetryPolicy(), seconds=0)
+        assert failing_run(none, [busy()])[:2] == (1, [])
+        for seconds in (-1.0, math.nan, math.inf):
+            with pytest.raises(ValueError, match="seconds"):
+                schema_change_policy(RetryPolicy(), seconds=seconds)
         for max_backoff in (-0.1, math.nan, math.inf):
             with pytest.raises(ValueError, match="max_backoff"):
                 schema_change_policy(RetryPolicy(), max_backoff=max_backoff)
 
     async def test_async_runs_keep_the_same_budgets(self) -> None:
         policy = schema_change_policy(RetryPolicy(max_attempts=2, initial_backoff=0.0))
-        for error, expected in ((busy(), SCHEMA_CHANGE_BUSY_ATTEMPTS), (server_error("40001"), 2)):
+        for error in (busy(), server_error("40001")):
             calls = 0
+            pauses: list[float] = []
 
             async def attempt(error: BaseException = error) -> None:
                 nonlocal calls
                 calls += 1
                 raise error
 
-            async def no_sleep(seconds: float) -> None:
-                pass
+            async def no_sleep(seconds: float, pauses: list[float] = pauses) -> None:
+                pauses.append(seconds)
 
             with pytest.raises(psycopg.Error):
                 await policy.arun(attempt, label="ttl", sleep=no_sleep)
-            assert calls == expected
+            if is_schema_change_busy(error):
+                assert sum(pauses) == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+            else:
+                assert calls == 2
 
     def test_busy_retries_log_the_busy_budget(self, caplog: pytest.LogCaptureFixture) -> None:
-        policy = schema_change_policy(RetryPolicy(initial_backoff=0.0))
+        policy = schema_change_policy(RetryPolicy(jitter=0.0), seconds=1.0)
         with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
             failing_run(policy, [busy()])
         messages = [record.getMessage() for record in caplog.records]
-        assert f"attempt 1 of {SCHEMA_CHANGE_BUSY_ATTEMPTS} failed" in messages[0]
-        assert f"Giving up on ttl after {SCHEMA_CHANGE_BUSY_ATTEMPTS} attempts" in messages[-1]
+        assert "attempt 1 failed, next try in 0.10s, 0.0s of 1s waited" in messages[0]
+        assert messages[-1].startswith("Giving up on ttl after 5 attempts and 1s of waiting")
 
     def test_the_budget_defaults_are_exported(self) -> None:
-        for name in ("SCHEMA_CHANGE_BUSY_ATTEMPTS", "SCHEMA_CHANGE_BUSY_MAX_BACKOFF"):
+        for name in (
+            "SCHEMA_CHANGE_BUSY_SECONDS",
+            "SCHEMA_CHANGE_BUSY_MAX_BACKOFF",
+            "SCHEMA_CHANGE_SETTLE_SECONDS",
+        ):
             assert name in langchain_cockroachdb.__all__
-        assert langchain_cockroachdb.SCHEMA_CHANGE_BUSY_ATTEMPTS == SCHEMA_CHANGE_BUSY_ATTEMPTS
-        assert (
-            langchain_cockroachdb.SCHEMA_CHANGE_BUSY_MAX_BACKOFF == SCHEMA_CHANGE_BUSY_MAX_BACKOFF
-        )
+            assert getattr(langchain_cockroachdb, name) == globals()[name]
+        assert not hasattr(langchain_cockroachdb, "SCHEMA_CHANGE_BUSY_ATTEMPTS")

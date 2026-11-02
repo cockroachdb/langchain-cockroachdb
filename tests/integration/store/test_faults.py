@@ -10,6 +10,7 @@ caller's own transaction to the caller.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import threading
@@ -33,7 +34,7 @@ from tests.integration.faults import (
     wait_for_statement,
 )
 from tests.integration.store.conftest import FAST
-from tests.integration.store.test_schema_upgrade import schema_0_5
+from tests.integration.store.test_schema_upgrade import NS, schema_0_5
 
 DIMS = 4
 EMBEDDINGS = DeterministicFakeEmbedding(size=DIMS)
@@ -543,3 +544,126 @@ async def test_async_parallel_setup_converges_while_migration_2_backfills(
     stores = await asyncio.wait_for(asyncio.gather(*(run() for _ in range(6))), 240)
     assert len(stores) == 6
     await asyncio.to_thread(assert_upgraded_once, libpq_url, stores[0])
+
+
+# A setup() whose migration 2 statement meets the same migration still
+# backfilling in another process gets an answer at once, before the columns
+# exist. It must wait for that migration before it records migration 2.
+STORE_LOGGER = "langchain_cockroachdb.store"
+WAITING = "is still applying migration 2"
+
+
+def migration_2_recorded(conn: Connection[Any], store: Any) -> bool:
+    row = conn.execute(
+        f"SELECT EXISTS (SELECT 1 FROM {store.sql.migrations_table} WHERE v = 2)"
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def write_id_usable(conn: Connection[Any], store: Any) -> bool:
+    try:
+        conn.execute(f"SELECT write_id FROM {store.sql.items} LIMIT 0")
+    except psycopg.errors.UndefinedColumn:
+        return False
+    return True
+
+
+def wait_for_backfill(libpq_url: str, store: Any, seconds: float = 10.0) -> bool:
+    """Wait until a schema change job runs on the store's items table, and say if one did."""
+    sql, params = store.sql.schema_changes_running()
+    deadline = time.monotonic() + seconds
+    with psycopg.connect(libpq_url, autocommit=True) as conn:
+        while time.monotonic() < deadline:
+            row = conn.execute(sql, params).fetchone()
+            if row is not None and row[0] > 0:
+                return True
+            time.sleep(0.05)
+    return False
+
+
+@pytest.mark.timeout(300)
+def test_a_setup_that_did_not_run_migration_2_waits_before_recording_it(
+    libpq_url, table_name, caplog
+) -> None:
+    # Two processes start on 0.6.0 over a 0.5 table that holds data. The
+    # second one's migration statement returns while the first one is still
+    # backfilling. A store that finds migration 2 recorded writes its columns
+    # at once, so it must not be recorded before they can be used
+    build_0_5_table(libpq_url, table_name)
+    settings = {"index": index_config(), "table_name": table_name}
+    # (migration 2 recorded, its columns usable), as a third process sees them
+    seen: list[tuple[bool, bool]] = []
+    stop = threading.Event()
+
+    def setup() -> None:
+        with CockroachDBStore.from_conn_string(libpq_url, **settings) as store:
+            store.setup()
+
+    def watch(store: Any) -> None:
+        with psycopg.connect(libpq_url, autocommit=True) as conn:
+            while not stop.is_set():
+                recorded = migration_2_recorded(conn, store)
+                seen.append((recorded, write_id_usable(conn, store)))
+                time.sleep(0.05)
+
+    with (
+        caplog.at_level(logging.INFO, logger=STORE_LOGGER),
+        CockroachDBStore.from_conn_string(libpq_url, **settings) as reader,
+        concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool,
+    ):
+        watcher = pool.submit(watch, reader)
+        try:
+            first = pool.submit(setup)
+            # The second starts once the first one's backfill runs. That takes
+            # seconds, so a second at most is early enough without the job
+            wait_for_backfill(libpq_url, reader, seconds=1.0)
+            second = pool.submit(setup)
+            concurrent.futures.wait([first, second], return_when=concurrent.futures.FIRST_COMPLETED)
+            # A store created as soon as either setup() returns writes with the
+            # migration 2 statements
+            with CockroachDBStore.from_conn_string(libpq_url, **settings) as store:
+                store.put(NS, "k", {"text": "hello"})
+            first.result()
+            second.result()
+        finally:
+            stop.set()
+        watcher.result()
+
+    # The setup() that did not run the backfill waited for it
+    assert any(WAITING in record.getMessage() for record in caplog.records)
+    assert seen[0] == (False, False) and seen[-1] == (True, True)
+    assert (True, False) not in seen
+    with psycopg.connect(libpq_url, autocommit=True) as conn:
+        row = conn.execute(
+            f"SELECT write_id FROM {reader.sql.items} WHERE prefix = %s AND key = %s",
+            (".".join(NS), "k"),
+        ).fetchone()
+    assert row is not None and row[0] is not None
+
+
+@pytest.mark.timeout(300)
+def test_the_migration_wait_sees_a_backfill_running(libpq_url, table_name) -> None:
+    # The checks setup() waits on, during a real backfill: the job is found
+    # in SHOW JOBS and the columns are not public until it is done
+    build_0_5_table(libpq_url, table_name)
+    with CockroachDBStore.from_conn_string(
+        libpq_url, index=index_config(), table_name=table_name
+    ) as store:
+        migration = store.sql.migrations()[2]
+
+        def run_migration() -> None:
+            with psycopg.connect(libpq_url, autocommit=True) as conn:
+                conn.execute(migration)
+
+        backfill = threading.Thread(target=run_migration)
+        backfill.start()
+        checks = [store.sql.schema_changes_running(), store.sql.reconcile_columns_exist()]
+        seen = []
+        while backfill.is_alive():
+            [[jobs], [columns]] = store._read_all(checks, "test")
+            seen.append((jobs["running"], columns["ready"]))
+            time.sleep(0.1)
+        backfill.join()
+        [[jobs], [columns]] = store._read_all(checks, "test")
+    assert any(running >= 1 and not ready for running, ready in seen), seen
+    assert (jobs["running"], columns["ready"]) == (0, True)

@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -72,7 +73,7 @@ from langchain_cockroachdb.store.reconcile import (
     Policy,
     ReconcileResult,
 )
-from langchain_cockroachdb.store.sql import TTLChange, VectorRow
+from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, TTLChange, VectorRow
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +300,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         MUST be called the first time the store is used. Safe to run from
         several processes at once: every migration is idempotent and versions
-        are recorded with ON CONFLICT DO NOTHING. With an index, it creates
+        are recorded with ON CONFLICT DO NOTHING. A setup() that finds another
+        process still applying migration 2 waits for it, for up to
+        SCHEMA_CHANGE_SETTLE_SECONDS, before it records the migration, so no
+        store writes the new columns before they exist. With an index, it creates
         the vectors table and its C-SPANN index (unless ``flat``) on every
         call, then checks an existing index against the configuration. With
         history, it creates the history table, and with ``ttl_days`` turns on
@@ -309,10 +313,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         It reads a table's TTL settings first and changes them only when
         they differ from the configuration. On CockroachDB v25.4 a TTL
         change fails while another schema change runs on the same table,
-        such as migration 2 run by another setup(). That error is retried
-        with the budget that schema_change_policy gives it, about a minute
-        by default, even if the policy's ``retry_on`` would refuse it;
-        ``max_attempts=1`` turns this off.
+        such as a vector index that another setup() builds. That error is
+        retried with the budget that schema_change_policy gives it, up to
+        ten minutes by default, even if the policy's ``retry_on`` would
+        refuse it; ``max_attempts=1`` turns this off.
 
         An application role that did not run setup() needs SELECT, INSERT,
         UPDATE and DELETE on the store's items and vectors tables, and on
@@ -332,6 +336,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             ValueError: If the vectors table exists with other dims, or its
                 index uses another distance. A different partition size, or
                 an index while ``flat`` is set, logs a WARNING instead.
+            TimeoutError: If another process is still applying migration 2
+                after SCHEMA_CHANGE_SETTLE_SECONDS. Run setup() again.
         """
         migrations = self.sql.migrations()
         version_sql = self.sql.migration_version()
@@ -353,18 +359,21 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         version = self._retry(init_and_read_version, label="store setup")
 
         for v in range(version + 1, len(migrations)):
+            label = f"store migration {v}"
+            self._run_ddl(migrations[v], label)
+            if v == MIGRATION_RECONCILE:
+                # Another setup() may be applying this migration. The statement
+                # then returns at once, before the columns exist
+                self._wait_for_migration()
 
-            def apply_migration(migration_v: int = v) -> None:
+            def record_migration(migration_v: int = v, label: str = label) -> None:
                 with self._cursor(
-                    timeout=self.retry_policy.ddl_attempt_timeout,
-                    label=f"store migration {migration_v}",
+                    timeout=self.retry_policy.ddl_attempt_timeout, label=label
                 ) as cur:
-                    cur.execute(migrations[migration_v])
-                    self._sync_pipeline()
                     cur.execute(record_sql, (migration_v,))
                     self._sync_pipeline()
 
-            self._retry(apply_migration, label=f"store migration {v}")
+            self._retry(record_migration, label=label)
 
         # A write before setup() may have cached the schema without
         # migration 2. The next write reads it again.
@@ -387,6 +396,54 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         if self._ttl_given:
             for change in self.sql.ttl_changes(self.ttl.cron):
                 self._set_ttl(change, "store TTL setup", policy)
+
+    def _wait_for_migration(self) -> None:
+        """Wait until migration 2 is in place, when another setup() is still applying it.
+
+        CockroachDB runs the migration as a schema change job that backfills
+        the items table. The same statement sent while that job runs returns
+        at once, before the columns exist, and recording migration 2 then
+        would let other stores write columns that are not there. So this
+        returns once the columns are public and no schema change job on the
+        items table is left, the job's last step being to wait until every
+        node uses the columns. For the setup() whose statement ran the job,
+        that is one read of the columns and one of SHOW JOBS. Otherwise it
+        checks again, with backoff up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+        seconds. SHOW JOBS is read only once the columns are public.
+
+        A job is found by its description. SHOW JOBS cuts a long description
+        short, which can cut a long qualified table name, and a role without
+        admin sees only its own jobs. Then no job is found, and the column
+        check alone guards.
+
+        This waits for another process and retries no failed statement, so
+        the retry policy's max_attempts does not shorten it. Each check
+        retries under the policy.
+
+        Raises:
+            TimeoutError: If the migration is not in place after
+                SCHEMA_CHANGE_SETTLE_SECONDS
+        """
+        columns = [self.sql.reconcile_columns_exist()]
+        # Found by the start of its description. A long qualified name may be
+        # cut from it, and another role's job is not shown: the column check
+        # then guards alone
+        jobs = [self.sql.schema_changes_running()]
+        deadline: float | None = None
+        check = 0
+        while not (
+            self._columns_public(self._read_all(columns, "store migration wait"))
+            and self._schema_changes_done(self._read_all(jobs, "store migration wait"))
+        ):
+            if deadline is None:
+                deadline = self._start_migration_wait()
+            self._sleep(self._settle_pause(check, deadline))
+            check += 1
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        """Sleep between the checks of _wait_for_migration."""
+        time.sleep(seconds)
 
     def _set_ttl(self, change: TTLChange, label: str, policy: RetryPolicy) -> None:
         """Turn on a table's row-level TTL, unless it already has those settings.
@@ -1688,7 +1745,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         Safe to run from several processes at once. On CockroachDB v25.4 a
         TTL change fails while another schema change runs on the same table;
         that error is retried with the budget that schema_change_policy
-        gives it, about a minute by default, even if the policy's
+        gives it, up to ten minutes by default, even if the policy's
         ``retry_on`` would refuse it. ``max_attempts=1`` turns this off.
         """
         policy = schema_change_policy(self.retry_policy)

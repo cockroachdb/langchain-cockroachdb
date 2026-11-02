@@ -452,8 +452,8 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
-        retried with the budget that schema_change_policy gives it, about a
-        minute by default, even if the policy's ``retry_on`` would refuse it.
+        retried with the budget that schema_change_policy gives it, up to ten
+        minutes by default, even if the policy's ``retry_on`` would refuse it.
         ``max_attempts=1`` turns this off.
 
         Args:
@@ -471,8 +471,8 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
-        retried with the budget that schema_change_policy gives it, about a
-        minute by default, even if the policy's ``retry_on`` would refuse it.
+        retried with the budget that schema_change_policy gives it, up to ten
+        minutes by default, even if the policy's ``retry_on`` would refuse it.
         ``max_attempts=1`` turns this off.
         """
         policy = schema_change_policy(self.retry_policy)
