@@ -94,16 +94,15 @@ def move_ahead(store: Any, key: str) -> tuple[str, tuple[str, str]]:
     )
 
 
-def check_never_back_in_time(
-    old: MemoryVersion, before: MemoryRecord, new: MemoryRecord | None
-) -> None:
-    """Check the history row and live memory a write left after replacing ``before``."""
+HISTORY = pytest.mark.parametrize("history", [False, True], ids=["no-history", "history"])
+
+
+def check_never_back_in_time(old: MemoryVersion, before: MemoryRecord, new: MemoryRecord) -> None:
+    """Check the history row a write left when it replaced ``before`` with ``new``."""
     assert (old.version, old.value, old.reason) == (1, WINDOW, "overwritten")
     assert old.written_at == before.item.updated_at
     assert old.ended_at >= old.written_at
     assert old.invalid_at is not None and old.invalid_at >= old.valid_at
-    assert new is not None and (new.version, new.item.value) == (2, AISLE)
-    assert new.item.updated_at >= before.item.updated_at
     # The archive and the write ran in one transaction, and the old memory
     # had no valid time of its own, so its fact ended when the store replaced it
     assert old.ended_at == new.item.updated_at == old.invalid_at
@@ -455,11 +454,12 @@ def test_a_batch_archives_every_key_it_overwrites_or_deletes(store_factory, admi
     assert a["write_id"] is not None and a["write_id"] == b["write_id"]
 
 
+@HISTORY
 @WRITERS
 def test_a_write_whose_clock_is_behind_never_goes_back_in_time(
-    store_factory, admin, mode, writer
+    store_factory, admin, mode, writer, history
 ) -> None:
-    store = store_factory(mode, history=True, index=seat_index())
+    store = store_factory(mode, history=history, index=seat_index())
     store.put(NS, "k", WINDOW)
     assert admin.execute(*move_ahead(store, "k")).rowcount == 1
     before = store.record(NS, "k")
@@ -467,13 +467,47 @@ def test_a_write_whose_clock_is_behind_never_goes_back_in_time(
 
     write_as(writer, store, AISLE)
 
-    [old] = store.history(NS, "k")
     new = store.record(NS, "k")
-    check_never_back_in_time(old, before, new)
+    assert new is not None and (new.version, new.item.value) == (2, AISLE)
+    assert new.item.updated_at >= before.item.updated_at
+    if history:
+        [old] = store.history(NS, "k")
+        check_never_back_in_time(old, before, new)
     # The version moved, so a put_if from the record read before the write is
     # refused, even where updated_at stayed where it was
     stale = store.put_if(NS, "k", VEGETARIAN, expected=before)
     assert stale == ConditionalWrite(applied=False, key="k", version=None, current=new)
+
+
+def expire_and_move_ahead(store: Any, key: str) -> tuple[str, tuple[str, str]]:
+    """The statement that expires a live memory and moves its updated_at an hour ahead.
+
+    It returns the new updated_at.
+    """
+    return (
+        f"UPDATE {store.sql.items} SET updated_at = updated_at + INTERVAL '1 hour', "
+        "expires_at = now() - INTERVAL '1 minute' WHERE prefix = %s AND key = %s "
+        "RETURNING updated_at",
+        (PREFIX, key),
+    )
+
+
+def test_a_write_over_an_expired_memory_never_starts_before_it_was_written(
+    store_factory, admin, mode
+) -> None:
+    # An expired memory is not archived, so on a store with history only its
+    # own updated_at holds the next version back
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", WINDOW, ttl=10.0)
+    moved = admin.execute(*expire_and_move_ahead(store, "k")).fetchone()
+    assert moved is not None
+
+    store.put(NS, "k", AISLE)
+
+    assert store.history(NS, "k") == []
+    new = store.record(NS, "k")
+    assert new is not None and (new.version, new.item.value) == (2, AISLE)
+    assert new.item.updated_at >= moved["updated_at"]
 
 
 @RECREATORS
@@ -511,6 +545,25 @@ def test_a_late_fact_is_never_written_before_the_memory_live_under_its_key(
     [row] = store.history(NS, "k")
     assert (row.version, row.reason, row.superseded_by) == (2, "superseded", "newer")
     assert row.written_at >= live.item.updated_at
+    assert row.ended_at == row.written_at
+
+
+def test_a_late_fact_is_never_written_before_the_key_history_ended(
+    store_factory, admin, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "k", VEGETARIAN)
+    store.delete(NS, "k")
+    store.put(NS, "newer", WINDOW)
+    moved = admin.execute(*move_history_ahead(store, "k", 1)).fetchone()
+    assert moved is not None
+
+    late = store.reconcile(NS, "k", AISLE, policy=superseded_by_newer, valid_at=OLD)
+
+    assert late.new == "superseded"
+    [row, deleted] = store.history(NS, "k")
+    assert (row.version, row.reason, deleted.reason) == (2, "superseded", "deleted")
+    assert row.written_at >= moved["ended_at"]
     assert row.ended_at == row.written_at
 
 
@@ -647,11 +700,12 @@ async def test_async_from_conn_string_takes_history(libpq_url, table_name, aadmi
         assert 7 * 86400 - 600 < float(row["left_seconds"]) <= 7 * 86400
 
 
+@HISTORY
 @WRITERS
 async def test_an_async_write_whose_clock_is_behind_never_goes_back_in_time(
-    astore_factory, aadmin, mode, writer
+    astore_factory, aadmin, mode, writer, history
 ) -> None:
-    store = await astore_factory(mode, history=True, index=seat_index())
+    store = await astore_factory(mode, history=history, index=seat_index())
     await store.aput(NS, "k", WINDOW)
     assert (await aadmin.execute(*move_ahead(store, "k"))).rowcount == 1
     before = await store.arecord(NS, "k")
@@ -659,11 +713,30 @@ async def test_an_async_write_whose_clock_is_behind_never_goes_back_in_time(
 
     await awrite_as(writer, store, AISLE)
 
-    [old] = await store.ahistory(NS, "k")
     new = await store.arecord(NS, "k")
-    check_never_back_in_time(old, before, new)
+    assert new is not None and (new.version, new.item.value) == (2, AISLE)
+    assert new.item.updated_at >= before.item.updated_at
+    if history:
+        [old] = await store.ahistory(NS, "k")
+        check_never_back_in_time(old, before, new)
     stale = await store.aput_if(NS, "k", VEGETARIAN, expected=before)
     assert stale == ConditionalWrite(applied=False, key="k", version=None, current=new)
+
+
+async def test_an_async_write_over_an_expired_memory_never_starts_before_it_was_written(
+    astore_factory, aadmin, mode
+) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())
+    await store.aput(NS, "k", WINDOW, ttl=10.0)
+    moved = await (await aadmin.execute(*expire_and_move_ahead(store, "k"))).fetchone()
+    assert moved is not None
+
+    await store.aput(NS, "k", AISLE)
+
+    assert await store.ahistory(NS, "k") == []
+    new = await store.arecord(NS, "k")
+    assert new is not None and (new.version, new.item.value) == (2, AISLE)
+    assert new.item.updated_at >= moved["updated_at"]
 
 
 @RECREATORS
@@ -700,6 +773,25 @@ async def test_an_async_late_fact_is_never_written_before_the_memory_live_under_
     [row] = await store.ahistory(NS, "k")
     assert (row.version, row.reason, row.superseded_by) == (2, "superseded", "newer")
     assert row.written_at >= live.item.updated_at
+    assert row.ended_at == row.written_at
+
+
+async def test_an_async_late_fact_is_never_written_before_the_key_history_ended(
+    astore_factory, aadmin, mode
+) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())
+    await store.aput(NS, "k", VEGETARIAN)
+    await store.adelete(NS, "k")
+    await store.aput(NS, "newer", WINDOW)
+    moved = await (await aadmin.execute(*move_history_ahead(store, "k", 1))).fetchone()
+    assert moved is not None
+
+    late = await store.areconcile(NS, "k", AISLE, policy=superseded_by_newer, valid_at=OLD)
+
+    assert late.new == "superseded"
+    [row, deleted] = await store.ahistory(NS, "k")
+    assert (row.version, row.reason, deleted.reason) == (2, "superseded", "deleted")
+    assert row.written_at >= moved["ended_at"]
     assert row.ended_at == row.written_at
 
 
