@@ -48,11 +48,12 @@ These let tests verify that the retry policy handles real CockroachDB errors exa
 two disposable application virtual clusters. It accepts their complete SQL
 URLs, including the supplied TLS and routing parameters. It does not start a
 testcontainer, provision resources, change users, or alter network access.
-For self-hosted deployments, use two physical clusters under the documented
-[virtualization limitations](../guides/virtual-clusters.md). For managed
-deployments, use two separately provisioned application targets supported by
-your Cloud service. Different URL strings alone do not establish that the
-targets are distinct virtual clusters; verify their deployment metadata first.
+For managed deployments, use two virtual clusters, which can share one Cloud
+dedicated host and each have their own SQL endpoint. For self-hosted
+deployments, use two physical clusters under the documented
+[virtualization limitations](../guides/virtual-clusters.md). Different URL
+strings alone do not establish that the targets are distinct virtual clusters;
+verify their deployment metadata first.
 
 The tests write different values under identical table names, document IDs,
 session IDs, and checkpoint IDs on both targets. They check vector insert,
@@ -74,6 +75,11 @@ These checks establish data routing and deletion isolation for the supplied
 targets. They do not test authorization, failover, or the supported number of
 virtual clusters on a host. Driver failures report the error class and SQLSTATE
 without a connection traceback because driver arguments may contain passwords.
+
+All four cases have been run against two managed virtual clusters sharing one
+CockroachDB Cloud dedicated host (CockroachDB v26.3.1) and passed, confirming
+that vector data, chat history, and sync and async checkpoints stay isolated to
+their own virtual cluster.
 
 Keep credentials in a local, ignored `.env.local` file, then run:
 

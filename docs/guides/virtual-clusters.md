@@ -1,8 +1,35 @@
 # Virtual-cluster connections
 
-On a self-hosted CockroachDB deployment with cluster virtualization enabled,
-choose the application virtual cluster with the connection URL's `options`
-parameter:
+A virtual cluster is a database target selected by the connection URL. Point
+each client (the engine, chat history, and the checkpointers) at the SQL URL
+for the virtual cluster you want, and the library preserves that routing. How
+you select a virtual cluster depends on whether it is managed or self-hosted.
+
+## Managed virtual clusters
+
+On CockroachDB Cloud, a dedicated host can run several virtual clusters, and
+each virtual cluster has its own SQL endpoint. Routing is by endpoint, so you
+do not add a cluster-selection option. Use a virtual cluster's complete SQL
+connection URL from the Cloud console's Connect dialog, selecting that virtual
+cluster when you obtain the URL:
+
+```text
+postgresql://app:PASSWORD@vc-endpoint.aws-us-east-2.cockroachlabs.cloud:26257/agents?sslmode=verify-full
+```
+
+A dedicated host's console URL is a management address, not a SQL connection
+string. Keep the supplied hostname, port, database, and TLS parameters,
+including `sslrootcert` when needed. Do not assume a virtual cluster is named
+`main` or construct its connection string from the host cluster's identifier.
+[Cockroach Continuum virtual clusters](https://www.cockroachlabs.com/product/continuum/)
+share a dedicated host this way. Use the topology supported by your Cloud
+service; this integration does not provision virtual clusters or establish a
+supported virtual-cluster count.
+
+## Self-hosted virtual clusters
+
+On a self-hosted deployment with cluster virtualization enabled, select the
+application virtual cluster with the connection URL's `options` parameter:
 
 ```text
 postgresql://app:PASSWORD@HOST:26257/agents?sslmode=verify-full&options=-ccluster%3Dmain
@@ -10,35 +37,16 @@ postgresql://app:PASSWORD@HOST:26257/agents?sslmode=verify-full&options=-ccluste
 
 Here `main` selects the application virtual cluster, while `agents` selects a
 database inside it. Create the database and grant the application user access
-before connecting. Use the credentials and TLS parameters supplied for your
-deployment, including `sslrootcert` when needed.
-
-CockroachDB documents this routing syntax in
+before connecting. Application workloads belong on the application virtual
+cluster; the `system` virtual cluster is for administration and physical
+cluster replication (PCR). CockroachDB documents this routing syntax in
 [Work with Virtual Clusters](https://www.cockroachlabs.com/docs/stable/work-with-virtual-clusters).
-Application workloads belong on the application virtual cluster. The `system`
-virtual cluster is for administration and physical cluster replication (PCR).
 The [self-hosted virtualization limitations](https://www.cockroachlabs.com/docs/stable/cluster-virtualization-overview#known-limitations)
-currently allow one system virtual cluster and one application virtual
-cluster per physical cluster. Testing two self-hosted application virtual
-clusters therefore requires two physical clusters. This guide assumes an
-existing supported deployment.
-
-## Managed virtual clusters
-
-For a managed virtual cluster, use its complete SQL connection URL from the
-Cloud console's connection dialog. Select the virtual cluster itself when
-obtaining the URL. A dedicated host's console URL is a management address,
-not a SQL connection string.
-
-[Cockroach Continuum virtual clusters](https://www.cockroachlabs.com/product/continuum/)
-can share a dedicated host. Use the topology supported by your Cloud service;
-this integration does not provision virtual clusters or establish a supported
-virtual-cluster count.
-
-Keep the supplied hostname, port, database, TLS settings and any routing
-parameters. Do not assume a managed virtual cluster is named `main` or
-construct its connection string from the host cluster's identifier. The
-engine, chat history and saver examples below accept the supplied SQL URL.
+currently allow one system virtual cluster and one application virtual cluster
+per physical cluster, so testing two self-hosted application virtual clusters
+requires two physical clusters. The managed model above has no such per-host
+limit. The engine, chat history and saver examples below accept the supplied
+SQL URL either way.
 
 ## Engines and chat history
 
@@ -88,8 +96,10 @@ by psycopg and do not normalize `cockroachdb://` URLs.
 
 ## Combine connection options
 
-Use one `options` value containing all startup options, separated by spaces.
-For example, to select `main` and set a statement timeout:
+Startup options such as the self-hosted `-ccluster` selector go in one
+`options` value, separated by spaces. Managed virtual clusters route by
+endpoint and usually need no `-ccluster` option. For example, to select a
+self-hosted `main` cluster and set a statement timeout:
 
 ```python
 from urllib.parse import quote, urlencode

@@ -1,7 +1,12 @@
-"""Virtual-cluster routing reaches psycopg through each connection factory.
+"""Connection factories preserve self-hosted cluster-routing startup options.
 
-These tests inspect driver arguments without opening a database connection.
-They do not provision a virtual cluster or exercise server-side routing.
+A self-hosted virtual cluster is selected with the URL's `options=-ccluster=...`
+startup option. These tests check that each connection factory passes that
+option, and other startup options, through to psycopg unchanged. They inspect
+driver arguments without opening a database connection. Managed virtual clusters
+route by distinct endpoint instead, with no `-ccluster` option; that path is
+covered by the opt-in integration suite in
+tests/integration/test_virtual_cluster_deployment.py.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -27,7 +32,7 @@ REST = (
 SCHEMES = pytest.mark.parametrize("scheme", ["postgresql", "cockroachdb", "cockroachdb+psycopg"])
 
 
-def assert_routing(options: dict) -> None:
+def assert_self_hosted_options(options: dict) -> None:
     assert options["options"] == OPTIONS
     assert options["dbname"] == "agents"
     assert options["user"] == "app"
@@ -39,7 +44,7 @@ def assert_routing(options: dict) -> None:
 
 @SCHEMES
 @pytest.mark.parametrize("client", ["engine", "history"])
-async def test_sqlalchemy_factories_preserve_virtual_cluster_options(
+async def test_sqlalchemy_factories_preserve_self_hosted_cluster_options(
     scheme: str, client: str
 ) -> None:
     url = f"{scheme}://{REST}"
@@ -51,7 +56,7 @@ async def test_sqlalchemy_factories_preserve_virtual_cluster_options(
         engine = CockroachDBEngine.from_connection_string(url).engine
     try:
         _, options = engine.dialect.create_connect_args(engine.url)
-        assert_routing(options)
+        assert_self_hosted_options(options)
     finally:
         if history is not None:
             await history.aclose()
@@ -60,7 +65,7 @@ async def test_sqlalchemy_factories_preserve_virtual_cluster_options(
 
 
 @SCHEMES
-def test_sync_saver_passes_virtual_cluster_options_to_psycopg(
+def test_sync_saver_passes_self_hosted_cluster_options_to_psycopg(
     scheme: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = MagicMock(spec=psycopg.Connection)
@@ -74,7 +79,7 @@ def test_sync_saver_passes_virtual_cluster_options_to_psycopg(
     connect.assert_called_once()
     args, kwargs = connect.call_args
     assert args == (f"postgresql://{REST}",)
-    assert_routing(conninfo_to_dict(args[0], **kwargs))
+    assert_self_hosted_options(conninfo_to_dict(args[0], **kwargs))
     assert "connect_timeout" not in kwargs
     assert kwargs["autocommit"] is True
     assert kwargs["row_factory"] is dict_row
@@ -82,7 +87,7 @@ def test_sync_saver_passes_virtual_cluster_options_to_psycopg(
 
 
 @SCHEMES
-async def test_async_saver_passes_virtual_cluster_options_to_psycopg(
+async def test_async_saver_passes_self_hosted_cluster_options_to_psycopg(
     scheme: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = MagicMock(spec=psycopg.AsyncConnection)
@@ -96,7 +101,7 @@ async def test_async_saver_passes_virtual_cluster_options_to_psycopg(
     connect.assert_awaited_once()
     args, kwargs = connect.call_args
     assert args == (f"postgresql://{REST}",)
-    assert_routing(conninfo_to_dict(args[0], **kwargs))
+    assert_self_hosted_options(conninfo_to_dict(args[0], **kwargs))
     assert "connect_timeout" not in kwargs
     assert kwargs["autocommit"] is True
     assert kwargs["row_factory"] is dict_row
