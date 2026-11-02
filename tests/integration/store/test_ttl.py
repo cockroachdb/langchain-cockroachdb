@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from psycopg import AsyncConnection, Connection
 
+from tests.integration.faults import PsycopgFaults
 from tests.integration.store.test_parity import WAIT
 from tests.integration.store.test_semantic import TWO_MESSAGES, index_config
 
@@ -404,6 +405,66 @@ async def test_async_setup_applies_ttl_settings_to_both_tables(astore_factory, a
     for table in (store.sql.items, store.sql.vectors):
         statement = await acreate_statement(aadmin, table)
         assert SETTING in statement and cron_setting("0 3 * * *") in statement
+
+
+def ttl_settings() -> dict[str, Any]:
+    """A store's settings that turn on TTL for its items, vectors and history."""
+    return {
+        "index": index_config(),
+        "ttl": {"sweep_interval_minutes": 5},
+        "history": {"ttl_days": 30},
+    }
+
+
+def ttl_changes(faults: PsycopgFaults, store: Any) -> list[int]:
+    """How many TTL changes were sent for the items, vectors and history tables."""
+    return [
+        faults.count(f"alter table {table} set (ttl_expiration_expression")
+        for table in (store.sql.items, store.sql.vectors, store.sql.history)
+    ]
+
+
+def test_setup_changes_ttl_settings_only_when_they_differ(store_factory, admin) -> None:
+    store = store_factory("pool", **ttl_settings())
+    # Another setup() with the same settings reads them and changes nothing
+    same = PsycopgFaults(unsafe_internals=False)
+    store_factory("pool", connect_kwargs={"cursor_factory": same.cursor_class()}, **ttl_settings())
+    assert ttl_changes(same, store) == [0, 0, 0]
+    # A changed cron is applied to the items and vectors tables. The history
+    # keeps its hourly job
+    changed = PsycopgFaults(unsafe_internals=False)
+    store_factory(
+        "pool",
+        connect_kwargs={"cursor_factory": changed.cursor_class()},
+        **{**ttl_settings(), "ttl": {"sweep_interval_minutes": 10}},
+    )
+    assert ttl_changes(changed, store) == [1, 1, 0]
+    for table in (store.sql.items, store.sql.vectors):
+        statement = create_statement(admin, table)
+        assert SETTING in statement and cron_setting("*/10 * * * *") in statement
+    assert cron_setting("@hourly") in create_statement(admin, store.sql.history)
+
+
+async def test_async_setup_changes_ttl_settings_only_when_they_differ(
+    astore_factory, aadmin
+) -> None:
+    store = await astore_factory("pool", **ttl_settings())
+    same = PsycopgFaults(unsafe_internals=False)
+    await astore_factory(
+        "pool", connect_kwargs={"cursor_factory": same.async_cursor_class()}, **ttl_settings()
+    )
+    assert ttl_changes(same, store) == [0, 0, 0]
+    changed = PsycopgFaults(unsafe_internals=False)
+    await astore_factory(
+        "pool",
+        connect_kwargs={"cursor_factory": changed.async_cursor_class()},
+        **{**ttl_settings(), "ttl": {"sweep_interval_minutes": 10}},
+    )
+    assert ttl_changes(changed, store) == [1, 1, 0]
+    for table in (store.sql.items, store.sql.vectors):
+        statement = await acreate_statement(aadmin, table)
+        assert SETTING in statement and cron_setting("*/10 * * * *") in statement
+    assert cron_setting("@hourly") in await acreate_statement(aadmin, store.sql.history)
 
 
 def test_setup_without_ttl_leaves_existing_settings_and_disable_ttl_resets_them(

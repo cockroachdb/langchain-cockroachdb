@@ -136,7 +136,7 @@ Every call retries transient CockroachDB errors under the store's `RetryPolicy`.
 
 A `batch()` call validates every op and serializes every value before any statement runs. It then runs its reads, one round trip each for its gets, its searches and its listings, and commits all its puts and deletes together in one transaction. Semantic searches under a namespace add a round trip before the searches, and sometimes one after them, as [How Searches Use the Index](#how-searches-use-the-index) explains. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.
 
-On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table. The TTL step of `setup()`, `disable_ttl()` and `adisable_ttl()` retry that error, as described in [Configuring retries](resilience.md#configuring-retries).
+On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table, such as the column backfill of migration 2 when several processes upgrade to 0.6.0 at once. The TTL steps of `setup()`, `disable_ttl()` and `adisable_ttl()` retry that error for about a minute by default, as described in [Configuring retries](resilience.md#configuring-retries). `setup()` also reads each table's TTL settings first and changes them only when they differ, so the processes that start after the first one change nothing.
 
 ## Namespaces and Items
 
@@ -302,7 +302,7 @@ with CockroachDBStore.from_conn_string(
 
 ### The TTL Job
 
-CockroachDB deletes expired rows itself, with [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). With a `ttl` configuration, `setup()` sets `ttl_expiration_expression` to the `expires_at` column on the items table, and on the vectors table when there is an index. The job runs on the cron that `sweep_interval_minutes` gives, or `ttl_job_cron`, and hourly (`@hourly`) by default. A changed `sweep_interval_minutes` or `ttl_job_cron` takes effect at the next `setup()`. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.
+CockroachDB deletes expired rows itself, with [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl). With a `ttl` configuration, `setup()` sets `ttl_expiration_expression` to the `expires_at` column on the items table, and on the vectors table when there is an index. The job runs on the cron that `sweep_interval_minutes` gives, or `ttl_job_cron`, and hourly (`@hourly`) by default. A changed `sweep_interval_minutes` or `ttl_job_cron` takes effect at the next `setup()`, which leaves settings that already match alone. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.
 
 The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because `omit_expired` is on by default. That holds even for a store built without `ttl`, since another process may write items with an expiry to the same tables. Pass `ttl={"omit_expired": False}` to see expired items until the job deletes them. Their vectors stay as well, and make semantic searches run their second query more often, so with TTLs of minutes set `sweep_interval_minutes` lower than the default hour, as [How Searches Use the Index](#how-searches-use-the-index) explains.
 

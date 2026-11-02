@@ -78,7 +78,7 @@ from langchain_cockroachdb.store.reconcile import (
     Policy,
     ReconcileResult,
 )
-from langchain_cockroachdb.store.sql import VectorRow
+from langchain_cockroachdb.store.sql import TTLChange, VectorRow
 from langchain_cockroachdb.store.store import DEFAULT_SWEEP_INTERVAL_MINUTES
 
 logger = logging.getLogger(__name__)
@@ -368,10 +368,13 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         CockroachDB row-level TTL there. With a TTL configuration, it then
         turns on CockroachDB row-level TTL on ``expires_at``.
 
-        On CockroachDB v25.4 a TTL change fails while another setup() changes
-        the same table. That error is retried under the store's retry policy,
-        even if its ``retry_on`` would refuse it; ``max_attempts=1`` turns this
-        off.
+        It reads a table's TTL settings first and changes them only when
+        they differ from the configuration. On CockroachDB v25.4 a TTL
+        change fails while another schema change runs on the same table,
+        such as migration 2 run by another setup(). That error is retried
+        with the budget that schema_change_policy gives it, about a minute
+        by default, even if the policy's ``retry_on`` would refuse it;
+        ``max_attempts=1`` turns this off.
 
         An application role that did not run setup() needs SELECT, INSERT,
         UPDATE and DELETE on the store's items and vectors tables, and on
@@ -433,17 +436,42 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
             await self._run_ddl(statement, "store vector setup")
         if self.index is not None:
             await self._check_index()
+        # A TTL change waits out a schema change that another process runs
+        # on the same table, such as its migration 2
+        policy = schema_change_policy(self.retry_policy)
         if self._history is not None:
-            policy = schema_change_policy(self.retry_policy)
-            for statement in self.sql.history_statements(self._history.ttl_days):
-                await self._run_ddl(statement, "store history setup", policy=policy)
+            await self._run_ddl(
+                self.sql.create_history_table(), "store history setup", policy=policy
+            )
+            if self._history.ttl_days is not None:
+                await self._set_ttl(self.sql.history_ttl_change(), "store history setup", policy)
             # A write before setup() may have found no history table. The
             # next write reads the schema again.
             self._history_ready = None
         if self._ttl_given:
-            policy = schema_change_policy(self.retry_policy)
-            for statement in self.sql.ttl_statements(self.ttl.cron):
-                await self._run_ddl(statement, "store TTL setup", policy=policy)
+            for change in self.sql.ttl_changes(self.ttl.cron):
+                await self._set_ttl(change, "store TTL setup", policy)
+
+    async def _set_ttl(self, change: TTLChange, label: str, policy: RetryPolicy) -> None:
+        """Turn on a table's row-level TTL, unless it already has those settings.
+
+        Every attempt reads the table's settings before it changes them. So
+        a setup() that finds them in place changes nothing, and neither
+        does a retry after another process set them. On v25.4 a change waits
+        for any other schema change on the table.
+        """
+
+        async def apply() -> None:
+            async with self._cursor(timeout=policy.ddl_attempt_timeout, label=label) as cur:
+                await cur.execute(*change.applied)
+                await self._sync_pipeline()
+                row = await cur.fetchone()
+                if row is not None and row["applied"]:
+                    return
+                await cur.execute(change.statement)
+                await self._sync_pipeline()
+
+        await self._retry(apply, label=label, policy=policy)
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         """Run a batch of operations.
@@ -1771,7 +1799,8 @@ class AsyncCockroachDBStore(AsyncBatchedBaseStore, BaseCockroachDBStore, AsyncPs
         Expired items are still left out of reads while omit_expired is on.
         Safe to run from several processes at once. On CockroachDB v25.4 a
         TTL change fails while another schema change runs on the same table;
-        that error is retried under the store's retry policy, even if its
+        that error is retried with the budget that schema_change_policy
+        gives it, about a minute by default, even if the policy's
         ``retry_on`` would refuse it. ``max_attempts=1`` turns this off.
         """
         policy = schema_change_policy(self.retry_policy)

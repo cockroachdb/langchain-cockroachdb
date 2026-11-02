@@ -124,6 +124,16 @@ SCHEMA_CHANGE_BUSY_MESSAGES: tuple[str, ...] = (
     "another schema change on the table is being processed",
 )
 
+# The busy error means waiting for the other schema change to finish, which
+# takes far longer than a transient error takes to clear: a column backfill
+# on a table with data, say, or any schema change on a multi-region cluster.
+# So schema_change_policy gives it a budget of its own: this many attempts,
+# or the policy's max_attempts if larger, with the policy's backoff growing
+# up to this many seconds. Under the default policy that waits about a
+# minute.
+SCHEMA_CHANGE_BUSY_ATTEMPTS: int = 30
+SCHEMA_CHANGE_BUSY_MAX_BACKOFF: float = 3.0
+
 _MAX_CHAIN = 16
 
 
@@ -393,17 +403,15 @@ class RetryPolicy:
         Returns:
             Whatever ``fn`` returns
         """
-        attempt = 1
+        failures: dict[bool, int] = {}
         while True:
             try:
                 return fn()
             except Exception as error:
-                if not self._should_retry(error, attempt, label, can_retry):
+                pause = self._pause_before_retry(error, failures, label, can_retry)
+                if pause is None:
                     raise
-                pause = self.delay(attempt - 1)
-                self._log_retry(error, attempt, pause, label)
                 sleep(pause)
-                attempt += 1
 
     async def arun(
         self,
@@ -414,22 +422,51 @@ class RetryPolicy:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     ) -> T:
         """Async version of :meth:`run`; ``fn`` returns a new awaitable per attempt."""
-        attempt = 1
+        failures: dict[bool, int] = {}
         while True:
             try:
                 return await fn()
             except Exception as error:
-                if not self._should_retry(error, attempt, label, can_retry):
+                pause = self._pause_before_retry(error, failures, label, can_retry)
+                if pause is None:
                     raise
-                pause = self.delay(attempt - 1)
-                self._log_retry(error, attempt, pause, label)
                 await sleep(pause)
-                attempt += 1
+
+    def _budget(self, error: BaseException) -> RetryPolicy:
+        """The policy whose attempts and backoff apply to retrying ``error``.
+
+        A plain policy applies its own to every error. schema_change_policy
+        returns one that gives a busy schema change a budget of its own.
+        """
+        return self
+
+    def _pause_before_retry(
+        self,
+        error: BaseException,
+        failures: dict[bool, int],
+        label: str,
+        can_retry: Callable[[BaseException], bool] | None,
+    ) -> float | None:
+        """Seconds to wait before the next attempt after ``error``, or None to raise it.
+
+        ``failures`` counts a run's failed attempts by budget: under the
+        policy's own (True) or under the one _budget gives instead (False).
+        The errors of one budget never use up the attempts of the other.
+        """
+        budget = self._budget(error)
+        own = budget is self
+        attempt = failures[own] = failures.get(own, 0) + 1
+        if not self._should_retry(error, attempt, budget.max_attempts, label, can_retry):
+            return None
+        pause = budget.delay(attempt - 1)
+        self._log_retry(error, attempt, budget.max_attempts, pause, label)
+        return pause
 
     def _should_retry(
         self,
         error: BaseException,
         attempt: int,
+        max_attempts: int,
         label: str,
         can_retry: Callable[[BaseException], bool] | None,
     ) -> bool:
@@ -437,20 +474,22 @@ class RetryPolicy:
             return False
         if can_retry is not None and not can_retry(error):
             return False
-        if attempt >= self.max_attempts:
+        if attempt >= max_attempts:
             logger.warning(
                 "Giving up on %s after %d attempts: %s", label, attempt, _describe(error)
             )
             return False
         return True
 
-    def _log_retry(self, error: BaseException, attempt: int, pause: float, label: str) -> None:
+    def _log_retry(
+        self, error: BaseException, attempt: int, max_attempts: int, pause: float, label: str
+    ) -> None:
         logger.warning(
             "Retrying %s after %s (attempt %d of %d failed, next try in %.2fs)",
             label,
             _describe(error),
             attempt,
-            self.max_attempts,
+            max_attempts,
             pause,
         )
 
@@ -474,24 +513,92 @@ def is_schema_change_busy(
     )
 
 
+@dataclass(frozen=True)
+class _SchemaChangePolicy(RetryPolicy):
+    """A policy that retries a busy schema change under a budget of its own.
+
+    schema_change_policy builds it from a policy, whose fields it keeps.
+    ``busy_attempts`` and ``busy_max_backoff`` are that function's
+    ``attempts`` and ``max_backoff``.
+    """
+
+    busy_messages: tuple[str, ...] = SCHEMA_CHANGE_BUSY_MESSAGES
+    busy_attempts: int = SCHEMA_CHANGE_BUSY_ATTEMPTS
+    busy_max_backoff: float = SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+    # The busy error's budget: these fields with its attempts and backoff cap
+    _busy_budget: RetryPolicy = dataclasses.field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "busy_messages", _as_phrases(self.busy_messages, "messages"))
+        if (
+            isinstance(self.busy_attempts, bool)
+            or not isinstance(self.busy_attempts, int)
+            or self.busy_attempts < 1
+        ):
+            raise ValueError("attempts must be an integer of at least 1")
+        if not math.isfinite(self.busy_max_backoff) or self.busy_max_backoff < 0:
+            raise ValueError("max_backoff must be finite and not negative")
+        own = {field.name: getattr(self, field.name) for field in dataclasses.fields(RetryPolicy)}
+        # max_attempts=1 turns every retry off, the busy error's included
+        attempts = 1 if self.max_attempts == 1 else max(self.max_attempts, self.busy_attempts)
+        budget = RetryPolicy(
+            **{
+                **own,
+                "max_attempts": attempts,
+                "max_backoff": max(self.initial_backoff, self.busy_max_backoff),
+            }
+        )
+        object.__setattr__(self, "_busy_budget", budget)
+
+    def _budget(self, error: BaseException) -> RetryPolicy:
+        if is_schema_change_busy(error, self.busy_messages):
+            return self._busy_budget
+        return self
+
+
 def schema_change_policy(
-    policy: RetryPolicy, messages: Iterable[str] = SCHEMA_CHANGE_BUSY_MESSAGES
+    policy: RetryPolicy,
+    messages: Iterable[str] = SCHEMA_CHANGE_BUSY_MESSAGES,
+    *,
+    attempts: int = SCHEMA_CHANGE_BUSY_ATTEMPTS,
+    max_backoff: float = SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
 ) -> RetryPolicy:
     """``policy``, also retrying a schema change that met another running one.
 
     For idempotent schema changes, such as TTL settings, that several
-    processes may run at once. The busy error (see is_schema_change_busy) is
-    retried even when the policy's own ``retry_on`` would return False for
-    it. Every other error is decided by ``policy`` as it is, including its
-    ``retry_on``. Attempts, backoff and timeouts are the policy's, so
-    ``max_attempts=1`` turns the retry off.
+    processes may run at once. The busy error (see is_schema_change_busy)
+    is retried even when the policy's own ``retry_on`` would return False
+    for it. It means waiting for the other schema change to finish, such as
+    a column backfill, which takes longer than a transient error takes to
+    clear. So it has a budget of its own: ``attempts`` attempts (default
+    SCHEMA_CHANGE_BUSY_ATTEMPTS), or the policy's ``max_attempts`` if that
+    is larger, with the policy's backoff growing up to ``max_backoff``
+    seconds (default SCHEMA_CHANGE_BUSY_MAX_BACKOFF), or up to its
+    ``initial_backoff`` if that is larger. Under the default policy that
+    waits about a minute.
+
+    Every other error is decided by ``policy`` as it is, including its
+    ``retry_on``, and keeps its attempts and backoff. Those attempts are
+    counted apart from the busy error's. Timeouts are the policy's, and
+    ``max_attempts=1`` turns every retry off.
+
+    Raises:
+        ValueError: If ``attempts`` is not an integer of at least 1, or
+            ``max_backoff`` is negative or not finite
     """
     phrases = _as_phrases(messages, "messages")
 
     def retry_on(error: BaseException) -> bool:
         return is_schema_change_busy(error, phrases) or policy.is_retryable(error)
 
-    return dataclasses.replace(policy, retry_on=retry_on)
+    fields = {field.name: getattr(policy, field.name) for field in dataclasses.fields(RetryPolicy)}
+    return _SchemaChangePolicy(
+        **{**fields, "retry_on": retry_on},
+        busy_messages=phrases,
+        busy_attempts=attempts,
+        busy_max_backoff=max_backoff,
+    )
 
 
 def is_retryable_error(error: BaseException) -> bool:

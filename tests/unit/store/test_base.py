@@ -1199,7 +1199,8 @@ class BusyOnceCursor:
     """A cursor that fails the first TTL statement with the busy error.
 
     It records every statement, and reports ``latest`` as the migration
-    version, so setup() goes straight to its TTL step.
+    version, so setup() goes straight to its TTL step. Its TTL read finds
+    no settings in place, so every TTL change runs.
     """
 
     def __init__(self, latest: int) -> None:
@@ -1218,7 +1219,7 @@ class BusyOnceCursor:
         return self
 
     def fetchone(self) -> dict:
-        return {"v": self.latest}
+        return {"v": self.latest, "applied": False}
 
 
 class AsyncBusyOnceCursor(BusyOnceCursor):
@@ -1227,7 +1228,7 @@ class AsyncBusyOnceCursor(BusyOnceCursor):
         return self
 
     async def fetchone(self) -> dict:  # type: ignore[override]
-        return {"v": self.latest}
+        return {"v": self.latest, "applied": False}
 
 
 def ttl_statements(cursor: BusyOnceCursor) -> list[str]:
@@ -1284,6 +1285,185 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             with pytest.raises(psycopg.errors.FeatureNotSupported):
                 await getattr(store, operation)()
             assert len(ttl_statements(cursor)) == 1
+
+
+class TTLSetupCursor:
+    """A cursor that answers setup()'s reads and records its statements with their params.
+
+    It reports ``latest`` as the migration version, so setup() goes
+    straight to its schema statements, and the vectors table as the index
+    check expects it. The TTL read finds the settings in place on the
+    tables in ``applied``. The first ``busy`` ALTER TABLE statements fail
+    with the busy error. With ``winner``, each of those failures leaves its
+    table's settings in place, as another process's setup() would.
+    """
+
+    def __init__(
+        self, latest: int, *, applied: Sequence[str] = (), busy: int = 0, winner: bool = False
+    ) -> None:
+        self.latest = latest
+        self.applied = set(applied)
+        self.busy = busy
+        self.winner = winner
+        self.calls: list[tuple[str, list]] = []
+
+    def run(self, statement: str, params: Sequence[object]) -> None:
+        self.calls.append((statement, list(params)))
+        if statement.startswith("ALTER TABLE") and self.busy:
+            self.busy -= 1
+            if self.winner:
+                self.applied.add(statement.split()[2])
+            raise busy_error()
+
+    def execute(self, statement: str, params: Sequence[object] = ()) -> "TTLSetupCursor":
+        self.run(statement, params)
+        return self
+
+    def answer(self) -> dict:
+        statement, params = self.calls[-1]
+        if "reloptions" in statement:
+            return {"applied": params[-1] in self.applied}
+        if "create_statement" in statement:
+            return {"create_statement": VECTORS_TABLE.format(dims=3, index=COSINE_INDEX)}
+        return {"v": self.latest}
+
+    def fetchone(self) -> dict:
+        return self.answer()
+
+    def altered(self) -> list[str]:
+        """The table of each ALTER TABLE statement sent, failed ones included."""
+        return [s.split()[2] for s, _ in self.calls if s.startswith("ALTER TABLE")]
+
+
+class AsyncTTLSetupCursor(TTLSetupCursor):
+    async def execute(  # type: ignore[override]
+        self, statement: str, params: Sequence[object] = ()
+    ) -> "AsyncTTLSetupCursor":
+        self.run(statement, params)
+        return self
+
+    async def fetchone(self) -> dict:  # type: ignore[override]
+        return self.answer()
+
+
+def ttl_setup_cursor(make: str, **kwargs: Any) -> TTLSetupCursor:
+    """A TTLSetupCursor for the sync store, or its async form, at migration 2."""
+    cursor_class = TTLSetupCursor if make == "sync" else AsyncTTLSetupCursor
+    return cursor_class(MIGRATION_RECONCILE, **kwargs)
+
+
+def use_cursor(store: CockroachDBStore | AsyncCockroachDBStore, cursor: TTLSetupCursor) -> None:
+    """Make every connection checkout of ``store`` yield ``cursor``."""
+    if isinstance(store, AsyncCockroachDBStore):
+
+        @contextlib.asynccontextmanager
+        async def acursor(**kwargs: object) -> AsyncIterator[TTLSetupCursor]:
+            yield cursor
+
+        store._cursor = acursor  # type: ignore[method-assign,assignment]
+    else:
+
+        @contextlib.contextmanager
+        def scursor(**kwargs: object) -> Iterator[TTLSetupCursor]:
+            yield cursor
+
+        store._cursor = scursor  # type: ignore[method-assign,assignment]
+
+
+async def run_setup(store: CockroachDBStore | AsyncCockroachDBStore) -> None:
+    result = store.setup()
+    if isinstance(store, AsyncCockroachDBStore):
+        await result  # type: ignore[misc]
+
+
+def ttl_store(make: str, **settings: Any) -> CockroachDBStore | AsyncCockroachDBStore:
+    """A store with an index, a TTL configuration and history with ttl_days."""
+    settings.setdefault("index", {"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]})
+    settings.setdefault("ttl", {"sweep_interval_minutes": 5})
+    settings.setdefault("history", {"ttl_days": 30})
+    return make_store(make, **settings)
+
+
+ALL_TTL_TABLES = ("public.store_history", "public.store", "public.store_vectors")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    "applied", [(), ALL_TTL_TABLES, ("public.store",)], ids=["none", "all", "items"]
+)
+async def test_setup_changes_only_the_ttl_settings_not_in_place(
+    make: str, applied: tuple[str, ...]
+) -> None:
+    store = ttl_store(make)
+    cursor = ttl_setup_cursor(make, applied=applied)
+    use_cursor(store, cursor)
+
+    await run_setup(store)
+
+    # Each table's settings are read first, and changed only when they differ
+    create = (store.sql.create_history_table(), [])
+    expected = [create]
+    for change in (store.sql.history_ttl_change(), *store.sql.ttl_changes(store.ttl.cron)):
+        sql, params = change.applied
+        expected.append((sql, params))
+        if params[-1] not in applied:
+            expected.append((change.statement, []))
+    assert cursor.calls[cursor.calls.index(create) :] == expected
+    assert [params[-1] for _, params in expected[1:] if params] == list(ALL_TTL_TABLES)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_ttl_retry_reads_the_settings_again(make: str) -> None:
+    # The history's TTL change meets another process's schema change, which
+    # leaves the settings in place: the retry reads them and changes nothing
+    store = ttl_store(make)
+    cursor = ttl_setup_cursor(make, busy=1, winner=True)
+    use_cursor(store, cursor)
+
+    await run_setup(store)
+
+    history = store.sql.history_ttl_change()
+    items, vectors = store.sql.ttl_changes(store.ttl.cron)
+    create = (store.sql.create_history_table(), [])
+    assert cursor.calls[cursor.calls.index(create) :] == [
+        create,
+        history.applied,
+        (history.statement, []),
+        history.applied,
+        items.applied,
+        (items.statement, []),
+        vectors.applied,
+        (vectors.statement, []),
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("operation", "settings", "table"),
+    [
+        ("setup", {"history": {"ttl_days": 30}}, "public.store_history"),
+        ("setup", {"ttl": {"default_ttl": 5}}, "public.store"),
+        ("disable_ttl", {"ttl": {"default_ttl": 5}}, "public.store"),
+    ],
+    ids=["history-ttl", "ttl", "disable-ttl"],
+)
+async def test_ttl_changes_wait_out_a_schema_change_past_the_policys_attempts(
+    make: str, operation: str, settings: dict, table: str
+) -> None:
+    # The policy alone gives up after two attempts. The busy error has a
+    # budget of its own, so seven in a row are waited out
+    store = make_store(
+        make, retry_policy=RetryPolicy(max_attempts=2, initial_backoff=0.0), **settings
+    )
+    cursor = ttl_setup_cursor(make, busy=7)
+    use_cursor(store, cursor)
+
+    if operation == "setup":
+        await run_setup(store)
+    else:
+        await call(store, operation)
+
+    assert cursor.altered() == [table] * 8
 
 
 def test_cache_columns_reads_the_ready_row() -> None:
@@ -1851,7 +2031,7 @@ async def test_setup_creates_the_history_table_and_clears_its_check(make: str) -
     result = store.setup()
     if make == "async":
         await result  # type: ignore[misc]
-    create, ttl = store.sql.history_statements(30.0)
+    create, ttl = store.sql.create_history_table(), store.sql.history_ttl_change().statement
     # The TTL change met another schema change once and ran again, as the
     # items' TTL does
     assert [s for s in cursor.statements if store.sql.history in s] == [create, ttl, ttl]

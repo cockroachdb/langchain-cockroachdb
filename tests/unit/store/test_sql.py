@@ -8,11 +8,13 @@ import pytest
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
 from langchain_cockroachdb.store.sql import (
+    HISTORY_TTL_CRON,
     MAX_SEARCH_NAMESPACES,
     MIGRATION_RECONCILE,
     NAMESPACES,
     QUERY_VECTOR,
     StoreSQL,
+    TTLChange,
     bind,
 )
 
@@ -240,8 +242,10 @@ def test_no_cast_shorthand():
     )
     assert "::" not in query_sql
 
-    for stmt in sql.history_statements(30.0):
-        assert "::" not in stmt
+    assert "::" not in sql.create_history_table()
+    for change in (sql.history_ttl_change(), *sql.ttl_changes("@hourly")):
+        assert "::" not in change.statement
+        assert "::" not in change.applied[0]
     for query_sql, _ in (
         sql.archive(
             "a",
@@ -688,17 +692,34 @@ def test_sweep():
     assert len(sweeps) == 1
 
 
-def test_ttl_statements():
-    """ttl_statements() builds ALTER TABLE SET for TTL configuration."""
-    sql = StoreSQL("public", "store", index=_make_index())
-    stmts = sql.ttl_statements("@hourly")
+TTL_READ = (
+    "SELECT COALESCE(reloptions @> CAST(%s AS STRING[]), false) AS applied\n"
+    "FROM pg_catalog.pg_class WHERE oid = to_regclass(%s)"
+)
 
-    # With index: items and vectors
-    assert len(stmts) == 2
-    for stmt in stmts:
-        assert "ALTER TABLE" in stmt
-        assert "SET (ttl_expiration_expression" in stmt
-        assert "@hourly" in stmt
+
+def test_ttl_changes_set_each_table_and_read_its_settings_first():
+    """ttl_changes() pairs each table's ALTER TABLE SET with the read that can skip it."""
+    sql = StoreSQL("public", "store", index=_make_index())
+    items, vectors = sql.ttl_changes("*/5 * * * *")
+    wanted = ["ttl_expiration_expression='expires_at'", "ttl_job_cron='*/5 * * * *'"]
+    assert items == TTLChange(
+        "ALTER TABLE public.store SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '*/5 * * * *');",
+        (TTL_READ, [wanted, "public.store"]),
+    )
+    assert vectors == TTLChange(
+        "ALTER TABLE public.store_vectors SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '*/5 * * * *');",
+        (TTL_READ, [wanted, "public.store_vectors"]),
+    )
+    # Without an index there is no vectors table
+    [only] = StoreSQL("app", "mem").ttl_changes("@daily")
+    assert only.statement.startswith("ALTER TABLE app.mem SET ")
+    assert only.applied[1] == [
+        ["ttl_expiration_expression='expires_at'", "ttl_job_cron='@daily'"],
+        "app.mem",
+    ]
 
 
 def test_disable_ttl_statements():
@@ -725,11 +746,11 @@ def test_upsert_empty_rows_raises():
 
 
 def test_ttl_cron_validation():
-    """ttl_statements should reject cron with single quote."""
+    """ttl_changes should reject cron with single quote."""
     sql = StoreSQL("public", "store", index=None)
 
     with pytest.raises(ValueError, match="single quote"):
-        sql.ttl_statements("0 0 * * *'; DROP TABLE")
+        sql.ttl_changes("0 0 * * *'; DROP TABLE")
 
 
 def test_every_builder_has_one_param_per_placeholder():
@@ -834,6 +855,7 @@ def test_every_builder_has_one_param_per_placeholder():
         *candidate_statements(sql),
         *reconcile_statements(sql),
         *reconcile_statements(StoreSQL("public", "store")),
+        *(change.applied for change in (sql.history_ttl_change(), *sql.ttl_changes("@hourly"))),
     ):
         assert query_sql.count("%s") == len(params)
 
@@ -1039,8 +1061,7 @@ HISTORY_COLUMNS = [
 def test_history_table_statement() -> None:
     sql = StoreSQL("app", "mem")
     assert sql.history == "app.mem_history"
-    [create] = sql.history_statements(None)
-    lines = create.splitlines()
+    lines = sql.create_history_table().splitlines()
     assert lines[0] == "CREATE TABLE IF NOT EXISTS app.mem_history ("
     assert lines[-1] == ");"
     assert [line.strip().rstrip(",") for line in lines[1:-1]] == [
@@ -1049,17 +1070,21 @@ def test_history_table_statement() -> None:
     ]
 
 
-def test_history_ttl_statement_only_with_ttl_days() -> None:
+def test_history_ttl_change_runs_hourly_and_reads_the_settings_first() -> None:
     sql = StoreSQL("public", "store")
-    [create] = sql.history_statements(None)
-    statements = sql.history_statements(30.0)
-    assert statements == [
-        create,
+    assert HISTORY_TTL_CRON == "@hourly"
+    # Each archived row carries its own expires_at, so the days are not in the DDL
+    assert sql.history_ttl_change() == TTLChange(
         "ALTER TABLE public.store_history SET "
         "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');",
-    ]
-    # Each archived row carries its own expires_at, so the days are not in the DDL
-    assert "30" not in statements[1]
+        (
+            TTL_READ,
+            [
+                ["ttl_expiration_expression='expires_at'", "ttl_job_cron='@hourly'"],
+                "public.store_history",
+            ],
+        ),
+    )
 
 
 def test_archive_statement_binds_everything() -> None:

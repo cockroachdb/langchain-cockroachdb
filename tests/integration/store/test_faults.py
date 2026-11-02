@@ -33,6 +33,7 @@ from tests.integration.faults import (
     wait_for_statement,
 )
 from tests.integration.store.conftest import FAST
+from tests.integration.store.test_schema_upgrade import schema_0_5
 
 DIMS = 4
 EMBEDDINGS = DeterministicFakeEmbedding(size=DIMS)
@@ -438,3 +439,107 @@ async def test_async_parallel_setup_converges(libpq_url, table_name) -> None:
     stores = await asyncio.wait_for(asyncio.gather(*(run() for _ in range(6))), 180)
     assert len(stores) == 6
     assert_set_up_once(libpq_url, stores[0])
+
+
+# A 0.5 table with this many items takes migration 2 seconds to backfill,
+# longer than the policy's own budget of about a second
+ROWS_0_5 = 200_000
+HISTORIES = pytest.mark.parametrize(
+    "history", [None, {"ttl_days": 30}], ids=["without-history", "with-history"]
+)
+
+
+def build_0_5_table(libpq_url: str, table_name: str) -> None:
+    """The tables that 0.5.x setup() left, with ROWS_0_5 items in them."""
+    with (
+        CockroachDBStore.from_conn_string(
+            libpq_url, index=index_config(), table_name=table_name
+        ) as store,
+        psycopg.connect(libpq_url, autocommit=True) as conn,
+    ):
+        for statement in schema_0_5(store):
+            conn.execute(statement)
+        conn.execute(
+            f"INSERT INTO {store.sql.items} (prefix, key, value) "
+            "SELECT 'user.' || CAST(i %% 100 AS STRING), 'k' || CAST(i AS STRING), "
+            "CAST(%s AS JSONB) FROM generate_series(1, %s) AS i",
+            ('{"text": "hello"}', ROWS_0_5),
+        )
+
+
+def upgrade_settings(table_name: str, history: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "index": index_config(),
+        "ttl": {"default_ttl": 5},
+        "history": history,
+        "table_name": table_name,
+    }
+
+
+def assert_upgraded_once(libpq_url: str, store: Any) -> None:
+    """Migration 2 is recorded once and backfilled every item, and each TTL setting is in place."""
+    assert_set_up_once(libpq_url, store)
+    with psycopg.connect(libpq_url, autocommit=True) as conn:
+        row = conn.execute(
+            f"SELECT count(*) FROM {store.sql.items} WHERE version = 1 AND confirmations = 0"
+        ).fetchone()
+        assert row is not None and row[0] == ROWS_0_5
+        if store._history is not None:
+            found = conn.execute(
+                f"SELECT create_statement FROM [SHOW CREATE TABLE {store.sql.history}]"
+            ).fetchone()
+            assert found is not None
+            assert found[0].count(TTL_SETTING) == 1, found[0]
+            assert found[0].count("ttl_job_cron = '@hourly'") == 1, found[0]
+
+
+@pytest.mark.timeout(300)
+@HISTORIES
+def test_parallel_setup_converges_while_migration_2_backfills(
+    libpq_url, table_name, history
+) -> None:
+    # Six processes start on 0.6.0 together over a 0.5 table that holds
+    # data. One backfills migration 2's columns, while the others go on to
+    # the TTL step, which v25.4 refuses until the backfill is done
+    build_0_5_table(libpq_url, table_name)
+    errors: list[BaseException] = []
+    stores: list[CockroachDBStore] = []
+
+    def run() -> None:
+        try:
+            with CockroachDBStore.from_conn_string(
+                libpq_url, **upgrade_settings(table_name, history)
+            ) as store:
+                store.setup()
+                stores.append(store)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=run) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(240)
+    assert not any(thread.is_alive() for thread in threads), "a setup thread did not finish"
+    assert errors == []
+    assert len(stores) == 6
+    assert_upgraded_once(libpq_url, stores[0])
+
+
+@pytest.mark.timeout(300)
+@HISTORIES
+async def test_async_parallel_setup_converges_while_migration_2_backfills(
+    libpq_url, table_name, history
+) -> None:
+    await asyncio.to_thread(build_0_5_table, libpq_url, table_name)
+
+    async def run() -> AsyncCockroachDBStore:
+        async with AsyncCockroachDBStore.from_conn_string(
+            libpq_url, **upgrade_settings(table_name, history)
+        ) as store:
+            await store.setup()
+            return store
+
+    stores = await asyncio.wait_for(asyncio.gather(*(run() for _ in range(6))), 240)
+    assert len(stores) == 6
+    await asyncio.to_thread(assert_upgraded_once, libpq_url, stores[0])

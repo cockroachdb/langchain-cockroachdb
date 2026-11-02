@@ -46,6 +46,7 @@ TWINS = [
     ("_read_all", "_read_all"),
     ("_embed_put", "_embed_put"),
     ("setup", "setup"),
+    ("_set_ttl", "_set_ttl"),
     ("_run_puts", "_run_puts"),
     ("delete_namespace", "adelete_namespace"),
     ("_schema", "_aschema"),

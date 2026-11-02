@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from langgraph.store.base import NOT_PROVIDED, NotProvided
 
@@ -37,6 +37,10 @@ _RECONCILE_COLUMNS = (
     "valid_at",
     "confirm_id",
 )
+
+# The schedule of the history table's TTL job, which deletes the versions
+# past their history TTL
+HISTORY_TTL_CRON = "@hourly"
 
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
@@ -85,6 +89,18 @@ def bind(statement: tuple[str, list], placeholder: object, value: Any) -> tuple[
     """A copy of ``statement`` with ``value`` wherever ``placeholder`` is in its params."""
     sql, params = statement
     return (sql, [value if param is placeholder else param for param in params])
+
+
+class TTLChange(NamedTuple):
+    """A statement that turns on a table's row-level TTL, and the read that can skip it.
+
+    ``applied`` returns no row for a missing table, and otherwise one row
+    whose ``applied`` column says whether the table already has the
+    settings, so that the statement would change nothing.
+    """
+
+    statement: str
+    applied: tuple[str, list]
 
 
 class StoreSQL:
@@ -235,21 +251,12 @@ class StoreSQL:
 
         return stmts
 
-    def history_statements(self, ttl_days: float | None) -> list[str]:
-        """Return idempotent DDL statements for the history table.
+    def create_history_table(self) -> str:
+        """The idempotent statement that creates the history table.
 
-        setup() runs them only on a store with history, each on its own.
-
-        Args:
-            ttl_days: The history's TTL in days, or None to keep it. With a
-                TTL, CockroachDB's row-level TTL deletes a version once its
-                ``expires_at`` passes. The archive statement sets that.
-
-        Returns:
-            [history table], and the TTL setting with ``ttl_days``.
+        setup() runs it only on a store with history.
         """
-        stmts = [
-            f"""CREATE TABLE IF NOT EXISTS {self.history} (
+        return f"""CREATE TABLE IF NOT EXISTS {self.history} (
     prefix TEXT NOT NULL,
     key TEXT NOT NULL,
     version INT8 NOT NULL,
@@ -267,13 +274,16 @@ class StoreSQL:
     expires_at TIMESTAMPTZ,
     PRIMARY KEY (prefix, key, version)
 );"""
-        ]
-        if ttl_days is not None:
-            stmts.append(
-                f"ALTER TABLE {self.history} SET "
-                "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');"
-            )
-        return stmts
+
+    def history_ttl_change(self) -> TTLChange:
+        """The TTL change of the history table, for a store with history ``ttl_days``.
+
+        CockroachDB's row-level TTL then deletes a version once its
+        ``expires_at`` passes. The archive statement sets that from
+        ``ttl_days``, so the days are not in the DDL. The job runs on
+        HISTORY_TTL_CRON.
+        """
+        return self._ttl_change(self.history, HISTORY_TTL_CRON)
 
     def history_exists(self) -> tuple[str, list]:
         """The statement that tells whether the history table exists, as ``ready``."""
@@ -318,31 +328,49 @@ class StoreSQL:
         """A copy of a semantic search statement with its query vector bound."""
         return bind(statement, QUERY_VECTOR, vector_literal(embedding))
 
-    def ttl_statements(self, cron: str) -> list[str]:
-        """Return ALTER TABLE statements to enable TTL.
+    def ttl_changes(self, cron: str) -> list[TTLChange]:
+        """The TTL changes of the items table, and of the vectors table with an index.
 
         Args:
             cron: Cron expression for TTL job.
 
         Returns:
-            List of ALTER TABLE SET statements.
+            One TTLChange per table.
+
+        Raises:
+            ValueError: If cron contains single quote.
+        """
+        changes = [self._ttl_change(self.items, cron)]
+        if self._index is not None:
+            changes.append(self._ttl_change(self.vectors, cron))
+        return changes
+
+    @staticmethod
+    def _ttl_change(table: str, cron: str) -> TTLChange:
+        """The statement that turns on row-level TTL on ``table``, and the read that can skip it.
+
+        CockroachDB takes no bound parameters in storage parameters, so the
+        cron is formatted into the statement, and a cron with a quote is
+        refused. The read binds its values. It reads pg_class.reloptions,
+        which lists a table's storage parameters as CockroachDB renders
+        them, ``key='value'``.
 
         Raises:
             ValueError: If cron contains single quote.
         """
         if "'" in cron:
             raise ValueError("cron expression cannot contain single quote")
-
-        stmts = [
-            f"ALTER TABLE {self.items} SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
-        ]
-
-        if self._index is not None:
-            stmts.append(
-                f"ALTER TABLE {self.vectors} SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
-            )
-
-        return stmts
+        statement = (
+            f"ALTER TABLE {table} SET "
+            f"(ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
+        )
+        wanted = ["ttl_expiration_expression='expires_at'", f"ttl_job_cron='{cron}'"]
+        applied = (
+            "SELECT COALESCE(reloptions @> CAST(%s AS STRING[]), false) AS applied\n"
+            "FROM pg_catalog.pg_class WHERE oid = to_regclass(%s)",
+            [wanted, table],
+        )
+        return TTLChange(statement, applied)
 
     def disable_ttl_statements(self) -> list[str]:
         """Return ALTER TABLE statements to disable TTL.

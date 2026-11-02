@@ -452,8 +452,9 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
-        retried under the saver's retry policy, even if its ``retry_on`` would
-        refuse it. ``max_attempts=1`` turns this off.
+        retried with the budget that schema_change_policy gives it, about a
+        minute by default, even if the policy's ``retry_on`` would refuse it.
+        ``max_attempts=1`` turns this off.
 
         Args:
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
@@ -470,8 +471,9 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
-        retried under the saver's retry policy, even if its ``retry_on`` would
-        refuse it. ``max_attempts=1`` turns this off.
+        retried with the budget that schema_change_policy gives it, about a
+        minute by default, even if the policy's ``retry_on`` would refuse it.
+        ``max_attempts=1`` turns this off.
         """
         policy = schema_change_policy(self.retry_policy)
         for statement in self.DISABLE_TTL_SQL:
