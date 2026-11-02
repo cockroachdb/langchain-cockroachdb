@@ -497,11 +497,16 @@ def test_an_update_never_moves_updated_at_back() -> None:
     # it replaces, so the update keeps the later of the two
     sql = StoreSQL("public", "store")
     rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
-    for history in (False, True):
-        query, params = sql.upsert_items(rows, write_id="w-1", history=history)
-        assert "\n    updated_at = GREATEST(now(), public.store.updated_at),\n" in query
-        assert "updated_at = now()" not in query
-        assert params == ["w-1", *rows[0]]
+    query, params = sql.upsert_items(rows, write_id="w-1")
+    assert "\n    updated_at = GREATEST(now(), public.store.updated_at),\n" in query
+    assert "updated_at = now()" not in query
+    assert params == ["w-1", *rows[0]]
+    # With history the floor also takes in the key's history, through
+    # EXCLUDED.updated_at (see the test below)
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True)
+    assert "\n    updated_at = GREATEST(EXCLUDED.updated_at, public.store.updated_at),\n" in query
+    assert "updated_at = now()" not in query
+    assert params == ["w-1", *rows[0]]
     # Until setup() applies migration 2, puts still send the 0.5.1 statement
     plain, _ = sql.upsert_items([("user.a", "k", "{}", None)])
     assert "\n    updated_at = now(),\n" in plain
@@ -1174,9 +1179,19 @@ def test_upsert_with_history_continues_versions_after_the_history() -> None:
         "GREATEST(\n"
         "        COALESCE((SELECT i.version FROM public.store AS i "
         "WHERE i.prefix = rows_to_insert.prefix AND i.key = rows_to_insert.key), 0),\n"
-        "        COALESCE((SELECT max(h.version) FROM public.store_history AS h "
-        "WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key), 0)\n"
+        "        COALESCE(kh.version, 0)\n"
         "    ) + 1"
+    ) in query
+    assert (
+        "FROM (SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
+        "CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes, "
+        "CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at) AS rows_to_insert\n"
+        "CROSS JOIN LATERAL (\n"
+        "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+        "    FROM public.store_history AS h\n"
+        "    WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key\n"
+        ") AS kh\n"
+        "ON CONFLICT (prefix, key) DO UPDATE SET\n"
     ) in query
     assert "version = EXCLUDED.version" in query
     assert "version = public.store.version + 1" not in query
@@ -1189,6 +1204,37 @@ def test_upsert_with_history_continues_versions_after_the_history() -> None:
     assert "version = public.store.version + 1" in without
     with pytest.raises(ValueError, match="write id"):
         sql.upsert_items([("user.a", "k", "{}", None)], history=True)
+
+
+def test_with_history_a_version_never_starts_before_the_key_history_ended() -> None:
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True, return_version=True)
+    # A new row, as when the key is written again after a delete, starts no
+    # earlier than the latest end of a version in the key's history. Its
+    # created_at is the same, so a new row is still never updated after it
+    # was created
+    assert query.startswith(
+        "INSERT INTO public.store (prefix, key, value, expires_at, ttl_minutes, provenance, "
+        "valid_at, write_id, version, created_at, updated_at)\n"
+    )
+    assert (
+        "    ) + 1,\n    GREATEST(now(), kh.ended_at), GREATEST(now(), kh.ended_at)\nFROM ("
+    ) in query
+    # An update takes in the history too, through EXCLUDED.updated_at, so a
+    # late fact recorded under the live key never ends after the next version
+    # starts
+    assert "    updated_at = GREATEST(EXCLUDED.updated_at, public.store.updated_at),\n" in query
+    # The version and both floors come from one read of the history table,
+    # and no value is formatted into the text
+    assert query.count("public.store_history") == 1
+    assert params == ["w-1", *rows[0]]
+    assert query.count("%s") == len(params)
+
+    # Without history the new row keeps the column defaults, from now()
+    plain, _ = sql.upsert_items(rows, write_id="w-1")
+    assert "created_at" not in plain and "EXCLUDED.updated_at" not in plain
+    assert "kh." not in plain
 
 
 def test_upsert_can_return_the_written_version() -> None:
@@ -1243,7 +1289,8 @@ def test_no_history_row_ends_before_it_was_written() -> None:
     # writer of that version still has the now() it started with, which can
     # be earlier, so ended_at is the later of the two
     assert "\n    updated_at, GREATEST(now(), updated_at),\n" in query
-    # A late fact recorded straight into history is written and ended at one now()
+    # A late fact recorded straight into history is written and ended at one
+    # time, never before the key's live row was written or its history ended
     late, _ = sql.history_insert_superseded(
         "user.alice",
         "late-key",
@@ -1255,7 +1302,9 @@ def test_no_history_row_ends_before_it_was_written() -> None:
         write_id="w-1",
         ttl_days=None,
     )
-    assert "GREATEST(p.invalid_at, p.valid_at), now(), now()," in late
+    assert (
+        "GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),"
+    ) in late
 
 
 def test_history_insert_superseded_binds_everything() -> None:
@@ -1285,17 +1334,32 @@ def test_history_insert_superseded_binds_everything() -> None:
         assert value not in query
     assert query.startswith("INSERT INTO public.store_history (")
     # The version follows the key's live version and its highest version in
-    # history, as the upsert numbers them
+    # history, as the upsert numbers them. The key's row in the items table and
+    # its history are each read once, for the version and the floor below
     assert (
-        "GREATEST(\n"
-        "        COALESCE((SELECT i.version FROM public.store AS i "
-        "WHERE i.prefix = p.prefix AND i.key = p.key), 0),\n"
-        "        COALESCE((SELECT max(h.version) FROM public.store_history AS h "
-        "WHERE h.prefix = p.prefix AND h.key = p.key), 0)\n"
-        "    ) + 1"
+        "SELECT p.prefix, p.key,\n"
+        "    GREATEST(\n"
+        "        COALESCE(i.version, 0),\n"
+        "        COALESCE(kh.version, 0)\n"
+        "    ) + 1,\n"
     ) in query
-    # Never invalid before it became valid. The store held it for no time
-    assert "GREATEST(p.invalid_at, p.valid_at), now(), now()" in query
+    assert (
+        ") AS p\n"
+        "LEFT JOIN public.store AS i ON i.prefix = p.prefix AND i.key = p.key\n"
+        "CROSS JOIN LATERAL (\n"
+        "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+        "    FROM public.store_history AS h\n"
+        "    WHERE h.prefix = p.prefix AND h.key = p.key\n"
+        ") AS kh\n"
+        "WHERE NOT EXISTS (\n"
+    ) in query
+    # Never invalid before it became valid. The store held it for no time,
+    # written and ended at once, never before the key's live row was written
+    # or a version in its history ended
+    assert (
+        "GREATEST(p.invalid_at, p.valid_at),\n"
+        "    GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),\n"
+    ) in query
     # Inserted once per write id, whatever version a second run would compute.
     # The reason is part of the guard, so the same write's archive of the
     # memory under this key, as when it deletes it, never stands in for the

@@ -466,7 +466,12 @@ WHERE {where}"""
                 the live version and the highest version the key has in the
                 history table. So a key written again after a delete, or
                 after reconcile recorded a late fact under it straight into
-                history, never reuses a version kept there. Needs ``write_id``.
+                history, never reuses a version kept there. Its timestamps
+                follow the history too: a new row's created_at and
+                updated_at, and an update's updated_at, are never earlier
+                than the latest time a version of the key in history ended.
+                One read of the history table gives the version and that
+                floor. Needs ``write_id``.
             return_version: Whether the statement returns the version of
                 each row it inserts or updates, as ``version``. A row it
                 leaves as it is returns nothing. Needs ``write_id``.
@@ -523,25 +528,39 @@ ON CONFLICT (prefix, key) DO UPDATE SET
             return (sql, params)
 
         # Without history a new row starts at version 1, the column's
-        # default, and an update adds one. With history both take the next
-        # version over the live row and the key's history, computed once here
-        version_column, version_value = "", ""
+        # default, and an update adds one. An update never moves updated_at
+        # back. With history both take the next version over the live row and
+        # the key's history, computed once here, and a new row's timestamps
+        # start no earlier than the key's history ended. EXCLUDED.updated_at
+        # then carries that floor into the update
+        extra_columns, extra_values, key_history = "", "", ""
         version_update = f"{self.items}.version + 1"
+        updated_at = f"GREATEST(now(), {self.items}.updated_at)"
         if history:
-            version_column = ", version"
-            version_value = ",\n    " + self._next_version("rows_to_insert")
+            live_version = (
+                f"(SELECT i.version FROM {self.items} AS i "
+                "WHERE i.prefix = rows_to_insert.prefix AND i.key = rows_to_insert.key)"
+            )
+            extra_columns = ", version, created_at, updated_at"
+            extra_values = (
+                ",\n    "
+                + self._next_version(live_version)
+                + ",\n    GREATEST(now(), kh.ended_at), GREATEST(now(), kh.ended_at)"
+            )
+            key_history = "\n" + self._key_history("rows_to_insert")
             version_update = "EXCLUDED.version"
+            updated_at = f"GREATEST(EXCLUDED.updated_at, {self.items}.updated_at)"
         # The SET expressions read the row as it was before the update
         same_fact = (
             f"{self.items}.value = EXCLUDED.value AND "
             f"({self.items}.expires_at IS NULL OR {self.items}.expires_at > now())"
         )
-        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{version_column})
-SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){version_value}
-FROM ({union_sql}) AS rows_to_insert
+        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{extra_columns})
+SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){extra_values}
+FROM ({union_sql}) AS rows_to_insert{key_history}
 ON CONFLICT (prefix, key) DO UPDATE SET
     value = EXCLUDED.value,
-    updated_at = GREATEST(now(), {self.items}.updated_at),
+    updated_at = {updated_at},
     expires_at = EXCLUDED.expires_at,
     ttl_minutes = EXCLUDED.ttl_minutes,
     provenance = EXCLUDED.provenance,
@@ -555,21 +574,37 @@ WHERE {self.items}.write_id IS DISTINCT FROM EXCLUDED.write_id"""
             sql += "\nRETURNING version"
         return (sql, params)
 
-    def _next_version(self, source: str) -> str:
-        """The next version of the key that ``source`` names, on a store with history.
+    @staticmethod
+    def _next_version(live_version: str) -> str:
+        """The next version of a key, on a store with history.
 
-        One more than the larger of the key's version in the items table,
-        live or not, and its highest version in the history table, so a
-        key's versions stay unique across both. ``source`` is the alias of
-        a relation with ``prefix`` and ``key`` columns.
+        One more than the larger of ``live_version``, the key's version in
+        the items table, live or not, and ``kh.version``, its highest version
+        in the history table as the _key_history join reads it. So a key's
+        versions stay unique across both.
         """
         return (
             "GREATEST(\n"
-            f"        COALESCE((SELECT i.version FROM {self.items} AS i "
-            f"WHERE i.prefix = {source}.prefix AND i.key = {source}.key), 0),\n"
-            f"        COALESCE((SELECT max(h.version) FROM {self.history} AS h "
-            f"WHERE h.prefix = {source}.prefix AND h.key = {source}.key), 0)\n"
+            f"        COALESCE({live_version}, 0),\n"
+            "        COALESCE(kh.version, 0)\n"
             "    ) + 1"
+        )
+
+    def _key_history(self, source: str) -> str:
+        """The join that reads the history of the key that ``source`` names once, as ``kh``.
+
+        ``kh.version`` is the key's highest version in the history table and
+        ``kh.ended_at`` the latest time one of its versions ended, both NULL
+        for a key with no history, which GREATEST then ignores. The
+        aggregate returns one row for every row of ``source``, the alias of
+        a relation with ``prefix`` and ``key`` columns, so no row is lost.
+        """
+        return (
+            "CROSS JOIN LATERAL (\n"
+            "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+            f"    FROM {self.history} AS h\n"
+            f"    WHERE h.prefix = {source}.prefix AND h.key = {source}.key\n"
+            ") AS kh"
         )
 
     def delete_items(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
@@ -1101,8 +1136,10 @@ LIMIT %s OFFSET %s"""
         """The statement that reads the database's clock, as ``now``.
 
         In a transaction it reads the transaction's timestamp. That is also
-        the updated_at of every row the transaction writes, unless it
-        overwrites a row whose updated_at is later, which the row keeps.
+        the updated_at of every row the transaction writes, unless the live
+        row it overwrites was written later or, on a store with history, a
+        version of the key in history ended later. A version never starts
+        before the one it follows.
         """
         return ("SELECT now() AS now", [])
 
@@ -1488,8 +1525,11 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         upsert numbers them on a store with history, so it never takes a
         version the key has or gets later. It is valid from ``valid_at``
         until ``invalid_at``, never earlier, and the store held it for no
-        time: written_at and ended_at are both now, and it has no
-        confirmations. If a superseded row of the key already carries
+        time: written_at and ended_at are the same, and it has no
+        confirmations. That time is now, but never before the key's row in
+        the items table was written or a version in its history ended, as
+        for any version that follows them. One read of each gives the
+        version and that floor. If a superseded row of the key already carries
         ``write_id``, this write inserted it in an attempt that committed
         before its result was lost, and nothing is inserted. The same
         write's archive of the memory under the key, as when it deletes that
@@ -1512,8 +1552,9 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         """
         sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
 SELECT p.prefix, p.key,
-    {self._next_version("p")},
-    p.value, p.provenance, p.valid_at, GREATEST(p.invalid_at, p.valid_at), now(), now(),
+    {self._next_version("i.version")},
+    p.value, p.provenance, p.valid_at, GREATEST(p.invalid_at, p.valid_at),
+    GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),
     p.reason, p.superseded_by, p.write_id, now() + p.ttl_days * INTERVAL '1 day'
 FROM (
     SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, CAST(%s AS JSONB) AS value,
@@ -1522,6 +1563,8 @@ FROM (
         CAST(%s AS STRING) AS superseded_by, CAST(%s AS UUID) AS write_id,
         CAST(%s AS DECIMAL) AS ttl_days
 ) AS p
+LEFT JOIN {self.items} AS i ON i.prefix = p.prefix AND i.key = p.key
+{self._key_history("p")}
 WHERE NOT EXISTS (
     SELECT 1 FROM {self.history} AS h
     WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id
