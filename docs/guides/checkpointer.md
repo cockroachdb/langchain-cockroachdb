@@ -316,6 +316,15 @@ with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
     print("Completed:", result["messages"][-1])
 ```
 
+### Application-process Recovery
+
+For application-crash recovery coverage, see the
+[process-recovery tests](../development/testing.md#application-process-recovery).
+They validate approval resume and pending-write reuse with a fresh process and
+pool, using `durability="sync"` on both sync and async graph calls. Interrupted
+or unfinished nodes can execute code again, so external tool effects need
+application-level idempotency or reconciliation.
+
 ## Schema and Migrations
 
 The `setup()` method creates three tables and associated indexes:

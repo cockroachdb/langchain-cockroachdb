@@ -23,6 +23,8 @@ tests/
 │   ├── test_chat_history_resilience.py # Chat history resilience
 │   ├── test_checkpointer_faults.py # Checkpointer resilience
 │   ├── test_checkpointer_conformance.py # LangGraph standard tests
+│   ├── test_graph_process_recovery.py # Full graph recovery after process loss
+│   ├── graph_recovery_worker.py      # Spawned sync and async applications
 │   └── faults.py                   # Fault injection mechanisms
 └── e2e/
     └── test_examples.py            # End-to-end tests for all examples
@@ -39,6 +41,60 @@ The `tests/integration/faults.py` module provides three mechanisms for injecting
 3. **`kill_sessions` and `hold_row_lock`** - helper functions to cancel sessions (simulating node restarts or load balancer resets) and hold row locks (simulating stuck ranges).
 
 These let tests verify that the retry policy handles real CockroachDB errors exactly as they would appear in production.
+
+## Application-process Recovery
+
+`test_graph_process_recovery.py` exercises real LangGraph workflows with both
+checkpointers. Each worker runs three independent conversations through one
+pool capped at two connections. The parent kills that worker and starts a
+fresh process, so the resumed application cannot reuse its graph, event loop,
+connection pool, or Python state.
+
+The suite covers two crash boundaries:
+
+- A graph has saved a human-approval interrupt. The fresh application resumes
+  it with `Command(resume=...)` and the same thread ID.
+- One parallel node has committed pending writes while another is blocked.
+  The fresh application resumes with `None`, reuses the successful node's
+  output, and reruns the unfinished node.
+
+Pipe notifications wait for committed pending writes and blocked nodes before
+the parent kills the process. No fixed sleeps choose the crash point. The
+parent also reads the database between processes to check saved state and
+pending writes, then verifies distinct results for every thread after resume.
+For approvals, it compares the saved interrupt's payload and identity with the
+interrupt returned by the graph. Completed states must match each thread's
+expected values and have no pending writes.
+Each test deletes only its own randomly generated thread IDs.
+
+The workers use `durability="sync"` so parent checkpoints commit before the
+next graph step starts. LangGraph's `"async"` durability mode can lose a
+checkpoint on process failure while it is being saved. See LangGraph's
+[durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes).
+These are separate choices from using sync or async Python APIs; both APIs
+are tested with synchronous checkpoint durability.
+
+A file log outside the checkpointer records node effects across the crash.
+The assertions verify that a successful node with saved pending writes does
+not repeat, while code before an interrupt or unfinished node boundary runs
+again. This does not guarantee exactly-once external tool execution. A crash
+after an external effect and before its pending write commits can repeat the
+effect; applications need idempotency keys or reconciliation for that case.
+
+Run against a disposable CockroachDB instance with the normal fixture, or use
+an existing test instance:
+
+```bash
+USE_TESTCONTAINER=false \
+COCKROACHDB_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' \
+.venv/bin/pytest tests/integration/test_graph_process_recovery.py -v
+```
+
+The tests need the development `langgraph` dependency and skip when it is not
+installed, including CI's minimum runtime dependency job. No model API keys
+are needed. The database stays online throughout: database restarts, physical
+cluster replication, failover, and recovery-time measurements require
+separate infrastructure and are not covered here.
 
 ## Running Tests
 
