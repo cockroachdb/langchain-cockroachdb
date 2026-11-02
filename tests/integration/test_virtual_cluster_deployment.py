@@ -7,9 +7,12 @@ change grants or network access, or require a testcontainer.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, ExitStack
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack, ExitStack, contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
+from inspect import iscoroutinefunction
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -25,6 +28,7 @@ from langchain_cockroachdb import (
     CockroachDBEngine,
     CockroachDBSaver,
 )
+from langchain_cockroachdb.retry import get_sqlstate
 
 pytestmark = pytest.mark.timeout(180)
 
@@ -36,8 +40,44 @@ class VirtualClusterTargets:
     peer: str = field(repr=False)
 
 
+@contextmanager
+def database_errors_without_connection_details() -> Iterator[None]:
+    """Driver errors can include credential-bearing connection arguments."""
+    try:
+        yield
+    except AssertionError:
+        raise
+    except Exception as error:
+        raise pytest.fail.Exception(
+            f"Virtual-cluster operation failed: {type(error).__name__}; "
+            f"SQLSTATE={get_sqlstate(error) or 'unavailable'}. "
+            "Connection details omitted.",
+            pytrace=False,
+        ) from None
+
+
+def hide_connection_errors(test: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep live URLs out of driver tracebacks while preserving data assertions."""
+    if iscoroutinefunction(test):
+
+        @wraps(test)
+        async def async_test(*args: Any, **kwargs: Any) -> Any:
+            with database_errors_without_connection_details():
+                return await test(*args, **kwargs)
+
+        return async_test
+
+    @wraps(test)
+    def sync_test(*args: Any, **kwargs: Any) -> Any:
+        with database_errors_without_connection_details():
+            return test(*args, **kwargs)
+
+    return sync_test
+
+
 @pytest.fixture(scope="module")
 def virtual_cluster_targets() -> VirtualClusterTargets:
+    __tracebackhide__ = True
     primary = os.environ.get("COCKROACHDB_VIRTUAL_CLUSTER_URL")
     peer = os.environ.get("COCKROACHDB_VIRTUAL_CLUSTER_PEER_URL")
     if not primary or not peer:
@@ -54,17 +94,19 @@ def virtual_cluster_targets() -> VirtualClusterTargets:
 async def virtual_cluster_engines(
     virtual_cluster_targets: VirtualClusterTargets,
 ) -> AsyncIterator[list[CockroachDBEngine]]:
-    engines = [
-        CockroachDBEngine.from_connection_string(url, pool_size=1, max_overflow=0)
-        for url in (virtual_cluster_targets.primary, virtual_cluster_targets.peer)
-    ]
-    try:
-        yield engines
-    finally:
-        for engine in engines:
-            await engine.aclose()
+    with database_errors_without_connection_details():
+        engines = [
+            CockroachDBEngine.from_connection_string(url, pool_size=1, max_overflow=0)
+            for url in (virtual_cluster_targets.primary, virtual_cluster_targets.peer)
+        ]
+        try:
+            yield engines
+        finally:
+            for engine in engines:
+                await engine.aclose()
 
 
+@hide_connection_errors
 async def test_vector_crud_is_scoped_to_the_virtual_cluster(
     virtual_cluster_engines: list[CockroachDBEngine],
 ) -> None:
@@ -98,6 +140,7 @@ async def test_vector_crud_is_scoped_to_the_virtual_cluster(
             )
 
 
+@hide_connection_errors
 async def test_chat_history_is_scoped_to_the_virtual_cluster(
     virtual_cluster_engines: list[CockroachDBEngine],
 ) -> None:
@@ -140,6 +183,7 @@ def assert_checkpoint(saved: CheckpointTuple | None, value: str) -> None:
     assert saved.pending_writes == [("shared_task", "note", value)]
 
 
+@hide_connection_errors
 def test_sync_checkpoints_are_scoped_to_the_virtual_cluster(
     virtual_cluster_targets: VirtualClusterTargets,
 ) -> None:
@@ -170,6 +214,7 @@ def test_sync_checkpoints_are_scoped_to_the_virtual_cluster(
                 saver.delete_thread(thread_id)
 
 
+@hide_connection_errors
 async def test_async_checkpoints_are_scoped_to_the_virtual_cluster(
     virtual_cluster_targets: VirtualClusterTargets,
 ) -> None:

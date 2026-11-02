@@ -17,10 +17,11 @@ CockroachDB documents this routing syntax in
 [Work with Virtual Clusters](https://www.cockroachlabs.com/docs/stable/work-with-virtual-clusters).
 Application workloads belong on the application virtual cluster. The `system`
 virtual cluster is for administration and physical cluster replication (PCR).
-Consult the [self-hosted virtualization limitations](https://www.cockroachlabs.com/docs/stable/cluster-virtualization-overview#known-limitations)
-for the supported topology. Those limits do not describe virtual clusters on
-a Cockroach Continuum dedicated host. This guide assumes an existing
-supported deployment.
+The [self-hosted virtualization limitations](https://www.cockroachlabs.com/docs/stable/cluster-virtualization-overview#known-limitations)
+currently allow one system virtual cluster and one application virtual
+cluster per physical cluster. Testing two self-hosted application virtual
+clusters therefore requires two physical clusters. This guide assumes an
+existing supported deployment.
 
 ## Managed virtual clusters
 
@@ -28,6 +29,11 @@ For a managed virtual cluster, use its complete SQL connection URL from the
 Cloud console's connection dialog. Select the virtual cluster itself when
 obtaining the URL. A dedicated host's console URL is a management address,
 not a SQL connection string.
+
+[Cockroach Continuum virtual clusters](https://www.cockroachlabs.com/product/continuum/)
+can share a dedicated host. Use the topology supported by your Cloud service;
+this integration does not provision virtual clusters or establish a supported
+virtual-cluster count.
 
 Keep the supplied hostname, port, database, TLS settings and any routing
 parameters. Do not assume a managed virtual cluster is named `main` or
