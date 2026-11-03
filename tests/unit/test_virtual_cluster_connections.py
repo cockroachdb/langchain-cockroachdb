@@ -3,9 +3,9 @@
 A self-hosted virtual cluster is selected with the URL's `options=-ccluster=...`
 startup option. These tests check that each connection factory passes that
 option, and other startup options, through to psycopg unchanged. They inspect
-driver arguments without opening a database connection. Managed virtual clusters
-route by distinct endpoint instead, with no `-ccluster` option; that path is
-covered by the opt-in integration suite in
+driver arguments without opening a database connection. A managed Continuum
+virtual cluster uses its own generated connection string instead, with no
+`-ccluster` option; that path is covered by the opt-in integration suite in
 tests/integration/test_virtual_cluster_deployment.py.
 """
 
@@ -22,6 +22,7 @@ from langchain_cockroachdb import (
     CockroachDBEngine,
     CockroachDBSaver,
 )
+from langchain_cockroachdb.store import CockroachDBStore, PoolConfig
 
 OPTIONS = "-ccluster=main -cstatement_timeout=5000"
 REST = (
@@ -106,3 +107,55 @@ async def test_async_saver_passes_self_hosted_cluster_options_to_psycopg(
     assert kwargs["autocommit"] is True
     assert kwargs["row_factory"] is dict_row
     conn.__aexit__.assert_awaited_once()
+
+
+@SCHEMES
+def test_store_normalizes_self_hosted_cluster_url(
+    scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = MagicMock(spec=psycopg.Connection)
+    conn.__enter__.return_value = conn
+    connect = MagicMock(return_value=conn)
+    monkeypatch.setattr(psycopg.Connection, "connect", connect)
+
+    with CockroachDBStore.from_conn_string(f"{scheme}://{REST}"):
+        pass
+
+    connect.assert_called_once()
+    (url,), _ = connect.call_args
+    assert url == f"postgresql://{REST}"
+    assert conninfo_to_dict(url)["options"] == OPTIONS
+
+
+@SCHEMES
+def test_store_pool_config_normalizes_self_hosted_cluster_url(
+    scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    class FakePool:
+        def __init__(self, conninfo: str, **kwargs: object) -> None:
+            captured["conninfo"] = conninfo
+
+        def __enter__(self) -> "FakePool":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def wait(self, *a: object, **k: object) -> None:
+            pass
+
+        def open(self, *a: object, **k: object) -> None:
+            pass
+
+        def close(self, *a: object, **k: object) -> None:
+            pass
+
+    monkeypatch.setattr("langchain_cockroachdb.store.store.ConnectionPool", FakePool)
+
+    with CockroachDBStore.from_conn_string(f"{scheme}://{REST}", pool_config=PoolConfig()):
+        pass
+
+    assert captured["conninfo"] == f"postgresql://{REST}"
+    assert conninfo_to_dict(captured["conninfo"])["options"] == OPTIONS

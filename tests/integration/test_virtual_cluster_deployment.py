@@ -1,9 +1,10 @@
 """Opt-in CRUD and isolation checks against two provisioned virtual clusters.
 
-Each target is addressed by its own SQL URL: managed virtual clusters route by
-distinct endpoint, and self-hosted ones by the URL's `-ccluster` option. Use
-disposable application targets. The tests do not provision clusters, change
-grants or network access, or require a testcontainer.
+Each target is addressed by its own SQL URL: a managed Continuum virtual cluster
+uses its own generated connection string, and a self-hosted one is selected by
+the URL's `-ccluster` option. Use disposable application targets. The tests do
+not provision clusters, change grants or network access, or require a
+testcontainer.
 """
 
 from __future__ import annotations

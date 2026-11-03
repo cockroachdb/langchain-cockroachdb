@@ -2,8 +2,12 @@
 
 Learn how to configure langchain-cockroachdb for different workloads.
 
-For an existing virtualized deployment, see [Virtual-cluster connections](../guides/virtual-clusters.md)
-for URL routing with `options=-ccluster=main`.
+For an existing virtualized deployment, see [Virtual-cluster connections](../guides/virtual-clusters.md).
+On a self-hosted cluster the application virtual cluster is selected with the
+percent-encoded `options=-ccluster%3Dmain`. The unencoded `options=-ccluster=main`
+that the CockroachDB docs show for `cockroach sql` is rejected by psycopg/libpq
+(`extra key/value separator "=" in URI query parameter: "options"`); only
+SQLAlchemy accepts it.
 
 ## Engine Configuration
 
@@ -14,12 +18,12 @@ from langchain_cockroachdb import CockroachDBEngine
 
 engine = CockroachDBEngine.from_connection_string(
     "cockroachdb://user:pass@host:26257/db",
-    pool_size=10,                    # Base connections
-    max_overflow=20,                 # Additional connections
-    pool_pre_ping=True,              # Health check before use
-    pool_recycle=3600,               # Recycle after 1 hour
-    pool_timeout=30.0,               # Wait 30s for connection
-    connect_timeout=10,              # Connection timeout (default: 10)
+    pool_size=10,  # Base connections
+    max_overflow=20,  # Additional connections
+    pool_pre_ping=True,  # Health check before use
+    pool_recycle=3600,  # Recycle after 1 hour
+    pool_timeout=30.0,  # Wait 30s for connection
+    connect_timeout=10,  # Connection timeout (default: 10)
 )
 ```
 
@@ -59,16 +63,13 @@ vectorstore = AsyncCockroachDBVectorStore(
     engine=engine,
     embeddings=embeddings,
     collection_name="documents",
-    
     # Column names
     content_column="content",
     embedding_column="embedding",
     metadata_column="metadata",
     id_column="id",
-    
     # Distance metric
     distance_strategy=DistanceStrategy.COSINE,  # or L2, IP
-    
     # Batch size for inserts
     batch_size=100,
 )
@@ -211,7 +212,7 @@ General guidelines:
 import logging
 
 logging.basicConfig()
-logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
 ```
 
 ### Enable Pool Logging
@@ -219,8 +220,8 @@ logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
 ```python
 engine = CockroachDBEngine.from_connection_string(
     connection_string,
-    echo=True,        # Log all SQL
-    echo_pool=True,   # Log pool events
+    echo=True,  # Log all SQL
+    echo_pool=True,  # Log pool events
 )
 ```
 

@@ -5,26 +5,27 @@ each client (the engine, chat history, and the checkpointers) at the SQL URL
 for the virtual cluster you want, and the library preserves that routing. How
 you select a virtual cluster depends on whether it is managed or self-hosted.
 
-## Managed virtual clusters
+## Managed virtual clusters (Cockroach Continuum)
 
-On CockroachDB Cloud, a dedicated host can run several virtual clusters, and
-each virtual cluster has its own SQL endpoint. Routing is by endpoint, so you
-do not add a cluster-selection option. Use a virtual cluster's complete SQL
-connection URL from the Cloud console's Connect dialog, selecting that virtual
-cluster when you obtain the URL:
+A Cockroach Continuum deployment is a host cluster, a Mission Critical cluster
+with virtualization enabled, currently in preview. Each virtual cluster on the
+host has its own SQL connection string, its own network security configuration,
+and its own SQL users. Generate a virtual cluster's connection string from the
+Cloud Console's Connect dialog or with the `ccloud` CLI, and use it as is:
 
 ```text
 postgresql://app:PASSWORD@vc-endpoint.aws-us-east-2.cockroachlabs.cloud:26257/agents?sslmode=verify-full
 ```
 
-A dedicated host's console URL is a management address, not a SQL connection
-string. Keep the supplied hostname, port, database, and TLS parameters,
-including `sslrootcert` when needed. Do not assume a virtual cluster is named
-`main` or construct its connection string from the host cluster's identifier.
-[Cockroach Continuum virtual clusters](https://www.cockroachlabs.com/product/continuum/)
-share a dedicated host this way. Use the topology supported by your Cloud
-service; this integration does not provision virtual clusters or establish a
-supported virtual-cluster count.
+Do not add a `-ccluster` option to a Continuum connection string; the generated
+string already reaches its virtual cluster. A host cluster's console URL is a
+management address, not a SQL connection string. Keep the supplied hostname,
+port, database, and TLS parameters, including `sslrootcert` when needed, and do
+not assume a virtual cluster is named `main` or build its connection string from
+the host's identifier. An application connected to a virtual cluster cannot see
+or reach the host or any other virtual cluster in the workspace. See
+[Virtual clusters on a Continuum host](https://docs.cockroachlabs.com/docs/continuum/virtual-clusters).
+This integration does not provision virtual clusters.
 
 ## Self-hosted virtual clusters
 
@@ -44,9 +45,9 @@ cluster replication (PCR). CockroachDB documents this routing syntax in
 The [self-hosted virtualization limitations](https://www.cockroachlabs.com/docs/stable/cluster-virtualization-overview#known-limitations)
 currently allow one system virtual cluster and one application virtual cluster
 per physical cluster, so testing two self-hosted application virtual clusters
-requires two physical clusters. The managed model above has no such per-host
-limit. The engine, chat history and saver examples below accept the supplied
-SQL URL either way.
+requires two physical clusters, or one virtualized cluster that compares the
+`main` and `system` virtual clusters. The engine, chat history and saver
+examples below accept the supplied SQL URL either way.
 
 ## Engines and chat history
 
@@ -94,20 +95,41 @@ query parameters. For concurrent agents, use a
 `postgresql://` URL directly to `psycopg_pool`. Pool constructors are provided
 by psycopg and do not normalize `cockroachdb://` URLs.
 
+## Long-term memory store
+
+`CockroachDBStore` and `AsyncCockroachDBStore` accept the same URL through
+`from_conn_string`, including the `pool_config` path, which builds the pool from
+the normalized URL. Point them at the same virtual cluster:
+
+```python
+import os
+
+from langchain_cockroachdb.store import CockroachDBStore
+
+with CockroachDBStore.from_conn_string(os.environ["COCKROACHDB_URL"]) as store:
+    store.setup()
+```
+
+See the [long-term memory store guide](long-term-memory.md) for indexes, TTL and
+search.
+
 ## Combine connection options
 
 Startup options such as the self-hosted `-ccluster` selector go in one
-`options` value, separated by spaces. Managed virtual clusters route by
-endpoint and usually need no `-ccluster` option. For example, to select a
+`options` value, separated by spaces. If a connection string already carries an
+`options` value, append to it rather than replace it. For example, to select a
 self-hosted `main` cluster and set a statement timeout:
 
 ```python
 from urllib.parse import quote, urlencode
 
-query = urlencode({
-    "sslmode": "verify-full",
-    "options": "-ccluster=main -cstatement_timeout=5000",
-}, quote_via=quote)
+query = urlencode(
+    {
+        "sslmode": "verify-full",
+        "options": "-ccluster=main -cstatement_timeout=5000",
+    },
+    quote_via=quote,
+)
 connection_url = f"postgresql://app:PASSWORD@HOST:26257/agents?{query}"
 ```
 

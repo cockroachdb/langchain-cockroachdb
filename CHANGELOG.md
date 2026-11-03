@@ -7,13 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Documentation
-
-- Document virtual-cluster connection URLs for engines, chat history and checkpointers, covering managed virtual clusters (routed by their own endpoint) and self-hosted cluster selection (the `-ccluster` startup option, percent-encoded for SQLAlchemy and libpq).
-
 ### Added
 
-- Opt-in integration tests that run vector operations, chat history, and sync/async checkpoints against two virtual clusters (which can share one Cloud dedicated host) and confirm each virtual cluster's data stays isolated after its peer is deleted from.
+- Virtual-cluster connection coverage and documentation for engines, chat history, the checkpointers and the long-term memory store. Unit tests check connection-string handling across the supported URL schemes, and opt-in integration tests run vector operations, chat history, and sync/async checkpoints against two virtual clusters on a Continuum host cluster and confirm each virtual cluster's data stays isolated after its peer is deleted from. The guide covers managed Continuum virtual clusters, each with its own connection string, and self-hosted cluster selection with the `-ccluster` startup option, which libpq requires percent-encoded.
 
 ## [0.5.1] - 2026-10-28
 
