@@ -7,6 +7,7 @@ from langchain_cockroachdb.indexes import (
     CSPANNQueryOptions,
     DistanceStrategy,
     _find_vector_index,
+    _index_leads_with,
     _usable_vector_index,
     _vector_indexes,
 )
@@ -94,8 +95,16 @@ class TestCSPANNQueryOptions:
             CSPANNQueryOptions(beam_size=bad)
 
 
-def create_statement(*index_lines: str) -> str:
-    """A SHOW CREATE TABLE statement as v26.3 renders it, with these index lines."""
+def create_statement(
+    *index_lines: str,
+    namespace_index: bool = True,
+    primary_key: str = "CONSTRAINT docs_pkey PRIMARY KEY (id ASC)",
+) -> str:
+    """A SHOW CREATE TABLE statement as v25.4.14 and v26.3.4 render it, with these index lines.
+
+    ``namespace_index`` adds the index on the namespace column that
+    ainit_vectorstore_table creates.
+    """
     lines = [
         "\tid UUID NOT NULL DEFAULT gen_random_uuid(),",
         "\tnamespace STRING NOT NULL DEFAULT '':::STRING,",
@@ -104,8 +113,8 @@ def create_statement(*index_lines: str) -> str:
         "\tembedding VECTOR(3) NULL,",
         "\tother VECTOR(3) NULL,",
         "\tmetadata JSONB NULL DEFAULT '{}':::JSONB,",
-        "\tCONSTRAINT docs_pkey PRIMARY KEY (id ASC),",
-        "\tINDEX docs_namespace_idx (namespace ASC)",
+        f"\t{primary_key},",
+        *(["\tINDEX docs_namespace_idx (namespace ASC)"] if namespace_index else []),
         *(f"\t{line}" for line in index_lines),
     ]
     body = ",\n".join(line.rstrip(",") for line in lines)
@@ -249,3 +258,47 @@ class TestVectorIndexParsing:
         quoted = _find_vector_index(statement, "quoted")
         assert quoted is not None and quoted.opclass == "vector_l2_ops"
         assert _find_vector_index(statement, "docs_embedding") is None
+
+
+class TestIndexLeadingWith:
+    """Whether the primary key or a forward index can serve namespace = ... with a LIMIT."""
+
+    def test_the_index_ainit_vectorstore_table_creates(self) -> None:
+        assert _index_leads_with(create_statement(), "namespace")
+        assert _index_leads_with(create_statement(), "NAMESPACE")
+        assert not _index_leads_with(create_statement(namespace_index=False), "namespace")
+
+    def test_a_vector_or_inverted_index_does_not_count(self) -> None:
+        statement = create_statement(
+            "VECTOR INDEX docs_ns_vec (namespace, embedding vector_cosine_ops)",
+            "INVERTED INDEX docs_ns_meta (namespace, metadata)",
+            namespace_index=False,
+        )
+        assert not _index_leads_with(statement, "namespace")
+
+    def test_the_primary_key(self) -> None:
+        statement = create_statement(
+            namespace_index=False,
+            primary_key="CONSTRAINT docs_pkey PRIMARY KEY (namespace ASC, id ASC)",
+        )
+        assert _index_leads_with(statement, "namespace")
+        assert _index_leads_with(create_statement(namespace_index=False), "id")
+
+    @pytest.mark.parametrize(
+        ("line", "leads"),
+        [
+            ("UNIQUE INDEX docs_u (namespace ASC, id ASC)", True),
+            ("INDEX docs_s (namespace ASC) STORING (content)", True),
+            ("INDEX docs_h (namespace ASC) USING HASH WITH (bucket_count=16)", True),
+            ('INDEX "Docs Quoted" ("namespace" ASC)', True),
+            ("INDEX docs_second (id ASC, namespace ASC)", False),
+            ("INDEX docs_p (namespace ASC) WHERE content IS NOT NULL", False),
+            ("INDEX docs_hidden (namespace ASC) NOT VISIBLE", False),
+            ("INDEX docs_half (namespace ASC) VISIBILITY 0.50", False),
+            ("INDEX docs_expr ((lower(namespace)) ASC)", False),
+            ("INDEX docs_ns_extra (namespace_id ASC)", False),
+        ],
+    )
+    def test_forward_indexes(self, line: str, leads: bool) -> None:
+        statement = create_statement(line, namespace_index=False)
+        assert _index_leads_with(statement, "namespace") is leads

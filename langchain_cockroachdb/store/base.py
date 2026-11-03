@@ -39,7 +39,7 @@ from langgraph.store.base import (
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
 from langchain_cockroachdb import _psycopg_conn
-from langchain_cockroachdb._window import window_needs_exact_search
+from langchain_cockroachdb._window import window_for, window_needs_exact_search
 from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
 from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
@@ -1785,9 +1785,10 @@ class BaseCockroachDBStore:
                     statements.append(exact)
                     continue
                 # Room for every vector of each result up to the end of the
-                # page, twice. PostgresStore leaves out the offset and runs
-                # out of candidates on deep pages
-                over_fetch = (op.limit + op.offset) * self.index.estimated_vectors * 2 + 1
+                # page, twice, and at least WINDOW_FLOOR vectors, which cost
+                # the index no more to find. PostgresStore leaves out the
+                # offset and runs out of candidates on deep pages
+                over_fetch = window_for((op.limit + op.offset) * self.index.estimated_vectors)
                 statements.append(
                     self.sql.semantic_search_in(
                         filter=op.filter,

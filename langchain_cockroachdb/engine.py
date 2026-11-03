@@ -44,6 +44,58 @@ T = TypeVar("T")
 _ID_TYPE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\(\d+\))?$")
 
 
+class _VectorIndexCache:
+    """What filtered vector store searches learned about each table's vector indexes.
+
+    Every vector store on an engine shares it, so an application that builds
+    a store per request reads SHOW CREATE TABLE once per table and refresh
+    interval, not once per request. An answer is kept under the table, the
+    embedding column, the distance strategy and the namespace column (None
+    for a store without a namespace), all in lower case, with the
+    time.monotonic() at which its read began. forget() drops a table's
+    answers and starts a new generation of them, so an answer from a read
+    that began before an index was applied or dropped is not kept.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._answers: dict[tuple[str, str, str, str | None], tuple[bool, float]] = {}
+        self._generations: dict[str, int] = {}
+        self._failed: set[str] = set()
+
+    def get(self, key: tuple[str, str, str, str | None]) -> tuple[bool, float] | None:
+        """The answer for ``key`` and when its read began, if one is kept."""
+        with self._lock:
+            return self._answers.get(key)
+
+    def generation(self, table: str) -> int:
+        """The generation of ``table``'s answers, to pass to put() after a read."""
+        with self._lock:
+            return self._generations.get(table, 0)
+
+    def put(
+        self, key: tuple[str, str, str, str | None], usable: bool, read_at: float, generation: int
+    ) -> None:
+        """Keep an answer, unless the table's answers were forgotten since its read began."""
+        with self._lock:
+            if self._generations.get(key[0], 0) == generation:
+                self._answers[key] = (usable, read_at)
+
+    def forget(self, table: str) -> None:
+        """Drop ``table``'s answers, so the next filtered search reads them again."""
+        with self._lock:
+            self._generations[table] = self._generations.get(table, 0) + 1
+            for key in [key for key in self._answers if key[0] == table]:
+                del self._answers[key]
+
+    def first_failure(self, table: str) -> bool:
+        """True the first time a read of ``table`` fails, so it is logged once."""
+        with self._lock:
+            first = table not in self._failed
+            self._failed.add(table)
+            return first
+
+
 async def _driver_fileno(conn: AsyncConnection) -> int | None:
     """File descriptor of the driver connection's socket, if the driver exposes one."""
     try:
@@ -118,6 +170,7 @@ class CockroachDBEngine:
         self._usage_lock = threading.Lock()
         self._active = {"sync": 0, "async": 0}
         self._warned_mixed_use = False
+        self._vector_index_cache = _VectorIndexCache()
         _ENGINES.add(self)
 
     @property
@@ -467,7 +520,11 @@ class CockroachDBEngine:
                 f"CREATE INDEX IF NOT EXISTS {table_name}_{tsvector_col}_idx "
                 f"ON {fqn} USING GIN ({tsvector_col})"
             )
-        await self._run_ddl(statements, label=f"create table {fqn}")
+        try:
+            await self._run_ddl(statements, label=f"create table {fqn}")
+        finally:
+            # A table dropped and created again has none of its old indexes
+            self._vector_index_cache.forget(fqn.lower())
 
     async def adrop_table(self, table_name: str, *, schema: str = "public") -> None:
         """Drop a table.
@@ -486,7 +543,10 @@ class CockroachDBEngine:
         validate_identifier(table_name, what="table name")
         validate_identifier(schema, what="schema")
         fqn = f"{schema}.{table_name}"
-        await self._run_ddl([f"DROP TABLE IF EXISTS {fqn}"], label=f"drop table {fqn}")
+        try:
+            await self._run_ddl([f"DROP TABLE IF EXISTS {fqn}"], label=f"drop table {fqn}")
+        finally:
+            self._vector_index_cache.forget(fqn.lower())
 
     async def aclose(self) -> None:
         """Dispose the connection pool."""
@@ -522,6 +582,8 @@ def _after_fork_in_child() -> None:
     for engine in engines:
         engine._usage_lock = threading.Lock()
         engine._active = {"sync": 0, "async": 0}
+        # Its lock may have been held by another thread at the fork
+        engine._vector_index_cache = _VectorIndexCache()
         engine.engine.sync_engine.dispose(close=False)
     for engine in engines:
         if engine._loop is not None:

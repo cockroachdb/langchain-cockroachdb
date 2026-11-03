@@ -457,7 +457,8 @@ def test_semantic_paging_applies_after_dedup(store_factory, mode) -> None:
 
 
 def test_deep_semantic_page_has_candidates(store_factory, mode) -> None:
-    # One vector per item, so over_fetch without the offset would be 2 * 1 * 2 + 1 = 5
+    # One vector per item. The window counts the offset: (2 + 10) * 1 * 2 + 1 = 25,
+    # raised to the floor of 41. Without the offset it would count only the page
     store = store_factory(mode, index=index_config(fields=["text"]))
     for i in range(12):
         store.put(("docs",), f"k{i:02}", {"text": f"item number {i}"})

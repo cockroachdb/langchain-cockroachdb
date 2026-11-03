@@ -116,15 +116,17 @@ A key in `filter` is a filter on the JSON metadata column, not a prefix column, 
 
 ## Filtered Search
 
-CockroachDB uses a vector index only when every filter of the search matches the index's prefix columns. A metadata filter never does. So when the filter sits next to `ORDER BY distance LIMIT k`, CockroachDB scans the whole table, or the whole namespace, and ranks every row that passes.
+CockroachDB uses a vector index only when every filter of the search matches the index's prefix columns. A metadata filter never does. So when the filter sits next to `ORDER BY distance LIMIT k`, CockroachDB scans the table and ranks every row that passes.
 
 When the table has a usable index (see below), a search with a `filter` works in steps instead:
 
-1. It takes the `2 * k + 1` nearest rows from the index, with no filter. For a namespaced store, the namespace is the index's prefix column, so the index reads only that namespace.
+1. It takes the nearest rows from the index, with no filter: twice `k` plus one, and at least 41, which costs the index no more to find than fewer would. For a namespaced store, the namespace is the index's prefix column, so the index reads only that namespace.
 2. It applies the filter to those rows and keeps the `k` nearest that pass. Steps 1 and 2 are one statement.
-3. When fewer than `k` rows pass, matches may lie beyond the window, so the store runs the exact search, which filters every row of the table or namespace before it ranks them. It does not when the window held every row of the table or namespace, since the short result is then the whole answer.
+3. When fewer than `k` rows pass, matches may lie beyond the window, so the store runs the exact search: the statement every filtered search ran before 0.6.0, which filters before it ranks. When no row passes, it always does. When some do, it skips the exact search only if the window held every row of the table or namespace, since the short result is then the whole answer.
 
-A filter that most rows pass is served by the index alone. A selective filter often needs the exact search as well, which costs the scan it always did, plus the short indexed read before it.
+A filter that most rows near the query pass is served by the index alone, in one statement. A selective filter often needs the exact search as well, which costs the scan it always did, plus the short indexed read before it. The exact search returns only the store's namespace, but its plan can scan the whole table to find those rows.
+
+A result that comes from the window is approximate, as every index search is: the index can miss a near neighbor, and the beam size sets how often (see [Beam Size](#beam-size)). Before 0.6.0, filtered searches scanned and were always exact.
 
 A usable index:
 
@@ -132,9 +134,11 @@ A usable index:
 - has the operator class of the store's distance strategy (see [Index Opclasses](#index-opclasses));
 - has no prefix column for a store without a namespace, and the namespace column as its only prefix column for a namespaced store.
 
-The store reads the table's indexes with `SHOW CREATE TABLE` on its first filtered search. It reads them again once `VECTOR_INDEX_REFRESH_SECONDS` (60) have passed, so an index that another process creates is used within a minute. It also reads them right after it applies or drops an index itself. Without a filter, or without a usable index, a search runs the same single statement as before.
+A namespaced store also needs the primary key or another index to lead with the namespace column, so that counting the namespace's rows does not scan the table. `ainit_vectorstore_table` creates that index with the namespace column. A table without one keeps the exact search.
 
-This covers `similarity_search` and its variants, max marginal relevance search and the vector leg of hybrid search, in the sync and async stores. In MMR and hybrid search, the candidate pool (`fetch_k`) takes the place of `k`.
+The store reads the table's indexes with `SHOW CREATE TABLE` on its first filtered search. The engine keeps the answer for every store with the same table, embedding column, distance strategy and namespace column, so an application that builds a store per request, one per tenant for example, reads it once per table, not once per request. It is read again once `VECTOR_INDEX_REFRESH_SECONDS` (60) have passed, so an index that another process creates is used within a minute, and right after an index is applied or dropped through any store on the engine. Without a filter, or without a usable index, a search runs the same single statement as before.
+
+This covers `similarity_search` and its variants, max marginal relevance search and the vector leg of hybrid search, in the sync and async stores. In MMR search the candidate pool, `fetch_k`, takes the place of `k`. In hybrid search, so does its pool: `fetch_k`, or `max(4 * k, 20)` without it.
 
 ## Query-Time Tuning
 

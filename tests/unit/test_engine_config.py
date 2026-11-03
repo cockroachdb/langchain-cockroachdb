@@ -576,6 +576,18 @@ def test_loop_engine_accepts_a_loop_that_was_not_running_when_the_process_forked
         _close_loop(loop, thread)
 
 
+def test_fork_gives_each_engine_an_empty_vector_index_cache(monkeypatch) -> None:
+    # The cache's lock may have been held by another thread at the fork
+    _isolate_fork_state(monkeypatch)
+    engine = CockroachDBEngine.from_engine(_lazy_engine())
+    cache = engine._vector_index_cache
+    key = ("public.docs", "embedding", "cosine", None)
+    cache.put(key, True, 1.0, cache.generation("public.docs"))
+    engine_module._after_fork_in_child()
+    assert engine._vector_index_cache is not cache
+    assert engine._vector_index_cache.get(key) is None
+
+
 @pytest.mark.timeout(10)
 def test_forked_loop_record_does_not_keep_loops_alive(monkeypatch) -> None:
     _isolate_fork_state(monkeypatch)

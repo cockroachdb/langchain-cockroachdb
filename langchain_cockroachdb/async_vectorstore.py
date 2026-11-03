@@ -21,7 +21,7 @@ from sqlalchemy.sql.elements import TextClause
 
 from langchain_cockroachdb._filters import FilterBuilder
 from langchain_cockroachdb._sql import parse_vector, validate_identifier, vector_literal
-from langchain_cockroachdb._window import window_needs_exact_search
+from langchain_cockroachdb._window import window_for, window_needs_exact_search
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import (
     FusionType,
@@ -34,6 +34,7 @@ from langchain_cockroachdb.indexes import (
     DistanceStrategy,
     _ExistingVectorIndex,
     _find_vector_index,
+    _index_leads_with,
     _usable_vector_index,
 )
 from langchain_cockroachdb.retry import RetryPolicy, _describe, get_sqlstate, resolve_retry_policy
@@ -48,22 +49,17 @@ _ID_CHUNK = 10_000
 # the maximum batch size is 65,535 // 4 = 16,383 rows.
 _MAX_BATCH_SIZE = 65535 // 4
 
-# How long a store trusts what it read about its table's vector indexes, in
-# seconds. After that, its next filtered search reads SHOW CREATE TABLE
-# again, so an index another process creates or drops is seen within this
-# time. A store also reads again after it applies or drops an index itself.
+# How long the stores on an engine trust what they read about a table's
+# vector indexes, in seconds. After that, the next filtered search reads
+# SHOW CREATE TABLE again, so an index another process creates or drops is
+# seen within this time. An index applied or dropped through any store on
+# the engine is seen at once.
 VECTOR_INDEX_REFRESH_SECONDS: float = 60.0
 
-# With a usable vector index, a filtered search for k rows takes the
-# 2 * k + 1 nearest rows from the index and applies the filter to them:
-# twice the page, as the memory store's window, plus one so that a full
-# window shows.
-_WINDOW_FACTOR = 2
-
-# The names the windowed statement gives its own columns. A store that
-# selects a column of one of these names keeps the exact statement, where
-# they would be ambiguous.
-_WINDOW_NAMES = frozenset({"distance", "window_size", "scope_rows"})
+# The names the windowed statement refers to its own columns by. A store
+# that selects a column of one of these names keeps the exact statement,
+# where they would be ambiguous.
+_WINDOW_NAMES = frozenset({"distance", "window_size"})
 
 # Arguments of ainit_vectorstore_table. The schema and column ones also
 # configure the store, so from_texts passes those to both.
@@ -257,14 +253,6 @@ class AsyncCockroachDBVectorStore(VectorStore):
             jitter=retry_jitter,
         )
         self._fqn = f"{schema}.{collection_name}"
-        # Whether a vector index can serve filtered searches, as last read
-        # with SHOW CREATE TABLE at _index_read_at (time.monotonic()), or
-        # None to read it on the next filtered search. A reset bumps
-        # _index_generation, so a read that began before it is not kept.
-        self._index_usable = False
-        self._index_read_at: float | None = None
-        self._index_generation = 0
-        self._logged_index_read_error = False
 
     @property
     def embeddings(self) -> Embeddings:
@@ -629,11 +617,12 @@ class AsyncCockroachDBVectorStore(VectorStore):
         The inner query has no condition but the scope, the namespace for a
         namespaced store, so the C-SPANN index serves its ORDER BY and LIMIT,
         with the namespace as its prefix span. It keeps the ``window``
-        nearest rows, and count(*) OVER () counts them (window_size). The
-        outer query applies the filter to the window and returns the ``k``
-        nearest that pass, each with window_size and scope_rows, the scope's
-        rows counted up to the window from the namespace index or the
-        primary key. The LIMITs are bound parameters: CockroachDB plans the
+        nearest rows, window_for(k): 2 * k + 1, and at least WINDOW_FLOOR
+        (41), which costs the index no more to find. count(*) OVER () counts
+        them (window_size). The outer query applies the filter to the window
+        and returns the ``k`` nearest that pass, each with window_size and
+        scope_rows, the scope's rows counted up to the window from the
+        namespace index or the primary key. The LIMITs are bound parameters: CockroachDB plans the
         vector search from their values, also once psycopg prepares the
         statement and plan_cache_mode is auto, the default (measured on
         v25.4.14 and v26.3.4 over repeated runs).
@@ -641,7 +630,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         Returns:
             The statement, its parameters, and the window.
         """
-        window = _WINDOW_FACTOR * k + 1
+        window = window_for(k)
         builder = FilterBuilder(self.metadata_column)
         scope = ""
         if self.namespace is not None:
@@ -674,13 +663,20 @@ LIMIT :k"""
         The index must be on the embedding column with the distance
         strategy's operator class, and have the namespace column as its only
         prefix column for a namespaced store, or no prefix column otherwise
-        (_usable_vector_index). The answer comes from SHOW CREATE TABLE and is
-        kept for VECTOR_INDEX_REFRESH_SECONDS, or until this store applies or
-        drops an index. When the read fails with a database error that the
-        retry policy does not retry, such as a missing privilege, the store
-        logs it once at INFO and runs the exact search until the next read.
-        Any other error is raised, as the search's own statement would raise
-        it.
+        (_usable_vector_index). A namespaced store also needs the primary key
+        or an index to lead with the namespace column (_index_leads_with), so
+        that counting the namespace's rows does not scan the table.
+        ainit_vectorstore_table creates that index.
+
+        The answer comes from SHOW CREATE TABLE. The engine keeps it for every
+        store on the engine with the same table, embedding column, distance
+        strategy and namespace column, for VECTOR_INDEX_REFRESH_SECONDS, or
+        until an index is applied or dropped through a store on the engine,
+        or the engine creates or drops the table. When the read fails with a
+        database error that the retry policy does not retry, such as a
+        missing privilege, the store logs it once per engine and table at
+        INFO and runs the exact search until the next read. Any other error
+        is raised, as the search's own statement would raise it.
         """
         selected = (
             self.id_column,
@@ -690,53 +686,73 @@ LIMIT :k"""
         )
         if {name.lower() for name in selected} & _WINDOW_NAMES:
             return False
-        read_at = self._index_read_at
-        if read_at is not None and time.monotonic() - read_at < self._index_refresh_seconds:
-            return self._index_usable
-        generation = self._index_generation
+        cache = self.engine._vector_index_cache
+        key = self._vector_index_key()
         started = time.monotonic()
+        kept = cache.get(key)
+        if kept is not None and started - kept[1] < self._index_refresh_seconds:
+            return kept[0]
+        generation = cache.generation(key[0])
         try:
-            # SHOW CREATE TABLE takes no bound parameters; the name is validated
-            rows = await self._execute(
-                text(f"SELECT create_statement FROM [SHOW CREATE TABLE {self._fqn}]"),
-                label=f"look up vector indexes on {self._fqn}",
-                fetch=True,
+            create_statement = await self._show_create_table(
+                label=f"look up vector indexes on {self._fqn}"
             )
         except Exception as error:
             if get_sqlstate(error) is None or self.retry_policy.is_retryable(error):
                 raise
-            if not self._logged_index_read_error:
-                self._logged_index_read_error = True
+            if cache.first_failure(key[0]):
                 logger.info(
                     "Cannot read the vector indexes of %s with SHOW CREATE TABLE (%s). "
-                    "Its filtered searches run the exact search, which scans the table or "
-                    "the namespace, until a read works. The store reads again every %g "
-                    "seconds and logs this once.",
+                    "Its filtered searches run the exact search, which can scan the table, "
+                    "until a read works. The stores on this engine read again every %g "
+                    "seconds, and this is logged once.",
                     self._fqn,
                     _describe(error),
                     self._index_refresh_seconds,
                 )
             usable = False
         else:
-            prefix = [self.namespace_column] if self.namespace is not None else []
-            usable = bool(rows) and (
-                _usable_vector_index(
-                    rows[0][0],
-                    column=self.embedding_column,
-                    opclass=self.distance_strategy.get_opclass(),
-                    prefix=prefix,
-                )
-                is not None
-            )
-        if generation == self._index_generation:
-            self._index_usable = usable
-            self._index_read_at = started
+            usable = create_statement is not None and self._index_serves(create_statement)
+        cache.put(key, usable, started, generation)
         return usable
 
+    def _index_serves(self, create_statement: str) -> bool:
+        """Whether the table in ``create_statement`` can serve this store's filtered searches."""
+        namespaced = self.namespace is not None
+        vector_index = _usable_vector_index(
+            create_statement,
+            column=self.embedding_column,
+            opclass=self.distance_strategy.get_opclass(),
+            prefix=[self.namespace_column] if namespaced else [],
+        )
+        if vector_index is None:
+            return False
+        return not namespaced or _index_leads_with(create_statement, self.namespace_column)
+
+    def _vector_index_key(self) -> tuple[str, str, str, str | None]:
+        """This store's key in the engine's vector index cache."""
+        return (
+            self._fqn.lower(),
+            self.embedding_column.lower(),
+            self.distance_strategy.value,
+            self.namespace_column.lower() if self.namespace is not None else None,
+        )
+
     def _forget_vector_index(self) -> None:
-        """Make the next filtered search read the table's vector indexes again."""
-        self._index_generation += 1
-        self._index_read_at = None
+        """Make the next filtered search of any store on the engine read this table again."""
+        self.engine._vector_index_cache.forget(self._fqn.lower())
+
+    async def _show_create_table(self, *, label: str) -> str | None:
+        """The table's SHOW CREATE TABLE statement, or None if it returns no row.
+
+        It takes no bound parameters; the table's name is validated.
+        """
+        rows = await self._execute(
+            text(f"SELECT create_statement FROM [SHOW CREATE TABLE {self._fqn}]"),
+            label=label,
+            fetch=True,
+        )
+        return str(rows[0][0]) if rows else None
 
     async def _fts_search(self, query: str, k: int, filter: dict | None) -> list[tuple[str, float]]:
         """Full-text search returning (id, ts_rank score), best first.
@@ -841,14 +857,11 @@ LIMIT :k"""
         name = index.get_index_name(self.collection_name, self.embedding_column)
         try:
             # pg_indexes.indexdef leaves out the partition sizes on v25.4, so read
-            # SHOW CREATE TABLE, which renders them on every supported version.
-            # It takes no bound parameters; the identifiers are validated.
-            rows = await self._execute(
-                text(f"SELECT create_statement FROM [SHOW CREATE TABLE {self._fqn}]"),
-                label=f"look up vector index {name}",
-                fetch=True,
+            # SHOW CREATE TABLE, which renders them on every supported version
+            create_statement = await self._show_create_table(label=f"look up vector index {name}")
+            existing = (
+                _find_vector_index(create_statement, name) if create_statement is not None else None
             )
-            existing = _find_vector_index(rows[0][0], name) if rows else None
             if existing is not None:
                 self._warn_on_index_differences(index, name, existing, prefix_columns)
                 return

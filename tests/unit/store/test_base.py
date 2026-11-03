@@ -33,6 +33,7 @@ from langgraph.store.base import (
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from langchain_cockroachdb import _psycopg_conn
+from langchain_cockroachdb._window import WINDOW_FLOOR, window_for
 from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
     SCHEMA_CHANGE_PROGRESS_SECONDS,
@@ -778,8 +779,8 @@ def assert_query_statements(conn: SearchConnection) -> None:
     assert "prefix = ANY(CAST(%s AS STRING[]))" in first[0]
     assert "count(*) OVER () AS window_size" in first[0]
     assert first[1][:3] == ["[1.0,0.0,0.0]", ["a", "a.x"], "[1.0,0.0,0.0]"]
-    # over_fetch = (limit + offset) * estimated_vectors * 2 + 1
-    assert first[1][3] == (2 + 3) * 1 * 2 + 1
+    # over_fetch = (limit + offset) * estimated_vectors * 2 + 1 = 11, raised to the floor
+    assert first[1][3] == WINDOW_FLOOR == 41
     assert second[1][1] == ["a", "a.x"]
     # A search of the whole store has no lookup and ranks exactly at once
     assert "ANY(" not in root[0] and "GROUP BY i.prefix, i.key" in root[0]
@@ -1008,14 +1009,18 @@ def test_needs_exact_search() -> None:
 
 EXACT_ROWS = [search_row("best", 0.99), search_row("next", 0.5)]
 
+# The window of a search with the default limit of 10: 10 * 1 * 2 + 1 = 21,
+# raised to the floor of 41
+WINDOW = window_for(10)
+
 
 @pytest.mark.parametrize(
     ("indexed_rows", "namespaces", "runs_again"),
     [
-        ([search_row("k1", 0.9, 21)], ["a"], True),
-        ([search_row("k1", 0.9, 20)], ["a"], False),
-        ([search_row("k1", 0.9, 20, 21)], ["a"], True),
-        ([search_row(f"k{i}", 0.9, 21) for i in range(10)], ["a"], False),
+        ([search_row("k1", 0.9, WINDOW)], ["a"], True),
+        ([search_row("k1", 0.9, WINDOW - 1)], ["a"], False),
+        ([search_row("k1", 0.9, WINDOW - 1, WINDOW)], ["a"], True),
+        ([search_row(f"k{i}", 0.9, WINDOW) for i in range(10)], ["a"], False),
         ([], ["a"], True),
         ([], [], False),
     ],
@@ -1034,7 +1039,6 @@ def test_short_indexed_search_runs_again_exactly(
     store, conn = fake_search_store(namespaces)
     conn.indexed_rows = indexed_rows
     conn.exact_rows = EXACT_ROWS
-    # The default limit of 10, so over_fetch is 10 * 1 * 2 + 1 = 21
     [result] = store.batch([SearchOp(("a",), query="q", filter={"x": 1})])
     labels = [label for label, _, _ in conn.executed]
     assert labels[:2] == ["store search namespaces", "store search"]
@@ -1047,6 +1051,29 @@ def test_short_indexed_search_runs_again_exactly(
     else:
         assert labels[2:] == []
         assert [item.key for item in result] == [row["key"] for row in indexed_rows]
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset", "fields", "window"),
+    [
+        (3, 0, ["text"], 41),
+        (10, 0, ["text"], 41),
+        (20, 0, ["text"], 41),
+        (15, 10, ["text"], 51),
+        (10, 0, ["text", "title"], 41),
+        (12, 0, ["text", "title"], 49),
+    ],
+)
+def test_semantic_search_window_has_a_floor(
+    limit: int, offset: int, fields: list[str], window: int
+) -> None:
+    # Twice the vectors up to the end of the page, plus one, and at least 41,
+    # which costs the index no more to find than a smaller window
+    store, conn = fake_search_store(["a"], fields=fields)
+    store.batch([SearchOp(("a",), query="q", limit=limit, offset=offset)])
+    [params] = [params for label, _, params in conn.executed if label == "store search"]
+    assert params[3] == window
+    assert window == window_for((limit + offset) * len(fields))
 
 
 def test_exact_search_keeps_each_result_in_its_slot() -> None:
@@ -1075,7 +1102,7 @@ async def test_async_short_indexed_search_runs_again_exactly() -> None:
     )
     conn = AsyncSearchConnection(["a"])
     conn.attempts["store search"] = 1
-    conn.indexed_rows = [search_row("k1", 0.9, 21)]
+    conn.indexed_rows = [search_row("k1", 0.9, WINDOW)]
     conn.exact_rows = EXACT_ROWS
 
     @contextlib.asynccontextmanager

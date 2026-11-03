@@ -188,17 +188,44 @@ _VECTOR_INDEX_LINE = re.compile(
 )
 
 
+# The primary key or a forward index of SHOW CREATE TABLE, such as
+# CONSTRAINT docs_pkey PRIMARY KEY (id ASC) or
+# UNIQUE INDEX docs_ns_idx (namespace ASC, id ASC) STORING (content). Vector
+# and inverted index lines start with another word, so they do not match.
+_KEY_LINE = re.compile(
+    r'^\s*(?:CONSTRAINT (?:"(?:[^"]|"")+"|[^\s"(]+) PRIMARY KEY|'
+    r'(?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|[^\s"(]+)) '
+    r"\((?P<columns>[^)]*)\)(?P<rest>.*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def _unquote(name: str) -> str:
     if len(name) > 1 and name.startswith('"') and name.endswith('"'):
         return name[1:-1].replace('""', '"')
     return name
 
 
+def _column_parts(columns: str) -> list[list[str]]:
+    """Each column of an index's column list, split into its name and what follows."""
+    return [part.split() for part in columns.split(",") if part.strip()]
+
+
+def _is_partial(rest: str) -> bool:
+    """Whether the end of an index line has a WHERE clause."""
+    return re.search(r"\bWHERE\b", rest, re.IGNORECASE) is not None
+
+
+def _is_visible(rest: str) -> bool:
+    """Whether the end of an index line leaves the index fully visible to the optimizer."""
+    return re.search(r"\b(?:NOT VISIBLE|VISIBILITY)\b", rest, re.IGNORECASE) is None
+
+
 def _vector_indexes(create_statement: str) -> list[_ExistingVectorIndex]:
     """Every vector index in a SHOW CREATE TABLE statement, in the order shown."""
     found = []
     for match in _VECTOR_INDEX_LINE.finditer(create_statement):
-        parts = [part.split() for part in match.group("columns").split(",") if part.strip()]
+        parts = _column_parts(match.group("columns"))
         options = {}
         for option in (match.group("options") or "").split(","):
             key, sep, value = option.partition("=")
@@ -212,11 +239,32 @@ def _vector_indexes(create_statement: str) -> list[_ExistingVectorIndex]:
                 options=options,
                 name=_unquote(match.group("name")),
                 opclass=parts[-1][1].lower() if parts and len(parts[-1]) > 1 else "vector_l2_ops",
-                partial=re.search(r"\bWHERE\b", rest, re.IGNORECASE) is not None,
-                visible=re.search(r"\b(?:NOT VISIBLE|VISIBILITY)\b", rest, re.IGNORECASE) is None,
+                partial=_is_partial(rest),
+                visible=_is_visible(rest),
             )
         )
     return found
+
+
+def _index_leads_with(create_statement: str, column: str) -> bool:
+    """Whether the primary key or a forward index has ``column`` as its first column.
+
+    Such an index serves ``column = value`` with a LIMIT without a scan of
+    the table. A partial index, or one the optimizer may skip, does not
+    count, nor does a vector or inverted index.
+    """
+    wanted = column.lower()
+    for match in _KEY_LINE.finditer(create_statement):
+        parts = _column_parts(match.group("columns"))
+        rest = match.group("rest")
+        if (
+            parts
+            and parts[0][0].strip('"').lower() == wanted
+            and not _is_partial(rest)
+            and _is_visible(rest)
+        ):
+            return True
+    return False
 
 
 def _find_vector_index(create_statement: str, name: str) -> _ExistingVectorIndex | None:

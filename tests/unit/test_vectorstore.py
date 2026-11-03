@@ -23,8 +23,13 @@ from langchain_cockroachdb import (
     HybridSearchConfig,
 )
 from langchain_cockroachdb import async_vectorstore as vectorstore_module
-from langchain_cockroachdb._window import window_needs_exact_search
-from langchain_cockroachdb.async_vectorstore import _WINDOW_FACTOR, _check_batch_size
+from langchain_cockroachdb._window import (
+    WINDOW_FACTOR,
+    WINDOW_FLOOR,
+    window_for,
+    window_needs_exact_search,
+)
+from langchain_cockroachdb.async_vectorstore import _check_batch_size
 from tests.unit.test_indexes import create_statement
 
 
@@ -225,9 +230,12 @@ def engine():
 @pytest.fixture
 def make_store(engine, monkeypatch: pytest.MonkeyPatch):
     def make(
-        db: FakeDatabase, cls: type = AsyncCockroachDBVectorStore, **kwargs: Any
+        db: FakeDatabase,
+        cls: type = AsyncCockroachDBVectorStore,
+        on: CockroachDBEngine | None = None,
+        **kwargs: Any,
     ) -> AsyncCockroachDBVectorStore:
-        store = cls(engine, QueryEmbeddings(), "docs", **kwargs)
+        store = cls(on or engine, QueryEmbeddings(), "docs", **kwargs)
         monkeypatch.setattr(store, "_execute", db.execute)
         return store
 
@@ -246,8 +254,10 @@ def server_error(code: str, message: str = "boom") -> psycopg.Error:
 class TestWindowRule:
     """The rule both stores use to decide whether a windowed search stands."""
 
-    def test_the_window_factor(self) -> None:
-        assert _WINDOW_FACTOR == 2
+    def test_the_window_size(self) -> None:
+        assert (WINDOW_FACTOR, WINDOW_FLOOR) == (2, 41)
+        # Twice the page plus one, and never under the floor
+        assert [window_for(k) for k in (1, 4, 20, 21, 50)] == [41, 41, 41, 43, 101]
 
     @pytest.mark.parametrize(
         ("found", "window_size", "scope_rows", "exact"),
@@ -320,7 +330,7 @@ class TestWindowedStatement:
             "f0": "kind",
             "f1": '"x"',
             "query_vector": "[0.1,0.2,0.3]",
-            "window": _WINDOW_FACTOR * 4 + 1,
+            "window": WINDOW_FLOOR,
             "k": 4,
         }
 
@@ -344,7 +354,7 @@ class TestWindowedStatement:
         )
         assert "::" not in sql
         assert sent.params["f0"] == "tenant-a"
-        assert (sent.params["window"], sent.params["k"]) == (9, 4)
+        assert (sent.params["window"], sent.params["k"]) == (WINDOW_FLOOR, 4)
 
     async def test_with_embeddings_selects_them_through_the_window(self, make_store) -> None:
         db = FakeDatabase(create_statement(COSINE_INDEX))
@@ -360,11 +370,11 @@ class TestWindowedStatement:
         sql = flat(sent.sql)
         assert "AS distance, embedding FROM public.docs" in sql
         assert "SELECT id, content, metadata, distance, embedding, window_size" in sql
-        assert (sent.params["window"], sent.params["k"]) == (9, 4)
+        assert (sent.params["window"], sent.params["k"]) == (WINDOW_FLOOR, 4)
 
     async def test_beam_size_reaches_both_statements(self, make_store) -> None:
         db = FakeDatabase(create_statement(COSINE_INDEX))
-        db.window_rows = window_rows(1, window_size=9, scope_rows=9)
+        db.window_rows = window_rows(1, window_size=41, scope_rows=41)
         store = make_store(db)
 
         await store.asimilarity_search_with_score_by_vector(
@@ -383,7 +393,7 @@ class TestWindowDecision:
         [
             (window_rows(4, window_size=9, scope_rows=9), False),
             (window_rows(2, window_size=5, scope_rows=5), False),
-            (window_rows(2, window_size=9, scope_rows=9), True),
+            (window_rows(2, window_size=41, scope_rows=41), True),
             (window_rows(2, window_size=6, scope_rows=9), True),
             ([], True),
         ],
@@ -450,20 +460,70 @@ class TestWindowDecision:
             [exact] = db.exact()
             assert exact.sql == todays_statement(namespace=namespace is not None)
 
-    @pytest.mark.parametrize("column", ["content_column", "metadata_column", "id_column"])
-    @pytest.mark.parametrize("name", ["distance", "Window_Size", "scope_rows"])
+    @pytest.mark.parametrize(
+        "column", ["content_column", "metadata_column", "id_column", "embedding_column"]
+    )
+    @pytest.mark.parametrize("name", ["distance", "Window_Size"])
     async def test_a_column_named_like_the_windows_own_keeps_todays_statement(
         self, make_store, column: str, name: str
     ) -> None:
-        db = FakeDatabase(create_statement(COSINE_INDEX))
+        db = FakeDatabase(create_statement(f"VECTOR INDEX docs_idx ({name} vector_cosine_ops)"))
         db.window_rows = window_rows(4, window_size=9, scope_rows=9)
         store = make_store(db, **{column: name})
 
         await store.asimilarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
 
-        # The windowed statement would make the name ambiguous
+        # The windowed statement refers to its own column by that name
         assert db.reads() == [] and db.windowed() == []
         assert len(db.exact()) == 1
+
+    async def test_a_column_named_scope_rows_keeps_the_window(self, make_store) -> None:
+        # The statement never refers to scope_rows by name
+        db = FakeDatabase(create_statement(COSINE_INDEX))
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        store = make_store(db, content_column="scope_rows")
+
+        await store.asimilarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
+
+        assert len(db.windowed()) == 1 and db.exact() == []
+
+    @pytest.mark.parametrize(
+        ("statement", "windowed"),
+        [
+            (create_statement(NAMESPACE_INDEX), True),
+            (create_statement(NAMESPACE_INDEX, namespace_index=False), False),
+            (
+                create_statement(
+                    NAMESPACE_INDEX,
+                    namespace_index=False,
+                    primary_key="CONSTRAINT docs_pkey PRIMARY KEY (namespace ASC, id ASC)",
+                ),
+                True,
+            ),
+            (
+                create_statement(
+                    NAMESPACE_INDEX,
+                    "INDEX docs_part (namespace ASC) WHERE content IS NOT NULL",
+                    namespace_index=False,
+                ),
+                False,
+            ),
+        ],
+        ids=["namespace-index", "none", "primary-key", "partial"],
+    )
+    async def test_a_namespaced_store_needs_an_index_that_leads_with_the_namespace(
+        self, make_store, statement: str, windowed: bool
+    ) -> None:
+        # Without one, the count of the namespace's rows and the exact search
+        # would scan the table
+        db = FakeDatabase(statement)
+        db.window_rows = window_rows(4, window_size=41, scope_rows=41)
+        store = make_store(db, namespace="tenant-a")
+
+        await store.asimilarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
+
+        assert (len(db.windowed()) == 1) is windowed
+        assert (len(db.exact()) == 1) is not windowed
 
     async def test_the_distance_strategy_picks_the_operator_class(self, make_store) -> None:
         db = FakeDatabase(create_statement("VECTOR INDEX old (embedding)"))
@@ -629,14 +689,125 @@ class TestVectorIndexCache:
         assert db.exact() == []
 
 
+class TestEngineWideCache:
+    """The usable-index answer is kept on the engine, for every store on it."""
+
+    async def test_two_stores_share_the_answer_and_an_apply_resets_it(
+        self, make_store, clock: FakeClock
+    ) -> None:
+        db = FakeDatabase(create_statement())
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        first, second = make_store(db), make_store(db)
+
+        await first.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        await second.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert len(db.reads()) == 1 and db.windowed() == []
+
+        # An index applied through one store is seen by the other at once
+        await first.aapply_vector_index(CSPANNIndex())
+        db.create = create_statement(COSINE_INDEX)
+        await second.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        await first.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        # One read by the apply itself, one by the next search for both stores
+        assert len(db.reads()) == 3 and len(db.windowed()) == 2
+
+        # A store built for a later request uses the kept answer too
+        await make_store(db).asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert len(db.reads()) == 3 and len(db.windowed()) == 3
+
+        # Dropping through the second store resets it for the first
+        await second.adrop_vector_index()
+        db.create = create_statement()
+        await first.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert len(db.reads()) == 4 and len(db.windowed()) == 3
+
+    async def test_each_table_column_strategy_and_namespace_has_its_own_answer(
+        self, make_store, engine, clock: FakeClock
+    ) -> None:
+        db = FakeDatabase(create_statement(COSINE_INDEX, NAMESPACE_INDEX))
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        stores = [
+            make_store(db),
+            make_store(db, namespace="tenant-a"),
+            make_store(db, namespace="tenant-b"),
+            make_store(db, distance_strategy=DistanceStrategy.EUCLIDEAN),
+            make_store(db, schema="other"),
+        ]
+        for store in stores:
+            await store.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        # Tenants share an answer: the key is the namespace column, not its value
+        assert len(db.reads()) == 4
+        # The L2 store finds no vector_l2_ops index; the others take the window
+        assert len(db.windowed()) == 4 and len(db.exact()) == 1
+        assert {key for key in engine._vector_index_cache._answers} == {
+            ("public.docs", "embedding", "cosine", None),
+            ("public.docs", "embedding", "cosine", "namespace"),
+            ("public.docs", "embedding", "l2", None),
+            ("other.docs", "embedding", "cosine", None),
+        }
+
+    async def test_an_apply_resets_only_its_own_table(
+        self, make_store, engine, clock: FakeClock
+    ) -> None:
+        db = FakeDatabase(create_statement(COSINE_INDEX))
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        docs, other = make_store(db), make_store(db, schema="other")
+        await docs.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        await other.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        await docs.aapply_vector_index(CSPANNIndex())
+        assert [key[0] for key in engine._vector_index_cache._answers] == ["other.docs"]
+
+    async def test_the_engine_forgets_a_table_it_creates_or_drops(
+        self, make_store, engine, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+    ) -> None:
+        ddl: list[list[str]] = []
+
+        async def run_ddl(statements: list[str], **kwargs: Any) -> None:
+            ddl.append(statements)
+
+        monkeypatch.setattr(engine, "_run_ddl", run_ddl)
+        db = FakeDatabase(create_statement(COSINE_INDEX))
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        store = make_store(db)
+        for change in (
+            lambda: engine.ainit_vectorstore_table("docs", 3, drop_if_exists=True),
+            lambda: engine.adrop_table("docs"),
+        ):
+            await store.asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+            assert engine._vector_index_cache.get(store._vector_index_key()) is not None
+            await change()
+            assert engine._vector_index_cache.get(store._vector_index_key()) is None
+        assert len(ddl) == 2
+
+    async def test_a_read_error_is_logged_once_per_engine_and_table(
+        self, make_store, clock: FakeClock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db = FakeDatabase(create_statement(COSINE_INDEX))
+        db.read_error = SAProgrammingError(
+            "SHOW CREATE TABLE", {}, server_error("42501", "user has no privileges on docs")
+        )
+        with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.async_vectorstore"):
+            for _ in range(3):
+                # A store per request, each after the interval
+                await make_store(db).asimilarity_search_by_vector(QUERY, k=4, filter=FILTER)
+                clock.now += VECTOR_INDEX_REFRESH_SECONDS
+        assert len(db.reads()) == 3
+        records = [r for r in caplog.records if r.name == "langchain_cockroachdb.async_vectorstore"]
+        assert len(records) == 1
+
+
 class TestSyncParity:
     async def test_sync_searches_send_what_async_searches_send(self, make_store) -> None:
         rows = [hit(i, "[0.1,0.2,0.3]", 9, 9) for i in range(4)]
         dbs = [FakeDatabase(create_statement(COSINE_INDEX)) for _ in range(2)]
         for db in dbs:
             db.window_rows = rows
+        # Each on its own engine, so each reads the table's indexes itself
+        other_engine = CockroachDBEngine.from_connection_string(UNREACHABLE)
         async_store = make_store(dbs[0], namespace="tenant-a")
-        sync_store = make_store(dbs[1], cls=CockroachDBVectorStore, namespace="tenant-a")
+        sync_store = make_store(
+            dbs[1], cls=CockroachDBVectorStore, on=other_engine, namespace="tenant-a"
+        )
         dbs[0].create = dbs[1].create = create_statement(NAMESPACE_INDEX)
 
         mine = await async_store.asimilarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
@@ -650,10 +821,30 @@ class TestSyncParity:
         )
         assert mmr == sync_mmr
 
+        other_engine.close()
+
         assert [(s.sql, s.params, s.label) for s in dbs[0].sent] == [
             (s.sql, s.params, s.label) for s in dbs[1].sent
         ]
         assert len(dbs[1].windowed()) == 2 and dbs[1].exact() == []
+
+    async def test_sync_apply_and_drop_drop_the_kept_answer(
+        self, make_store, clock: FakeClock
+    ) -> None:
+        db = FakeDatabase(create_statement())
+        db.window_rows = window_rows(4, window_size=9, scope_rows=9)
+        store = make_store(db, cls=CockroachDBVectorStore)
+
+        store.similarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert db.windowed() == []
+        store.apply_vector_index(CSPANNIndex())
+        db.create = create_statement(COSINE_INDEX)
+        store.similarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert len(db.reads()) == 3 and len(db.windowed()) == 1
+        store.drop_vector_index()
+        db.create = create_statement()
+        store.similarity_search_by_vector(QUERY, k=4, filter=FILTER)
+        assert len(db.reads()) == 4 and len(db.windowed()) == 1
 
 
 class TestHybridVectorLeg:
@@ -667,7 +858,7 @@ class TestHybridVectorLeg:
         assert len(results) == 2
         [sent] = db.windowed()
         pool = max(2 * 4, 20)
-        assert (sent.params["k"], sent.params["window"]) == (pool, _WINDOW_FACTOR * pool + 1)
+        assert (sent.params["k"], sent.params["window"]) == (pool, window_for(pool))
         assert db.exact() == []
 
 

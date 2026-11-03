@@ -153,7 +153,7 @@ index = CSPANNIndex(name="documents_ns_vec_idx")
 await store_a.aapply_vector_index(index, prefix_columns=["namespace"])
 ```
 
-This creates `CREATE VECTOR INDEX ... ON documents (namespace, embedding vector_cosine_ops)`, which partitions the index by namespace. A search within a namespace reads only that namespace's part of the index, with or without a metadata filter, and never other tenants' vectors. With a filter, the store takes the nearest vectors of the namespace from the index, applies the filter to them, and runs the exact search over the namespace when they may have left matches out (see [Filtered Search](vector-indexes.md#filtered-search)). The namespace must be the index's only prefix column. An index on the embedding alone cannot serve a namespaced store's searches, since CockroachDB counts `namespace = ...` as a filter.
+This creates `CREATE VECTOR INDEX ... ON documents (namespace, embedding vector_cosine_ops)`, which partitions the index by namespace. A search within a namespace takes its nearest vectors from that namespace's part of the index, with or without a metadata filter. With a filter, the store applies it to those vectors, and when they may have left matches out it runs the exact search, which returns only the namespace's rows but can scan the whole table to find them (see [Filtered Search](vector-indexes.md#filtered-search)). The namespace must be the index's only prefix column, and the table needs the plain index on the namespace column that `ainit_vectorstore_table` creates. An index on the embedding alone cannot serve a namespaced store's searches, since CockroachDB counts `namespace = ...` as a filter.
 
 ## Metadata Filtering with Namespaces
 
