@@ -163,11 +163,13 @@ Waits for another schema change log less often. A TTL change that meets another 
 WARNING langchain_cockroachdb.retry: Retrying store TTL setup after FeatureNotSupported (SQLSTATE 0A000): cannot modify TTL settings while another schema change on the table is being processed: another schema change on the table is still running (attempt 1 failed, 0s of up to 600s waited, next try in 0.09s)
 ```
 
-A store `setup()` that waits for another process's migration logs on the store's logger: an INFO line when it starts, a WARNING once it has waited `SCHEMA_CHANGE_QUIET_SECONDS` (30), then one every minute with how long it has waited and what it still waits for (the columns, or schema change jobs that SHOW JOBS shows on the table), and an INFO line when it ends. When no job applies the migration and it applies the migration itself, it logs that at INFO:
+A store `setup()` that waits for another process's migration logs on the store's logger: an INFO line when it starts, a WARNING once it has waited `SCHEMA_CHANGE_QUIET_SECONDS` (30), then one every minute with how long it has waited and what it still waits for (the columns, or schema change jobs that SHOW JOBS shows on the table), and an INFO line when it ends. The WARNING reads:
 
 ```text
 WARNING langchain_cockroachdb.store.store: setup() has waited 31s for another process to apply migration 2 to public.store: its columns are not public yet, and SHOW JOBS shows 1 schema change job on the table. Check SHOW JOBS for the schema change job. setup() waits up to 600 seconds in all.
 ```
+
+When no job applies the migration and that `setup()` applies the migration itself, it logs that at INFO.
 
 ## Trying it
 

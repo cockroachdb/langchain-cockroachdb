@@ -420,12 +420,16 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         A job is found by its description. SHOW JOBS cuts a long description
         short, which can cut a long qualified table name, and a role without
         admin sees only its own jobs. Then no job is found, and the column
-        check alone guards. An error from SHOW JOBS that the retry policy
-        would not retry also leaves the column check alone, logged once.
+        check alone guards. An error from SHOW JOBS of SQLSTATE class 42 or
+        0A, a renamed column, a missing permission or a statement turned
+        off, also leaves the column check alone, logged once.
 
         This waits for another process and retries no failed statement, so
         the retry policy's max_attempts does not shorten it. Each check
         retries under the policy.
+
+        Before it gives up, it reads the columns and SHOW JOBS again, and
+        takes over if a peer's job has gone in the meantime.
 
         Raises:
             TimeoutError: If the migration is not in place after
@@ -436,24 +440,33 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         while (left := self._migration_left(migration, wait)) is not None:
             if wait.started is None:
                 self._start_migration_wait(wait, left)
+            elif self._wait_over(wait):
+                # The job count can be a minute old. Read both again before
+                # giving up, and take over if a peer's job has gone
+                left = self._migration_left(migration, wait, fresh=True)
+                if left is None:
+                    break
+                raise self._wait_timeout(left)
             self._sleep(self._settle_pause(wait, check, left))
             check += 1
         if wait.started is not None:
             self._end_migration_wait(wait)
 
-    def _migration_left(self, migration: str, wait: _MigrationWait) -> str | None:
+    def _migration_left(
+        self, migration: str, wait: _MigrationWait, *, fresh: bool = False
+    ) -> str | None:
         """What still keeps migration 2 from being in place, or None once nothing does.
 
         It reads the columns, then SHOW JOBS: on every check once the
-        columns are public, and otherwise as _jobs_due allows, keeping the
-        last count in between. When a check that read SHOW JOBS finds the
-        columns not public and no job, it sends ``migration`` again, then
-        reads both again, so a takeover that applied the migration ends the
-        wait.
+        columns are public or with ``fresh``, and otherwise as _jobs_due
+        allows, keeping the last count in between. When a check that read
+        SHOW JOBS finds the columns not public and no job, it sends
+        ``migration`` again, then reads both again, so a takeover that
+        applied the migration ends the wait.
         """
         columns = [self.sql.reconcile_columns_exist()]
         public = self._columns_public(self._read_all(columns, "store migration wait"))
-        if not public and not self._jobs_due(wait):
+        if not public and not fresh and not self._jobs_due(wait):
             return self._migration_condition(public, wait.jobs)
         running = self._note_jobs(wait, self._jobs_on_items())
         if not public and not running:
@@ -474,8 +487,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         A job is found by the start of its description. A long qualified
         name may be cut from it, and another role's job is not shown: the
-        column check then guards alone. So does an error the retry policy
-        would not retry, after _skip_job_check logs it.
+        column check then guards alone. So does an error of SQLSTATE class
+        42 or 0A, after _skip_job_check logs it.
         """
         if self._jobs_unreadable:
             return None

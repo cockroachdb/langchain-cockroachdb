@@ -1768,7 +1768,7 @@ async def test_migration_wait_reads_show_jobs_once_a_minute_until_the_columns_tu
 async def test_migration_wait_falls_back_to_the_columns_when_show_jobs_fails(
     make: str, monkeypatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # A SHOW JOBS that the policy would not retry, such as a renamed column
+    # A SHOW JOBS error of SQLSTATE class 42 or 0A, such as a renamed column
     # or a permission error, never fails setup(): it is logged once, and the
     # columns alone decide from then on
     clock = FakeClock()
@@ -1874,10 +1874,52 @@ async def test_migration_wait_gives_up_saying_what_remained(
     )
     # It checked again until the budget ran out, and never slept past it. It
     # read SHOW JOBS on every check once the columns were public, and once
-    # within the ten seconds while they were not
+    # within the ten seconds while they were not. Before it gave up, it read
+    # the columns and SHOW JOBS fresh
     assert sum(pauses) == pytest.approx(10.0)
     checks = len(pauses) + 1
-    assert len(log) == (2 * checks if public else checks + 1)
+    assert len(log) == (2 * checks if public else checks + 1) + 2
+    columns, jobs, _ = settle_reads(store)
+    assert log[-2:] == [columns, jobs]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reads_again_before_giving_up(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The peer's job shows at the SHOW JOBS read a minute into the wait, then
+    # fails, with the columns still missing. The next read would come after
+    # the deadline, so the job count is stale when the deadline passes. A
+    # fresh read finds no job, and the wait takes over instead of raising
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    monkeypatch.setattr(store, "_MIGRATION_SETTLE_SECONDS", 100.0)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    start = clock.now
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        took_over = ("ddl", store.sql.migrations()[MIGRATION_RECONCILE]) in log
+        if took_over:
+            reads.states = [(0, True)]
+        elif clock.now - start >= 80.0:
+            reads.states = [(0, False)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    _, _, takeover = settle_reads(store)
+    assert log.count(takeover) == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert "setup() applied migration 2 to public.store itself" in messages[-2]
+    assert messages[-1].startswith("Migration 2 on public.store is in place after 10")
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])

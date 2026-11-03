@@ -1348,7 +1348,7 @@ class BaseCockroachDBStore:
     _migrations_unreadable: bool
     # Whether the fallback to the column read has been logged, to log it once
     _logged_column_fallback: bool
-    # Whether SHOW JOBS failed with an error the retry policy does not retry.
+    # Whether SHOW JOBS failed with an error of SQLSTATE class 42 or 0A.
     # setup() then waits for migration 2 on its columns alone, for good
     _jobs_unreadable: bool
     # Marks the threads that are running a reconcile policy of this store,
@@ -1921,24 +1921,29 @@ class BaseCockroachDBStore:
         wait.started = time.monotonic()
         wait.deadline = wait.started + self._MIGRATION_SETTLE_SECONDS
 
+    @staticmethod
+    def _wait_over(wait: _MigrationWait) -> bool:
+        """Whether the wait for migration 2 has reached its deadline."""
+        return time.monotonic() >= wait.deadline
+
+    def _wait_timeout(self, left: str) -> TimeoutError:
+        """The error of a wait for migration 2 that ran out, saying what remained."""
+        return TimeoutError(
+            f"Another process is still applying migration 2 to {self.sql.items}: after "
+            f"{self._MIGRATION_SETTLE_SECONDS:g} seconds, {left}. Check SHOW JOBS for the "
+            "schema change job, then run setup() again."
+        )
+
     def _settle_pause(self, wait: _MigrationWait, check: int, left: str) -> float:
         """Seconds to wait before checking again whether migration 2 is in place.
 
         Logs a WARNING once the wait passes SCHEMA_CHANGE_QUIET_SECONDS, then
         one every SCHEMA_CHANGE_PROGRESS_SECONDS, with what ``left`` says
-        still keeps the migration from being in place.
-
-        Raises:
-            TimeoutError: Once the wait's deadline has passed
+        still keeps the migration from being in place. The pause never goes
+        past the wait's deadline.
         """
         now = time.monotonic()
         waited = now - (wait.started or now)
-        if now >= wait.deadline:
-            raise TimeoutError(
-                f"Another process is still applying migration 2 to {self.sql.items}: after "
-                f"{self._MIGRATION_SETTLE_SECONDS:g} seconds, {left}. Check SHOW JOBS for the "
-                "schema change job, then run setup() again."
-            )
         due = wait.reported is None or now - wait.reported >= SCHEMA_CHANGE_PROGRESS_SECONDS
         if waited >= SCHEMA_CHANGE_QUIET_SECONDS and due:
             wait.reported = now
@@ -1951,7 +1956,7 @@ class BaseCockroachDBStore:
                 left,
                 self._MIGRATION_SETTLE_SECONDS,
             )
-        return min(_SETTLE_PACE.delay(check), wait.deadline - now)
+        return max(0.0, min(_SETTLE_PACE.delay(check), wait.deadline - now))
 
     def _end_migration_wait(self, wait: _MigrationWait) -> None:
         """Log that migration 2 is in place and setup() goes on to record it."""
