@@ -524,10 +524,12 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     def bound(statement: tuple[str, list]) -> tuple[str, list]:
         return StoreSQL.bind_query_vector(bind(statement, NAMESPACES, ["user.big"]), query)
 
+    # The window the store sends for limit=3: 3 * 1 * 2 + 1, raised to 41
+    window = window_for(3)
     # On a cluster with several nodes, each node picks up new statistics a few
     # seconds after ANALYZE. Until then the optimizer may plan with the empty
     # table it saw at creation and scan, so plan again until it sees them.
-    statement = bound(store.sql.semantic_search_in(over_fetch=7, **common))
+    statement = bound(store.sql.semantic_search_in(over_fetch=window, **common))
     deadline = time.monotonic() + STATS_WAIT
     while "vector search" not in (indexed := explain(admin, statement)):
         if time.monotonic() > deadline:
@@ -544,7 +546,7 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     vectors = store.sql.vectors.split(".", 1)[1]
     assert f"table: {vectors}@{vectors}_pkey" in count, indexed
     assert "spans: [/'user.big' - /'user.big']" in count, indexed
-    assert "limit: 7" in count, indexed
+    assert f"limit: {window}" in count, indexed
     assert "FULL SCAN" not in count, indexed
     for statement in (
         store.sql.semantic_search(namespace_prefix=("user",), **common),

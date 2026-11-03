@@ -26,6 +26,7 @@ from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
 from langchain_cockroachdb._sql import parse_vector
 from tests.integration.faults import Interruption
 from tests.integration.store.conftest import FAST, drop_store_tables
+from tests.integration.store.test_semantic_filters import record_reads
 
 DIMS = 16
 FIELDS = ["text", "messages[*].content"]
@@ -457,15 +458,19 @@ def test_semantic_paging_applies_after_dedup(store_factory, mode) -> None:
 
 
 def test_deep_semantic_page_has_candidates(store_factory, mode) -> None:
-    # One vector per item. The window counts the offset: (2 + 10) * 1 * 2 + 1 = 25,
-    # raised to the floor of 41. Without the offset it would count only the page
+    # One vector per item, more items than the window floor of 41, and a page
+    # past it. The window counts the offset, (2 + 45) * 1 * 2 + 1 = 95, so it
+    # holds the page and the indexed search alone returns it. A window that
+    # left out the offset would be the floor, 41, would hold none of the
+    # page, and the search would need its exact second query.
     store = store_factory(mode, index=index_config(fields=["text"]))
-    for i in range(12):
-        store.put(("docs",), f"k{i:02}", {"text": f"item number {i}"})
-    full = store.search(("docs",), query="item number 3", limit=12)
-    assert len(full) == 12
-    deep = store.search(("docs",), query="item number 3", limit=2, offset=10)
-    assert plain_order(deep) == plain_order(full[10:])
+    store.batch([PutOp(("docs",), f"k{i:02}", {"text": f"item number {i}"}) for i in range(60)])
+    full = store.search(("docs",), query="item number 3", limit=60)
+    assert len(full) == 60
+    reads = record_reads(store)
+    deep = store.search(("docs",), query="item number 3", limit=2, offset=45)
+    assert plain_order(deep) == plain_order(full[45:47])
+    assert [label for label, _ in reads] == ["store search namespaces", "store search"]
 
 
 def dot(a: list[float], b: list[float]) -> float:

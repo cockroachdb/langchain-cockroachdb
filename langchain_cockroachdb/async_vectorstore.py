@@ -618,14 +618,15 @@ class AsyncCockroachDBVectorStore(VectorStore):
         namespaced store, so the C-SPANN index serves its ORDER BY and LIMIT,
         with the namespace as its prefix span. It keeps the ``window``
         nearest rows, window_for(k): 2 * k + 1, and at least WINDOW_FLOOR
-        (41), which costs the index no more to find. count(*) OVER () counts
-        them (window_size). The outer query applies the filter to the window
-        and returns the ``k`` nearest that pass, each with window_size and
-        scope_rows, the scope's rows counted up to the window from the
-        namespace index or the primary key. The LIMITs are bound parameters: CockroachDB plans the
-        vector search from their values, also once psycopg prepares the
-        statement and plan_cache_mode is auto, the default (measured on
-        v25.4.14 and v26.3.4 over repeated runs).
+        (41), which costs the index about the same as fewer (see _window.py).
+        count(*) OVER () counts them (window_size). The outer query applies
+        the filter to the window and returns the ``k`` nearest that pass,
+        each with window_size and scope_rows, the scope's rows counted up to
+        the window from the namespace index or the primary key. The LIMITs
+        are bound parameters: CockroachDB plans the vector search from their
+        values, also once psycopg prepares the statement and plan_cache_mode
+        is auto, the default (measured on v25.4.14 and v26.3.4 over repeated
+        runs).
 
         Returns:
             The statement, its parameters, and the window.

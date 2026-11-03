@@ -1068,7 +1068,7 @@ def test_semantic_search_window_has_a_floor(
     limit: int, offset: int, fields: list[str], window: int
 ) -> None:
     # Twice the vectors up to the end of the page, plus one, and at least 41,
-    # which costs the index no more to find than a smaller window
+    # which costs the index about the same as a smaller window
     store, conn = fake_search_store(["a"], fields=fields)
     store.batch([SearchOp(("a",), query="q", limit=limit, offset=offset)])
     [params] = [params for label, _, params in conn.executed if label == "store search"]

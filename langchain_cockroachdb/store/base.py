@@ -1786,8 +1786,9 @@ class BaseCockroachDBStore:
                     continue
                 # Room for every vector of each result up to the end of the
                 # page, twice, and at least WINDOW_FLOOR vectors, which cost
-                # the index no more to find. PostgresStore leaves out the
-                # offset and runs out of candidates on deep pages
+                # the index about the same as fewer (see _window.py).
+                # PostgresStore leaves out the offset and runs out of
+                # candidates on deep pages
                 over_fetch = window_for((op.limit + op.offset) * self.index.estimated_vectors)
                 statements.append(
                     self.sql.semantic_search_in(

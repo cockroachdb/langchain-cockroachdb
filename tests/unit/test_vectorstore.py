@@ -804,24 +804,27 @@ class TestSyncParity:
             db.window_rows = rows
         # Each on its own engine, so each reads the table's indexes itself
         other_engine = CockroachDBEngine.from_connection_string(UNREACHABLE)
-        async_store = make_store(dbs[0], namespace="tenant-a")
-        sync_store = make_store(
-            dbs[1], cls=CockroachDBVectorStore, on=other_engine, namespace="tenant-a"
-        )
-        dbs[0].create = dbs[1].create = create_statement(NAMESPACE_INDEX)
+        try:
+            async_store = make_store(dbs[0], namespace="tenant-a")
+            sync_store = make_store(
+                dbs[1], cls=CockroachDBVectorStore, on=other_engine, namespace="tenant-a"
+            )
+            dbs[0].create = dbs[1].create = create_statement(NAMESPACE_INDEX)
 
-        mine = await async_store.asimilarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
-        theirs = sync_store.similarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
-        assert mine == theirs
-        mmr = await async_store.amax_marginal_relevance_search_by_vector(
-            QUERY, k=2, fetch_k=4, filter=FILTER
-        )
-        sync_mmr = sync_store.max_marginal_relevance_search_by_vector(
-            QUERY, k=2, fetch_k=4, filter=FILTER
-        )
-        assert mmr == sync_mmr
-
-        other_engine.close()
+            mine = await async_store.asimilarity_search_with_score_by_vector(
+                QUERY, k=4, filter=FILTER
+            )
+            theirs = sync_store.similarity_search_with_score_by_vector(QUERY, k=4, filter=FILTER)
+            assert mine == theirs
+            mmr = await async_store.amax_marginal_relevance_search_by_vector(
+                QUERY, k=2, fetch_k=4, filter=FILTER
+            )
+            sync_mmr = sync_store.max_marginal_relevance_search_by_vector(
+                QUERY, k=2, fetch_k=4, filter=FILTER
+            )
+            assert mmr == sync_mmr
+        finally:
+            other_engine.close()
 
         assert [(s.sql, s.params, s.label) for s in dbs[0].sent] == [
             (s.sql, s.params, s.label) for s in dbs[1].sent

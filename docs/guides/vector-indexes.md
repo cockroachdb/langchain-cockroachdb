@@ -120,7 +120,7 @@ CockroachDB uses a vector index only when every filter of the search matches the
 
 When the table has a usable index (see below), a search with a `filter` works in steps instead:
 
-1. It takes the nearest rows from the index, with no filter: twice `k` plus one, and at least 41, which costs the index no more to find than fewer would. For a namespaced store, the namespace is the index's prefix column, so the index reads only that namespace.
+1. It takes the nearest rows from the index, with no filter: twice `k` plus one, and at least 41, which costs the index about the same as fewer (on a 20,000-row table, a window of 41 read about 10% more rows than a window of 9, in the same time). For a namespaced store, the namespace is the index's prefix column, so the index reads only that namespace.
 2. It applies the filter to those rows and keeps the `k` nearest that pass. Steps 1 and 2 are one statement.
 3. When fewer than `k` rows pass, matches may lie beyond the window, so the store runs the exact search: the statement every filtered search ran before 0.6.0, which filters before it ranks. When no row passes, it always does. When some do, it skips the exact search only if the window held every row of the table or namespace, since the short result is then the whole answer.
 
