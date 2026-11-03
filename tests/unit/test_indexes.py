@@ -2,7 +2,14 @@
 
 import pytest
 
-from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
+from langchain_cockroachdb.indexes import (
+    CSPANNIndex,
+    CSPANNQueryOptions,
+    DistanceStrategy,
+    _find_vector_index,
+    _usable_vector_index,
+    _vector_indexes,
+)
 
 
 class TestDistanceStrategy:
@@ -85,3 +92,160 @@ class TestCSPANNQueryOptions:
     def test_rejects_invalid_beam_size(self, bad) -> None:
         with pytest.raises(ValueError):
             CSPANNQueryOptions(beam_size=bad)
+
+
+def create_statement(*index_lines: str) -> str:
+    """A SHOW CREATE TABLE statement as v26.3 renders it, with these index lines."""
+    lines = [
+        "\tid UUID NOT NULL DEFAULT gen_random_uuid(),",
+        "\tnamespace STRING NOT NULL DEFAULT '':::STRING,",
+        '\t"user" STRING NULL,',
+        "\tcontent STRING NULL,",
+        "\tembedding VECTOR(3) NULL,",
+        "\tother VECTOR(3) NULL,",
+        "\tmetadata JSONB NULL DEFAULT '{}':::JSONB,",
+        "\tCONSTRAINT docs_pkey PRIMARY KEY (id ASC),",
+        "\tINDEX docs_namespace_idx (namespace ASC)",
+        *(f"\t{line}" for line in index_lines),
+    ]
+    body = ",\n".join(line.rstrip(",") for line in lines)
+    return f"CREATE TABLE public.docs (\n{body}\n) WITH (schema_locked = true);"
+
+
+def usable(statement: str, strategy: DistanceStrategy, prefix: list[str]) -> str | None:
+    return _usable_vector_index(
+        statement, column="embedding", opclass=strategy.get_opclass(), prefix=prefix
+    )
+
+
+COSINE = DistanceStrategy.COSINE
+
+
+class TestVectorIndexParsing:
+    def test_a_table_without_a_vector_index(self) -> None:
+        statement = create_statement()
+        assert _vector_indexes(statement) == []
+        assert _find_vector_index(statement, "docs_embedding_vector_idx") is None
+        assert usable(statement, COSINE, []) is None
+        assert usable(statement, COSINE, ["namespace"]) is None
+
+    def test_every_vector_index_with_its_parts(self) -> None:
+        statement = create_statement(
+            "VECTOR INDEX a_plain (embedding)",
+            "VECTOR INDEX c_ns (namespace, embedding vector_ip_ops) "
+            "WITH (min_partition_size=8, max_partition_size=64)",
+            'VECTOR INDEX "D_Quoted" ("user", embedding vector_l2_ops)',
+        )
+        found = _vector_indexes(statement)
+        assert [index.name for index in found] == ["a_plain", "c_ns", "D_Quoted"]
+        assert [index.columns for index in found] == [
+            ["embedding"],
+            ["namespace", "embedding"],
+            ["user", "embedding"],
+        ]
+        # No operator class means vector_l2_ops, the default. v25.4.14 and
+        # v26.3.4 always show one, but a line without one reads the same
+        assert [index.opclass for index in found] == [
+            "vector_l2_ops",
+            "vector_ip_ops",
+            "vector_l2_ops",
+        ]
+        assert found[1].options == {"min_partition_size": "8", "max_partition_size": "64"}
+        assert found[0].options == {}
+
+    @pytest.mark.parametrize("strategy", list(DistanceStrategy))
+    def test_the_operator_class_must_match_the_distance_strategy(
+        self, strategy: DistanceStrategy
+    ) -> None:
+        for opclass in ("vector_cosine_ops", "vector_l2_ops", "vector_ip_ops"):
+            statement = create_statement(f"VECTOR INDEX docs_idx (embedding {opclass})")
+            expected = "docs_idx" if opclass == strategy.get_opclass() else None
+            assert usable(statement, strategy, []) == expected
+        # A line without an operator class has the default, vector_l2_ops
+        statement = create_statement("VECTOR INDEX docs_idx (embedding)")
+        expected = "docs_idx" if strategy is DistanceStrategy.EUCLIDEAN else None
+        assert usable(statement, strategy, []) == expected
+
+    def test_an_index_without_prefix_columns_serves_only_a_store_without_a_namespace(
+        self,
+    ) -> None:
+        statement = create_statement("VECTOR INDEX plain (embedding vector_cosine_ops)")
+        assert usable(statement, COSINE, []) == "plain"
+        # namespace = ... is a filter too, and filters must match prefix columns
+        assert usable(statement, COSINE, ["namespace"]) is None
+
+    def test_a_namespace_prefix_serves_only_a_namespaced_store(self) -> None:
+        statement = create_statement("VECTOR INDEX ns (namespace, embedding vector_cosine_ops)")
+        assert usable(statement, COSINE, ["namespace"]) == "ns"
+        # Every prefix column must be constrained to a value, and a store
+        # without a namespace constrains none
+        assert usable(statement, COSINE, []) is None
+        # Column names compare without regard to case
+        assert usable(statement, COSINE, ["NameSpace"]) == "ns"
+
+    def test_other_prefix_columns_serve_neither(self) -> None:
+        statement = create_statement(
+            'VECTOR INDEX by_user ("user", embedding vector_cosine_ops)',
+            'VECTOR INDEX two (namespace, "user", embedding vector_cosine_ops)',
+        )
+        assert usable(statement, COSINE, []) is None
+        assert usable(statement, COSINE, ["namespace"]) is None
+        assert usable(statement, COSINE, ["user"]) == "by_user"
+
+    def test_an_index_on_another_vector_column_does_not_count(self) -> None:
+        statement = create_statement("VECTOR INDEX docs_other (other vector_cosine_ops)")
+        assert usable(statement, COSINE, []) is None
+
+    def test_quoted_names(self) -> None:
+        statement = create_statement(
+            'VECTOR INDEX "select" ("namespace", "embedding" vector_cosine_ops)',
+            'VECTOR INDEX "Mixed ""Case"" idx" (embedding vector_cosine_ops)',
+        )
+        found = _vector_indexes(statement)
+        assert [index.name for index in found] == ["select", 'Mixed "Case" idx']
+        assert found[0].columns == ["namespace", "embedding"]
+        assert usable(statement, COSINE, ["namespace"]) == "select"
+        assert usable(statement, COSINE, []) == 'Mixed "Case" idx'
+
+    def test_several_indexes_pick_one_that_serves(self) -> None:
+        statement = create_statement(
+            "VECTOR INDEX old_l2 (embedding vector_l2_ops)",
+            "VECTOR INDEX by_ns (namespace, embedding vector_cosine_ops)",
+            "VECTOR INDEX whole (embedding vector_cosine_ops)",
+        )
+        assert usable(statement, COSINE, []) == "whole"
+        assert usable(statement, COSINE, ["namespace"]) == "by_ns"
+        assert usable(statement, DistanceStrategy.EUCLIDEAN, []) == "old_l2"
+        assert usable(statement, DistanceStrategy.INNER_PRODUCT, []) is None
+
+    def test_partial_and_invisible_indexes_do_not_serve(self) -> None:
+        statement = create_statement(
+            "VECTOR INDEX partial (embedding vector_cosine_ops) WHERE namespace = 'x':::STRING",
+            "VECTOR INDEX hidden (embedding vector_cosine_ops) NOT VISIBLE",
+            "VECTOR INDEX half (embedding vector_cosine_ops) VISIBILITY 0.50",
+        )
+        found = _vector_indexes(statement)
+        assert [index.name for index in found] == ["partial", "hidden", "half"]
+        assert [index.partial for index in found] == [True, False, False]
+        assert [index.visible for index in found] == [True, False, False]
+        assert usable(statement, COSINE, []) is None
+
+    def test_find_vector_index_by_name(self) -> None:
+        statement = create_statement(
+            "VECTOR INDEX docs_embedding_vector_idx (namespace, embedding vector_cosine_ops) "
+            "WITH (min_partition_size=10, max_partition_size=50)",
+            'VECTOR INDEX "Quoted" (embedding vector_l2_ops) NOT VISIBLE',
+        )
+        found = _find_vector_index(statement, "docs_embedding_vector_idx")
+        assert found is not None
+        assert found.columns == ["namespace", "embedding"]
+        assert found.options == {"min_partition_size": "10", "max_partition_size": "50"}
+        assert found.definition == (
+            "\tVECTOR INDEX docs_embedding_vector_idx (namespace, embedding vector_cosine_ops) "
+            "WITH (min_partition_size=10, max_partition_size=50)"
+        )
+        # Names compare without regard to case, quoted or not
+        assert _find_vector_index(statement, "DOCS_EMBEDDING_VECTOR_IDX") is not None
+        quoted = _find_vector_index(statement, "quoted")
+        assert quoted is not None and quoted.opclass == "vector_l2_ops"
+        assert _find_vector_index(statement, "docs_embedding") is None

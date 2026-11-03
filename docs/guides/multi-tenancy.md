@@ -6,7 +6,7 @@ Isolate documents by namespace within a single table for multi-tenant applicatio
 
 Multi-tenancy lets multiple tenants share the same vector store table while keeping their data completely isolated. Each tenant's documents are invisible to other tenants during search, retrieval, and deletion.
 
-CockroachDB is uniquely well-suited for this pattern because its C-SPANN vector indexes support **prefix columns** -- the namespace filter is applied at the index level, not as a post-filter.
+CockroachDB suits this pattern because its C-SPANN vector indexes support **prefix columns**. With the namespace as the index's prefix column, the namespace filter is applied at the index level, not as a post-filter.
 
 ## Quick Start
 
@@ -149,14 +149,11 @@ For best performance with multi-tenancy, create a vector index with the namespac
 ```python
 from langchain_cockroachdb.indexes import CSPANNIndex
 
-index = CSPANNIndex(
-    name="documents_ns_vec_idx",
-    prefix_columns=["namespace"],
-)
-await store_a.aapply_vector_index(index)
+index = CSPANNIndex(name="documents_ns_vec_idx")
+await store_a.aapply_vector_index(index, prefix_columns=["namespace"])
 ```
 
-This creates a `CREATE VECTOR INDEX ... ON documents (namespace, embedding)` which partitions the index by namespace. Searches within a namespace only scan that namespace's partition -- no wasted work scanning other tenants' data.
+This creates `CREATE VECTOR INDEX ... ON documents (namespace, embedding vector_cosine_ops)`, which partitions the index by namespace. A search within a namespace reads only that namespace's part of the index, with or without a metadata filter, and never other tenants' vectors. With a filter, the store takes the nearest vectors of the namespace from the index, applies the filter to them, and runs the exact search over the namespace when they may have left matches out (see [Filtered Search](vector-indexes.md#filtered-search)). The namespace must be the index's only prefix column. An index on the embedding alone cannot serve a namespaced store's searches, since CockroachDB counts `namespace = ...` as a filter.
 
 ## Metadata Filtering with Namespaces
 

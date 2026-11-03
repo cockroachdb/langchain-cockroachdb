@@ -39,6 +39,7 @@ from langgraph.store.base import (
 from langgraph.store.base.embed import get_text_at_path, tokenize_path
 
 from langchain_cockroachdb import _psycopg_conn
+from langchain_cockroachdb._window import window_needs_exact_search
 from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
 from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
@@ -390,15 +391,17 @@ def needs_exact_search(rows: Sequence[Mapping[str, Any]], *, limit: int, over_fe
     the index itself, which a small beam_size or small partitions can do.
     In both cases matches may be missing, because candidates that failed
     the filter or had expired took their places. With no rows at all the
-    sizes are unknown. All of these run again.
+    sizes are unknown. All of these run again. The vector store decides
+    with the same rule, window_needs_exact_search in _window.py.
     """
-    if len(rows) >= limit:
-        return False
-    if not rows:
-        return True
-    window = int(rows[0]["window_size"])
-    held = int(rows[0]["namespace_vectors"])
-    return window >= over_fetch or window < held
+    first = rows[0] if rows else None
+    return window_needs_exact_search(
+        len(rows),
+        limit=limit,
+        window=over_fetch,
+        window_size=int(first["window_size"]) if first else 0,
+        scope_rows=int(first["namespace_vectors"]) if first else 0,
+    )
 
 
 def needs_exact_candidates(

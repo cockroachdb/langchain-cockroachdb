@@ -1,14 +1,21 @@
 """Integration tests for vector store."""
 
+import asyncio
+import math
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
-from langchain_core.embeddings import Embeddings
-from sqlalchemy import text
+from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
+from sqlalchemy import event, text
 
 from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.indexes import CSPANNIndex, CSPANNQueryOptions, DistanceStrategy
+from langchain_cockroachdb.vectorstores import CockroachDBVectorStore
 
 
 class FakeEmbeddings(Embeddings):
@@ -996,3 +1003,415 @@ async def test_multi_tenant_search_uses_vector_index(
     assert "prefix spans" in plan.lower(), f"No prefix spans in plan:\n{plan}"
 
     await cockroachdb_engine.adrop_table(table_name)
+
+
+# Filtered search through the C-SPANN index. A JSON metadata filter in the
+# same WHERE as ORDER BY <distance> LIMIT k made CockroachDB scan the whole
+# table, since the index serves a search only when every filter matches its
+# prefix columns. The store now ranks a window from the index, filters it,
+# and runs the exact statement when the window may have left matches out.
+
+STATS_WAIT = 60
+PLAN_DIM = 8
+PLAN_ROWS = 3000
+QUERY = [1.0, 0.0, 0.0]
+
+
+def angle(theta: float) -> list[float]:
+    """A vector ``theta`` radians from QUERY: its cosine distance is 1 - cos(theta)."""
+    return [math.cos(theta), math.sin(theta), 0.0]
+
+
+@contextmanager
+def sent_statements(engine: CockroachDBEngine) -> Iterator[list[str]]:
+    """Every statement the engine sends while the block runs, as the driver gets it."""
+    seen: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        seen.append(statement)
+
+    target = engine.engine.sync_engine
+    event.listen(target, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(target, "before_cursor_execute", record)
+
+
+def vector_searches(seen: list[str]) -> list[str]:
+    return [s for s in seen if "AS VECTOR)" in s and "ORDER BY" in s]
+
+
+def windowed(seen: list[str]) -> list[str]:
+    return [s for s in vector_searches(seen) if "count(*) OVER ()" in s]
+
+
+def exact(seen: list[str]) -> list[str]:
+    return [s for s in vector_searches(seen) if "count(*) OVER ()" not in s]
+
+
+def index_reads(seen: list[str]) -> int:
+    return sum("SHOW CREATE TABLE" in s for s in seen)
+
+
+async def analyze(engine: CockroachDBEngine, table: str) -> None:
+    async with engine.engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(text(f"ANALYZE public.{table}"))
+
+
+async def fill_plan_table(engine: CockroachDBEngine, table: str, *, namespaced: bool) -> None:
+    """PLAN_ROWS random vectors; with namespaced, in three namespaces ns0 to ns2."""
+    await engine.ainit_vectorstore_table(
+        table,
+        PLAN_DIM,
+        namespace_column="namespace" if namespaced else None,
+        drop_if_exists=True,
+    )
+    namespaces: list[str | None] = ["ns0", "ns1", "ns2"] if namespaced else [None]
+    per = PLAN_ROWS // len(namespaces)
+    for namespace in namespaces:
+        writer = AsyncCockroachDBVectorStore(
+            engine, DeterministicFakeEmbedding(size=PLAN_DIM), table, namespace=namespace
+        )
+        await writer.aadd_texts(
+            [f"{namespace}-doc-{i}" for i in range(per)],
+            metadatas=[{"kind": "x" if i % 4 else "y", "i": i} for i in range(per)],
+        )
+
+
+async def explain_filtered_search(
+    store: AsyncCockroachDBVectorStore, *, wait: bool = True, **search: Any
+) -> str:
+    """EXPLAIN the first statement a filtered search sends, through the store's own _execute.
+
+    Each node picks up new statistics a few seconds after ANALYZE. Until then
+    the optimizer may plan with the empty table it saw at creation and scan,
+    so with ``wait`` it plans again until it shows a vector search, as the
+    memory store's plan tests do.
+    """
+    sent: list[tuple[Any, Any, dict[str, Any]]] = []
+    execute = store._execute
+
+    async def recording(statement: Any, params: Any = None, **kwargs: Any) -> list[Any]:
+        if " ORDER BY " in statement.text:
+            sent.append((statement, params, kwargs))
+        return await execute(statement, params, **kwargs)
+
+    store._execute = recording  # type: ignore[method-assign]
+    try:
+        embedding = DeterministicFakeEmbedding(size=PLAN_DIM).embed_query("a query")
+        await store.asimilarity_search_by_vector(embedding, **search)
+    finally:
+        del store._execute
+    statement, params, kwargs = sent[0]
+    deadline = time.monotonic() + STATS_WAIT
+    while True:
+        rows = await execute(
+            text("EXPLAIN " + statement.text),
+            params,
+            label="explain a filtered search",
+            settings=kwargs.get("settings"),
+            fetch=True,
+        )
+        plan = "\n".join(row[0] for row in rows)
+        if not wait or "vector search" in plan or time.monotonic() > deadline:
+            return plan
+        await asyncio.sleep(1)
+
+
+@pytest.mark.parametrize("namespaced", [False, True], ids=["whole-table", "namespace"])
+async def test_filtered_search_ranks_a_window_from_the_index(
+    cockroachdb_engine: CockroachDBEngine, namespaced: bool
+) -> None:
+    """EXPLAIN: a filtered search takes its window from a vector search, never a full scan.
+
+    The window of 2 * 4 + 1 nearest vectors comes from the C-SPANN index,
+    with the namespace as its prefix span for a namespaced store, and the
+    filter applies to that window. The count of the scope's rows reads at
+    most the window's size from the namespace index or the primary key.
+    """
+    table = f"filtered_plan_{'ns' if namespaced else 'all'}"
+    await fill_plan_table(cockroachdb_engine, table, namespaced=namespaced)
+    store = AsyncCockroachDBVectorStore(
+        cockroachdb_engine,
+        DeterministicFakeEmbedding(size=PLAN_DIM),
+        table,
+        namespace="ns1" if namespaced else None,
+    )
+    await store.aapply_vector_index(
+        CSPANNIndex(), prefix_columns=["namespace"] if namespaced else None
+    )
+    await analyze(cockroachdb_engine, table)
+
+    plan = await explain_filtered_search(store, k=4, filter={"kind": "x"})
+
+    assert "vector search" in plan, f"no vector search after {STATS_WAIT} s:\n{plan}"
+    index_name = CSPANNIndex().get_index_name(table, "embedding")
+    assert f"table: {table}@{index_name}" in plan, plan
+    assert "• window" in plan, plan
+    assert "FULL SCAN" not in plan, plan
+    count = plan[plan.index("• subquery") :]
+    assert "limit: 9" in count, plan
+    if namespaced:
+        assert "prefix spans: [/'ns1' - /'ns1']" in plan, plan
+        assert f"table: {table}@{table}_namespace_idx" in count, plan
+        assert "spans: [/'ns1' - /'ns1']" in count, plan
+    else:
+        assert "spans: LIMITED SCAN" in count, plan
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_an_index_without_prefix_columns_cannot_serve_a_namespace(
+    cockroachdb_engine: CockroachDBEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A namespaced store's namespace = ... is a filter, so it needs the namespace prefix.
+
+    With an index on the embedding alone, the store keeps today's single
+    statement. EXPLAIN shows why: once the optimizer has statistics, the
+    index serves the whole table's window, but the namespace's window scans
+    the table.
+    """
+    table = "filtered_plan_noprefix"
+    await fill_plan_table(cockroachdb_engine, table, namespaced=True)
+    embeddings = DeterministicFakeEmbedding(size=PLAN_DIM)
+    store = AsyncCockroachDBVectorStore(cockroachdb_engine, embeddings, table, namespace="ns1")
+    whole = AsyncCockroachDBVectorStore(cockroachdb_engine, embeddings, table)
+    await store.aapply_vector_index(CSPANNIndex())
+    await analyze(cockroachdb_engine, table)
+
+    with sent_statements(cockroachdb_engine) as seen:
+        await store.asimilarity_search_by_vector(
+            embeddings.embed_query("a query"), k=4, filter={"kind": "x"}
+        )
+    assert windowed(seen) == [] and len(exact(seen)) == 1
+
+    plan = await explain_filtered_search(whole, k=4, filter={"kind": "x"})
+    assert "vector search" in plan, f"no vector search after {STATS_WAIT} s:\n{plan}"
+
+    async def always() -> bool:
+        return True
+
+    monkeypatch.setattr(store, "_has_usable_index", always)
+    plan = await explain_filtered_search(store, wait=False, k=4, filter={"kind": "x"})
+    assert "vector search" not in plan, plan
+    assert CSPANNIndex().get_index_name(table, "embedding") not in plan, plan
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def angle_store(
+    engine: CockroachDBEngine,
+    table: str,
+    rare: set[int],
+    *,
+    count: int = 60,
+    index: bool = True,
+) -> tuple[AsyncCockroachDBVectorStore, list[str]]:
+    """``count`` documents, document i at 0.02 * i radians from QUERY.
+
+    Every distance differs from the next by far more than float32 rounding,
+    so the exact order is known. The documents in ``rare`` have kind
+    "rare", the others "common".
+    """
+    await engine.ainit_vectorstore_table(table, 3, drop_if_exists=True)
+    store = AsyncCockroachDBVectorStore(engine, FakeEmbeddings(), table)
+    ids = await store.aadd_embeddings(
+        [f"doc {i}" for i in range(count)],
+        [angle(0.02 * i) for i in range(count)],
+        metadatas=[{"kind": "rare" if i in rare else "common", "i": i} for i in range(count)],
+    )
+    if index:
+        await store.aapply_vector_index(CSPANNIndex())
+    return store, ids
+
+
+async def test_filtered_search_matches_the_exact_answer_when_the_window_suffices(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_window"
+    rare = set(range(0, 60, 4))
+    store, ids = await angle_store(cockroachdb_engine, table, rare)
+    common = [i for i in range(60) if i not in rare]
+
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store.asimilarity_search_with_score_by_vector(
+            QUERY, k=5, filter={"kind": "common"}
+        )
+
+    assert [doc.id for doc, _ in results] == [ids[i] for i in common[:5]]
+    assert [distance for _, distance in results] == pytest.approx(
+        [1 - math.cos(0.02 * i) for i in common[:5]], abs=1e-6
+    )
+    # The window of 11 nearest held 5 matches, so nothing else ran
+    assert len(windowed(seen)) == 1 and exact(seen) == []
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_a_selective_filter_falls_back_to_the_exact_answer(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_fallback"
+    store, ids = await angle_store(cockroachdb_engine, table, {3, 30, 45, 59})
+
+    # The window of 9 nearest holds one match, and it is full, so the exact
+    # statement runs and finds the other three
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+    assert [doc.id for doc in results] == [ids[3], ids[30], ids[45], ids[59]]
+    assert len(windowed(seen)) == 1 and len(exact(seen)) == 1
+
+    # No match in the window at all
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store.asimilarity_search_by_vector(QUERY, k=2, filter={"i": {"$gte": 50}})
+    assert [doc.id for doc in results] == [ids[50], ids[51]]
+    assert len(windowed(seen)) == 1 and len(exact(seen)) == 1
+
+    # No match anywhere
+    results = await store.asimilarity_search_by_vector(QUERY, k=2, filter={"kind": "none"})
+    assert results == []
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_a_short_result_from_a_window_that_holds_every_row_is_exact(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_short"
+    store, ids = await angle_store(cockroachdb_engine, table, {1, 4}, count=6)
+
+    # The window of 9 holds all 6 rows, as the count of the table shows, so
+    # its two matches are the whole answer
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+    assert [doc.id for doc in results] == [ids[1], ids[4]]
+    assert len(windowed(seen)) == 1 and exact(seen) == []
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_without_an_index_a_filtered_search_sends_todays_single_statement(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_no_index"
+    store, ids = await angle_store(cockroachdb_engine, table, {3, 30}, index=False)
+
+    with sent_statements(cockroachdb_engine) as seen:
+        first = await store.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+        second = await store.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+    assert [doc.id for doc in first] == [doc.id for doc in second] == [ids[3], ids[30]]
+    assert windowed(seen) == []
+    assert len(exact(seen)) == 2
+    # One look at the table's indexes, kept for the next search
+    assert index_reads(seen) == 1
+
+    # A search without a filter never looks
+    other = AsyncCockroachDBVectorStore(cockroachdb_engine, FakeEmbeddings(), table)
+    with sent_statements(cockroachdb_engine) as seen:
+        await other.asimilarity_search_by_vector(QUERY, k=4)
+    assert index_reads(seen) == 0 and len(exact(seen)) == 1
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_an_index_this_store_applies_or_drops_takes_effect_at_once(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_apply"
+    store, ids = await angle_store(cockroachdb_engine, table, {3, 30}, index=False)
+
+    async def search() -> list[str]:
+        with sent_statements(cockroachdb_engine) as seen:
+            results = await store.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+        assert [doc.id for doc in results] == [ids[3], ids[30]]
+        return seen
+
+    assert windowed(await search()) == []
+    await store.aapply_vector_index(CSPANNIndex())
+    assert len(windowed(await search())) == 1
+    await store.adrop_vector_index()
+    assert windowed(await search()) == []
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_filtered_mmr_takes_the_window_path(cockroachdb_engine: CockroachDBEngine) -> None:
+    table = "filtered_mmr"
+    rare = set(range(0, 60, 4))
+    store, ids = await angle_store(cockroachdb_engine, table, rare)
+
+    with sent_statements(cockroachdb_engine) as seen:
+        docs = await store.amax_marginal_relevance_search_by_vector(
+            QUERY, k=3, fetch_k=6, filter={"kind": "common"}
+        )
+
+    assert len(docs) == 3
+    assert all(doc.metadata["kind"] == "common" for doc in docs)
+    [statement] = windowed(seen)
+    assert "AS distance, embedding" in statement
+    assert exact(seen) == []
+    await cockroachdb_engine.adrop_table(table)
+
+
+async def test_filtered_search_keeps_namespaces_apart_on_both_paths(
+    cockroachdb_engine: CockroachDBEngine,
+) -> None:
+    table = "filtered_tenants"
+    await cockroachdb_engine.ainit_vectorstore_table(
+        table, 3, namespace_column="namespace", drop_if_exists=True
+    )
+    store_a = AsyncCockroachDBVectorStore(
+        cockroachdb_engine, FakeEmbeddings(), table, namespace="tenant-a"
+    )
+    store_b = AsyncCockroachDBVectorStore(
+        cockroachdb_engine, FakeEmbeddings(), table, namespace="tenant-b"
+    )
+    # Tenant B's documents lie nearer the query than any of tenant A's
+    ids_b = await store_b.aadd_embeddings(
+        [f"b {i}" for i in range(40)],
+        [angle(0.01 * i) for i in range(40)],
+        metadatas=[{"kind": "rare" if i % 2 else "common"} for i in range(40)],
+    )
+    ids_a = await store_a.aadd_embeddings(
+        [f"a {i}" for i in range(40)],
+        [angle(0.5 + 0.02 * i) for i in range(40)],
+        metadatas=[{"kind": "rare" if i in (10, 25) else "common"} for i in range(40)],
+    )
+    await store_a.aapply_vector_index(CSPANNIndex(), prefix_columns=["namespace"])
+
+    # The window path
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store_a.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "common"})
+    assert [doc.id for doc in results] == ids_a[:4]
+    assert len(windowed(seen)) == 1 and exact(seen) == []
+
+    # The fallback: the window of 9 holds none of tenant A's rare documents
+    with sent_statements(cockroachdb_engine) as seen:
+        results = await store_a.asimilarity_search_by_vector(QUERY, k=4, filter={"kind": "rare"})
+    assert [doc.id for doc in results] == [ids_a[10], ids_a[25]]
+    assert len(windowed(seen)) == 1 and len(exact(seen)) == 1
+    assert not {doc.id for doc in results} & set(ids_b)
+    await cockroachdb_engine.adrop_table(table)
+
+
+def test_sync_filtered_search_takes_the_same_paths(connection_string: str) -> None:
+    engine = CockroachDBEngine.from_connection_string(connection_string)
+    table = "filtered_sync"
+    try:
+        engine.init_vectorstore_table(table, 3, drop_if_exists=True)
+        store = CockroachDBVectorStore(engine, FakeEmbeddings(), table)
+        rare = {3, 30}
+        ids = store.add_embeddings(
+            [f"doc {i}" for i in range(60)],
+            [angle(0.02 * i) for i in range(60)],
+            metadatas=[{"kind": "rare" if i in rare else "common"} for i in range(60)],
+        )
+        store.apply_vector_index(CSPANNIndex())
+
+        with sent_statements(engine) as seen:
+            common = store.similarity_search_by_vector(QUERY, k=3, filter={"kind": "common"})
+        assert [doc.id for doc in common] == [ids[0], ids[1], ids[2]]
+        assert len(windowed(seen)) == 1 and exact(seen) == []
+
+        with sent_statements(engine) as seen:
+            found = store.similarity_search_by_vector(QUERY, k=3, filter={"kind": "rare"})
+        assert [doc.id for doc in found] == [ids[3], ids[30]]
+        assert len(windowed(seen)) == 1 and len(exact(seen)) == 1
+        engine.drop_table(table)
+    finally:
+        engine.close()

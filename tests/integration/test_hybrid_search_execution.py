@@ -12,7 +12,9 @@ from langchain_core.embeddings import Embeddings
 from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import FusionType, HybridSearchConfig
+from langchain_cockroachdb.indexes import CSPANNIndex
 from langchain_cockroachdb.vectorstores import CockroachDBVectorStore
+from tests.integration.test_vectorstore import exact, sent_statements, windowed
 
 COLLECTION = "test_hybrid_execution"
 
@@ -137,6 +139,26 @@ class TestHybridSearchExecution:
 
         for doc in results:
             assert doc.metadata["topic"] == "databases"
+
+    async def test_filtered_hybrid_search_ranks_its_vector_leg_through_the_index(
+        self, cockroachdb_engine: CockroachDBEngine
+    ) -> None:
+        """With a filter and a vector index, the vector leg ranks a window from the index."""
+        config = HybridSearchConfig(fts_weight=0.7, vector_weight=0.3)
+        store = await _make_store(cockroachdb_engine, config)
+        await store.aapply_vector_index(CSPANNIndex())
+
+        with sent_statements(cockroachdb_engine) as seen:
+            results = await store.asimilarity_search(
+                "zebra", k=2, filter={"topic": {"$in": ["animals", "databases"]}}
+            )
+
+        assert {doc.metadata["topic"] for doc in results} == {"animals", "databases"}
+        assert "zebra" in results[0].page_content
+        # The window of 41 holds all four documents, so the vector leg is exact
+        # without its fallback, and the full-text leg ran beside it
+        assert len(windowed(seen)) == 1 and exact(seen) == []
+        assert any("ts_rank" in statement for statement in seen)
 
     async def test_hybrid_with_no_fts_matches_falls_back_to_vector(
         self, cockroachdb_engine: CockroachDBEngine

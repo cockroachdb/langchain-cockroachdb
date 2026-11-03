@@ -1,6 +1,9 @@
 """LangChain integration for CockroachDB with native vector support."""
 
-from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
+from langchain_cockroachdb.async_vectorstore import (
+    VECTOR_INDEX_REFRESH_SECONDS,
+    AsyncCockroachDBVectorStore,
+)
 from langchain_cockroachdb.chat_message_histories import CockroachDBChatMessageHistory
 from langchain_cockroachdb.checkpointer import AsyncCockroachDBSaver, CockroachDBSaver
 from langchain_cockroachdb.engine import CockroachDBEngine
@@ -46,6 +49,7 @@ __all__ = [
     "CSPANNIndex",
     "CSPANNQueryOptions",
     "DistanceStrategy",
+    "VECTOR_INDEX_REFRESH_SECONDS",
     "FusionType",
     "HybridSearchConfig",
     "CockroachDBChatMessageHistory",
