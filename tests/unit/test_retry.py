@@ -1,6 +1,7 @@
 """Unit tests for retry classification and RetryPolicy."""
 
 import asyncio
+import dataclasses
 import logging
 import math
 from collections.abc import Sequence
@@ -991,6 +992,23 @@ class TestSchemaChangePolicy:
         calls, pauses, _ = failing_run(policy, [busy()], clock)
         assert pauses[:3] == pytest.approx([0.1, 0.2, 0.4])
         assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+
+    def test_replace_keeps_the_two_halves_together(self, clock: FakeClock) -> None:
+        # Deriving with dataclasses.replace changes the user's policy too, so
+        # every error follows the new fields
+        policy = schema_change_policy(RetryPolicy(jitter=0.0))
+        transient = server_error("40001")
+        one = dataclasses.replace(policy, max_attempts=1)
+        for error in (transient, busy()):
+            assert failing_run(one, [error], clock)[:2] == (1, [])
+        three = dataclasses.replace(policy, max_attempts=3)
+        assert failing_run(three, [transient])[0] == 3
+        slow = dataclasses.replace(policy, initial_backoff=1.0)
+        assert failing_run(slow, [transient])[1] == pytest.approx([1.0, 2.0, 4.0, 8.0])
+        assert slow.delay(0) == 1.0
+        # A subclass stays a subclass
+        sentinel = dataclasses.replace(schema_change_policy(Sentinel(jitter=0.0)), max_attempts=2)
+        assert failing_run(sentinel, [transient]) == (2, [0.123], transient)
 
     def test_the_busy_budget_can_be_set(self, clock: FakeClock) -> None:
         policy = schema_change_policy(

@@ -431,26 +431,31 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             TimeoutError: If the migration is not in place after
                 SCHEMA_CHANGE_SETTLE_SECONDS, saying what remained
         """
-        wait: _MigrationWait | None = None
+        wait = _MigrationWait()
         check = 0
-        while (left := self._migration_left(migration)) is not None:
-            if wait is None:
-                wait = self._start_migration_wait(left)
+        while (left := self._migration_left(migration, wait)) is not None:
+            if wait.started is None:
+                self._start_migration_wait(wait, left)
             self._sleep(self._settle_pause(wait, check, left))
             check += 1
-        if wait is not None:
+        if wait.started is not None:
             self._end_migration_wait(wait)
 
-    def _migration_left(self, migration: str) -> str | None:
+    def _migration_left(self, migration: str, wait: _MigrationWait) -> str | None:
         """What still keeps migration 2 from being in place, or None once nothing does.
 
-        It reads the columns, then SHOW JOBS. When the columns are not public
-        and no job applies the migration, it sends ``migration`` again.
+        It reads the columns, then SHOW JOBS: on every check once the
+        columns are public, and otherwise as _jobs_due allows, keeping the
+        last count in between. When a check that read SHOW JOBS finds the
+        columns not public and no job, it sends ``migration`` again, then
+        reads both again, so a takeover that applied the migration ends the
+        wait.
         """
-        public = self._columns_public(
-            self._read_all([self.sql.reconcile_columns_exist()], "store migration wait")
-        )
-        running = self._jobs_on_items()
+        columns = [self.sql.reconcile_columns_exist()]
+        public = self._columns_public(self._read_all(columns, "store migration wait"))
+        if not public and not self._jobs_due(wait):
+            return self._migration_condition(public, wait.jobs)
+        running = self._note_jobs(wait, self._jobs_on_items())
         if not public and not running:
             # No job that SHOW JOBS shows applies the migration: a peer's
             # migration failed or was reverted, or the job is another role's or
@@ -458,6 +463,10 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             # statement is idempotent: it takes the migration over, or returns
             # at once while another job runs it
             self._run_ddl(migration, "store migration 2")
+            public = self._columns_public(self._read_all(columns, "store migration wait"))
+            running = self._note_jobs(wait, self._jobs_on_items())
+            if public:
+                self._log_takeover()
         return self._migration_condition(public, running)
 
     def _jobs_on_items(self) -> int | None:

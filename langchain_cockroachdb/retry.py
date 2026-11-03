@@ -538,10 +538,12 @@ class _SchemaChangePolicy(RetryPolicy):
     """``base``, with a busy schema change retried under a budget of its own.
 
     schema_change_policy builds it. Its RetryPolicy fields are copies of
-    ``base``'s, for code that reads them. Every other error, and every
-    delay, is ``base``'s own, so a subclass of RetryPolicy keeps its
-    overrides. ``busy_seconds`` and ``busy_max_backoff`` are that
-    function's ``seconds`` and ``max_backoff``.
+    ``base``'s, for code that reads them, and dataclasses.replace on it
+    changes ``base`` the same way. Every other error goes to ``base``'s
+    is_retryable, and every delay to its delay, so a subclass of RetryPolicy
+    keeps its overrides of those two. Overrides of run and arun are not
+    kept. ``busy_seconds`` and ``busy_max_backoff`` are that function's
+    ``seconds`` and ``max_backoff``.
     """
 
     base: RetryPolicy = dataclasses.field(default_factory=RetryPolicy, repr=False, compare=False)
@@ -561,6 +563,10 @@ class _SchemaChangePolicy(RetryPolicy):
         if not math.isfinite(self.busy_max_backoff) or self.busy_max_backoff < 0:
             raise ValueError("max_backoff must be finite and not negative")
         own = {field.name: getattr(self, field.name) for field in dataclasses.fields(RetryPolicy)}
+        # dataclasses.replace changed the copies: change base the same way, so
+        # every error follows them. replace keeps a subclass
+        if any(getattr(self.base, name) != value for name, value in own.items()):
+            object.__setattr__(self, "base", dataclasses.replace(self.base, **own))
         # Waiting for another schema change needs pauses that grow, even under
         # a policy without backoff, or with a constant one
         initial = self.initial_backoff or DEFAULT_RETRY_POLICY.initial_backoff
@@ -653,9 +659,11 @@ def schema_change_policy(
     SCHEMA_CHANGE_PROGRESS_SECONDS, and one when it gives up.
 
     Every other error is decided by ``policy`` itself, including its
-    ``retry_on``, attempts and backoff, and a subclass's overrides. Those
+    ``retry_on``, attempts and backoff, and a subclass's overrides of
+    is_retryable and delay. Overrides of run and arun are not kept. Those
     attempts are counted apart from the busy error's. Timeouts are the
-    policy's, and ``max_attempts=1`` turns every retry off.
+    policy's, and ``max_attempts=1`` turns every retry off. A policy
+    derived from the result with dataclasses.replace keeps both together.
 
     Raises:
         ValueError: If ``seconds`` or ``max_backoff`` is negative or not

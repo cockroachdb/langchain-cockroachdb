@@ -46,6 +46,7 @@ from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_QUIET_SECONDS,
     SCHEMA_CHANGE_SETTLE_SECONDS,
     RetryPolicy,
+    get_sqlstate,
 )
 from langchain_cockroachdb.store.config import (
     DEFAULT_RECONCILE_SCAN_LIMIT,
@@ -109,14 +110,27 @@ _REASON_RANK = {"key": 0, "slot": 1, "similar": 2}
 _SETTLE_PACE = RetryPolicy(max_backoff=SCHEMA_CHANGE_BUSY_MAX_BACKOFF)
 
 
+# The SQLSTATE classes of a SHOW JOBS error that setup() goes on without:
+# syntax or access (a renamed column, a missing permission) and feature not
+# supported (a gated statement). Any other error is raised
+_SKIPPED_JOB_ERRORS = frozenset({"42", "0A"})
+
+
 @dataclass
 class _MigrationWait:
-    """A setup()'s wait for another process's migration 2, by time.monotonic()."""
+    """A setup()'s wait for migration 2, by time.monotonic().
 
-    started: float
-    deadline: float
+    ``started`` and ``deadline`` are set once a check finds the migration
+    not in place. ``jobs`` is what SHOW JOBS showed when it was last read,
+    at ``jobs_read``: None when it was not read, or cannot be.
+    """
+
+    started: float | None = None
+    deadline: float = 0.0
     # When it last logged a WARNING about the wait
     reported: float | None = None
+    jobs_read: float | None = None
+    jobs: int | None = None
 
 
 def _check_paging(limit: int, offset: int) -> None:
@@ -1849,12 +1863,14 @@ class BaseCockroachDBStore:
     def _skip_job_check(self, error: BaseException) -> bool:
         """Whether setup() goes on without SHOW JOBS after ``error``.
 
-        An error the retry policy would retry has used up its retries, and
-        is raised. Any other error, a renamed column or a permission or
-        gating error, is logged once, and from then on the columns alone
-        decide, as the schema check falls back for the migrations table.
+        Only an error of SQLSTATE class 42 or 0A is skipped: a renamed
+        column, a missing permission, or a statement turned off. It is
+        logged once, and from then on the columns alone decide, as the
+        schema check falls back for the migrations table. Any other error,
+        such as a pool timeout or a closed event loop, is raised.
         """
-        if self.retry_policy.is_retryable(error):
+        code = get_sqlstate(error)
+        if code is None or code[:2] not in _SKIPPED_JOB_ERRORS:
             return False
         lines = str(error).strip().splitlines()
         self._log.info(
@@ -1867,7 +1883,33 @@ class BaseCockroachDBStore:
         self._jobs_unreadable = True
         return True
 
-    def _start_migration_wait(self, left: str) -> _MigrationWait:
+    @staticmethod
+    def _jobs_due(wait: _MigrationWait) -> bool:
+        """Whether a check whose columns are not public reads SHOW JOBS.
+
+        It does on the first check, then at most once every
+        SCHEMA_CHANGE_PROGRESS_SECONDS, since SHOW JOBS is slow on a cluster
+        with many jobs. A check whose columns are public always reads it.
+        """
+        last = wait.jobs_read
+        return last is None or time.monotonic() - last >= SCHEMA_CHANGE_PROGRESS_SECONDS
+
+    @staticmethod
+    def _note_jobs(wait: _MigrationWait, running: int | None) -> int | None:
+        """Keep what SHOW JOBS showed for the checks that do not read it, and return it."""
+        wait.jobs_read = time.monotonic()
+        wait.jobs = running
+        return running
+
+    def _log_takeover(self) -> None:
+        """Log that this setup() applied migration 2, since no job it could see was applying it."""
+        self._log.info(
+            "setup() applied migration 2 to %s itself: no schema change job it could see was "
+            "applying it.",
+            self.sql.items,
+        )
+
+    def _start_migration_wait(self, wait: _MigrationWait, left: str) -> None:
         """Log that setup() waits for another process's migration 2, and start the wait."""
         self._log.info(
             "Another process is still applying migration 2 to %s: %s. setup() waits for it, "
@@ -1876,8 +1918,8 @@ class BaseCockroachDBStore:
             left,
             self._MIGRATION_SETTLE_SECONDS,
         )
-        now = time.monotonic()
-        return _MigrationWait(started=now, deadline=now + self._MIGRATION_SETTLE_SECONDS)
+        wait.started = time.monotonic()
+        wait.deadline = wait.started + self._MIGRATION_SETTLE_SECONDS
 
     def _settle_pause(self, wait: _MigrationWait, check: int, left: str) -> float:
         """Seconds to wait before checking again whether migration 2 is in place.
@@ -1890,7 +1932,7 @@ class BaseCockroachDBStore:
             TimeoutError: Once the wait's deadline has passed
         """
         now = time.monotonic()
-        waited = now - wait.started
+        waited = now - (wait.started or now)
         if now >= wait.deadline:
             raise TimeoutError(
                 f"Another process is still applying migration 2 to {self.sql.items}: after "
@@ -1913,10 +1955,11 @@ class BaseCockroachDBStore:
 
     def _end_migration_wait(self, wait: _MigrationWait) -> None:
         """Log that migration 2 is in place and setup() goes on to record it."""
+        now = time.monotonic()
         self._log.info(
             "Migration 2 on %s is in place after %.0fs of waiting. setup() records it.",
             self.sql.items,
-            time.monotonic() - wait.started,
+            now - (wait.started or now),
         )
 
     def _check_vector_index(self, create_statement: str) -> None:

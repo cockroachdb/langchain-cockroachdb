@@ -30,7 +30,7 @@ from langgraph.store.base import (
     SearchItem,
     SearchOp,
 )
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.retry import (
@@ -1631,31 +1631,137 @@ async def test_migration_wait_lasts_while_a_schema_change_job_runs(
 
     await wait_for_migration(store)
 
+    # SHOW JOBS is read on the first check, then not again within a minute
+    # while the columns are not public, then on every check once they are
     columns, jobs, _ = settle_reads(store)
-    assert log == [columns, jobs] * 4
+    assert log == [columns, jobs, columns, columns, jobs, columns, jobs]
     assert len(pauses) == 3
     assert all(0 < pause <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF for pause in pauses)
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
 async def test_migration_wait_takes_over_when_no_job_applies_the_migration(
-    make: str, monkeypatch
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The columns are not there and no job runs: a peer's migration failed or
     # was reverted, or SHOW JOBS cannot show the job. The wait sends the
-    # idempotent statement again, which takes the migration over, rather than
-    # waiting out its budget
+    # idempotent statement again, which takes the migration over, then reads
+    # the columns and SHOW JOBS again. It applied the migration itself, so it
+    # neither waits nor says another process is applying it
     clock = FakeClock()
     monkeypatch.setattr(store_base, "time", clock)
     store = make_store(make)
     log: list = []
-    _, pauses = wait_fakes(store, [(0, False), (0, False), (0, True)], clock, log)
+    _, pauses = wait_fakes(store, [(0, False), (0, True)], clock, log)
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    columns, jobs, takeover = settle_reads(store)
+    assert log == [columns, jobs, takeover, columns, jobs]
+    assert pauses == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        "setup() applied migration 2 to public.store itself: no schema change job it could "
+        "see was applying it."
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_long_takeover_after_the_wait_started_ends_the_wait(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The peer's job shows for 200 s, then is gone with the columns still
+    # missing. The wait takes over, and its own backfill runs for 700 s, past
+    # the wait's deadline. The wait ends once the columns are public, with no
+    # TimeoutError
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    start = clock.now
+    applied: list[float] = []
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        if applied:
+            reads.states = [(0, True)]
+        elif clock.now - start >= 200.0:
+            reads.states = [(0, False)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
+
+    def backfill() -> None:
+        applied.append(clock.now - start)
+        clock.now += 700.0
+
+    if isinstance(store, AsyncCockroachDBStore):
+
+        async def arun_ddl(statement: str, label: str, **kwargs: object) -> None:
+            backfill()
+
+        store._run_ddl = arun_ddl  # type: ignore[method-assign,assignment]
+    else:
+
+        def run_ddl(statement: str, label: str, **kwargs: object) -> None:
+            backfill()
+
+        store._run_ddl = run_ddl  # type: ignore[method-assign,assignment]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    # It took over at its first SHOW JOBS read after the job was gone
+    assert len(applied) == 1 and 200.0 <= applied[0] < 260.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Another process is still applying migration 2" in messages[0]
+    assert "setup() applied migration 2 to public.store itself" in messages[-2]
+    assert messages[-1].startswith("Migration 2 on public.store is in place after 9")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reads_show_jobs_once_a_minute_until_the_columns_turn_public(
+    make: str, monkeypatch
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    reads, _ = wait_fakes(store, [(1, False)], clock, [])
+    start = clock.now
+    # (seconds into the wait, what was read)
+    timeline: list[tuple[float, str]] = []
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        [(sql, _)] = statements
+        waited = clock.now - start
+        timeline.append((waited, "columns" if "pg_attribute" in sql else "jobs"))
+        if waited >= 210.0:
+            reads.states = [(0, True)]
+        elif waited >= 200.0:
+            reads.states = [(1, True)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
 
     await wait_for_migration(store)
 
-    columns, jobs, takeover = settle_reads(store)
-    assert log == [columns, jobs, takeover, columns, jobs, takeover, columns, jobs]
-    assert len(pauses) == 2
+    # While the columns are not public: the first check, then once a minute
+    before = [waited for waited, kind in timeline if kind == "jobs" and waited < 200.0]
+    assert len(before) == 4 and before[0] == 0.0
+    gaps = [later - earlier for earlier, later in zip(before, before[1:], strict=False)]
+    assert all(
+        SCHEMA_CHANGE_PROGRESS_SECONDS <= gap < SCHEMA_CHANGE_PROGRESS_SECONDS + 4 for gap in gaps
+    )
+    # Once they are public: on every check
+    after = [kind for waited, kind in timeline if waited >= 200.0]
+    assert after == ["columns", "jobs"] * (len(after) // 2) and len(after) >= 4
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
@@ -1677,20 +1783,62 @@ async def test_migration_wait_falls_back_to_the_columns_when_show_jobs_fails(
 
     columns, jobs, takeover = settle_reads(store)
     assert log == [columns, jobs, takeover, columns]
-    assert len(pauses) == 1
+    assert pauses == []
     fallbacks = [
         r for r in caplog.records if "SHOW JOBS" in r.getMessage() and "cannot" in r.getMessage()
     ]
     assert [r.levelno for r in fallbacks] == [logging.INFO]
     assert 'column "description" does not exist' in fallbacks[0].getMessage()
 
-    # An error the policy would retry, once its retries ran out, is raised
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("code", ["42703", "42501", "0A000"])
+async def test_migration_wait_skips_show_jobs_after_a_schema_or_permission_error(
+    make: str, code: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Classes 42 and 0A: a renamed column, a missing permission, a feature
+    # turned off. Skipped once, with one INFO line, for the store's lifetime
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
     store = make_store(make)
-    _, _ = wait_fakes(
-        store, [(0, True)], clock, [], jobs_error=psycopg.errors.SerializationFailure("busy")
-    )
-    with pytest.raises(psycopg.errors.SerializationFailure):
+    log: list = []
+    error = psycopg.errors.lookup(code)(f"failed with {code}")
+    wait_fakes(store, [(0, True)], clock, log, jobs_error=error)
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
         await wait_for_migration(store)
+        await wait_for_migration(store)
+
+    columns, jobs, _ = settle_reads(store)
+    assert log == [columns, jobs, columns]
+    assert [r.levelno for r in caplog.records] == [logging.INFO]
+    assert f"failed with {code}" in caplog.records[0].getMessage()
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        PoolTimeout("couldn't get a connection after 30.00 sec"),
+        psycopg.errors.SerializationFailure("restart transaction"),
+        psycopg.errors.lookup("25001")("active sql transaction"),
+        RuntimeError("Event loop is closed"),
+        KeyError("running"),
+    ],
+    ids=["pool-timeout", "40001", "25001", "loop-closed", "key-error"],
+)
+async def test_migration_wait_raises_any_other_show_jobs_error(
+    make: str, error: BaseException, monkeypatch
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    wait_fakes(store, [(0, True)], clock, [], jobs_error=error)
+
+    with pytest.raises(type(error)):
+        await wait_for_migration(store)
+
+    assert store._jobs_unreadable is False
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
@@ -1708,6 +1856,7 @@ async def test_migration_wait_falls_back_to_the_columns_when_show_jobs_fails(
 async def test_migration_wait_gives_up_saying_what_remained(
     make: str, states: list, condition: str, monkeypatch
 ) -> None:
+    public = states[0][1]
     clock = FakeClock()
     monkeypatch.setattr(store_base, "time", clock)
     store = make_store(make)
@@ -1723,9 +1872,12 @@ async def test_migration_wait_gives_up_saying_what_remained(
         f"Another process is still applying migration 2 to public.store: after 10 seconds, "
         f"{condition}. Check SHOW JOBS for the schema change job, then run setup() again."
     )
-    # It checked again until the budget ran out, and never slept past it
+    # It checked again until the budget ran out, and never slept past it. It
+    # read SHOW JOBS on every check once the columns were public, and once
+    # within the ten seconds while they were not
     assert sum(pauses) == pytest.approx(10.0)
-    assert len(log) == 2 * (len(pauses) + 1)
+    checks = len(pauses) + 1
+    assert len(log) == (2 * checks if public else checks + 1)
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])

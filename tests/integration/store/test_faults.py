@@ -677,7 +677,8 @@ def test_the_migration_wait_takes_over_when_no_job_applies_it(
 ) -> None:
     # A peer's migration failed or was reverted, or never ran: the columns
     # are not there and no job applies them. The wait applies the migration
-    # itself instead of waiting out its budget
+    # itself instead of waiting out its budget, then reads the columns and
+    # SHOW JOBS again and ends
     build_0_5_table(libpq_url, table_name, 1_000)
     with (
         caplog.at_level(logging.INFO, logger=STORE_LOGGER),
@@ -689,9 +690,10 @@ def test_the_migration_wait_takes_over_when_no_job_applies_it(
         with psycopg.connect(libpq_url, autocommit=True) as conn:
             assert write_id_usable(conn, store)
             assert not migration_2_recorded(conn, store)
+    # It applied the migration itself at its first check, so it did not wait
     messages = [record.getMessage() for record in caplog.records]
-    assert any("its columns are not public yet" in message for message in messages)
-    assert any("Migration 2 on" in message and "is in place" in message for message in messages)
+    assert any("applied migration 2 to" in message and "itself" in message for message in messages)
+    assert not any(WAITING in message for message in messages)
 
 
 @pytest.mark.timeout(300)
