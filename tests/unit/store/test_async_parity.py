@@ -47,6 +47,8 @@ TWINS = [
     ("_embed_put", "_embed_put"),
     ("setup", "setup"),
     ("_wait_for_migration", "_wait_for_migration"),
+    ("_migration_left", "_migration_left"),
+    ("_jobs_on_items", "_jobs_on_items"),
     ("_set_ttl", "_set_ttl"),
     ("_run_puts", "_run_puts"),
     ("delete_namespace", "adelete_namespace"),

@@ -26,6 +26,7 @@ from psycopg import Connection
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore, RetryPolicy, get_sqlstate
 from langchain_cockroachdb._sql import parse_vector
+from langchain_cockroachdb.store.sql import SCHEMA_CHANGE_JOB_TYPES, UNFINISHED_JOB_STATES
 from tests.integration.faults import (
     FailAfterCommit,
     PsycopgFaults,
@@ -397,7 +398,8 @@ def assert_set_up_once(libpq_url: str, store: Any) -> None:
 @pytest.mark.timeout(240)
 def test_parallel_setup_converges(libpq_url, table_name) -> None:
     # Six stores with the default retry policy, as six processes starting
-    # together would. On v25.4 their TTL steps fail each other until retried
+    # together would. On v25.4 their TTL steps fail each other until retried,
+    # or skip the change another one made
     errors: list[BaseException] = []
     stores: list[CockroachDBStore] = []
 
@@ -442,16 +444,19 @@ async def test_async_parallel_setup_converges(libpq_url, table_name) -> None:
     assert_set_up_once(libpq_url, stores[0])
 
 
-# A 0.5 table with this many items takes migration 2 seconds to backfill,
-# longer than the policy's own budget of about a second
-ROWS_0_5 = 200_000
+# A 0.5 table with this many items takes migration 2 seconds to backfill.
+# The processes whose migration statement returns at once wait for it in
+# setup(), and their TTL steps then meet each other's TTL changes
+ROWS_CONVERGE = 100_000
+# The tests that watch a waiting setup() need the backfill to run longer
+ROWS_BACKFILL = 200_000
 HISTORIES = pytest.mark.parametrize(
     "history", [None, {"ttl_days": 30}], ids=["without-history", "with-history"]
 )
 
 
-def build_0_5_table(libpq_url: str, table_name: str) -> None:
-    """The tables that 0.5.x setup() left, with ROWS_0_5 items in them."""
+def build_0_5_table(libpq_url: str, table_name: str, rows: int) -> None:
+    """The tables that 0.5.x setup() left, with ``rows`` items in them."""
     with (
         CockroachDBStore.from_conn_string(
             libpq_url, index=index_config(), table_name=table_name
@@ -464,7 +469,7 @@ def build_0_5_table(libpq_url: str, table_name: str) -> None:
             f"INSERT INTO {store.sql.items} (prefix, key, value) "
             "SELECT 'user.' || CAST(i %% 100 AS STRING), 'k' || CAST(i AS STRING), "
             "CAST(%s AS JSONB) FROM generate_series(1, %s) AS i",
-            ('{"text": "hello"}', ROWS_0_5),
+            ('{"text": "hello"}', rows),
         )
 
 
@@ -477,14 +482,14 @@ def upgrade_settings(table_name: str, history: dict[str, Any] | None) -> dict[st
     }
 
 
-def assert_upgraded_once(libpq_url: str, store: Any) -> None:
-    """Migration 2 is recorded once and backfilled every item, and each TTL setting is in place."""
+def assert_upgraded_once(libpq_url: str, store: Any, rows: int) -> None:
+    """Migration 2 is recorded once and backfilled all ``rows``, and each TTL setting is in place."""
     assert_set_up_once(libpq_url, store)
     with psycopg.connect(libpq_url, autocommit=True) as conn:
         row = conn.execute(
             f"SELECT count(*) FROM {store.sql.items} WHERE version = 1 AND confirmations = 0"
         ).fetchone()
-        assert row is not None and row[0] == ROWS_0_5
+        assert row is not None and row[0] == rows
         if store._history is not None:
             found = conn.execute(
                 f"SELECT create_statement FROM [SHOW CREATE TABLE {store.sql.history}]"
@@ -500,9 +505,11 @@ def test_parallel_setup_converges_while_migration_2_backfills(
     libpq_url, table_name, history
 ) -> None:
     # Six processes start on 0.6.0 together over a 0.5 table that holds
-    # data. One backfills migration 2's columns, while the others go on to
-    # the TTL step, which v25.4 refuses until the backfill is done
-    build_0_5_table(libpq_url, table_name)
+    # data. One backfills migration 2's columns. The others' migration
+    # statement returns at once, so they wait in setup() until it is done,
+    # then their TTL steps meet each other's TTL changes, which v25.4 refuses
+    # while another runs
+    build_0_5_table(libpq_url, table_name, ROWS_CONVERGE)
     errors: list[BaseException] = []
     stores: list[CockroachDBStore] = []
 
@@ -524,7 +531,7 @@ def test_parallel_setup_converges_while_migration_2_backfills(
     assert not any(thread.is_alive() for thread in threads), "a setup thread did not finish"
     assert errors == []
     assert len(stores) == 6
-    assert_upgraded_once(libpq_url, stores[0])
+    assert_upgraded_once(libpq_url, stores[0], ROWS_CONVERGE)
 
 
 @pytest.mark.timeout(300)
@@ -532,7 +539,7 @@ def test_parallel_setup_converges_while_migration_2_backfills(
 async def test_async_parallel_setup_converges_while_migration_2_backfills(
     libpq_url, table_name, history
 ) -> None:
-    await asyncio.to_thread(build_0_5_table, libpq_url, table_name)
+    await asyncio.to_thread(build_0_5_table, libpq_url, table_name, ROWS_CONVERGE)
 
     async def run() -> AsyncCockroachDBStore:
         async with AsyncCockroachDBStore.from_conn_string(
@@ -543,7 +550,7 @@ async def test_async_parallel_setup_converges_while_migration_2_backfills(
 
     stores = await asyncio.wait_for(asyncio.gather(*(run() for _ in range(6))), 240)
     assert len(stores) == 6
-    await asyncio.to_thread(assert_upgraded_once, libpq_url, stores[0])
+    await asyncio.to_thread(assert_upgraded_once, libpq_url, stores[0], ROWS_CONVERGE)
 
 
 # A setup() whose migration 2 statement meets the same migration still
@@ -568,9 +575,17 @@ def write_id_usable(conn: Connection[Any], store: Any) -> bool:
     return True
 
 
-def wait_for_backfill(libpq_url: str, store: Any, seconds: float = 10.0) -> bool:
-    """Wait until a schema change job runs on the store's items table, and say if one did."""
-    sql, params = store.sql.schema_changes_running()
+def wait_for_backfill(libpq_url: str, table_name: str, seconds: float = 30.0) -> bool:
+    """Wait until a schema change job names the table, and say if one did.
+
+    It matches more loosely than the store does: the table's name anywhere
+    in the description.
+    """
+    sql = (
+        "SELECT count(*) FROM [SHOW JOBS] WHERE job_type = ANY(CAST(%s AS STRING[])) "
+        "AND status = ANY(CAST(%s AS STRING[])) AND strpos(description, %s) > 0"
+    )
+    params = (list(SCHEMA_CHANGE_JOB_TYPES), list(UNFINISHED_JOB_STATES), table_name)
     deadline = time.monotonic() + seconds
     with psycopg.connect(libpq_url, autocommit=True) as conn:
         while time.monotonic() < deadline:
@@ -583,27 +598,41 @@ def wait_for_backfill(libpq_url: str, store: Any, seconds: float = 10.0) -> bool
 
 @pytest.mark.timeout(300)
 def test_a_setup_that_did_not_run_migration_2_waits_before_recording_it(
-    libpq_url, table_name, caplog
+    libpq_url, table_name, caplog, monkeypatch
 ) -> None:
     # Two processes start on 0.6.0 over a 0.5 table that holds data. The
     # second one's migration statement returns while the first one is still
     # backfilling. A store that finds migration 2 recorded writes its columns
     # at once, so it must not be recorded before they can be used
-    build_0_5_table(libpq_url, table_name)
+    build_0_5_table(libpq_url, table_name, ROWS_BACKFILL)
     settings = {"index": index_config(), "table_name": table_name}
     # (migration 2 recorded, its columns usable), as a third process sees them
     seen: list[tuple[bool, bool]] = []
     stop = threading.Event()
+    # What each setup() found when it began to wait: whether the columns were
+    # already public, which is False after a statement that returned early
+    found_public: list[bool] = []
+    wait_for_migration = CockroachDBStore._wait_for_migration
+
+    def recording_wait(store: CockroachDBStore, migration: str) -> None:
+        [[row]] = store._read_all([store.sql.reconcile_columns_exist()], "test")
+        found_public.append(bool(row["ready"]))
+        wait_for_migration(store, migration)
+
+    monkeypatch.setattr(CockroachDBStore, "_wait_for_migration", recording_wait)
 
     def setup() -> None:
         with CockroachDBStore.from_conn_string(libpq_url, **settings) as store:
             store.setup()
 
+    def observe(conn: Connection[Any], store: Any) -> tuple[bool, bool]:
+        recorded = migration_2_recorded(conn, store)
+        return recorded, write_id_usable(conn, store)
+
     def watch(store: Any) -> None:
         with psycopg.connect(libpq_url, autocommit=True) as conn:
             while not stop.is_set():
-                recorded = migration_2_recorded(conn, store)
-                seen.append((recorded, write_id_usable(conn, store)))
+                seen.append(observe(conn, store))
                 time.sleep(0.05)
 
     with (
@@ -614,9 +643,8 @@ def test_a_setup_that_did_not_run_migration_2_waits_before_recording_it(
         watcher = pool.submit(watch, reader)
         try:
             first = pool.submit(setup)
-            # The second starts once the first one's backfill runs. That takes
-            # seconds, so a second at most is early enough without the job
-            wait_for_backfill(libpq_url, reader, seconds=1.0)
+            # The second starts once the first one's backfill shows in SHOW JOBS
+            assert wait_for_backfill(libpq_url, table_name), "no backfill job showed up"
             second = pool.submit(setup)
             concurrent.futures.wait([first, second], return_when=concurrent.futures.FIRST_COMPLETED)
             # A store created as soon as either setup() returns writes with the
@@ -628,9 +656,12 @@ def test_a_setup_that_did_not_run_migration_2_waits_before_recording_it(
         finally:
             stop.set()
         watcher.result()
+        with psycopg.connect(libpq_url, autocommit=True) as conn:
+            seen.append(observe(conn, reader))
 
-    # The setup() that did not run the backfill waited for it
-    assert any(WAITING in record.getMessage() for record in caplog.records)
+    # A setup() whose statement returned early waited for the backfill
+    if False in found_public:
+        assert any(WAITING in record.getMessage() for record in caplog.records)
     assert seen[0] == (False, False) and seen[-1] == (True, True)
     assert (True, False) not in seen
     with psycopg.connect(libpq_url, autocommit=True) as conn:
@@ -641,11 +672,33 @@ def test_a_setup_that_did_not_run_migration_2_waits_before_recording_it(
     assert row is not None and row[0] is not None
 
 
+def test_the_migration_wait_takes_over_when_no_job_applies_it(
+    libpq_url, table_name, caplog
+) -> None:
+    # A peer's migration failed or was reverted, or never ran: the columns
+    # are not there and no job applies them. The wait applies the migration
+    # itself instead of waiting out its budget
+    build_0_5_table(libpq_url, table_name, 1_000)
+    with (
+        caplog.at_level(logging.INFO, logger=STORE_LOGGER),
+        CockroachDBStore.from_conn_string(
+            libpq_url, index=index_config(), table_name=table_name
+        ) as store,
+    ):
+        store._wait_for_migration(store.sql.migrations()[2])
+        with psycopg.connect(libpq_url, autocommit=True) as conn:
+            assert write_id_usable(conn, store)
+            assert not migration_2_recorded(conn, store)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("its columns are not public yet" in message for message in messages)
+    assert any("Migration 2 on" in message and "is in place" in message for message in messages)
+
+
 @pytest.mark.timeout(300)
 def test_the_migration_wait_sees_a_backfill_running(libpq_url, table_name) -> None:
     # The checks setup() waits on, during a real backfill: the job is found
     # in SHOW JOBS and the columns are not public until it is done
-    build_0_5_table(libpq_url, table_name)
+    build_0_5_table(libpq_url, table_name, ROWS_BACKFILL)
     with CockroachDBStore.from_conn_string(
         libpq_url, index=index_config(), table_name=table_name
     ) as store:

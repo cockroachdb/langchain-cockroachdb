@@ -128,10 +128,11 @@ SCHEMA_CHANGE_BUSY_MESSAGES: tuple[str, ...] = (
 # takes far longer than a transient error takes to clear: a column backfill
 # on a table with data, say, a vector index built over many vectors, or any
 # schema change on a multi-region cluster. So schema_change_policy gives it
-# a budget of its own: it is retried until its pauses add up to this many
-# seconds, as long as setup() waits for another process's migration
-# (SCHEMA_CHANGE_SETTLE_SECONDS). The pauses grow as the policy's backoff
-# does, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF seconds.
+# a budget of its own: it is retried for up to this many seconds of wall
+# time from the first busy error, as long as setup() waits for another
+# process's migration (SCHEMA_CHANGE_SETTLE_SECONDS). The pauses grow as the
+# policy's backoff does, at least doubling, up to
+# SCHEMA_CHANGE_BUSY_MAX_BACKOFF seconds.
 SCHEMA_CHANGE_BUSY_SECONDS: float = 600.0
 SCHEMA_CHANGE_BUSY_MAX_BACKOFF: float = 3.0
 
@@ -145,6 +146,15 @@ SCHEMA_CHANGE_BUSY_MAX_BACKOFF: float = 3.0
 # not shorten it. The busy error's budget (SCHEMA_CHANGE_BUSY_SECONDS) is as
 # long.
 SCHEMA_CHANGE_SETTLE_SECONDS: float = 600.0
+
+# How a wait for another schema change reports itself. A busy schema change
+# logs a WARNING on its first retry, then at most one every
+# SCHEMA_CHANGE_PROGRESS_SECONDS, and one when it gives up. The store's
+# setup(), waiting for another process's migration, logs an INFO line when
+# it starts, a WARNING once it has waited SCHEMA_CHANGE_QUIET_SECONDS, then
+# one every SCHEMA_CHANGE_PROGRESS_SECONDS, and an INFO line when it ends.
+SCHEMA_CHANGE_QUIET_SECONDS: float = 30.0
+SCHEMA_CHANGE_PROGRESS_SECONDS: float = 60.0
 
 _MAX_CHAIN = 16
 
@@ -494,12 +504,14 @@ class _RunState:
 
     ``failed`` counts the attempts that failed under the policy's own
     budget. schema_change_policy keeps a busy schema change apart: the
-    attempts that met it, and the seconds paused after them.
+    attempts that met it, when the first one did and when its retry was
+    last logged, by time.monotonic().
     """
 
     failed: int = 0
     busy_failed: int = 0
-    busy_paused: float = 0.0
+    busy_since: float | None = None
+    busy_logged: float | None = None
 
 
 DEFAULT_RETRY_POLICY = RetryPolicy()
@@ -523,18 +535,22 @@ def is_schema_change_busy(
 
 @dataclass(frozen=True)
 class _SchemaChangePolicy(RetryPolicy):
-    """A policy that retries a busy schema change under a budget of its own.
+    """``base``, with a busy schema change retried under a budget of its own.
 
-    schema_change_policy builds it from a policy, whose fields it keeps.
-    ``busy_seconds`` and ``busy_max_backoff`` are that function's
-    ``seconds`` and ``max_backoff``.
+    schema_change_policy builds it. Its RetryPolicy fields are copies of
+    ``base``'s, for code that reads them. Every other error, and every
+    delay, is ``base``'s own, so a subclass of RetryPolicy keeps its
+    overrides. ``busy_seconds`` and ``busy_max_backoff`` are that
+    function's ``seconds`` and ``max_backoff``.
     """
 
+    base: RetryPolicy = dataclasses.field(default_factory=RetryPolicy, repr=False, compare=False)
     busy_messages: tuple[str, ...] = SCHEMA_CHANGE_BUSY_MESSAGES
     busy_seconds: float = SCHEMA_CHANGE_BUSY_SECONDS
     busy_max_backoff: float = SCHEMA_CHANGE_BUSY_MAX_BACKOFF
     # The busy error's backoff: the policy's, from RetryPolicy's default
-    # initial backoff when the policy has none, up to busy_max_backoff
+    # initial backoff when the policy has none, at least doubling, up to
+    # busy_max_backoff
     _busy_pace: RetryPolicy = dataclasses.field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -545,17 +561,26 @@ class _SchemaChangePolicy(RetryPolicy):
         if not math.isfinite(self.busy_max_backoff) or self.busy_max_backoff < 0:
             raise ValueError("max_backoff must be finite and not negative")
         own = {field.name: getattr(self, field.name) for field in dataclasses.fields(RetryPolicy)}
-        # Waiting for another schema change needs pauses, even under a policy
-        # without backoff
+        # Waiting for another schema change needs pauses that grow, even under
+        # a policy without backoff, or with a constant one
         initial = self.initial_backoff or DEFAULT_RETRY_POLICY.initial_backoff
         pace = RetryPolicy(
             **{
                 **own,
                 "initial_backoff": initial,
                 "max_backoff": max(initial, self.busy_max_backoff),
+                "backoff_multiplier": max(
+                    self.backoff_multiplier, DEFAULT_RETRY_POLICY.backoff_multiplier
+                ),
             }
         )
         object.__setattr__(self, "_busy_pace", pace)
+
+    def is_retryable(self, error: BaseException) -> bool:
+        return is_schema_change_busy(error, self.busy_messages) or self.base.is_retryable(error)
+
+    def delay(self, retry_number: int, *, rand: Callable[[], float] = random.random) -> float:
+        return self.base.delay(retry_number, rand=rand)
 
     def _pause_before_retry(
         self,
@@ -565,37 +590,40 @@ class _SchemaChangePolicy(RetryPolicy):
         can_retry: Callable[[BaseException], bool] | None,
     ) -> float | None:
         if not is_schema_change_busy(error, self.busy_messages):
-            return super()._pause_before_retry(error, state, label, can_retry)
+            return self.base._pause_before_retry(error, state, label, can_retry)
         attempt = state.busy_failed = state.busy_failed + 1
         # max_attempts=1 turns every retry off, the busy error's included
         if self.max_attempts == 1 or (can_retry is not None and not can_retry(error)):
             return None
-        paused = state.busy_paused
-        left = self.busy_seconds - paused
+        now = time.monotonic()
+        if state.busy_since is None:
+            state.busy_since = now
+        waited = now - state.busy_since
+        left = self.busy_seconds - waited
         if left <= 0:
             logger.warning(
-                "Giving up on %s after %d attempts and %gs of waiting: %s",
+                "Giving up on %s after %d attempts and %.0fs of waiting for another "
+                "schema change on the table: %s",
                 label,
                 attempt,
-                paused,
+                waited,
                 _describe(error),
             )
             return None
-        pause = self._busy_pace.delay(attempt - 1)
-        if pause >= left:
-            # The last pause ends with the budget
-            pause, state.busy_paused = left, self.busy_seconds
-        else:
-            state.busy_paused = paused + pause
-        logger.warning(
-            "Retrying %s after %s (attempt %d failed, next try in %.2fs, %.1fs of %gs waited)",
-            label,
-            _describe(error),
-            attempt,
-            pause,
-            paused,
-            self.busy_seconds,
-        )
+        # The last pause ends with the budget
+        pause = min(self._busy_pace.delay(attempt - 1), left)
+        if state.busy_logged is None or now - state.busy_logged >= SCHEMA_CHANGE_PROGRESS_SECONDS:
+            state.busy_logged = now
+            logger.warning(
+                "Retrying %s after %s: another schema change on the table is still running "
+                "(attempt %d failed, %.0fs of up to %gs waited, next try in %.2fs)",
+                label,
+                _describe(error),
+                attempt,
+                waited,
+                self.busy_seconds,
+                pause,
+            )
         return pause
 
 
@@ -614,31 +642,30 @@ def schema_change_policy(
     for it. It means waiting for the other schema change to finish, such as
     a column backfill or a vector index build, which takes far longer than
     a transient error takes to clear. So it has a budget of its own: it is
-    retried until its pauses add up to ``seconds`` (default
-    SCHEMA_CHANGE_BUSY_SECONDS, ten minutes, as long as the store's setup()
-    waits for another process's migration). The pauses grow as the
-    policy's backoff does, from RetryPolicy's default initial backoff when
-    the policy has none, up to ``max_backoff`` seconds (default
-    SCHEMA_CHANGE_BUSY_MAX_BACKOFF), or up to the initial backoff if that
-    is larger. ``seconds=0`` turns this off.
+    retried for up to ``seconds`` of wall time from the first busy error
+    (default SCHEMA_CHANGE_BUSY_SECONDS, ten minutes, as long as the
+    store's setup() waits for another process's migration). The pauses
+    grow as the policy's backoff does, from RetryPolicy's default initial
+    backoff when the policy has none, at least doubling, up to
+    ``max_backoff`` seconds (default SCHEMA_CHANGE_BUSY_MAX_BACKOFF), or up
+    to the initial backoff if that is larger. ``seconds=0`` turns this off.
+    It logs a WARNING on the first retry, then at most one every
+    SCHEMA_CHANGE_PROGRESS_SECONDS, and one when it gives up.
 
-    Every other error is decided by ``policy`` as it is, including its
-    ``retry_on``, and keeps its attempts and backoff. Those attempts are
-    counted apart from the busy error's. Timeouts are the policy's, and
-    ``max_attempts=1`` turns every retry off.
+    Every other error is decided by ``policy`` itself, including its
+    ``retry_on``, attempts and backoff, and a subclass's overrides. Those
+    attempts are counted apart from the busy error's. Timeouts are the
+    policy's, and ``max_attempts=1`` turns every retry off.
 
     Raises:
         ValueError: If ``seconds`` or ``max_backoff`` is negative or not
             finite
     """
     phrases = _as_phrases(messages, "messages")
-
-    def retry_on(error: BaseException) -> bool:
-        return is_schema_change_busy(error, phrases) or policy.is_retryable(error)
-
     fields = {field.name: getattr(policy, field.name) for field in dataclasses.fields(RetryPolicy)}
     return _SchemaChangePolicy(
-        **{**fields, "retry_on": retry_on},
+        **fields,
+        base=policy,
         busy_messages=phrases,
         busy_seconds=seconds,
         busy_max_backoff=max_backoff,

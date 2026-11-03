@@ -48,6 +48,7 @@ from langchain_cockroachdb.store.base import (
     _check_limit,
     _check_policy,
     _memory_prefix,
+    _MigrationWait,
     _namespace_to_delete,
     _resolve_confirm_ttl,
     _row_to_record,
@@ -303,7 +304,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         are recorded with ON CONFLICT DO NOTHING. A setup() that finds another
         process still applying migration 2 waits for it, for up to
         SCHEMA_CHANGE_SETTLE_SECONDS, before it records the migration, so no
-        store writes the new columns before they exist. With an index, it creates
+        store writes the new columns before they exist. When no job applies
+        the migration, as after a peer's migration failed, it applies the
+        migration itself. With an index, it creates
         the vectors table and its C-SPANN index (unless ``flat``) on every
         call, then checks an existing index against the configuration. With
         history, it creates the history table, and with ``ttl_days`` turns on
@@ -315,8 +318,8 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         change fails while another schema change runs on the same table,
         such as a vector index that another setup() builds. That error is
         retried with the budget that schema_change_policy gives it, up to
-        ten minutes by default, even if the policy's ``retry_on`` would
-        refuse it; ``max_attempts=1`` turns this off.
+        ten minutes by default for each table, even if the policy's
+        ``retry_on`` would refuse it; ``max_attempts=1`` turns this off.
 
         An application role that did not run setup() needs SELECT, INSERT,
         UPDATE and DELETE on the store's items and vectors tables, and on
@@ -363,8 +366,9 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             self._run_ddl(migrations[v], label)
             if v == MIGRATION_RECONCILE:
                 # Another setup() may be applying this migration. The statement
-                # then returns at once, before the columns exist
-                self._wait_for_migration()
+                # then returns at once, before the columns exist. A future ALTER
+                # migration needs the same wait, and the same takeover
+                self._wait_for_migration(migrations[v])
 
             def record_migration(migration_v: int = v, label: str = label) -> None:
                 with self._cursor(
@@ -397,7 +401,7 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
             for change in self.sql.ttl_changes(self.ttl.cron):
                 self._set_ttl(change, "store TTL setup", policy)
 
-    def _wait_for_migration(self) -> None:
+    def _wait_for_migration(self, migration: str) -> None:
         """Wait until migration 2 is in place, when another setup() is still applying it.
 
         CockroachDB runs the migration as a schema change job that backfills
@@ -409,12 +413,15 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         node uses the columns. For the setup() whose statement ran the job,
         that is one read of the columns and one of SHOW JOBS. Otherwise it
         checks again, with backoff up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF
-        seconds. SHOW JOBS is read only once the columns are public.
+        seconds, and logs its progress (see _settle_pause). When the columns
+        are not public and no job applies the migration, it sends
+        ``migration`` again (see _migration_left).
 
         A job is found by its description. SHOW JOBS cuts a long description
         short, which can cut a long qualified table name, and a role without
         admin sees only its own jobs. Then no job is found, and the column
-        check alone guards.
+        check alone guards. An error from SHOW JOBS that the retry policy
+        would not retry also leaves the column check alone, logged once.
 
         This waits for another process and retries no failed statement, so
         the retry policy's max_attempts does not shorten it. Each check
@@ -422,23 +429,54 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
 
         Raises:
             TimeoutError: If the migration is not in place after
-                SCHEMA_CHANGE_SETTLE_SECONDS
+                SCHEMA_CHANGE_SETTLE_SECONDS, saying what remained
         """
-        columns = [self.sql.reconcile_columns_exist()]
-        # Found by the start of its description. A long qualified name may be
-        # cut from it, and another role's job is not shown: the column check
-        # then guards alone
-        jobs = [self.sql.schema_changes_running()]
-        deadline: float | None = None
+        wait: _MigrationWait | None = None
         check = 0
-        while not (
-            self._columns_public(self._read_all(columns, "store migration wait"))
-            and self._schema_changes_done(self._read_all(jobs, "store migration wait"))
-        ):
-            if deadline is None:
-                deadline = self._start_migration_wait()
-            self._sleep(self._settle_pause(check, deadline))
+        while (left := self._migration_left(migration)) is not None:
+            if wait is None:
+                wait = self._start_migration_wait(left)
+            self._sleep(self._settle_pause(wait, check, left))
             check += 1
+        if wait is not None:
+            self._end_migration_wait(wait)
+
+    def _migration_left(self, migration: str) -> str | None:
+        """What still keeps migration 2 from being in place, or None once nothing does.
+
+        It reads the columns, then SHOW JOBS. When the columns are not public
+        and no job applies the migration, it sends ``migration`` again.
+        """
+        public = self._columns_public(
+            self._read_all([self.sql.reconcile_columns_exist()], "store migration wait")
+        )
+        running = self._jobs_on_items()
+        if not public and not running:
+            # No job that SHOW JOBS shows applies the migration: a peer's
+            # migration failed or was reverted, or the job is another role's or
+            # its long qualified name was cut from its description. The
+            # statement is idempotent: it takes the migration over, or returns
+            # at once while another job runs it
+            self._run_ddl(migration, "store migration 2")
+        return self._migration_condition(public, running)
+
+    def _jobs_on_items(self) -> int | None:
+        """The schema change jobs that SHOW JOBS shows on the items table, or None without it.
+
+        A job is found by the start of its description. A long qualified
+        name may be cut from it, and another role's job is not shown: the
+        column check then guards alone. So does an error the retry policy
+        would not retry, after _skip_job_check logs it.
+        """
+        if self._jobs_unreadable:
+            return None
+        try:
+            found = self._read_all([self.sql.schema_changes_running()], "store migration wait")
+        except Exception as error:
+            if not self._skip_job_check(error):
+                raise
+            return None
+        return self._running_jobs(found)
 
     @staticmethod
     def _sleep(seconds: float) -> None:

@@ -42,6 +42,8 @@ from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.indexes import DistanceStrategy, _find_vector_index
 from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_PROGRESS_SECONDS,
+    SCHEMA_CHANGE_QUIET_SECONDS,
     SCHEMA_CHANGE_SETTLE_SECONDS,
     RetryPolicy,
 )
@@ -105,6 +107,16 @@ _REASON_RANK = {"key": 0, "slot": 1, "similar": 2}
 # How setup() paces its checks while it waits for another process's
 # migration: RetryPolicy's default backoff, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF
 _SETTLE_PACE = RetryPolicy(max_backoff=SCHEMA_CHANGE_BUSY_MAX_BACKOFF)
+
+
+@dataclass
+class _MigrationWait:
+    """A setup()'s wait for another process's migration 2, by time.monotonic()."""
+
+    started: float
+    deadline: float
+    # When it last logged a WARNING about the wait
+    reported: float | None = None
 
 
 def _check_paging(limit: int, offset: int) -> None:
@@ -1288,6 +1300,8 @@ class BaseCockroachDBStore:
     sql: StoreSQL
     index: ResolvedIndex | None
     ttl: ResolvedTTL
+    # Set by the store; the schema checks decide by it what to retry
+    retry_policy: RetryPolicy
     # The most vectors a namespace may hold for find_conflicts and reconcile
     # to rank all of them. Above it they use the C-SPANN index
     reconcile_scan_limit: int
@@ -1320,6 +1334,9 @@ class BaseCockroachDBStore:
     _migrations_unreadable: bool
     # Whether the fallback to the column read has been logged, to log it once
     _logged_column_fallback: bool
+    # Whether SHOW JOBS failed with an error the retry policy does not retry.
+    # setup() then waits for migration 2 on its columns alone, for good
+    _jobs_unreadable: bool
     # Marks the threads that are running a reconcile policy of this store,
     # as ``inside``. A store call from a policy is refused (_refuse_inside_user_callable)
     _policy_marks: threading.local
@@ -1349,6 +1366,7 @@ class BaseCockroachDBStore:
         self._schema_lock = threading.Lock()
         self._migrations_unreadable = False
         self._logged_column_fallback = False
+        self._jobs_unreadable = False
         self._policy_marks = threading.local()
 
     def _trusted(self, ready: bool | None, *, refresh: bool) -> bool | None:
@@ -1807,35 +1825,99 @@ class BaseCockroachDBStore:
         return bool(columns["ready"])
 
     @staticmethod
-    def _schema_changes_done(found: list[list[Any]]) -> bool:
-        """Whether the job check, as _read_all returns it, found no schema change job left."""
+    def _running_jobs(found: list[list[Any]]) -> int:
+        """The schema change jobs that the job check, as _read_all returns it, found."""
         [[jobs]] = found
-        return bool(jobs["running"] == 0)
+        return int(jobs["running"])
 
-    def _start_migration_wait(self) -> float:
-        """Log that setup() waits for another process's migration 2, and return its deadline."""
+    @staticmethod
+    def _migration_condition(public: bool, running: int | None) -> str | None:
+        """What keeps migration 2 from being in place, or None once nothing does.
+
+        ``running`` is None when SHOW JOBS cannot be read.
+        """
+        jobs = None
+        if running:
+            plural = "" if running == 1 else "s"
+            jobs = f"SHOW JOBS shows {running} schema change job{plural} on the table"
+        if public:
+            return jobs
+        if jobs is None:
+            return "its columns are not public yet"
+        return f"its columns are not public yet, and {jobs}"
+
+    def _skip_job_check(self, error: BaseException) -> bool:
+        """Whether setup() goes on without SHOW JOBS after ``error``.
+
+        An error the retry policy would retry has used up its retries, and
+        is raised. Any other error, a renamed column or a permission or
+        gating error, is logged once, and from then on the columns alone
+        decide, as the schema check falls back for the migrations table.
+        """
+        if self.retry_policy.is_retryable(error):
+            return False
+        lines = str(error).strip().splitlines()
         self._log.info(
-            "Another process is still applying migration 2 to %s. setup() waits for it, "
+            "setup() cannot read SHOW JOBS (%s: %s), so it waits for migration 2 on %s by "
+            "its columns alone.",
+            type(error).__name__,
+            lines[0] if lines else "",
+            self.sql.items,
+        )
+        self._jobs_unreadable = True
+        return True
+
+    def _start_migration_wait(self, left: str) -> _MigrationWait:
+        """Log that setup() waits for another process's migration 2, and start the wait."""
+        self._log.info(
+            "Another process is still applying migration 2 to %s: %s. setup() waits for it, "
             "for up to %g seconds, before it records the migration.",
             self.sql.items,
+            left,
             self._MIGRATION_SETTLE_SECONDS,
         )
-        return time.monotonic() + self._MIGRATION_SETTLE_SECONDS
+        now = time.monotonic()
+        return _MigrationWait(started=now, deadline=now + self._MIGRATION_SETTLE_SECONDS)
 
-    def _settle_pause(self, check: int, deadline: float) -> float:
+    def _settle_pause(self, wait: _MigrationWait, check: int, left: str) -> float:
         """Seconds to wait before checking again whether migration 2 is in place.
 
+        Logs a WARNING once the wait passes SCHEMA_CHANGE_QUIET_SECONDS, then
+        one every SCHEMA_CHANGE_PROGRESS_SECONDS, with what ``left`` says
+        still keeps the migration from being in place.
+
         Raises:
-            TimeoutError: Once ``deadline`` has passed
+            TimeoutError: Once the wait's deadline has passed
         """
-        left = deadline - time.monotonic()
-        if left <= 0:
+        now = time.monotonic()
+        waited = now - wait.started
+        if now >= wait.deadline:
             raise TimeoutError(
-                f"Another process is still applying migration 2 to {self.sql.items}: "
-                f"setup() waited {self._MIGRATION_SETTLE_SECONDS:g} seconds for it. "
-                "Run setup() again."
+                f"Another process is still applying migration 2 to {self.sql.items}: after "
+                f"{self._MIGRATION_SETTLE_SECONDS:g} seconds, {left}. Check SHOW JOBS for the "
+                "schema change job, then run setup() again."
             )
-        return min(_SETTLE_PACE.delay(check), left)
+        due = wait.reported is None or now - wait.reported >= SCHEMA_CHANGE_PROGRESS_SECONDS
+        if waited >= SCHEMA_CHANGE_QUIET_SECONDS and due:
+            wait.reported = now
+            self._log.warning(
+                "setup() has waited %.0fs for another process to apply migration 2 to %s: %s. "
+                "Check SHOW JOBS for the schema change job. setup() waits up to %g seconds "
+                "in all.",
+                waited,
+                self.sql.items,
+                left,
+                self._MIGRATION_SETTLE_SECONDS,
+            )
+        return min(_SETTLE_PACE.delay(check), wait.deadline - now)
+
+    def _end_migration_wait(self, wait: _MigrationWait) -> None:
+        """Log that migration 2 is in place and setup() goes on to record it."""
+        self._log.info(
+            "Migration 2 on %s is in place after %.0fs of waiting. setup() records it.",
+            self.sql.items,
+            time.monotonic() - wait.started,
+        )
 
     def _check_vector_index(self, create_statement: str) -> None:
         """Compare the vectors table and its index with the store's configuration.

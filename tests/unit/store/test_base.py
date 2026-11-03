@@ -35,6 +35,8 @@ from psycopg_pool import AsyncConnectionPool
 from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb.retry import (
     SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_PROGRESS_SECONDS,
+    SCHEMA_CHANGE_QUIET_SECONDS,
     SCHEMA_CHANGE_SETTLE_SECONDS,
     RetryPolicy,
 )
@@ -1474,7 +1476,8 @@ async def test_ttl_changes_wait_out_a_schema_change_past_the_policys_attempts(
 
 # A setup() whose migration 2 statement meets the same migration still
 # backfilling in another process gets an answer at once, before the columns
-# exist. It waits for that migration before it records migration 2.
+# exist. It waits for that migration before it records migration 2, and
+# takes it over when no job is applying it.
 
 
 class MigrationReads:
@@ -1483,13 +1486,19 @@ class MigrationReads:
     ``states`` holds (running jobs, columns public) for each check in turn,
     and the last one again once they run out. A check starts with a read of
     the columns, which moves to the next state. A read of the jobs answers
-    from the same state. Each read is logged in ``log`` as ("read", its
-    statements' SQL).
+    from the same state, or raises ``jobs_error``. Each read is logged in
+    ``log`` as ("read", its statements' SQL).
     """
 
-    def __init__(self, states: Sequence[tuple[int, bool]], log: list) -> None:
+    def __init__(
+        self,
+        states: Sequence[tuple[int, bool]],
+        log: list,
+        jobs_error: BaseException | None = None,
+    ) -> None:
         self.states = list(states)
         self.log = log
+        self.jobs_error = jobs_error
         self.checks = 0
 
     def answer(self, statements: list[tuple[str, list]]) -> list[list[dict]]:
@@ -1500,6 +1509,8 @@ class MigrationReads:
         running, ready = self.states[min(self.checks, len(self.states)) - 1]
         if "pg_attribute" in sql:
             return [[{"ready": ready}]]
+        if self.jobs_error is not None:
+            raise self.jobs_error
         return [[{"running": running}]]
 
 
@@ -1508,12 +1519,16 @@ def wait_fakes(
     states: Sequence[tuple[int, bool]],
     clock: "FakeClock",
     log: list,
+    *,
+    ddl: bool = True,
+    jobs_error: BaseException | None = None,
 ) -> tuple[MigrationReads, list[float]]:
     """Answer the store's reads from ``states``, and make its sleeps move ``clock`` on.
 
-    Returns the reads and the list of pauses slept.
+    With ``ddl``, schema statements are logged as ("ddl", statement) instead
+    of run. Returns the reads and the list of pauses slept.
     """
-    reads = MigrationReads(states, log)
+    reads = MigrationReads(states, log, jobs_error)
     pauses: list[float] = []
     if isinstance(store, AsyncCockroachDBStore):
 
@@ -1524,8 +1539,13 @@ def wait_fakes(
             pauses.append(seconds)
             clock.now += seconds
 
+        async def arun_ddl(statement: str, label: str, **kwargs: object) -> None:
+            log.append(("ddl", statement))
+
         store._read_all = aread_all  # type: ignore[method-assign,assignment]
         store._sleep = asleep  # type: ignore[method-assign,assignment]
+        if ddl:
+            store._run_ddl = arun_ddl  # type: ignore[method-assign,assignment]
     else:
 
         def read_all(statements: list, label: str, session: object = None) -> list:
@@ -1535,21 +1555,27 @@ def wait_fakes(
             pauses.append(seconds)
             clock.now += seconds
 
+        def run_ddl(statement: str, label: str, **kwargs: object) -> None:
+            log.append(("ddl", statement))
+
         store._read_all = read_all  # type: ignore[method-assign,assignment]
         store._sleep = sleep  # type: ignore[method-assign,assignment]
+        if ddl:
+            store._run_ddl = run_ddl  # type: ignore[method-assign,assignment]
     return reads, pauses
 
 
 async def wait_for_migration(store: CockroachDBStore | AsyncCockroachDBStore) -> None:
-    result = store._wait_for_migration()
+    result = store._wait_for_migration(store.sql.migrations()[MIGRATION_RECONCILE])
     if isinstance(store, AsyncCockroachDBStore):
         await result  # type: ignore[misc]
 
 
-def settle_reads(store: CockroachDBStore | AsyncCockroachDBStore) -> tuple[tuple, tuple]:
-    """The log entries of a read of the columns, and of a read of the jobs."""
+def settle_reads(store: CockroachDBStore | AsyncCockroachDBStore) -> tuple[tuple, tuple, tuple]:
+    """The log entries of a read of the columns, a read of the jobs, and a takeover."""
     columns = ("read", [store.sql.reconcile_columns_exist()[0]])
-    return columns, ("read", [store.sql.schema_changes_running()[0]])
+    jobs = ("read", [store.sql.schema_changes_running()[0]])
+    return columns, jobs, ("ddl", store.sql.migrations()[MIGRATION_RECONCILE])
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
@@ -1566,7 +1592,7 @@ async def test_migration_wait_ends_at_once_when_the_columns_are_public_and_no_jo
 
     await wait_for_migration(store)
 
-    columns, jobs = settle_reads(store)
+    columns, jobs, _ = settle_reads(store)
     assert (log, pauses) == ([columns, jobs], [])
 
 
@@ -1584,7 +1610,7 @@ async def test_migration_wait_lasts_while_a_job_finishes_after_the_columns_turn_
 
     await wait_for_migration(store)
 
-    columns, jobs = settle_reads(store)
+    columns, jobs, _ = settle_reads(store)
     assert log == [columns, jobs] * 3
     assert len(pauses) == 2
 
@@ -1605,50 +1631,139 @@ async def test_migration_wait_lasts_while_a_schema_change_job_runs(
 
     await wait_for_migration(store)
 
-    # SHOW JOBS is read only once the columns are public
-    columns, jobs = settle_reads(store)
-    assert log == [columns, columns, columns, jobs, columns, jobs]
+    columns, jobs, _ = settle_reads(store)
+    assert log == [columns, jobs] * 4
     assert len(pauses) == 3
     assert all(0 < pause <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF for pause in pauses)
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_migration_wait_needs_the_columns_when_no_job_is_visible(
+async def test_migration_wait_takes_over_when_no_job_applies_the_migration(
     make: str, monkeypatch
 ) -> None:
-    # A role sees only its own jobs, so another role's backfill shows none
+    # The columns are not there and no job runs: a peer's migration failed or
+    # was reverted, or SHOW JOBS cannot show the job. The wait sends the
+    # idempotent statement again, which takes the migration over, rather than
+    # waiting out its budget
     clock = FakeClock()
     monkeypatch.setattr(store_base, "time", clock)
     store = make_store(make)
     log: list = []
-    _, pauses = wait_fakes(store, [(0, False), (0, False), (0, False), (0, True)], clock, log)
+    _, pauses = wait_fakes(store, [(0, False), (0, False), (0, True)], clock, log)
 
     await wait_for_migration(store)
 
-    columns, jobs = settle_reads(store)
-    assert (log, len(pauses)) == ([columns] * 4 + [jobs], 3)
+    columns, jobs, takeover = settle_reads(store)
+    assert log == [columns, jobs, takeover, columns, jobs, takeover, columns, jobs]
+    assert len(pauses) == 2
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
-async def test_migration_wait_gives_up_with_a_clear_error(make: str, monkeypatch) -> None:
+async def test_migration_wait_falls_back_to_the_columns_when_show_jobs_fails(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A SHOW JOBS that the policy would not retry, such as a renamed column
+    # or a permission error, never fails setup(): it is logged once, and the
+    # columns alone decide from then on
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    renamed = psycopg.errors.lookup("42703")('column "description" does not exist')
+    _, pauses = wait_fakes(store, [(0, False), (0, True)], clock, log, jobs_error=renamed)
+
+    with caplog.at_level(logging.INFO):
+        await wait_for_migration(store)
+
+    columns, jobs, takeover = settle_reads(store)
+    assert log == [columns, jobs, takeover, columns]
+    assert len(pauses) == 1
+    fallbacks = [
+        r for r in caplog.records if "SHOW JOBS" in r.getMessage() and "cannot" in r.getMessage()
+    ]
+    assert [r.levelno for r in fallbacks] == [logging.INFO]
+    assert 'column "description" does not exist' in fallbacks[0].getMessage()
+
+    # An error the policy would retry, once its retries ran out, is raised
+    store = make_store(make)
+    _, _ = wait_fakes(
+        store, [(0, True)], clock, [], jobs_error=psycopg.errors.SerializationFailure("busy")
+    )
+    with pytest.raises(psycopg.errors.SerializationFailure):
+        await wait_for_migration(store)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("states", "condition"),
+    [
+        (
+            [(1, False)],
+            "its columns are not public yet, and SHOW JOBS shows 1 schema change job on the table",
+        ),
+        ([(2, True)], "SHOW JOBS shows 2 schema change jobs on the table"),
+    ],
+    ids=["columns-and-job", "jobs"],
+)
+async def test_migration_wait_gives_up_saying_what_remained(
+    make: str, states: list, condition: str, monkeypatch
+) -> None:
     clock = FakeClock()
     monkeypatch.setattr(store_base, "time", clock)
     store = make_store(make)
     assert store._MIGRATION_SETTLE_SECONDS == SCHEMA_CHANGE_SETTLE_SECONDS
     monkeypatch.setattr(store, "_MIGRATION_SETTLE_SECONDS", 10.0)
     log: list = []
-    _, pauses = wait_fakes(store, [(1, False)], clock, log)
+    _, pauses = wait_fakes(store, states, clock, log)
 
-    with pytest.raises(
-        TimeoutError,
-        match=r"Another process is still applying migration 2 to public\.store\b.*"
-        r"Run setup\(\) again",
-    ):
+    with pytest.raises(TimeoutError) as info:
         await wait_for_migration(store)
 
+    assert str(info.value) == (
+        f"Another process is still applying migration 2 to public.store: after 10 seconds, "
+        f"{condition}. Check SHOW JOBS for the schema change job, then run setup() again."
+    )
     # It checked again until the budget ran out, and never slept past it
     assert sum(pauses) == pytest.approx(10.0)
-    assert len(log) == len(pauses) + 1
+    assert len(log) == 2 * (len(pauses) + 1)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reports_its_progress(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An INFO line when it starts, a WARNING once it has waited
+    # SCHEMA_CHANGE_QUIET_SECONDS, then one every SCHEMA_CHANGE_PROGRESS_SECONDS
+    # with what it still waits for, and an INFO line when it ends
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    done_at = clock.now + 140.0
+    answer = reads.answer
+
+    def answer_until(statements: list) -> list:
+        reads.states = [(0, True)] if clock.now >= done_at else [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_until  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    records = [r for r in caplog.records if r.name.startswith("langchain_cockroachdb.store")]
+    levels = [r.levelno for r in records]
+    assert levels == [logging.INFO, logging.WARNING, logging.WARNING, logging.INFO]
+    start, first, second, end = (r.getMessage() for r in records)
+    assert "Another process is still applying migration 2 to public.store" in start
+    for message in (first, second):
+        assert "its columns are not public yet" in message
+        assert "SHOW JOBS shows 1 schema change job on the table" in message
+    waited = [float(m.split("waited ")[1].split("s ")[0]) for m in (first, second)]
+    assert SCHEMA_CHANGE_QUIET_SECONDS <= waited[0] < SCHEMA_CHANGE_QUIET_SECONDS + 4
+    assert waited[1] - waited[0] >= SCHEMA_CHANGE_PROGRESS_SECONDS
+    assert "Migration 2 on public.store is in place after 14" in end
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
@@ -1661,19 +1776,19 @@ async def test_setup_records_migration_2_only_after_waiting_for_it(
     store = make_store(make)
     cursor = (TTLSetupCursor if make == "sync" else AsyncTTLSetupCursor)(latest)
     use_cursor(store, cursor)
-    _, pauses = wait_fakes(store, [(1, False), (0, True)], clock, cursor.calls)
+    _, pauses = wait_fakes(store, [(1, False), (0, True)], clock, cursor.calls, ddl=False)
 
     await run_setup(store)
 
     migrations = store.sql.migrations()
     record = f"INSERT INTO {store.sql.migrations_table} (v) VALUES (%s) ON CONFLICT DO NOTHING"
-    columns, jobs = settle_reads(store)
+    columns, jobs, _ = settle_reads(store)
     expected: list = [(migrations[0], []), (store.sql.migration_version(), [])]
     for v in range(latest + 1, len(migrations)):
         expected.append((migrations[v], []))
         if v == MIGRATION_RECONCILE:
             # The statement returned before the backfill was done: wait for it
-            expected += [columns, columns, jobs]
+            expected += [columns, jobs, columns, jobs]
         expected.append((record, [v]))
     assert cursor.calls == expected
     assert len(pauses) == 1
