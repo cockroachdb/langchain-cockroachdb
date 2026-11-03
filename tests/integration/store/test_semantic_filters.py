@@ -37,6 +37,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import psycopg
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.store.base import PutOp, SearchItem
@@ -395,16 +396,26 @@ def steady_capped_queries(
     vectors = {text: vector_literal(MODEL.embed_query(text)) for text in texts if text not in tried}
     seen: dict[str, list[int]] = {text: [] for text in vectors}
     while time.monotonic() < deadline:
-        with admin.transaction():
-            admin.execute("SET LOCAL vector_search_beam_size = 1")
-            for text, vector in vectors.items():
-                row = admin.execute(
-                    f"SELECT count(*) AS n FROM (SELECT 1 FROM {store.sql.vectors}"
-                    f"@{store.sql.vector_index_name} WHERE prefix = ANY(CAST(%s AS STRING[])) "
-                    "ORDER BY embedding <=> CAST(%s AS VECTOR) LIMIT %s) AS w",
-                    [[namespace], vector, window],
-                ).fetchone()
-                seen[text].append(row["n"])
+        sizes_now: dict[str, int] = {}
+        try:
+            with admin.transaction():
+                admin.execute("SET LOCAL vector_search_beam_size = 1")
+                for text, vector in vectors.items():
+                    row = admin.execute(
+                        f"SELECT count(*) AS n FROM (SELECT 1 FROM {store.sql.vectors}"
+                        f"@{store.sql.vector_index_name} WHERE prefix = ANY(CAST(%s AS STRING[])) "
+                        "ORDER BY embedding <=> CAST(%s AS VECTOR) LIMIT %s) AS w",
+                        [[namespace], vector, window],
+                    ).fetchone()
+                    sizes_now[text] = row["n"]
+        except psycopg.errors.SerializationFailure:
+            # On a multi-node cluster a search can meet a C-SPANN split
+            # inside its uncertainty interval and fail with 40001. The store
+            # retries that; this poll is dropped and taken again
+            time.sleep(0.5)
+            continue
+        for text, size in sizes_now.items():
+            seen[text].append(size)
         steady = [
             text
             for text, sizes in seen.items()
