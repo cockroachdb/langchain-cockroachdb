@@ -4,22 +4,49 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
+import traceback
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, TypedDict
 
+import psycopg
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver
 
 POOL_OPTIONS = {"autocommit": True, "row_factory": dict_row, "gssencmode": "disable"}
+
+
+def make_redactor(url: str) -> Callable[[str], str]:
+    """Return a function that scrubs the URL and its password from text.
+
+    A connection error from libpq can echo a malformed URL, password included,
+    so the worker redacts tracebacks before sending them to the parent.
+    """
+    secrets = {url}
+    try:
+        password = conninfo_to_dict(url).get("password")
+    except psycopg.Error:
+        password = None
+    if password:
+        secrets.add(password)
+    userinfo = re.compile(r"([a-z][a-z0-9+.-]*://[^:/@\s]*):[^@\s]*@", re.I)
+
+    def redact(text: str) -> str:
+        for secret in sorted(secrets, key=len, reverse=True):
+            text = text.replace(str(secret), "<redacted>")
+        return userinfo.sub(r"\1:<redacted>@", text)
+
+    return redact
 
 
 class AgentState(TypedDict, total=False):
@@ -119,6 +146,8 @@ def graph_input(scenario: str, phase: str, agent: str) -> Any:
 def run_sync(
     url: str, scenario: str, phase: str, agents: list[str], audit_dir: Path, notify: Callable
 ) -> None:
+    redact = make_redactor(url)
+
     def work(state: AgentState) -> dict:
         agent = state["agent"]
         record(audit_dir, agent, "work")
@@ -145,8 +174,14 @@ def run_sync(
                 )
             except Exception as error:
                 # Report failures even if another graph is intentionally blocked.
-                # Connection exception messages can contain credentials.
-                notify("error", agent, type(error).__name__)
+                # A redacted traceback keeps credentials out of libpq's messages.
+                notify(
+                    "error",
+                    agent,
+                    redact(
+                        "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                    ),
+                )
                 raise
             notify("paused" if phase == "crash" else "result", agent, state)
 
@@ -159,6 +194,8 @@ def run_sync(
 async def run_async(
     url: str, scenario: str, phase: str, agents: list[str], audit_dir: Path, notify: Callable
 ) -> None:
+    redact = make_redactor(url)
+
     async def work(state: AgentState) -> dict:
         agent = state["agent"]
         record(audit_dir, agent, "work")
@@ -185,7 +222,13 @@ async def run_async(
                     graph_input(scenario, phase, agent), config(agent), durability="sync"
                 )
             except Exception as error:
-                notify("error", agent, type(error).__name__)
+                notify(
+                    "error",
+                    agent,
+                    redact(
+                        "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                    ),
+                )
                 raise
             notify("paused" if phase == "crash" else "result", agent, state)
 

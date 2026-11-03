@@ -321,7 +321,9 @@ with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
 For application-crash recovery coverage, see the
 [process-recovery tests](../development/testing.md#application-process-recovery).
 They validate approval resume and pending-write reuse with a fresh process and
-pool, using `durability="sync"` on both sync and async graph calls. Interrupted
+pool, using `durability="sync"` on both sync and async graph calls. On Python
+3.10, approval resume works only with the sync API, because an async graph's
+`interrupt()` needs Python 3.11 or newer. Interrupted
 or unfinished nodes can execute code again, so external tool effects need
 application-level idempotency or reconciliation.
 

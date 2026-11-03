@@ -7,6 +7,7 @@ these tests' scope.
 from __future__ import annotations
 
 import multiprocessing
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
@@ -48,16 +49,24 @@ def application(
 
 
 def receive(receiver: Connection, process: multiprocessing.Process, deadline: float) -> tuple:
-    diagnostic = f"{process.name} (pid={process.pid}, exitcode={process.exitcode})"
     assert receiver.poll(max(0, deadline - monotonic())), (
-        f"{diagnostic} did not complete its checkpoint barriers within 45 seconds"
+        f"{process.name} (pid={process.pid}) did not complete its "
+        "checkpoint barriers within 45 seconds"
     )
     try:
         event, agent, state = receiver.recv()
     except EOFError:
-        pytest.fail(f"{diagnostic} closed its pipe before reaching its checkpoint barrier")
+        process.join(timeout=5)
+        pytest.fail(
+            f"{process.name} (pid={process.pid}, exitcode={process.exitcode}) "
+            "closed its pipe before reaching its checkpoint barrier"
+        )
     if event == "error":
-        pytest.fail(f"{diagnostic} failed for thread {agent}: {state}")
+        process.join(timeout=5)
+        pytest.fail(
+            f"{process.name} (pid={process.pid}, exitcode={process.exitcode}) "
+            f"failed for thread {agent}:\n{state}"
+        )
     return event, agent, state
 
 
@@ -100,6 +109,11 @@ def assert_recoverable_state(
 def test_concurrent_graphs_resume_in_a_fresh_process(
     libpq_url: str, tmp_path: Path, mode: str, scenario: str
 ) -> None:
+    if mode == "async" and scenario == "approval" and sys.version_info < (3, 11):
+        pytest.skip(
+            "LangGraph's interrupt() needs Python 3.11 in an async graph: before 3.11 "
+            "asyncio tasks take no context, so the node cannot find its run config"
+        )
     agents = [f"recovery_{uuid4().hex}_{index}" for index in range(3)]
     with CockroachDBSaver.from_conn_string(libpq_url) as inspector:
         inspector.setup()

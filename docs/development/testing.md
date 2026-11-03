@@ -72,7 +72,10 @@ next graph step starts. LangGraph's `"async"` durability mode can lose a
 checkpoint on process failure while it is being saved. See LangGraph's
 [durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes).
 These are separate choices from using sync or async Python APIs; both APIs
-are tested with synchronous checkpoint durability.
+are tested with synchronous checkpoint durability. On Python 3.10, LangGraph's
+`interrupt()` works only with the sync API, because an async graph's tasks carry
+no run-config context before Python 3.11, so the async approval case is skipped
+there.
 
 A file log outside the checkpointer records node effects across the crash.
 The assertions verify that a successful node with saved pending writes does
