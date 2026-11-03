@@ -1,9 +1,9 @@
 """A graph survives connection replacement or resumes after saver retries run out.
 
-The cursor closes only its own checked-out connection before a selected SQL
-statement. Psycopg raises the real error, and the pool must replace the closed
-connection. This is a client-side connection fault, not a network partition or
-a server failover. No server fault-injection privileges are needed.
+The cursor drops the socket of its own checked-out connection before a selected
+SQL statement, so psycopg marks the connection broken and the pool must replace
+it. This is a client-side connection fault, not a network partition or a server
+failover. No server fault-injection privileges are needed.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 pytest.importorskip("langgraph.graph")
@@ -27,18 +28,35 @@ from langchain_cockroachdb import (  # noqa: E402
     CockroachDBSaver,
     RetryPolicy,
 )
-from tests.integration.graph_recovery_worker import POOL_OPTIONS, config  # noqa: E402
+from langchain_cockroachdb._guard import shutdown_socket  # noqa: E402
+
+# Defined locally so this test does not depend on the process-recovery worker.
+POOL_OPTIONS = {"autocommit": True, "row_factory": dict_row, "gssencmode": "disable"}
+
+
+def config(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}
+
 
 ATTEMPTS = 3
-POLICY = RetryPolicy(max_attempts=ATTEMPTS, initial_backoff=0, max_backoff=0, jitter=0)
+# No transient_messages, so only psycopg's broken-connection flag can make the
+# error retryable. The fault drops the socket, so the connection really breaks,
+# and the test does not depend on the exact TLS error text on Cloud.
+POLICY = RetryPolicy(
+    max_attempts=ATTEMPTS,
+    initial_backoff=0,
+    max_backoff=0,
+    jitter=0,
+    transient_messages=(),
+)
 
 
 class CheckpointDisconnects:
-    """Close the next N checkpoint INSERT connections at a deterministic boundary."""
+    """Break the next N checkpoint INSERT connections at a deterministic boundary."""
 
     def __init__(self) -> None:
         self.remaining = 0
-        self.closed_connections: list[Any] = []
+        self.broken_connections: list[Any] = []
         self._lock = threading.Lock()
 
     def arm(self, count: int) -> None:
@@ -52,7 +70,7 @@ class CheckpointDisconnects:
             if not self.remaining:
                 return False
             self.remaining -= 1
-            self.closed_connections.append(connection)
+            self.broken_connections.append(connection)
             return True
 
     def cursor_class(self) -> type[psycopg.Cursor]:
@@ -61,7 +79,7 @@ class CheckpointDisconnects:
         class DisconnectingCursor(psycopg.Cursor):
             def execute(self, query, params=None, **kwargs):
                 if disconnects.due(query, self.connection):
-                    self.connection.close()
+                    shutdown_socket(self.connection.fileno())
                 return super().execute(query, params, **kwargs)
 
         return DisconnectingCursor
@@ -72,7 +90,7 @@ class CheckpointDisconnects:
         class DisconnectingAsyncCursor(psycopg.AsyncCursor):
             async def execute(self, query, params=None, **kwargs):
                 if disconnects.due(query, self.connection):
-                    await self.connection.close()
+                    shutdown_socket(self.connection.fileno())
                 return await super().execute(query, params, **kwargs)
 
         return DisconnectingAsyncCursor
@@ -132,9 +150,9 @@ def assert_recovered(
     # commit can still repeat; this is not an exactly-once guarantee.
     assert executions == ["prepare", "finish"]
     assert disconnects.remaining == 0
-    assert len(disconnects.closed_connections) == failures
-    assert all(connection.closed for connection in disconnects.closed_connections)
-    assert len({id(connection) for connection in disconnects.closed_connections}) == failures
+    assert len(disconnects.broken_connections) == failures
+    assert all(connection.broken for connection in disconnects.broken_connections)
+    assert len({id(connection) for connection in disconnects.broken_connections}) == failures
 
 
 def assert_exhaustion_log(caplog: pytest.LogCaptureFixture) -> None:
@@ -147,6 +165,12 @@ def assert_exhaustion_log(caplog: pytest.LogCaptureFixture) -> None:
         )
         == 1
     )
+
+
+def assert_retry_log(caplog: pytest.LogCaptureFixture) -> None:
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum(message.startswith("Retrying put checkpoint after") for message in messages) == 1
+    assert not any(message.startswith("Giving up on put checkpoint after") for message in messages)
 
 
 @pytest.mark.timeout(120)
@@ -169,16 +193,21 @@ def test_sync_graph_recovers_after_checkpoint_connection_loss(
                 if failures == ATTEMPTS:
                     with pytest.raises(psycopg.OperationalError):
                         graph.invoke({"agent": agent}, config(agent), durability="sync")
-                    assert len(disconnects.closed_connections) == ATTEMPTS
+                    assert len(disconnects.broken_connections) == ATTEMPTS
                     assert_exhaustion_log(caplog)
                     assert_exhausted(saver.get_tuple(config(agent)), agent, executions)
                     result = graph.invoke(None, config(agent), durability="sync")
                 else:
                     result = graph.invoke({"agent": agent}, config(agent), durability="sync")
+                    assert_retry_log(caplog)
             assert_recovered(result, agent, executions, disconnects, failures)
             saved = saver.get_tuple(config(agent))
             assert saved is not None
             assert saved.checkpoint["channel_values"]["finished"] == result["finished"]
+            # One checkpoint per step and no leftover pending writes: nothing was
+            # lost or duplicated across the connection fault.
+            assert [c.metadata["step"] for c in saver.list(config(agent))] == [2, 1, 0, -1]
+            assert not saved.pending_writes
         finally:
             saver.delete_thread(agent)
 
@@ -205,15 +234,18 @@ async def test_async_graph_recovers_after_checkpoint_connection_loss(
                 if failures == ATTEMPTS:
                     with pytest.raises(psycopg.OperationalError):
                         await graph.ainvoke({"agent": agent}, config(agent), durability="sync")
-                    assert len(disconnects.closed_connections) == ATTEMPTS
+                    assert len(disconnects.broken_connections) == ATTEMPTS
                     assert_exhaustion_log(caplog)
                     assert_exhausted(await saver.aget_tuple(config(agent)), agent, executions)
                     result = await graph.ainvoke(None, config(agent), durability="sync")
                 else:
                     result = await graph.ainvoke({"agent": agent}, config(agent), durability="sync")
+                    assert_retry_log(caplog)
             assert_recovered(result, agent, executions, disconnects, failures)
             saved = await saver.aget_tuple(config(agent))
             assert saved is not None
             assert saved.checkpoint["channel_values"]["finished"] == result["finished"]
+            assert [c.metadata["step"] async for c in saver.alist(config(agent))] == [2, 1, 0, -1]
+            assert not saved.pending_writes
         finally:
             await saver.adelete_thread(agent)
