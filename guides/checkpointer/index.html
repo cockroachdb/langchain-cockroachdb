@@ -1094,6 +1094,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#application-process-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Application-process Recovery
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2428,6 +2439,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#application-process-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Application-process Recovery
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2911,6 +2933,15 @@
 <a id="__codelineno-14-40" name="__codelineno-14-40" href="#__codelineno-14-40"></a>    <span class="n">result</span> <span class="o">=</span> <span class="n">app</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
 <a id="__codelineno-14-41" name="__codelineno-14-41" href="#__codelineno-14-41"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Completed:"</span><span class="p">,</span> <span class="n">result</span><span class="p">[</span><span class="s2">"messages"</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
 </code></pre></div>
+<h3 id="application-process-recovery">Application-process Recovery<a class="headerlink" href="#application-process-recovery" title="Permanent link">&para;</a></h3>
+<p>For application-crash recovery coverage, see the
+<a href="../../development/testing/#application-process-recovery">process-recovery tests</a>.
+They validate approval resume and pending-write reuse with a fresh process and
+pool, using <code>durability="sync"</code> on both sync and async graph calls. On Python
+3.10, approval resume works only with the sync API, because an async graph's
+<code>interrupt()</code> needs Python 3.11 or newer. Interrupted
+or unfinished nodes can execute code again, so external tool effects need
+application-level idempotency or reconciliation.</p>
 <h2 id="schema-and-migrations">Schema and Migrations<a class="headerlink" href="#schema-and-migrations" title="Permanent link">&para;</a></h2>
 <p>The <code>setup()</code> method creates three tables and associated indexes:</p>
 <table>
