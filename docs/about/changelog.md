@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- LangGraph integration tests that kill and restart concurrent sync and async applications using pooled checkpointers, covering approval resume, pending-write reuse, thread separation and node replay with synchronous checkpoint durability.
+
 ## [0.5.1] - 2026-10-28
 
 ### Fixed
