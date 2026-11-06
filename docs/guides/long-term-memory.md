@@ -878,6 +878,8 @@ store.purge(memories, "passport")  # True: the item, its vectors and its history
 store.delete_namespace(("user", "bob"))  # bob's items, vectors and history
 ```
 
+`purge` forgets one key. A memory that `reconcile` or `resolve` superseded keeps its own key in history, so forgetting a fact together with the versions it replaced means purging each of those keys. `history(namespace)` lists them, and a superseded version's `superseded_by` names the memory that replaced it. To forget everything a namespace holds, such as all of one user's memories, use `delete_namespace`.
+
 `delete_namespace` also deletes history on a store created without history, when the history table exists, so a store that kept history before leaves nothing of the namespace behind. A role that did not run `setup()` needs SELECT and DELETE on that table for this, even with history off. `purge` raises `ValueError` on a store without history, where `delete` already removes a memory and its vectors. To purge one key's leftover history after turning history off, call `purge` on a store created with `history=True` for the same table.
 
 ### Provenance and Valid Time
