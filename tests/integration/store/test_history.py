@@ -6,7 +6,8 @@ transaction. delete becomes a soft delete; purge() and delete_namespace()
 remove history too. A batch retried after its commit archives nothing twice.
 A version never ends before it was written, and no version of a key starts
 before the one it follows ended, across an overwrite, a delete or a late
-fact, even for a transaction whose now() is behind them.
+fact, even for a transaction whose now() is behind them. history() lists one
+key's versions, or without a key those of every memory in a namespace.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from langchain_cockroachdb.store import (
     MemoryRecord,
     MemoryVersion,
     keep_all,
+    supersede_same_slot,
 )
 from tests.integration.faults import FailAfterCommit
 from tests.integration.store.conftest import seat_index
@@ -322,6 +324,134 @@ def test_history_leaves_out_versions_past_their_ttl(store_factory, admin, mode) 
     # The expired version is still in the table after history() ran: it was
     # left out, not yet deleted by the TTL job
     assert count(admin, store.sql.history, PREFIX, "k") == 2
+
+
+SEAT_TEXTS = ("Prefers window seats", "Prefers aisle seats", "Prefers window seats on long flights")
+
+
+def test_a_namespace_history_finds_facts_superseded_under_generated_keys(
+    store_factory, mode
+) -> None:
+    # The guide's agent pattern: reconcile with key=None, so the store picks
+    # every key, and only history(namespace) can find the facts it replaced
+    store = store_factory(mode, history=True, index=seat_index())
+    keys = []
+    for text in SEAT_TEXTS:
+        value = {"slot": "seat", "text": text}
+        keys.append(store.reconcile(NS, None, value, slot="slot", policy=supersede_same_slot()).key)
+    first, second, third = keys
+
+    versions = store.history(NS)
+    assert all(isinstance(v, MemoryVersion) and v.namespace == NS for v in versions)
+    assert [(v.key, v.version, v.reason, v.superseded_by) for v in versions] == [
+        (second, 1, "superseded", third),
+        (first, 1, "superseded", second),
+    ]
+    assert [v.value for v in versions] == [
+        {"slot": "seat", "text": "Prefers aisle seats"},
+        {"slot": "seat", "text": "Prefers window seats"},
+    ]
+    # superseded_by leads from the oldest fact to the one live now
+    item = store.get(NS, third)
+    assert item is not None and item.value["text"] == "Prefers window seats on long flights"
+
+
+def test_a_namespace_history_lists_overwritten_and_deleted_versions_newest_first(
+    store_factory, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    store.put(NS, "b", WINDOW)
+    store.put(NS, "b", AISLE)  # ends b's version 1
+    store.put(NS, "a", VEGETARIAN)
+    store.delete(NS, "a")  # ends a's version 1
+    store.put(NS, "b", PEANUTS)  # ends b's version 2
+
+    versions = store.history(NS)
+    # By when each version ended, which neither key nor version order gives
+    assert [(v.key, v.version, v.reason, v.value) for v in versions] == [
+        ("b", 2, "overwritten", AISLE),
+        ("a", 1, "deleted", VEGETARIAN),
+        ("b", 1, "overwritten", WINDOW),
+    ]
+    assert versions[0].ended_at > versions[1].ended_at > versions[2].ended_at
+
+
+def test_a_namespace_history_breaks_ties_by_key_then_version_and_pages(
+    store_factory, admin, mode
+) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    for value in (WINDOW, AISLE, VEGETARIAN):
+        store.put(NS, "b", value)
+    store.put(NS, "c", WINDOW)
+    store.delete(NS, "c")
+    store.put(NS, "a", WINDOW)
+    store.put(NS, "a", AISLE)
+    # Every version ends at the same time, so only the tie-breaks order them
+    admin.execute(f"UPDATE {store.sql.history} SET ended_at = now() WHERE prefix = %s", (PREFIX,))
+
+    versions = store.history(NS)
+    assert [(v.key, v.version) for v in versions] == [("a", 1), ("b", 2), ("b", 1), ("c", 1)]
+    # Pages split that order with no gaps and no repeats
+    assert store.history(NS, limit=2) == versions[:2]
+    assert store.history(NS, limit=2, offset=1) == versions[1:3]
+    assert store.history(NS, limit=2, offset=2) == versions[2:]
+    assert store.history(NS, offset=3) == versions[3:]
+    assert store.history(NS, offset=4) == []
+    assert store.history(NS, limit=0) == []
+
+
+def test_a_namespace_history_leaves_out_other_namespaces(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    # A parent, the namespace, a child, and a sibling whose text starts with
+    # the namespace's
+    namespaces = {
+        ("user",): VEGETARIAN,
+        NS: WINDOW,
+        (*NS, "trips"): AISLE,
+        ("user", "alicex"): PEANUTS,
+    }
+    for ns, value in namespaces.items():
+        store.put(ns, "k", value)
+        store.delete(ns, "k")
+
+    for ns, value in namespaces.items():
+        assert [(v.namespace, v.value) for v in store.history(ns)] == [(ns, value)]
+
+
+def test_a_namespace_history_leaves_out_versions_past_their_ttl(store_factory, admin, mode) -> None:
+    store = store_factory(mode, history={"ttl_days": 30}, index=seat_index())
+    store.put(NS, "a", WINDOW)
+    store.put(NS, "a", AISLE)
+    store.put(NS, "b", VEGETARIAN)
+    store.delete(NS, "b")
+    admin.execute(
+        f"UPDATE {store.sql.history} SET expires_at = now() - INTERVAL '1 hour' "
+        "WHERE prefix = %s AND key = %s",
+        (PREFIX, "a"),
+    )
+
+    assert [(v.key, v.reason) for v in store.history(NS)] == [("b", "deleted")]
+    # Left out, not yet deleted by the TTL job
+    assert count(admin, store.sql.history, PREFIX) == 2
+
+
+def test_the_key_form_lists_only_that_key_and_pages_with_offset(store_factory, mode) -> None:
+    store = store_factory(mode, history=True, index=seat_index())
+    for value in (WINDOW, AISLE, VEGETARIAN, PEANUTS):
+        store.put(NS, "k", value)
+    store.put(NS, "other", WINDOW)
+    store.delete(NS, "other")
+
+    versions = store.history(NS, "k")
+    assert [(v.key, v.version, v.value) for v in versions] == [
+        ("k", 3, VEGETARIAN),
+        ("k", 2, AISLE),
+        ("k", 1, WINDOW),
+    ]
+    assert store.history(NS, "k", limit=2, offset=1) == versions[1:]
+    assert store.history(NS, "k", offset=3) == []
+    # The namespace form lists the other memory's version too, newest first
+    assert [v.key for v in store.history(NS)] == ["other", "k", "k", "k"]
 
 
 @pytest.mark.parametrize("mode", ["pipeline", "pool"])
@@ -648,6 +778,31 @@ async def test_async_store_archives_overwrites_and_deletes(astore_factory, aadmi
     cur = await aadmin.execute(f"SELECT count(*) AS n FROM {store.sql.history}")
     row = await cur.fetchone()
     assert row is not None and row["n"] == 0
+
+
+async def test_async_store_lists_the_history_of_a_namespace(astore_factory, mode) -> None:
+    store = await astore_factory(mode, history=True, index=seat_index())
+    keys = []
+    for text in SEAT_TEXTS[:2]:
+        value = {"slot": "seat", "text": text}
+        result = await store.areconcile(NS, None, value, slot="slot", policy=supersede_same_slot())
+        keys.append(result.key)
+    first, second = keys
+    await store.aput(NS, "k", VEGETARIAN)
+    await store.adelete(NS, "k")
+    # A child namespace's history stays out
+    await store.aput((*NS, "trips"), "k", PEANUTS)
+    await store.adelete((*NS, "trips"), "k")
+
+    versions = await store.ahistory(NS)
+    assert [(v.namespace, v.key, v.reason, v.superseded_by) for v in versions] == [
+        (NS, "k", "deleted", None),
+        (NS, first, "superseded", second),
+    ]
+    assert await store.ahistory(NS, limit=1, offset=1) == versions[1:]
+    assert await store.ahistory(NS, offset=2) == []
+    # The key form reads one key, as before
+    assert await store.ahistory(NS, "k") == versions[:1]
 
 
 async def test_async_store_without_history_deletes_the_history_left_under_a_namespace(

@@ -1806,21 +1806,43 @@ ON CONFLICT (prefix, key, version) DO NOTHING"""
         )
         return (sql, [prefix, list(keys)])
 
-    def history_versions(self, prefix: str, key: str, *, limit: int) -> tuple[str, list]:
-        """Build the SELECT for the versions of one key in history, newest first.
+    def history_versions(
+        self, prefix: str, key: str | None, *, limit: int, offset: int
+    ) -> tuple[str, list]:
+        """Build the SELECT for versions in history, newest first.
+
+        With a key, it reads that key's versions, highest version first.
+        Without one, it reads the versions of every key in exactly the
+        namespace ``prefix``, not its descendants, newest first by
+        ``ended_at``, then by key, then highest version first. History's
+        primary key is (prefix, key, version), so no two rows of a namespace
+        tie and pages are stable. That read scans the namespace's rows
+        through the primary key, which leads with prefix, and sorts them.
 
         Versions past their history TTL are left out, though CockroachDB's
         TTL job may not have deleted them yet.
 
         Returns:
-            Tuple of (SQL, parameters).
+            Tuple of (SQL, parameters). Each row has the version's ``key``.
+
+        Raises:
+            ValueError: If limit or offset is negative.
         """
-        sql = f"""SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmed_at, confirmations
+        _validate_paging(limit, offset)
+        params: list[Any] = [prefix]
+        condition = "prefix = %s"
+        order_by = "ended_at DESC, key, version DESC"
+        if key is not None:
+            condition += " AND key = %s"
+            params.append(key)
+            order_by = "version DESC"
+        sql = f"""SELECT key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmed_at, confirmations
 FROM {self.history}
-WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())
-ORDER BY version DESC
-LIMIT %s"""
-        return (sql, [prefix, key, limit])
+WHERE {condition} AND (expires_at IS NULL OR expires_at > now())
+ORDER BY {order_by}
+LIMIT %s OFFSET %s"""
+        params.extend([limit, offset])
+        return (sql, params)
 
     def purge(self, prefix: str, key: str) -> tuple[str, list]:
         """Build one statement that deletes an item, its vectors and its history.

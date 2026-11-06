@@ -256,7 +256,8 @@ def test_no_cast_shorthand():
             write_id="w",
             ttl_days=1.0,
         ),
-        sql.history_versions("a", "k1", limit=1),
+        sql.history_versions("a", "k1", limit=1, offset=0),
+        sql.history_versions("a", None, limit=1, offset=0),
         sql.history_exists(),
         sql.reconcile_columns_exist(),
         sql.reconcile_migration_recorded(),
@@ -846,7 +847,8 @@ def test_every_builder_has_one_param_per_placeholder():
     )
     assert query_sql.count("%s") == len(params)
     for query_sql, params in (
-        sql.history_versions("a.b.c", "k1", limit=3),
+        sql.history_versions("a.b.c", "k1", limit=3, offset=1),
+        sql.history_versions("a.b.c", None, limit=3, offset=1),
         sql.history_exists(),
         sql.reconcile_columns_exist(),
         sql.reconcile_migration_recorded(),
@@ -1144,21 +1146,44 @@ def test_archive_statement_binds_everything() -> None:
 
 def test_history_reads_bind_the_key_and_skip_expired_versions() -> None:
     sql = StoreSQL("public", "store")
-    query, params = sql.history_versions("user.alice", "seat-key", limit=5)
+    query, params = sql.history_versions("user.alice", "seat-key", limit=5, offset=2)
+    # Each row names its key, as a row of a namespace's history must
     assert query.startswith(
-        "SELECT version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, "
-        "superseded_by, confirmed_at, confirmations\n"
+        "SELECT key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, "
+        "reason, superseded_by, confirmed_at, confirmations\n"
     )
     assert "FROM public.store_history\n" in query
     assert "prefix = %s AND key = %s" in query
     assert "(expires_at IS NULL OR expires_at > now())" in query
-    assert "ORDER BY version DESC\nLIMIT %s" in query
-    assert params == ["user.alice", "seat-key", 5]
+    assert query.endswith("ORDER BY version DESC\nLIMIT %s OFFSET %s")
+    assert params == ["user.alice", "seat-key", 5, 2]
 
     # The schema check asks for the history table by its validated name
     query, params = sql.history_exists()
     assert query == "SELECT to_regclass(%s) IS NOT NULL AS ready"
     assert params == ["public.store_history"]
+
+
+def test_a_namespace_history_read_binds_the_prefix_and_orders_stable_pages() -> None:
+    sql = StoreSQL("public", "store")
+    query, params = sql.history_versions("user.alice", None, limit=5, offset=10)
+    assert query.startswith("SELECT key, version, value, ")
+    assert "FROM public.store_history\n" in query
+    # Exactly the namespace, as the key form reads it: no key condition, and
+    # no range over the namespace's descendants
+    assert "\nWHERE prefix = %s AND (expires_at IS NULL OR expires_at > now())\n" in query
+    assert "key =" not in query and "prefix >=" not in query
+    # Newest first, then by key, then highest version first. History's primary
+    # key is (prefix, key, version), so no two rows of a namespace tie
+    assert query.endswith("ORDER BY ended_at DESC, key, version DESC\nLIMIT %s OFFSET %s")
+    assert params == ["user.alice", 5, 10]
+
+    for paging, name in (
+        ({"limit": -1, "offset": 0}, "limit"),
+        ({"limit": 1, "offset": -1}, "offset"),
+    ):
+        with pytest.raises(ValueError, match=f"{name} must be non-negative"):
+            sql.history_versions("user.alice", None, **paging)
 
 
 def test_purge_deletes_the_item_its_vectors_and_history_in_one_statement() -> None:

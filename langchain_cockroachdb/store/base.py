@@ -183,6 +183,13 @@ def _check_limit(limit: object) -> None:
     _check_paging(limit, 0)
 
 
+def _check_offset(offset: object) -> None:
+    """Raise ValueError unless ``offset`` is a non-negative int."""
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError(f"offset must be a non-negative integer, got {offset!r}")
+    _check_paging(0, offset)
+
+
 def _check_filter(filter: object) -> None:
     """Raise ValueError unless ``filter`` is None or a filter dict that search accepts."""
     if filter is not None and not isinstance(filter, Mapping):
@@ -1053,11 +1060,11 @@ def _row_to_search_item(row: dict[str, Any]) -> SearchItem:
     )
 
 
-def _row_to_version(namespace: tuple[str, ...], key: str, row: Mapping[str, Any]) -> MemoryVersion:
-    """Build a MemoryVersion from a row of StoreSQL.history_versions."""
+def _row_to_version(namespace: tuple[str, ...], row: Mapping[str, Any]) -> MemoryVersion:
+    """Build a MemoryVersion from a row of StoreSQL.history_versions, which names its key."""
     return MemoryVersion(
         namespace=namespace,
-        key=key,
+        key=row["key"],
         version=int(row["version"]),
         value=row["value"],
         provenance=row["provenance"],

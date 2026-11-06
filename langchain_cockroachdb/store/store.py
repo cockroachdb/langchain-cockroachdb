@@ -46,6 +46,7 @@ from langchain_cockroachdb.store.base import (
     SchemaCheck,
     _carries_confirm_id,
     _check_limit,
+    _check_offset,
     _check_policy,
     _memory_prefix,
     _MigrationWait,
@@ -839,9 +840,14 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         return self._retry(write, label="store delete namespace")
 
     def history(
-        self, namespace: tuple[str, ...], key: str, *, limit: int = 20
+        self,
+        namespace: tuple[str, ...],
+        key: str | None = None,
+        *,
+        limit: int = 20,
+        offset: int = 0,
     ) -> list[MemoryVersion]:
-        """The old versions of a memory, newest first.
+        """The old versions of a memory, or of every memory in a namespace, newest first.
 
         A store with history keeps every version that a write ends: one a
         put overwrites (reason "overwritten"), one a delete ends
@@ -851,28 +857,45 @@ class CockroachDBStore(BaseStore, BaseCockroachDBStore, PsycopgOps):
         already superseded by a newer fact is kept there too, as
         "superseded". The live value is not one of them; get() returns it.
 
+        Without a key, it lists the old versions of every memory in exactly
+        ``namespace``, not its descendants, as get() reads a namespace. That
+        is how to find the old versions of memories that reconcile saved
+        under keys the store generated. Each version carries its own ``key``
+        and ``superseded_by``, so versions can be grouped by a field of
+        their value, or followed to the memory that replaced them. Each call
+        reads the namespace's whole history to sort it, which suits
+        per-user namespaces. For a very large history, page with ``limit``
+        and ``offset``.
+
         Args:
             namespace: The memory's namespace.
-            key: The memory's key.
+            key: The memory's key, or None for every memory in the namespace.
             limit: Most versions to return (default 20).
+            offset: Versions to skip, for paging (default 0).
 
         Returns:
-            Up to ``limit`` versions, highest version first, each with the
-            confirmations it had when it ended. Versions past the history's
+            Up to ``limit`` versions, each with the confirmations it had
+            when it ended. With a key, highest version first. Without one,
+            newest first by ``ended_at``, then by key, then highest version
+            first, so pages are stable. Versions past the history's
             ``ttl_days`` are left out.
 
         Raises:
             ValueError: If the store keeps no history (create it with
                 history=True and run setup()), setup() has not created the
-                history table, or ``limit`` is not a non-negative int
+                history table, or ``limit`` or ``offset`` is not a
+                non-negative int
             InvalidNamespaceError: If the namespace is empty or a label is invalid
         """
         prefix = _memory_prefix(namespace, "history")
         _check_limit(limit)
+        _check_offset(offset)
         self._history_schema()
-        statement = self.sql.history_versions(prefix, str(key), limit=limit)
+        statement = self.sql.history_versions(
+            prefix, None if key is None else str(key), limit=limit, offset=offset
+        )
         [rows] = self._read_all([statement], "store history")
-        return [_row_to_version(tuple(namespace), str(key), row) for row in rows]
+        return [_row_to_version(tuple(namespace), row) for row in rows]
 
     def purge(self, namespace: tuple[str, ...], key: str) -> bool:
         """Forget a memory: delete the item, its vectors and its history.

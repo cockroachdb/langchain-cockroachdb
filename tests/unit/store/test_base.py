@@ -2550,6 +2550,32 @@ async def test_history_and_purge_validate_before_any_io(make: str) -> None:
 
 
 @pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_namespace_history_checks_what_the_key_form_checks_before_any_io(
+    make: str,
+) -> None:
+    # Without a key, history reads a whole namespace, and refuses the same
+    # things before it touches the connection, which would raise
+    with pytest.raises(ValueError, match="history=True"):
+        await call(make_store(make), "history", ("a",))
+    store = make_store(make, history=True)
+    for namespace in ((), ("a.b",), ("a", "")):
+        with pytest.raises(InvalidNamespaceError):
+            await call(store, "history", namespace)
+    with pytest.raises(ValueError, match="limit must be non-negative"):
+        await call(store, "history", ("a",), limit=-1)
+    for bad in (1.5, "3", True, None):
+        with pytest.raises(ValueError, match="limit must be a non-negative integer"):
+            await call(store, "history", ("a",), limit=bad)
+    # offset is checked the same way, with a key or without one
+    for key in (None, "k"):
+        with pytest.raises(ValueError, match="offset must be non-negative"):
+            await call(store, "history", ("a",), key, offset=-1)
+        for bad in (1.5, "3", True, None):
+            with pytest.raises(ValueError, match="offset must be a non-negative integer"):
+                await call(store, "history", ("a",), key, offset=bad)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
 async def test_setup_creates_the_history_table_and_clears_its_check(make: str) -> None:
     if make == "sync":
         store: CockroachDBStore | AsyncCockroachDBStore = CockroachDBStore(
@@ -4500,9 +4526,11 @@ def test_applied_result_lists_only_what_the_rows_prove() -> None:
     )
 
 
-def test_a_history_row_gives_the_version_with_its_confirmations() -> None:
-    # A version ends with the confirmations it had while it was live
+def test_a_history_row_gives_the_version_with_its_key_and_confirmations() -> None:
+    # A version ends with the confirmations it had while it was live. Its key
+    # comes from the row, as the rows of a namespace's history name their keys
     row = {
+        "key": "seat-1",
         "version": 2,
         "value": {"text": "window"},
         "provenance": {"source": "chat"},
@@ -4515,9 +4543,9 @@ def test_a_history_row_gives_the_version_with_its_confirmations() -> None:
         "confirmed_at": T0 + timedelta(hours=1),
         "confirmations": 3,
     }
-    assert store_base._row_to_version(NS, "k", row) == MemoryVersion(
+    assert store_base._row_to_version(NS, row) == MemoryVersion(
         namespace=NS,
-        key="k",
+        key="seat-1",
         version=2,
         value={"text": "window"},
         provenance={"source": "chat"},

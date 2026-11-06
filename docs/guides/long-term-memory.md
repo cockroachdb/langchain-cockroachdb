@@ -541,7 +541,7 @@ Deciding what contradicts what stays with your application, which may use rules 
 | `record` | Reads a memory with its version, provenance, valid time and confirmations |
 | `confirm` | Marks a memory as confirmed: renews its expiry and counts the confirmation |
 | `put_if`, `delete_if` | Write or delete a memory only if it is still the one you read |
-| `history` | Lists the old versions of a memory, on a store with history |
+| `history` | Lists the old versions of a memory, or of every memory in a namespace, on a store with history |
 | `purge` | Removes a memory with its vectors and its history |
 
 `AsyncCockroachDBStore` has each of them as a coroutine with an `a` prefix: `areconcile`, `afind_conflicts`, `aresolve`, `arecord`, `aconfirm`, `aput_if`, `adelete_if`, `ahistory` and `apurge`. They run on the caller's event loop, not through the store's batch queue, so on a pool they run concurrently. The types and the built-in policies are imported from `langchain_cockroachdb.store`. [`examples/memory_reconciliation.py`](../examples/memory-reconciliation.md) runs through all of this with a scripted judge.
@@ -833,7 +833,7 @@ The constant covers `Conflicts` with what it keeps for `resolve`, `Decision`, `R
 
 With history on, every write that ends a version keeps it, in the same transaction: a `put` that overwrites a memory (reason `"overwritten"`), a `delete` (`"deleted"`) and a supersede (`"superseded"`, with `superseded_by`). That includes plain `put` and `delete`, so LangMem-style tools, which write through them and keep no history of their own, get version history from the store.
 
-`history(namespace, key, limit=20)` returns the old versions of a memory, newest first, as `MemoryVersion`s. The live version is not one of them: `get` or `record` returns it.
+`history(namespace, key, limit=20, offset=0)` returns the old versions of a memory, newest first, as `MemoryVersion`s. The live version is not one of them: `get` or `record` returns it.
 
 ```python
 for version in store.history(memories, "seat-1"):
@@ -842,7 +842,23 @@ for version in store.history(memories, "seat-1"):
     print("  stored from", version.written_at, "to", version.ended_at)
 ```
 
-Each version has its `value` and `provenance`; `valid_at` and `invalid_at`, when its fact was true; `written_at` and `ended_at`, when the store held it; its `reason`; `superseded_by`; and `confirmations` and `confirmed_at`, the confirmations it had when it ended. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. `history` raises `ValueError` on a store without history.
+Each version has its `key`, `value` and `provenance`; `valid_at` and `invalid_at`, when its fact was true; `written_at` and `ended_at`, when the store held it; its `reason`; `superseded_by`; and `confirmations` and `confirmed_at`, the confirmations it had when it ended. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. `history` raises `ValueError` on a store without history.
+
+Without a key, `history(namespace)` lists the old versions of every memory in the namespace, not in its descendants. They come newest first by `ended_at`, then by key, then highest version first, so pages are stable, and `limit` and `offset` page through them. This is how to find the old versions of memories that `reconcile` saved under keys the store generated. Each version names its `key` and `superseded_by`, so you can group versions by a field of their value, or follow `superseded_by` to the memory that replaced each one. Here is a timeline of what the store held for each slot:
+
+```python
+from collections import defaultdict
+
+timeline = defaultdict(list)
+for version in store.history(memories, limit=100):
+    timeline[version.value.get("slot")].append(version)
+for slot, versions in timeline.items():
+    print(slot)
+    for version in versions:
+        print(" ", version.ended_at, version.reason, version.value["text"], version.superseded_by)
+```
+
+`history(namespace)` reads the namespace's whole history to sort it, which suits per-user namespaces like this one. For a namespace with a very large history, page with `limit` and `offset`: each page comes back small, though each call still reads the whole history.
 
 Turn history on for every store that writes the same table, and only once every writer runs 0.6.0. A store with history off numbers a key it creates from 1, without looking at the key's history, and so does a 0.5 writer. If history already holds a version 1 of that key, the next archive of the new version 1 is dropped, since history keeps one row per version. A 0.5 writer also never archives, so the versions it overwrites or deletes are not kept.
 
@@ -974,7 +990,7 @@ Every method here retries transient errors under the store's `RetryPolicy`, like
 
 ### Tools for an Agent
 
-With `create_agent`, a `remember` tool can reconcile what the model wants to save, under a topic the model names. Recall stays a plain search, since superseded memories are no longer live:
+With `create_agent`, a `remember` tool can reconcile what the model wants to save, under a topic the model names. Recall stays a plain search, since superseded memories are no longer live. `remember` lets the store generate the keys, so a `past_memories` tool reads the old versions with `history(namespace)` and keeps those about the topic:
 
 ```python
 from langchain.tools import ToolRuntime, tool
@@ -1007,9 +1023,22 @@ def recall(query: str, runtime: ToolRuntime[Context, dict]) -> str:
     namespace = ("user", runtime.context.user_id, "memories")
     items = runtime.store.search(namespace, query=query, limit=3)
     return "\n".join(item.value["text"] for item in items) or "No memories found."
+
+
+@tool
+def past_memories(topic: str, runtime: ToolRuntime[Context, dict]) -> str:
+    """List what the user used to say about a topic, newest first."""
+    assert isinstance(runtime.store, CockroachDBStore)
+    namespace = ("user", runtime.context.user_id, "memories")
+    lines = [
+        f"{version.ended_at:%Y-%m-%d}: {version.value['text']} ({version.reason})"
+        for version in runtime.store.history(namespace, limit=100)
+        if version.value.get("topic") == topic
+    ]
+    return "\n".join(lines) or f"No earlier memories about {topic}."
 ```
 
-`Context` is the one from [With create_agent](#with-create_agent). With `AsyncCockroachDBStore`, write the tools as async functions that call `areconcile` and `asearch`. Tools that know only `BaseStore` write through plain `put` and `delete`, and still get history on a store with history on.
+`Context` is the one from [With create_agent](#with-create_agent). `past_memories` needs a store with history on. With `AsyncCockroachDBStore`, write the tools as async functions that call `areconcile`, `asearch` and `ahistory`. Tools that know only `BaseStore` write through plain `put` and `delete`, and still get history on a store with history on.
 
 ### Upgrading From 0.5
 

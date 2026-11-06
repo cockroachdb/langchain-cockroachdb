@@ -251,7 +251,7 @@ A policy is a function of the `Proposal` and the sequence of candidates that ret
 | `confirm()` | `aconfirm()` | Confirm a memory: renew its expiry and count the confirmation |
 | `put_if()` | `aput_if()` | Write a memory only if it is still the one `record` returned |
 | `delete_if()` | `adelete_if()` | Delete a memory only if it is still the one `record` returned |
-| `history()` | `ahistory()` | List a memory's old versions, newest first, on a store with history |
+| `history()` | `ahistory()` | List the old versions of a memory, or of every memory in a namespace, newest first, on a store with history |
 | `purge()` | `apurge()` | Remove a memory with its vectors and its history |
 | `sweep_ttl()` | `sweep_ttl()` | Delete expired items now, return the count |
 | `start_ttl_sweeper()` | `start_ttl_sweeper()` | Sweep periodically in a background thread or task |
