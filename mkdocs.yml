@@ -68,6 +68,7 @@ nav:
   - Guides:
     - Vector Store: guides/vector-store.md
     - Multi-Tenancy: guides/multi-tenancy.md
+    - Virtual Clusters: guides/virtual-clusters.md
     - Vector Indexes: guides/vector-indexes.md
     - Hybrid Search: guides/hybrid-search.md
     - Chat History: guides/chat-history.md

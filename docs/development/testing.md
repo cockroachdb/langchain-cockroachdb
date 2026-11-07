@@ -101,6 +101,58 @@ separate infrastructure and are not covered here.
 
 ## Running Tests
 
+### Provisioned Virtual Clusters
+
+`tests/integration/test_virtual_cluster_deployment.py` is an opt-in suite for
+two disposable application virtual clusters. It accepts their complete SQL
+URLs, including the supplied TLS and routing parameters. It does not start a
+testcontainer, provision resources, change users, or alter network access.
+For a managed Continuum host, use two of the host's virtual clusters, each with
+its own connection string. For self-hosted testing, use one virtualized cluster
+and compare the `main` and `system` virtual clusters (primary on
+`-ccluster%3Dmain`, peer on `-ccluster%3Dsystem`): two physical clusters both on
+`-ccluster%3Dmain` would not catch a dropped `options` value, since each
+connection would still reach its own cluster's default virtual cluster. Different
+URL strings alone do not establish that the targets are distinct virtual
+clusters; verify their deployment metadata first.
+
+The tests write different values under identical table names, document IDs,
+session IDs, and checkpoint IDs on both targets. They check vector insert,
+lookup, search and deletion, chat persistence and clearing, and sync/async
+checkpoint and pending-write round trips. Removing data from the first
+target must leave the peer's data intact. Randomly named tables and threads
+are cleaned up after the run; existing application data is not targeted.
+Checkpointer setup leaves its normal tables and migrations in place.
+
+Set `COCKROACHDB_VIRTUAL_CLUSTER_URL` and
+`COCKROACHDB_VIRTUAL_CLUSTER_PEER_URL` to two separate test virtual clusters.
+For a managed Continuum host, obtain each virtual cluster's connection string
+from its own Connect dialog or `ccloud`. A host cluster's console URL is not a
+SQL endpoint. For self-hosted virtualization, keep the URL's percent-encoded
+`-ccluster` option.
+The SQL users need permission to create and drop the test tables and set up
+checkpoint tables in the chosen databases.
+
+These checks establish data routing and deletion isolation for the supplied
+targets. They do not test authorization, failover, or the supported number of
+virtual clusters on a host. Driver failures report the error class and SQLSTATE
+without a connection traceback because driver arguments may contain passwords.
+
+All four cases have been run against two virtual clusters on a Cockroach
+Continuum host cluster (CockroachDB v26.3.1) and passed, confirming that vector
+data, chat history, and sync and async checkpoints stay isolated to their own
+virtual cluster.
+
+Keep credentials in a local, ignored `.env.local` file, then run:
+
+```bash
+uv run --no-sync --env-file .env.local pytest tests/integration/test_virtual_cluster_deployment.py -v
+```
+
+Without both variables the four tests skip, including in regular CI. Never
+commit URLs containing passwords. No model API keys are used. Run this suite
+against designated test targets because it creates and removes its own data.
+
 ### All Tests
 
 ```bash
@@ -158,6 +210,7 @@ open htmlcov/index.html
 import pytest
 from langchain_cockroachdb import CSPANNIndex, DistanceStrategy
 
+
 class TestCSPANNIndex:
     def test_index_creation(self):
         """Test creating C-SPANN index configuration."""
@@ -165,15 +218,15 @@ class TestCSPANNIndex:
             name="test_index",
             distance_strategy=DistanceStrategy.COSINE,
         )
-        
+
         assert index.name == "test_index"
         assert index.distance_strategy == DistanceStrategy.COSINE
-    
+
     def test_index_sql_generation(self):
         """Test SQL generation for index creation."""
         index = CSPANNIndex()
         sql = index.get_create_sql("table", "embedding")
-        
+
         assert "CREATE VECTOR INDEX" in sql
         assert "table" in sql
         assert "embedding" in sql
@@ -186,6 +239,7 @@ import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
 
+
 class TestVectorStore:
     @pytest.mark.asyncio
     async def test_add_and_search(self, connection_string: str):
@@ -197,25 +251,25 @@ class TestVectorStore:
             vector_dimension=384,
             drop_if_exists=True,
         )
-        
+
         embeddings = DeterministicFakeEmbedding(size=384)
         vectorstore = AsyncCockroachDBVectorStore(
             engine=engine,
             embeddings=embeddings,
             collection_name="test_docs",
         )
-        
+
         # Test
         texts = ["doc1", "doc2", "doc3"]
         ids = await vectorstore.aadd_texts(texts)
-        
+
         assert len(ids) == 3
-        
+
         results = await vectorstore.asimilarity_search("doc1", k=2)
-        
+
         assert len(results) == 2
         assert results[0].page_content in texts
-        
+
         # Cleanup
         await engine.aclose()
 ```
@@ -231,9 +285,9 @@ Available in `conftest.py`:
 def connection_string() -> str:
     """Get CockroachDB connection string."""
     return os.getenv(
-        "COCKROACHDB_URL",
-        "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+        "COCKROACHDB_URL", "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
     )
+
 
 @pytest.fixture
 async def engine(connection_string: str):
@@ -241,6 +295,7 @@ async def engine(connection_string: str):
     engine = CockroachDBEngine.from_connection_string(connection_string)
     yield engine
     await engine.aclose()
+
 
 @pytest.fixture
 async def vectorstore(engine: CockroachDBEngine):
@@ -250,14 +305,14 @@ async def vectorstore(engine: CockroachDBEngine):
         vector_dimension=384,
         drop_if_exists=True,
     )
-    
+
     embeddings = DeterministicFakeEmbedding(size=384)
     vs = AsyncCockroachDBVectorStore(
         engine=engine,
         embeddings=embeddings,
         collection_name="test_vectors",
     )
-    
+
     yield vs
 ```
 
@@ -267,12 +322,11 @@ async def vectorstore(engine: CockroachDBEngine):
 
 ```python
 # Good
-async def test_add_texts_with_metadata_returns_correct_ids():
-    ...
+async def test_add_texts_with_metadata_returns_correct_ids(): ...
+
 
 # Bad
-async def test_add():
-    ...
+async def test_add(): ...
 ```
 
 ### 2. Test One Thing
@@ -282,6 +336,7 @@ async def test_add():
 async def test_add_texts_returns_ids():
     ids = await vectorstore.aadd_texts(["doc1"])
     assert len(ids) == 1
+
 
 # Bad: Tests multiple behaviors
 async def test_vectorstore():
@@ -299,6 +354,7 @@ async def test_search(vectorstore):
     await vectorstore.aadd_texts(["doc1"])
     results = await vectorstore.asimilarity_search("doc1")
     assert len(results) > 0
+
 
 # Bad: Setup in test
 async def test_search():
