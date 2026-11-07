@@ -1,4 +1,4 @@
-# <img src="https://raw.githubusercontent.com/cockroachdb/langchain-cockroachdb/main/assets/cockroachdb_logo.svg" width="25" height="25" style="vertical-align: middle;"/> langchain-cockroachdb
+# <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cockroachdb/langchain-cockroachdb/main/assets/cockroachlabs-icon-dark-bg.svg"><img src="https://raw.githubusercontent.com/cockroachdb/langchain-cockroachdb/main/assets/cockroachlabs-icon-light-bg.svg" width="25" height="25" style="vertical-align: middle;" alt="Cockroach Labs"/></picture> langchain-cockroachdb
 
 [![Tests](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml/badge.svg)](https://github.com/cockroachdb/langchain-cockroachdb/actions/workflows/test.yml)
 [![PyPI version](https://img.shields.io/pypi/v/langchain-cockroachdb)](https://pypi.org/project/langchain-cockroachdb/)

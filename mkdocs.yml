@@ -8,6 +8,8 @@ repo_url: https://github.com/cockroachdb/langchain-cockroachdb
 
 theme:
   name: material
+  logo: assets/cockroachlabs-icon-dark-bg.svg
+  favicon: assets/favicon.svg
   palette:
     - scheme: default
       primary: indigo
