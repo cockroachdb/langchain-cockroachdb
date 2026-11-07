@@ -23,6 +23,9 @@ tests/
 │   ├── test_chat_history_resilience.py # Chat history resilience
 │   ├── test_checkpointer_faults.py # Checkpointer resilience
 │   ├── test_checkpointer_conformance.py # LangGraph standard tests
+│   ├── test_graph_process_recovery.py # Full graph recovery after process loss
+│   ├── test_graph_connection_recovery.py # Connection replacement and explicit resume
+│   ├── graph_recovery_worker.py      # Spawned sync and async applications
 │   └── faults.py                   # Fault injection mechanisms
 └── e2e/
     └── test_examples.py            # End-to-end tests for all examples
@@ -40,7 +43,163 @@ The `tests/integration/faults.py` module provides three mechanisms for injecting
 
 These let tests verify that the retry policy handles real CockroachDB errors exactly as they would appear in production.
 
+## Application-process Recovery
+
+`test_graph_process_recovery.py` exercises real LangGraph workflows with both
+checkpointers. Each worker runs three independent conversations through one
+pool capped at two connections. The parent kills that worker and starts a
+fresh process, so the resumed application cannot reuse its graph, event loop,
+connection pool, or Python state.
+
+The suite covers two crash boundaries:
+
+- A graph has saved a human-approval interrupt. The fresh application resumes
+  it with `Command(resume=...)` and the same thread ID.
+- One parallel node has committed pending writes while another is blocked.
+  The fresh application resumes with `None`, reuses the successful node's
+  output, and reruns the unfinished node.
+
+Pipe notifications wait for committed pending writes and blocked nodes before
+the parent kills the process. No fixed sleeps choose the crash point. The
+parent also reads the database between processes to check saved state and
+pending writes, then verifies distinct results for every thread after resume.
+For approvals, it compares the saved interrupt's payload and identity with the
+interrupt returned by the graph. Completed states must match each thread's
+expected values and have no pending writes.
+Each test deletes only its own randomly generated thread IDs.
+
+The workers use `durability="sync"` so parent checkpoints commit before the
+next graph step starts. LangGraph's `"async"` durability mode can lose a
+checkpoint on process failure while it is being saved. See LangGraph's
+[durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes).
+These are separate choices from using sync or async Python APIs; both APIs
+are tested with synchronous checkpoint durability. On Python 3.10, LangGraph's
+`interrupt()` works only with the sync API, because an async graph's tasks carry
+no run-config context before Python 3.11, so the async approval case is skipped
+there.
+
+A file log outside the checkpointer records node effects across the crash.
+The assertions verify that a successful node with saved pending writes does
+not repeat, while code before an interrupt or unfinished node boundary runs
+again. This does not guarantee exactly-once external tool execution. A crash
+after an external effect and before its pending write commits can repeat the
+effect; applications need idempotency keys or reconciliation for that case.
+
+Run against a disposable CockroachDB instance with the normal fixture, or use
+an existing test instance:
+
+```bash
+USE_TESTCONTAINER=false \
+COCKROACHDB_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' \
+.venv/bin/pytest tests/integration/test_graph_process_recovery.py -v
+```
+
+The tests need the development `langgraph` dependency and skip when it is not
+installed, including CI's minimum runtime dependency job. No model API keys
+are needed. The database stays online throughout: database restarts, physical
+cluster replication, failover, and recovery-time measurements require
+separate infrastructure and are not covered here.
+
+## Graph Recovery After Connection Loss
+
+`test_graph_connection_recovery.py` runs a deterministic two-node LangGraph
+workflow with sync and async pooled checkpointers. A completed preparation node
+arms the test cursor to close its own checked-out connection immediately before
+the next checkpoint INSERT. Psycopg raises the closed-connection error during
+normal execution. This fault uses client-side connection closure: it does not
+simulate a network partition, terminate server sessions, or restart a database.
+It needs no unsafe CockroachDB internals or server administration privileges.
+
+Each Python API has two cases:
+
+- One closed connection is replaced by the pool, and the saver retries the
+  checkpoint without failing the graph invocation.
+- Three consecutive closed connections exhaust a policy of three total attempts.
+  The graph invocation raises the driver error. The test verifies the exact
+  number of closed connections, two retry warnings, and one exhaustion warning.
+  It then reads the durable input checkpoint and the preparation node's pending
+  writes before explicitly resuming the graph with `invoke(None, config)` or
+  `ainvoke(None, config)`.
+
+Both cases verify the final persisted state and exactly one execution of each
+node. The pool is capped at one connection to make replacement observable;
+concurrent pool usage is covered separately by the process-recovery tests.
+Each test uses `durability="sync"`, an independent random thread ID, and only
+deletes its own thread's data. No model calls or fixed sleeps select the failure
+boundary.
+
+The no-replay assertion applies to a node whose pending writes already committed.
+If an external tool succeeds before its pending writes commit, an application
+failure can still cause that tool to run again. Applications need idempotency
+keys or reconciliation for those effects. These tests also do not establish
+recovery guarantees for ambiguous commits, real network outages, or database
+failover.
+
+Run the four cases on a disposable CockroachDB instance:
+
+```bash
+USE_TESTCONTAINER=false \
+COCKROACHDB_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' \
+.venv/bin/pytest tests/integration/test_graph_connection_recovery.py -v
+```
+
+The tests require the development `langgraph` dependency and skip when it is
+absent. They use the normal integration fixtures and work without paid model
+credentials.
+
 ## Running Tests
+
+### Provisioned Virtual Clusters
+
+`tests/integration/test_virtual_cluster_deployment.py` is an opt-in suite for
+two disposable application virtual clusters. It accepts their complete SQL
+URLs, including the supplied TLS and routing parameters. It does not start a
+testcontainer, provision resources, change users, or alter network access.
+For a managed Continuum host, use two of the host's virtual clusters, each with
+its own connection string. For self-hosted testing, use one virtualized cluster
+and compare the `main` and `system` virtual clusters (primary on
+`-ccluster%3Dmain`, peer on `-ccluster%3Dsystem`): two physical clusters both on
+`-ccluster%3Dmain` would not catch a dropped `options` value, since each
+connection would still reach its own cluster's default virtual cluster. Different
+URL strings alone do not establish that the targets are distinct virtual
+clusters; verify their deployment metadata first.
+
+The tests write different values under identical table names, document IDs,
+session IDs, and checkpoint IDs on both targets. They check vector insert,
+lookup, search and deletion, chat persistence and clearing, and sync/async
+checkpoint and pending-write round trips. Removing data from the first
+target must leave the peer's data intact. Randomly named tables and threads
+are cleaned up after the run; existing application data is not targeted.
+Checkpointer setup leaves its normal tables and migrations in place.
+
+Set `COCKROACHDB_VIRTUAL_CLUSTER_URL` and
+`COCKROACHDB_VIRTUAL_CLUSTER_PEER_URL` to two separate test virtual clusters.
+For a managed Continuum host, obtain each virtual cluster's connection string
+from its own Connect dialog or `ccloud`. A host cluster's console URL is not a
+SQL endpoint. For self-hosted virtualization, keep the URL's percent-encoded
+`-ccluster` option.
+The SQL users need permission to create and drop the test tables and set up
+checkpoint tables in the chosen databases.
+
+These checks establish data routing and deletion isolation for the supplied
+targets. They do not test authorization, failover, or the supported number of
+virtual clusters on a host. Driver failures report the error class and SQLSTATE
+without a connection traceback because driver arguments may contain passwords.
+
+All four cases have been run against two virtual clusters on a Cockroach
+Continuum host cluster (CockroachDB v26.3.1) and passed, confirming that vector
+data, chat history, and sync and async checkpoints stay isolated to their own
+virtual cluster.
+
+Keep credentials in a local, ignored `.env.local` file, then run:
+
+```bash
+uv run --no-sync --env-file .env.local pytest tests/integration/test_virtual_cluster_deployment.py -v
+```
+
+Without both variables the four tests skip, including in regular CI. Never
+commit URLs containing passwords. No model API keys are used. Run this suite
+against designated test targets because it creates and removes its own data.
 
 ### All Tests
 
@@ -99,6 +258,7 @@ open htmlcov/index.html
 import pytest
 from langchain_cockroachdb import CSPANNIndex, DistanceStrategy
 
+
 class TestCSPANNIndex:
     def test_index_creation(self):
         """Test creating C-SPANN index configuration."""
@@ -106,15 +266,15 @@ class TestCSPANNIndex:
             name="test_index",
             distance_strategy=DistanceStrategy.COSINE,
         )
-        
+
         assert index.name == "test_index"
         assert index.distance_strategy == DistanceStrategy.COSINE
-    
+
     def test_index_sql_generation(self):
         """Test SQL generation for index creation."""
         index = CSPANNIndex()
         sql = index.get_create_sql("table", "embedding")
-        
+
         assert "CREATE VECTOR INDEX" in sql
         assert "table" in sql
         assert "embedding" in sql
@@ -127,6 +287,7 @@ import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
 
+
 class TestVectorStore:
     @pytest.mark.asyncio
     async def test_add_and_search(self, connection_string: str):
@@ -138,25 +299,25 @@ class TestVectorStore:
             vector_dimension=384,
             drop_if_exists=True,
         )
-        
+
         embeddings = DeterministicFakeEmbedding(size=384)
         vectorstore = AsyncCockroachDBVectorStore(
             engine=engine,
             embeddings=embeddings,
             collection_name="test_docs",
         )
-        
+
         # Test
         texts = ["doc1", "doc2", "doc3"]
         ids = await vectorstore.aadd_texts(texts)
-        
+
         assert len(ids) == 3
-        
+
         results = await vectorstore.asimilarity_search("doc1", k=2)
-        
+
         assert len(results) == 2
         assert results[0].page_content in texts
-        
+
         # Cleanup
         await engine.aclose()
 ```
@@ -172,9 +333,9 @@ Available in `conftest.py`:
 def connection_string() -> str:
     """Get CockroachDB connection string."""
     return os.getenv(
-        "COCKROACHDB_URL",
-        "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
+        "COCKROACHDB_URL", "cockroachdb://root@localhost:26257/defaultdb?sslmode=disable"
     )
+
 
 @pytest.fixture
 async def engine(connection_string: str):
@@ -182,6 +343,7 @@ async def engine(connection_string: str):
     engine = CockroachDBEngine.from_connection_string(connection_string)
     yield engine
     await engine.aclose()
+
 
 @pytest.fixture
 async def vectorstore(engine: CockroachDBEngine):
@@ -191,14 +353,14 @@ async def vectorstore(engine: CockroachDBEngine):
         vector_dimension=384,
         drop_if_exists=True,
     )
-    
+
     embeddings = DeterministicFakeEmbedding(size=384)
     vs = AsyncCockroachDBVectorStore(
         engine=engine,
         embeddings=embeddings,
         collection_name="test_vectors",
     )
-    
+
     yield vs
 ```
 
@@ -208,12 +370,11 @@ async def vectorstore(engine: CockroachDBEngine):
 
 ```python
 # Good
-async def test_add_texts_with_metadata_returns_correct_ids():
-    ...
+async def test_add_texts_with_metadata_returns_correct_ids(): ...
+
 
 # Bad
-async def test_add():
-    ...
+async def test_add(): ...
 ```
 
 ### 2. Test One Thing
@@ -223,6 +384,7 @@ async def test_add():
 async def test_add_texts_returns_ids():
     ids = await vectorstore.aadd_texts(["doc1"])
     assert len(ids) == 1
+
 
 # Bad: Tests multiple behaviors
 async def test_vectorstore():
@@ -240,6 +402,7 @@ async def test_search(vectorstore):
     await vectorstore.aadd_texts(["doc1"])
     results = await vectorstore.asimilarity_search("doc1")
     assert len(results) > 0
+
 
 # Bad: Setup in test
 async def test_search():
