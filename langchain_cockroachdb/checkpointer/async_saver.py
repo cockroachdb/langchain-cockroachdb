@@ -21,6 +21,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -43,7 +44,11 @@ from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._loop import LoopMessages
 from langchain_cockroachdb._psycopg_ops import AsyncPsycopgOps
-from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
+from langchain_cockroachdb.checkpointer.base import (
+    BaseCockroachDBSaver,
+    _DeltaHistoryWalk,
+    connection_options,
+)
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
@@ -380,6 +385,64 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
                     value["_blob_values"] = blob_values
             return await self._load_checkpoint_tuple_with_cursor(cur, value)
 
+    async def aget_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, Any]:
+        """Rebuild DeltaChannel history for a checkpoint asynchronously.
+
+        LangGraph's default walks the parent chain with one aget_tuple per
+        ancestor, which is three queries per ancestor. This fetches the chain
+        a page at a time instead, in pages that grow up to DELTA_HISTORY_PAGE_SIZE,
+        and returns the same result.
+
+        Args:
+            config: Config identifying the checkpoint.
+            channels: DeltaChannel names to rebuild.
+
+        Returns:
+            Per-channel writes, and the seed value where one was found.
+        """
+        if not channels:
+            return {}
+        walk = _DeltaHistoryWalk(channels)
+        target = await self.aget_tuple(config)
+        cursor = target.parent_config if target else None
+        limit = min(self.DELTA_HISTORY_FIRST_PAGE, self.DELTA_HISTORY_PAGE_SIZE)
+        while cursor is not None and walk.remaining:
+            page = await self._retry(
+                partial(self._fetch_chain_page, cursor, limit), label="get delta channel history"
+            )
+            for tup in page:
+                walk.visit(tup)
+                if not walk.remaining:
+                    break
+            cursor = page[-1].parent_config if page and len(page) == limit else None
+            limit = min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE)
+        return walk.result()
+
+    async def _fetch_chain_page(
+        self, cursor: RunnableConfig, limit: int
+    ) -> builtins.list[CheckpointTuple]:
+        async with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="get delta channel history"
+        ) as cur:
+            await cur.execute(self.SELECT_PARENT_CHAIN_SQL, self._chain_page_params(cursor, limit))
+            ids = [row["checkpoint_id"] for row in await cur.fetchall()]
+        if not ids:
+            return []
+        query, params = self._chain_tuples_query(cursor, ids)
+        by_id = {
+            tup.config["configurable"]["checkpoint_id"]: tup
+            for tup in await self._fetch_list(query, params)
+        }
+        # Keep chain order and stop at the first missing ancestor, as the default does
+        page = []
+        for checkpoint_id in ids:
+            if checkpoint_id not in by_id:
+                break
+            page.append(by_id[checkpoint_id])
+        return page
+
     async def aput(
         self,
         config: RunnableConfig,
@@ -548,6 +611,12 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple (sync wrapper for aget_tuple)."""
         return self._run_sync(self.aget_tuple(config))
+
+    def get_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, Any]:
+        """Rebuild DeltaChannel history (sync wrapper for aget_delta_channel_history)."""
+        return self._run_sync(self.aget_delta_channel_history(config=config, channels=channels))
 
     def put(
         self,
