@@ -15,12 +15,15 @@ from uuid import uuid4
 import psycopg
 import pytest
 from langgraph.checkpoint.base import BaseCheckpointSaver, empty_checkpoint
-from langgraph.graph import START, StateGraph
 
 from langchain_cockroachdb.checkpointer.async_saver import AsyncCockroachDBSaver
 from langchain_cockroachdb.checkpointer.saver import CockroachDBSaver
 
+# The minimum-dependency job installs langgraph-checkpoint without langgraph,
+# and DeltaChannel is only in recent langgraph releases.
+pytest.importorskip("langgraph.graph")
 DeltaChannel = pytest.importorskip("langgraph.channels.delta").DeltaChannel
+from langgraph.graph import START, StateGraph  # noqa: E402
 
 CHANNELS = ["items", "tags", "never_written"]
 
