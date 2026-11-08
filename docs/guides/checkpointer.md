@@ -316,6 +316,41 @@ with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
     print("Completed:", result["messages"][-1])
 ```
 
+### Crash Recovery and Durability Modes
+
+LangGraph decides when a checkpoint is written through the `durability`
+argument of `invoke`, `stream` and their async versions. See LangGraph's
+[durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes).
+
+- `"sync"`: each checkpoint is written before the next step starts.
+- `"async"`: each checkpoint is written in the background while the next step
+  runs. This is LangGraph's default.
+- `"exit"`: state is written only when the run ends.
+
+With `"async"`, a process that dies shortly after a step can lose that step's
+checkpoint, and with it the record of a tool call the model made. After a
+restart the graph resumes from an older checkpoint, so the model can plan the
+same call again under a new tool-call ID. An idempotency key built from the
+tool-call ID does not catch that repeat, because the ID it was built from was
+never saved.
+
+When a crash between steps matters, for example when tools charge cards, send
+messages or change other systems, pass `durability="sync"`:
+
+```python
+result = app.invoke(inputs, config, durability="sync")
+```
+
+`"sync"` adds a write to CockroachDB before each step. Keep `"async"` where
+losing the last step is acceptable, such as a chat turn the user can repeat.
+
+Even with `"sync"`, a node that was interrupted or did not finish runs again
+from its first line when the graph resumes, so a tool that reached an external
+service before the crash can run twice. Make such tools idempotent. Derive a
+key from state that was saved before the tool ran, such as the thread ID and the
+tool-call ID, and have the receiving service ignore a repeated key and return the
+original result.
+
 ### Application-process Recovery
 
 For application-crash recovery coverage, see the
