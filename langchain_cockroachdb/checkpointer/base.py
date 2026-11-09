@@ -134,14 +134,16 @@ where bl.thread_id = %s
     and (bl.channel, bl.version) = ANY(%s)
 """
 
-# Fetch pending writes for a single checkpoint.
+# Fetch pending writes for a single checkpoint. LangGraph applies a step's
+# writes in writes_sort_key order (task_path, task_id, idx) and replays stored
+# writes in the order they are returned, so they must come back in that order.
 SELECT_WRITES_SQL = """
 select cw.task_id, cw.channel, cw.type, cw.blob
 from checkpoint_writes cw
 where cw.thread_id = %s
     and cw.checkpoint_ns = %s
     and cw.checkpoint_id = %s
-order by cw.task_id, cw.idx
+order by cw.task_path, cw.task_id, cw.idx
 """
 
 # Batch fetch: blobs for multiple checkpoints in one query.
@@ -169,7 +171,7 @@ from checkpoint_writes cw
 where cw.thread_id = %s
     and cw.checkpoint_ns = %s
     and cw.checkpoint_id = ANY(%s)
-order by cw.checkpoint_id, cw.task_id, cw.idx
+order by cw.checkpoint_id, cw.task_path, cw.task_id, cw.idx
 """
 
 SELECT_PENDING_SENDS_SQL = f"""
@@ -221,6 +223,62 @@ INSERT_MIGRATION_SQL = (
     "INSERT INTO checkpoint_migrations (v) VALUES (%s) ON CONFLICT (v) DO NOTHING"
 )
 
+# One page of a checkpoint's parent chain, starting at the checkpoint itself
+# and newest first. Follows parent_checkpoint_id, so a forked thread yields
+# only the ancestors on its own path.
+SELECT_PARENT_CHAIN_SQL = """
+WITH RECURSIVE chain (checkpoint_id, parent_checkpoint_id, depth) AS (
+    SELECT checkpoint_id, parent_checkpoint_id, 1
+    FROM checkpoints
+    WHERE thread_id = %(thread_id)s
+        AND checkpoint_ns = %(checkpoint_ns)s
+        AND checkpoint_id = %(checkpoint_id)s
+    UNION ALL
+    SELECT c.checkpoint_id, c.parent_checkpoint_id, chain.depth + 1
+    FROM chain
+    JOIN checkpoints c
+        ON c.thread_id = %(thread_id)s
+        AND c.checkpoint_ns = %(checkpoint_ns)s
+        AND c.checkpoint_id = chain.parent_checkpoint_id
+    WHERE chain.depth < %(limit)s
+)
+SELECT checkpoint_id FROM chain ORDER BY depth
+"""
+
+
+class _DeltaHistoryWalk:
+    """Collect DeltaChannel history over ancestors visited newest first.
+
+    This is the accumulation in BaseCheckpointSaver.get_delta_channel_history,
+    kept the same so the result is the same. Only how the ancestors are
+    fetched differs: in pages, not one get_tuple per ancestor.
+    """
+
+    def __init__(self, channels: Sequence[str]) -> None:
+        self.channels = list(channels)
+        self.collected: dict[str, list[Any]] = {c: [] for c in self.channels}
+        self.seed: dict[str, Any] = {}
+        self.remaining = set(self.channels)
+
+    def visit(self, tup: CheckpointTuple) -> None:
+        if tup.pending_writes:
+            for write in reversed(tup.pending_writes):
+                if write[1] in self.remaining:
+                    self.collected[write[1]].append(write)
+        for channel in list(self.remaining):
+            if channel in tup.checkpoint["channel_values"]:
+                self.seed[channel] = tup.checkpoint["channel_values"][channel]
+                self.remaining.discard(channel)
+
+    def result(self) -> dict[str, Any]:
+        history: dict[str, Any] = {}
+        for channel in self.channels:
+            entry: dict[str, Any] = {"writes": list(reversed(self.collected[channel]))}
+            if channel in self.seed:
+                entry["seed"] = self.seed[channel]
+            history[channel] = entry
+        return history
+
 
 class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     """Base class for CockroachDB checkpoint savers.
@@ -243,7 +301,30 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     UPSERT_CHECKPOINT_WRITES_SQL = UPSERT_CHECKPOINT_WRITES_SQL
     INSERT_CHECKPOINT_WRITES_SQL = INSERT_CHECKPOINT_WRITES_SQL
     INSERT_MIGRATION_SQL = INSERT_MIGRATION_SQL
+    SELECT_PARENT_CHAIN_SQL = SELECT_PARENT_CHAIN_SQL
+    # Most ancestors fetched per round trip when rebuilding DeltaChannel history.
+    # Pages start at DELTA_HISTORY_FIRST_PAGE and grow fourfold up to this.
+    # Sizes below 1 count as 1.
+    DELTA_HISTORY_PAGE_SIZE = 256
+    DELTA_HISTORY_FIRST_PAGE = 16
     supports_pipeline: bool
+
+    def _chain_page_params(self, start: RunnableConfig, limit: int) -> dict[str, Any]:
+        configurable = start["configurable"]
+        return {
+            "thread_id": configurable["thread_id"],
+            "checkpoint_ns": configurable.get("checkpoint_ns", ""),
+            "checkpoint_id": get_checkpoint_id(start),
+            "limit": limit,
+        }
+
+    def _chain_tuples_query(self, start: RunnableConfig, ids: list[str]) -> tuple[str, list[Any]]:
+        configurable = start["configurable"]
+        return (
+            self.SELECT_SQL
+            + "WHERE thread_id = %s AND checkpoint_ns = %s AND checkpoint_id = ANY(%s)",
+            [configurable["thread_id"], configurable.get("checkpoint_ns", ""), ids],
+        )
 
     @staticmethod
     def _validate_ttl_params(ttl_interval: str, cron: str) -> None:

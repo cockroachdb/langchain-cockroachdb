@@ -15,6 +15,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from functools import partial
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -36,7 +37,11 @@ from psycopg_pool import ConnectionPool
 from langchain_cockroachdb import _psycopg_conn
 from langchain_cockroachdb._connection import to_libpq_url
 from langchain_cockroachdb._psycopg_ops import PsycopgOps
-from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver, connection_options
+from langchain_cockroachdb.checkpointer.base import (
+    BaseCockroachDBSaver,
+    _DeltaHistoryWalk,
+    connection_options,
+)
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
@@ -220,10 +225,10 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
             params.append(int(limit))
         yield from self._retry(lambda: self._fetch_list(query, params), label="list checkpoints")
 
-    def _fetch_list(self, query: str, params: builtins.list[Any]) -> builtins.list[CheckpointTuple]:
-        with self._cursor(
-            timeout=self.retry_policy.attempt_timeout, label="list checkpoints"
-        ) as cur:
+    def _fetch_list(
+        self, query: str, params: builtins.list[Any], *, label: str = "list checkpoints"
+    ) -> builtins.list[CheckpointTuple]:
+        with self._cursor(timeout=self.retry_policy.attempt_timeout, label=label) as cur:
             cur.execute(query, params, binary=True)
             values = cur.fetchall()
             if not values:
@@ -313,6 +318,66 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
                     self._migrate_pending_sends(sends["sends"], value["checkpoint"], blob_values)
                     value["_blob_values"] = blob_values
             return self._load_checkpoint_tuple_with_cursor(cur, value)
+
+    def get_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, Any]:
+        """Rebuild DeltaChannel history for a checkpoint.
+
+        LangGraph's default walks the parent chain with one get_tuple per
+        ancestor, which is three queries per ancestor. This fetches the chain
+        a page at a time instead, in pages that grow up to DELTA_HISTORY_PAGE_SIZE,
+        and returns the same result.
+
+        Args:
+            config: Config identifying the checkpoint.
+            channels: DeltaChannel names to rebuild.
+
+        Returns:
+            Per-channel writes, and the seed value where one was found.
+        """
+        if not channels:
+            return {}
+        walk = _DeltaHistoryWalk(channels)
+        target = self.get_tuple(config)
+        start = target.parent_config if target else None
+        # A page always holds its start row, so a limit below 1 would make the
+        # first page look like the end of the chain
+        limit = max(1, min(self.DELTA_HISTORY_FIRST_PAGE, self.DELTA_HISTORY_PAGE_SIZE))
+        while start is not None and walk.remaining:
+            page = self._retry(
+                partial(self._fetch_chain_page, start, limit), label="get delta channel history"
+            )
+            for tup in page:
+                walk.visit(tup)
+                if not walk.remaining:
+                    break
+            start = page[-1].parent_config if page and len(page) == limit else None
+            limit = max(1, min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE))
+        return walk.result()
+
+    def _fetch_chain_page(
+        self, start: RunnableConfig, limit: int
+    ) -> builtins.list[CheckpointTuple]:
+        with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="get delta channel history"
+        ) as cur:
+            cur.execute(self.SELECT_PARENT_CHAIN_SQL, self._chain_page_params(start, limit))
+            ids = [row["checkpoint_id"] for row in cur.fetchall()]
+        if not ids:
+            return []
+        query, params = self._chain_tuples_query(start, ids)
+        by_id = {
+            tup.config["configurable"]["checkpoint_id"]: tup
+            for tup in self._fetch_list(query, params, label="get delta channel history")
+        }
+        # Keep chain order and stop at the first missing ancestor, as the default does
+        page = []
+        for checkpoint_id in ids:
+            if checkpoint_id not in by_id:
+                break
+            page.append(by_id[checkpoint_id])
+        return page
 
     def put(
         self,
