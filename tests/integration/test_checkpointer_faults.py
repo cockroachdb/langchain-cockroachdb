@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 import psycopg
 import pytest
 import pytest_asyncio
-from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.base import BaseCheckpointSaver, empty_checkpoint
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
@@ -165,6 +165,74 @@ def test_pipeline_mode_saver_recovers_from_retryable_errors(libpq_url, unsafe_in
         saver.delete_thread(thread)
         assert saver.get_tuple(config(thread)) is None
         assert faults.injected == ["40001"] * 5
+
+
+# Only recent langgraph-checkpoint releases have the default history walk to compare with
+needs_delta_history = pytest.mark.skipif(
+    not hasattr(BaseCheckpointSaver, "get_delta_channel_history"),
+    reason="langgraph-checkpoint has no get_delta_channel_history",
+)
+# Two statements of a history page to fail: the parent chain, then the page's checkpoints
+HISTORY_PAGE_STATEMENTS = ["with recursive chain", "checkpoint_id = any("]
+
+
+def history_checkpoint() -> dict:
+    """An empty checkpoint in version 4, as LangGraph's graphs write them.
+
+    Reading an older version also reads its pending sends, a statement that
+    matches "checkpoint_id = any(" before the history page does.
+    """
+    return {**empty_checkpoint(), "v": 4}
+
+
+def history_chain(saver: CockroachDBSaver, thread: str) -> dict:
+    """Save six checkpoints, each the child of the last, each with a write to "items".
+
+    None stores a value for "items", so its history reaches the root.
+    """
+    saved = config(thread)
+    for step in range(6):
+        saved = saver.put(saved, history_checkpoint(), {"step": step}, {})
+        saver.put_writes(saved, [("items", [step])], task_id=f"task-{step}")
+    return saved
+
+
+def assert_history_read_retried(caplog: pytest.LogCaptureFixture, times: int) -> None:
+    prefix = "Retrying get delta channel history after "
+    retries = [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+    assert len(retries) == times
+    assert all("SQLSTATE 40001" in message for message in retries)
+
+
+@needs_delta_history
+def test_pipeline_mode_saver_retries_delta_channel_history_reads(
+    libpq_url, unsafe_internals, caplog
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    app = app_name()
+    with CockroachDBSaver.from_conn_string(
+        libpq_url,
+        pipeline=True,
+        retry_policy=FAST,
+        connect_kwargs={"cursor_factory": faults.cursor_class(), "application_name": app},
+    ) as saver:
+        saver.setup()
+        # Pages of two, then eight, so the history takes more than one page
+        saver.DELTA_HISTORY_FIRST_PAGE = 2
+        thread = str(uuid.uuid4())
+        target = history_chain(saver, thread)
+        expected = BaseCheckpointSaver.get_delta_channel_history(
+            saver, config=target, channels=["items"]
+        )
+        assert len(expected["items"]["writes"]) == 5
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            for statement in HISTORY_PAGE_STATEMENTS:
+                faults.fail_next("40001", match=statement)
+                history = saver.get_delta_channel_history(config=target, channels=["items"])
+                assert history == expected
+        saver.delete_thread(thread)
+        assert faults.injected == ["40001"] * 2
+        assert_history_read_retried(caplog, 2)
 
 
 def test_sync_saver_raises_non_retryable_errors_once(sync_pool, unsafe_internals) -> None:
@@ -519,6 +587,46 @@ async def test_pipeline_mode_async_saver_recovers_from_retryable_errors(
         await saver.adelete_thread(thread)
         assert await saver.aget_tuple(config(thread)) is None
         assert faults.injected == ["40001"] * 5
+
+
+async def ahistory_chain(saver: AsyncCockroachDBSaver, thread: str) -> dict:
+    """history_chain for the async saver."""
+    saved = config(thread)
+    for step in range(6):
+        saved = await saver.aput(saved, history_checkpoint(), {"step": step}, {})
+        await saver.aput_writes(saved, [("items", [step])], task_id=f"task-{step}")
+    return saved
+
+
+@needs_delta_history
+async def test_pipeline_mode_async_saver_retries_delta_channel_history_reads(
+    libpq_url, unsafe_internals, caplog
+) -> None:
+    faults = PsycopgFaults(unsafe_internals)
+    app = app_name()
+    async with AsyncCockroachDBSaver.from_conn_string(
+        libpq_url,
+        pipeline=True,
+        retry_policy=FAST,
+        connect_kwargs={"cursor_factory": faults.async_cursor_class(), "application_name": app},
+    ) as saver:
+        await saver.setup()
+        # Pages of two, then eight, so the history takes more than one page
+        saver.DELTA_HISTORY_FIRST_PAGE = 2
+        thread = str(uuid.uuid4())
+        target = await ahistory_chain(saver, thread)
+        expected = await BaseCheckpointSaver.aget_delta_channel_history(
+            saver, config=target, channels=["items"]
+        )
+        assert len(expected["items"]["writes"]) == 5
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            for statement in HISTORY_PAGE_STATEMENTS:
+                faults.fail_next("40001", match=statement)
+                history = await saver.aget_delta_channel_history(config=target, channels=["items"])
+                assert history == expected
+        await saver.adelete_thread(thread)
+        assert faults.injected == ["40001"] * 2
+        assert_history_read_retried(caplog, 2)
 
 
 @pytest.mark.parametrize("phrases", ["default", "none"])
