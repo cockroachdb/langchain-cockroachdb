@@ -1454,6 +1454,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_delta_channel_history
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_tuple" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1570,6 +1581,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aget_delta_channel_history
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_tuple" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1629,6 +1651,17 @@
     <span class="md-ellipsis">
       
         from_conn_string
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.get_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_delta_channel_history
       
     </span>
   </a>
@@ -2212,6 +2245,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_delta_channel_history
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_tuple" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2328,6 +2372,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        aget_delta_channel_history
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_tuple" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2387,6 +2442,17 @@
     <span class="md-ellipsis">
       
         from_conn_string
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.get_delta_channel_history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_delta_channel_history
       
     </span>
   </a>
@@ -2945,6 +3011,98 @@ refuse it. <code>max_attempts=1</code> turns this off.</p>
             <td>
               <div class="doc-md-description">
                 <p>CockroachDBSaver instance.</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_delta_channel_history" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">get_delta_channel_history</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">channels</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.checkpointer.saver.CockroachDBSaver.get_delta_channel_history" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Rebuild DeltaChannel history for a checkpoint.</p>
+<p>LangGraph's default walks the parent chain with one get_tuple per
+ancestor, which is three queries per ancestor. This fetches the chain
+a page at a time instead, in pages that grow up to DELTA_HISTORY_PAGE_SIZE,
+and returns the same result.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>config</code>
+            </td>
+            <td>
+                  <code><span title="langchain_core.runnables.RunnableConfig">RunnableConfig</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Config identifying the checkpoint.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>channels</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Sequence">Sequence</span>[<span title="str">str</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>DeltaChannel names to rebuild.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="collections.abc.Mapping">Mapping</span>[<span title="str">str</span>, <span title="typing.Any">Any</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Per-channel writes, and the seed value where one was found.</p>
               </div>
             </td>
           </tr>
@@ -3626,6 +3784,102 @@ refuse it. <code>max_attempts=1</code> turns this off.</p>
 <div class="doc doc-object doc-function">
 
 
+<h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_delta_channel_history" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">aget_delta_channel_history</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">channels</span><span class="p">)</span></code>
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-async"><code>async</code></small>
+  </span>
+
+<a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_delta_channel_history" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Rebuild DeltaChannel history for a checkpoint asynchronously.</p>
+<p>LangGraph's default walks the parent chain with one aget_tuple per
+ancestor, which is three queries per ancestor. This fetches the chain
+a page at a time instead, in pages that grow up to DELTA_HISTORY_PAGE_SIZE,
+and returns the same result.</p>
+
+
+<p><span class="doc-section-title">Parameters:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Description</th>
+          <th>Default</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                <code>config</code>
+            </td>
+            <td>
+                  <code><span title="langchain_core.runnables.RunnableConfig">RunnableConfig</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Config identifying the checkpoint.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>channels</code>
+            </td>
+            <td>
+                  <code><span title="collections.abc.Sequence">Sequence</span>[<span title="str">str</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>DeltaChannel names to rebuild.</p>
+              </div>
+            </td>
+            <td>
+                <em>required</em>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    <p><span class="doc-section-title">Returns:</span></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+          <tr class="doc-section-item">
+            <td>
+                  <code><span title="collections.abc.Mapping">Mapping</span>[<span title="str">str</span>, <span title="typing.Any">Any</span>]</code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Per-channel writes, and the seed value where one was found.</p>
+              </div>
+            </td>
+          </tr>
+      </tbody>
+    </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
 <h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.aget_tuple" class="doc doc-heading">
             <code class="highlight language-python"><span class="n">aget_tuple</span><span class="p">(</span><span class="n">config</span><span class="p">)</span></code>
 
@@ -4241,6 +4495,24 @@ afterwards, so no connection or lock is held while the caller iterates.</p>
           </tr>
       </tbody>
     </table>
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.get_delta_channel_history" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">get_delta_channel_history</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">channels</span><span class="p">)</span></code>
+
+<a href="#langchain_cockroachdb.checkpointer.async_saver.AsyncCockroachDBSaver.get_delta_channel_history" class="headerlink" title="Permanent link">&para;</a></h3>
+
+
+    <div class="doc doc-contents ">
+
+        <p>Rebuild DeltaChannel history (sync wrapper for aget_delta_channel_history).</p>
 
 
     </div>
