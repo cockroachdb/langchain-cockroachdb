@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LangGraph integration tests that kill and restart concurrent sync and async applications using pooled checkpointers, covering approval resume, pending-write reuse, thread separation and node replay with synchronous checkpoint durability.
 - Virtual-cluster connection coverage and documentation for engines, chat history, the checkpointers and the long-term memory store. Unit tests check connection-string handling across the supported URL schemes, and opt-in integration tests run vector operations, chat history, and sync/async checkpoints against two virtual clusters on a Continuum host cluster and confirm each virtual cluster's data stays isolated after its peer is deleted from. The guide covers managed Continuum virtual clusters, each with its own connection string, and self-hosted cluster selection with the `-ccluster` startup option, which libpq requires percent-encoded.
 - LangGraph integration tests for sync and async pooled checkpointers that replace closed connections, surface retry exhaustion after three attempts, and resume explicitly using persisted pending writes without repeating a completed node.
+- A checkpointer guide section on LangGraph's durability modes. It explains that LangGraph's default, `"async"`, can lose the last checkpoint and the tool call recorded in it when the process dies, why an idempotency key built from the tool-call ID does not catch the repeat that follows, and when to pass `durability="sync"`.
 
 ## [0.5.1] - 2026-10-28
 
