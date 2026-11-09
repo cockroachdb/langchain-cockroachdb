@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -1116,6 +1116,17 @@
     <span class="md-ellipsis">
       
         Human-in-the-Loop
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#crash-recovery-and-durability-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Crash Recovery and Durability Modes
       
     </span>
   </a>
@@ -2468,6 +2479,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#crash-recovery-and-durability-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Crash Recovery and Durability Modes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#application-process-recovery" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2961,6 +2983,34 @@
 <a id="__codelineno-14-40" name="__codelineno-14-40" href="#__codelineno-14-40"></a>    <span class="n">result</span> <span class="o">=</span> <span class="n">app</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
 <a id="__codelineno-14-41" name="__codelineno-14-41" href="#__codelineno-14-41"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Completed:"</span><span class="p">,</span> <span class="n">result</span><span class="p">[</span><span class="s2">"messages"</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
 </code></pre></div>
+<h3 id="crash-recovery-and-durability-modes">Crash Recovery and Durability Modes<a class="headerlink" href="#crash-recovery-and-durability-modes" title="Permanent link">&para;</a></h3>
+<p>LangGraph decides when a checkpoint is written through the <code>durability</code>
+argument of <code>invoke</code>, <code>stream</code> and their async versions. See LangGraph's
+<a href="https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes">durability modes</a>.</p>
+<ul>
+<li><code>"sync"</code>: each checkpoint is written before the next step starts.</li>
+<li><code>"async"</code>: each checkpoint is written in the background while the next step
+  runs. This is LangGraph's default.</li>
+<li><code>"exit"</code>: state is written only when the run ends.</li>
+</ul>
+<p>With <code>"async"</code>, a process that dies shortly after a step can lose that step's
+checkpoint, and with it the record of a tool call the model made. After a
+restart the graph resumes from an older checkpoint, so the model can plan the
+same call again under a new tool-call ID. An idempotency key built from the
+tool-call ID does not catch that repeat, because the ID it was built from was
+never saved.</p>
+<p>When a crash between steps matters, for example when tools charge cards, send
+messages or change other systems, pass <code>durability="sync"</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">result</span> <span class="o">=</span> <span class="n">app</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">durability</span><span class="o">=</span><span class="s2">"sync"</span><span class="p">)</span>
+</code></pre></div>
+<p><code>"sync"</code> adds a write to CockroachDB before each step. Keep <code>"async"</code> where
+losing the last step is acceptable, such as a chat turn the user can repeat.</p>
+<p>Even with <code>"sync"</code>, a node that was interrupted or did not finish runs again
+from its first line when the graph resumes, so a tool that reached an external
+service before the crash can run twice. Make such tools idempotent. Derive a
+key from state that was saved before the tool ran, such as the thread ID and the
+tool-call ID, and have the receiving service ignore a repeated key and return the
+original result.</p>
 <h3 id="application-process-recovery">Application-process Recovery<a class="headerlink" href="#application-process-recovery" title="Permanent link">&para;</a></h3>
 <p>For application-crash recovery coverage, see the
 <a href="../../development/testing/#application-process-recovery">process-recovery tests</a>.
@@ -2998,21 +3048,21 @@ application-level idempotency or reconciliation.</p>
 <h2 id="row-level-ttl">Row-Level TTL<a class="headerlink" href="#row-level-ttl" title="Permanent link">&para;</a></h2>
 <p>CockroachDB supports automatic deletion of expired rows via <a href="https://www.cockroachlabs.com/docs/stable/row-level-ttl">Row-Level TTL</a>. The checkpointer exposes this as an opt-in feature for automatic cleanup of old checkpoint data.</p>
 <h3 id="enabling-ttl">Enabling TTL<a class="headerlink" href="#enabling-ttl" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># Sync</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">with</span> <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">saver</span><span class="p">:</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>
-<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>    <span class="c1"># Expire checkpoints older than 30 days, clean up daily</span>
-<a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s2">"30 days"</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s2">"@daily"</span><span class="p">)</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>
-<a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="c1"># Async</span>
-<a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncCockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">saver</span><span class="p">:</span>
-<a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>    <span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
-<a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>    <span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">aenable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s2">"7 days"</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s2">"@hourly"</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1"># Sync</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">with</span> <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">saver</span><span class="p">:</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>    <span class="c1"># Expire checkpoints older than 30 days, clean up daily</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s2">"30 days"</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s2">"@daily"</span><span class="p">)</span>
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a><span class="c1"># Async</span>
+<a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a><span class="k">async</span> <span class="k">with</span> <span class="n">AsyncCockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">saver</span><span class="p">:</span>
+<a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a>    <span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a>    <span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">aenable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s2">"7 days"</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s2">"@hourly"</span><span class="p">)</span>
 </code></pre></div>
 <h3 id="disabling-ttl">Disabling TTL<a class="headerlink" href="#disabling-ttl" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="n">saver</span><span class="o">.</span><span class="n">disable_ttl</span><span class="p">()</span>       <span class="c1"># sync</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">adisable_ttl</span><span class="p">()</span>  <span class="c1"># async</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="n">saver</span><span class="o">.</span><span class="n">disable_ttl</span><span class="p">()</span>       <span class="c1"># sync</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">adisable_ttl</span><span class="p">()</span>  <span class="c1"># async</span>
 </code></pre></div>
 <h3 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h3>
 <ul>
@@ -3047,9 +3097,9 @@ application-level idempotency or reconciliation.</p>
 <p>The <code>from_conn_string()</code> factory automatically converts <code>cockroachdb://</code> URLs to <code>postgresql://</code> for psycopg compatibility.</p>
 <h3 id="explicit-table-function-aliases">Explicit Table Function Aliases<a class="headerlink" href="#explicit-table-function-aliases" title="Permanent link">&para;</a></h3>
 <p>CockroachDB requires explicit aliases for set-returning functions like <code>jsonb_each_text()</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="c1">-- Required for CockroachDB:</span>
-<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">jsonb_each_text</span><span class="p">(</span><span class="k">checkpoint</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="s1">'channel_versions'</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">jt</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="c1">-- Not: FROM jsonb_each_text(checkpoint -&gt; 'channel_versions')</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="c1">-- Required for CockroachDB:</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">jsonb_each_text</span><span class="p">(</span><span class="k">checkpoint</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="s1">'channel_versions'</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">jt</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="c1">-- Not: FROM jsonb_each_text(checkpoint -&gt; 'channel_versions')</span>
 </code></pre></div>
 <h2 id="comparison-with-postgressaver">Comparison with PostgresSaver<a class="headerlink" href="#comparison-with-postgressaver" title="Permanent link">&para;</a></h2>
 <table>
@@ -3183,7 +3233,7 @@ application-level idempotency or reconciliation.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
     
   </body>

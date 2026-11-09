@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -2478,6 +2478,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>LangGraph integration tests that kill and restart concurrent sync and async applications using pooled checkpointers, covering approval resume, pending-write reuse, thread separation and node replay with synchronous checkpoint durability.</li>
 <li>Virtual-cluster connection coverage and documentation for engines, chat history, the checkpointers and the long-term memory store. Unit tests check connection-string handling across the supported URL schemes, and opt-in integration tests run vector operations, chat history, and sync/async checkpoints against two virtual clusters on a Continuum host cluster and confirm each virtual cluster's data stays isolated after its peer is deleted from. The guide covers managed Continuum virtual clusters, each with its own connection string, and self-hosted cluster selection with the <code>-ccluster</code> startup option, which libpq requires percent-encoded.</li>
 <li>LangGraph integration tests for sync and async pooled checkpointers that replace closed connections, surface retry exhaustion after three attempts, and resume explicitly using persisted pending writes without repeating a completed node.</li>
+<li>A checkpointer guide section on LangGraph's durability modes. It explains that LangGraph's default, <code>"async"</code>, can lose the last checkpoint and the tool call recorded in it when the process dies, why an idempotency key built from the tool-call ID does not catch the repeat that follows, and when to pass <code>durability="sync"</code>.</li>
 </ul>
 <h2 id="051-2026-10-28">[0.5.1] - 2026-10-28<a class="headerlink" href="#051-2026-10-28" title="Permanent link">&para;</a></h2>
 <h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
@@ -2706,7 +2707,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
     
   </body>
