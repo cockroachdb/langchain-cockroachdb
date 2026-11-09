@@ -132,17 +132,24 @@ def test_reloaded_state_keeps_the_order_the_run_produced(libpq_url: str) -> None
     # Each step's two parallel nodes write the same delta channel. LangGraph
     # applies a step's writes in (task_path, task_id, idx) order, so a reload
     # must replay them in that order too, not in task_id (hash) order.
+    # Each invoke starts from state rebuilt from the stored history, so only
+    # its own steps are in run order: compare after every invoke. A turn that
+    # ends on a snapshot of "items" stores the run's order, so it checks
+    # nothing. In each other turn, task_id order differs from run order half
+    # the time. 16 turns check 11, so task_id order passes 1 time in 2048.
     thread_id = f"delta-{uuid4()}"
     config = {"configurable": {"thread_id": thread_id}}
     try:
-        with CockroachDBSaver.from_conn_string(libpq_url) as saver:
+        with (
+            CockroachDBSaver.from_conn_string(libpq_url) as saver,
+            CockroachDBSaver.from_conn_string(libpq_url) as fresh,
+        ):
             saver.setup()
-            graph = _graph(saver)
-            for _ in range(8):
+            graph, reloader = _graph(saver), _graph(fresh)
+            for turn in range(1, 17):
                 live = graph.invoke({"items": ["in"]}, config)
-        with CockroachDBSaver.from_conn_string(libpq_url) as fresh:
-            reloaded = _graph(fresh).get_state(config).values["items"]
-        assert reloaded == live["items"]
+                reloaded = reloader.get_state(config).values["items"]
+                assert reloaded == live["items"], f"turn {turn}"
     finally:
         with CockroachDBSaver.from_conn_string(libpq_url) as saver:
             saver.delete_thread(thread_id)
@@ -167,12 +174,22 @@ def test_pending_writes_follow_writes_sort_key(libpq_url: str) -> None:
             saver.delete_thread(thread_id)
 
 
+def _pages(saver: Any, ancestors: int) -> int:
+    """How many pages the override reads to cover ``ancestors`` checkpoints."""
+    pages, size = 0, max(1, saver.DELTA_HISTORY_FIRST_PAGE)
+    while ancestors > 0:
+        pages, ancestors = pages + 1, ancestors - size
+        size = max(1, min(size * 4, saver.DELTA_HISTORY_PAGE_SIZE))
+    return pages
+
+
 def test_fewer_statements_than_the_default(libpq_url: str, monkeypatch: Any) -> None:
     thread_id = f"delta-{uuid4()}"
     with CockroachDBSaver.from_conn_string(libpq_url) as saver:
         saver.setup()
         try:
             config = _run(_graph(saver), thread_id, turns=10)
+            checkpoints = len(list(saver.list(config)))
             target = next(iter(saver.list(config, limit=1))).config
             statements = 0
             execute = psycopg.Cursor.execute
@@ -188,12 +205,14 @@ def test_fewer_statements_than_the_default(libpq_url: str, monkeypatch: Any) -> 
             statements = 0
             saver.get_delta_channel_history(config=target, channels=CHANNELS)
             monkeypatch.undo()
-            # "tags" and "never_written" have no snapshot, so both walks reach the
-            # root, about 30 ancestors. The default reads them one get_tuple (three
-            # statements) at a time. The override reads the target, then two pages
-            # (16, then up to 64 ancestors), four statements each.
-            assert statements <= 3 + 2 * 4
-            assert default >= 3 * 30
+            # "tags" and "never_written" have no snapshot, so both walks read every
+            # checkpoint of the thread. The default reads each with get_tuple, at
+            # least two statements: the checkpoint and its writes, plus its blobs
+            # if it has any. The override reads the target with get_tuple, then
+            # the ancestors in growing pages, four statements a page: the chain,
+            # then the page's checkpoints, blobs and writes.
+            assert default >= 2 * checkpoints
+            assert statements <= 3 + 4 * _pages(saver, checkpoints - 1)
         finally:
             saver.delete_thread(thread_id)
 

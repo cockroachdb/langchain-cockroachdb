@@ -304,21 +304,22 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     SELECT_PARENT_CHAIN_SQL = SELECT_PARENT_CHAIN_SQL
     # Most ancestors fetched per round trip when rebuilding DeltaChannel history.
     # Pages start at DELTA_HISTORY_FIRST_PAGE and grow fourfold up to this.
+    # Sizes below 1 count as 1.
     DELTA_HISTORY_PAGE_SIZE = 256
     DELTA_HISTORY_FIRST_PAGE = 16
     supports_pipeline: bool
 
-    def _chain_page_params(self, cursor: RunnableConfig, limit: int) -> dict[str, Any]:
-        configurable = cursor["configurable"]
+    def _chain_page_params(self, start: RunnableConfig, limit: int) -> dict[str, Any]:
+        configurable = start["configurable"]
         return {
             "thread_id": configurable["thread_id"],
             "checkpoint_ns": configurable.get("checkpoint_ns", ""),
-            "checkpoint_id": get_checkpoint_id(cursor),
+            "checkpoint_id": get_checkpoint_id(start),
             "limit": limit,
         }
 
-    def _chain_tuples_query(self, cursor: RunnableConfig, ids: list[str]) -> tuple[str, list[Any]]:
-        configurable = cursor["configurable"]
+    def _chain_tuples_query(self, start: RunnableConfig, ids: list[str]) -> tuple[str, list[Any]]:
+        configurable = start["configurable"]
         return (
             self.SELECT_SQL
             + "WHERE thread_id = %s AND checkpoint_ns = %s AND checkpoint_id = ANY(%s)",

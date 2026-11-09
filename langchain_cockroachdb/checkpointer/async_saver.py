@@ -285,11 +285,9 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
             yield item
 
     async def _fetch_list(
-        self, query: str, params: builtins.list[Any]
+        self, query: str, params: builtins.list[Any], *, label: str = "list checkpoints"
     ) -> builtins.list[CheckpointTuple]:
-        async with self._cursor(
-            timeout=self.retry_policy.attempt_timeout, label="list checkpoints"
-        ) as cur:
+        async with self._cursor(timeout=self.retry_policy.attempt_timeout, label=label) as cur:
             await cur.execute(query, params, binary=True)
             values = await cur.fetchall()
             if not values:
@@ -406,34 +404,36 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
             return {}
         walk = _DeltaHistoryWalk(channels)
         target = await self.aget_tuple(config)
-        cursor = target.parent_config if target else None
-        limit = min(self.DELTA_HISTORY_FIRST_PAGE, self.DELTA_HISTORY_PAGE_SIZE)
-        while cursor is not None and walk.remaining:
+        start = target.parent_config if target else None
+        # A page always holds its start row, so a limit below 1 would make the
+        # first page look like the end of the chain
+        limit = max(1, min(self.DELTA_HISTORY_FIRST_PAGE, self.DELTA_HISTORY_PAGE_SIZE))
+        while start is not None and walk.remaining:
             page = await self._retry(
-                partial(self._fetch_chain_page, cursor, limit), label="get delta channel history"
+                partial(self._fetch_chain_page, start, limit), label="get delta channel history"
             )
             for tup in page:
                 walk.visit(tup)
                 if not walk.remaining:
                     break
-            cursor = page[-1].parent_config if page and len(page) == limit else None
-            limit = min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE)
+            start = page[-1].parent_config if page and len(page) == limit else None
+            limit = max(1, min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE))
         return walk.result()
 
     async def _fetch_chain_page(
-        self, cursor: RunnableConfig, limit: int
+        self, start: RunnableConfig, limit: int
     ) -> builtins.list[CheckpointTuple]:
         async with self._cursor(
             timeout=self.retry_policy.attempt_timeout, label="get delta channel history"
         ) as cur:
-            await cur.execute(self.SELECT_PARENT_CHAIN_SQL, self._chain_page_params(cursor, limit))
+            await cur.execute(self.SELECT_PARENT_CHAIN_SQL, self._chain_page_params(start, limit))
             ids = [row["checkpoint_id"] for row in await cur.fetchall()]
         if not ids:
             return []
-        query, params = self._chain_tuples_query(cursor, ids)
+        query, params = self._chain_tuples_query(start, ids)
         by_id = {
             tup.config["configurable"]["checkpoint_id"]: tup
-            for tup in await self._fetch_list(query, params)
+            for tup in await self._fetch_list(query, params, label="get delta channel history")
         }
         # Keep chain order and stop at the first missing ancestor, as the default does
         page = []
