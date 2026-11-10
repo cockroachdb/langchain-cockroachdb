@@ -5,9 +5,9 @@ version and is written once, so a channel that has not changed since an
 early step keeps an old blob row that every newer checkpoint uses. These
 tests age rows with SQL, as time would, and check that a put refreshes the
 blob rows its checkpoint uses, that enable_ttl gives blob rows a grace,
-stores months and years as days, and refreshes once the blob rows of
-threads idle when it runs, and that the saver reads the TTL setting from
-the catalog. They delete expired rows the way the TTL job would, so they
+stores months and years as days, pauses TTL while every saver learns the
+new setting, and refreshes once the blob rows of threads idle when it runs,
+and that the saver reads the TTL setting from the catalog. They delete expired rows the way the TTL job would, so they
 need not wait for it. Each test has a database of its own, since TTL is a
 table setting.
 
@@ -353,7 +353,7 @@ def refresh_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.name == base.__name__ and r.getMessage().startswith("enable_ttl:")
+        if r.name == base.__name__ and "orward" in r.getMessage()
     ]
 
 
@@ -647,6 +647,188 @@ def test_a_ttl_setting_written_by_0_5_still_refreshes(libpq_url: str) -> None:
         # The window parsed from it is six minutes
         assert blob_age(url, "facts") < timedelta(minutes=1)
         assert timedelta(minutes=1) <= blob_age(url, "notes") < timedelta(minutes=6)
+
+
+def make_idle(url: str) -> None:
+    """Age the thread "idle" as if idle for 20 hours, inside an interval of one day.
+
+    Its profile is ten days old; its messages and turn rows were written
+    with its newest checkpoint.
+    """
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE checkpoints SET created_at = now() - INTERVAL '20 hours' "
+            "WHERE thread_id = 'idle'"
+        )
+        conn.execute(
+            "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '20 hours' "
+            "WHERE thread_id = 'idle'"
+        )
+        conn.execute(
+            "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '10 days' "
+            "WHERE thread_id = 'idle' AND channel = 'profile'"
+        )
+
+
+def expiry_margins(url: str, thread_id: str) -> dict[str, timedelta]:
+    """How long after the thread's latest checkpoint each blob row it uses expires, with TTL 1 day."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        rows = conn.execute(
+            "WITH latest AS (SELECT thread_id, checkpoint_ns, checkpoint, created_at "
+            "FROM checkpoints WHERE thread_id = %s ORDER BY checkpoint_id DESC LIMIT 1) "
+            "SELECT b.channel, (b.created_at + INTERVAL '1 day' + INTERVAL '1 day' / 10) "
+            "- (l.created_at + INTERVAL '1 day') "
+            "FROM latest AS l "
+            "CROSS JOIN LATERAL jsonb_each_text(l.checkpoint -> 'channel_versions') "
+            "AS v (channel, version) "
+            "JOIN checkpoint_blobs AS b ON b.thread_id = l.thread_id "
+            "AND b.checkpoint_ns = l.checkpoint_ns AND b.channel = v.channel "
+            "AND b.version = v.version",
+            [thread_id],
+        ).fetchall()
+    return {channel: margin for channel, margin in rows}
+
+
+def test_a_thread_written_while_the_pass_runs_keeps_its_rows(libpq_url: str) -> None:
+    """The case the pause closes.
+
+    Another saver read "TTL off" before enable_ttl. Once the pass has read
+    the idle thread's checkpoints, it writes a step on that thread that
+    changes neither its profile nor its messages. By then it has read the
+    paused setting, so it refreshes them. Without the pause it refreshed
+    nothing, and the messages row, which the pass left alone, expired 17
+    hours 36 minutes before the new checkpoint.
+    """
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver, sync_saver(url) as other:
+        thread = Thread(other, "idle")
+        thread.put(profile=PROFILE, messages=["m1"], turn=["t1"])
+        make_idle(url)
+        assert other._ttl_refresh_window() is None
+        read_page = saver._read_checkpoint_page
+
+        def put_after_the_page_is_read(*args: Any) -> Any:
+            page = read_page(*args)
+            if args[0] is None:
+                thread.put(turn=["t1", "t2"])
+            return page
+
+        saver._read_checkpoint_page = put_after_the_page_is_read  # type: ignore[method-assign]
+        saver.enable_ttl("1 day")
+        margins = expiry_margins(url, "idle")
+        assert set(margins) == {"profile", "messages", "turn"}
+        assert all(margin >= timedelta(0) for margin in margins.values()), margins
+
+
+async def test_async_a_thread_written_while_the_pass_runs_keeps_its_rows(libpq_url: str) -> None:
+    with fresh_database(libpq_url) as url:
+        async with async_saver(url) as saver, async_saver(url) as other:
+            thread = Thread(other, "idle")
+            await thread.aput(profile=PROFILE, messages=["m1"], turn=["t1"])
+            make_idle(url)
+            assert await other._ttl_refresh_window() is None
+            read_page = saver._read_checkpoint_page
+
+            async def put_after_the_page_is_read(*args: Any) -> Any:
+                page = await read_page(*args)
+                if args[0] is None:
+                    await thread.aput(turn=["t1", "t2"])
+                return page
+
+            saver._read_checkpoint_page = put_after_the_page_is_read  # type: ignore[method-assign]
+            await saver.aenable_ttl("1 day")
+            margins = expiry_margins(url, "idle")
+            assert set(margins) == {"profile", "messages", "turn"}
+            assert all(margin >= timedelta(0) for margin in margins.values()), margins
+
+
+def pause_as_a_stopped_run_leaves_it(url: str, saver: Any, interval: str, cron: str) -> None:
+    """Write the settings with TTL paused, as enable_ttl does before it waits."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        for statement in saver._ttl_plan(interval, cron).paused:
+            conn.execute(statement)
+
+
+def test_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        pause_as_a_stopped_run_leaves_it(url, saver, "1 hour", "@daily")
+        assert "ttl_pause=true" in ttl_options(url, "checkpoint_blobs")
+        thread = Thread(saver)
+        thread.put(facts=FACTS, messages=["hello"])
+        age(url, "facts", "2 hours")
+        # Puts refresh while TTL is paused
+        thread.put(messages=["hello", "hi"])
+        assert blob_age(url, "facts") < timedelta(minutes=1)
+        # The same interval again: the paused setting is a run that stopped,
+        # so this run refreshes and resumes TTL
+        saver.enable_ttl("1 hour")
+        assert len(refresh_logs(caplog)) == 2
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+            assert "ttl_pause=true" not in ttl_options(url, table)
+        assert_grace_written(url)
+
+
+async def test_async_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        async with async_saver(url) as saver:
+            pause_as_a_stopped_run_leaves_it(url, saver, "1 hour", "@daily")
+            thread = Thread(saver)
+            await thread.aput(facts=FACTS, messages=["hello"])
+            age(url, "facts", "2 hours")
+            await thread.aput(messages=["hello", "hi"])
+            assert blob_age(url, "facts") < timedelta(minutes=1)
+            await saver.aenable_ttl("1 hour")
+            assert len(refresh_logs(caplog)) == 2
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert "ttl_pause=true" not in ttl_options(url, table)
+
+
+def canary_rows(url: str) -> int:
+    with psycopg.connect(url, autocommit=True) as conn:
+        row = conn.execute("SELECT count(*) FROM canary").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_ttl_expiration_deletes_nothing_while_ttl_is_paused(libpq_url: str) -> None:
+    """CockroachDB's TTL job keeps expired rows while enable_ttl has TTL paused.
+
+    A canary table with TTL running on the same cron shows when the job has
+    run: twice over, once its expired row is gone, and again for a second.
+    """
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        Thread(saver).put(facts=FACTS, messages=["hello"])
+        age_thread(url, THREAD, "2 hours")
+        pause_as_a_stopped_run_leaves_it(url, saver, "1 second", "* * * * *")
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(
+                "CREATE TABLE canary (id INT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL)"
+            )
+            conn.execute(
+                "ALTER TABLE canary SET (ttl_expiration_expression = "
+                "$$(created_at + '1 second')$$, ttl_job_cron = '* * * * *')"
+            )
+        deadline = time.monotonic() + 300
+        for round_ in range(2):
+            with psycopg.connect(url, autocommit=True) as conn:
+                conn.execute("INSERT INTO canary VALUES (%s, now() - INTERVAL '2 hours')", [round_])
+            while canary_rows(url):
+                assert time.monotonic() < deadline, "the TTL job did not run within 5 minutes"
+                time.sleep(5)
+        with psycopg.connect(url, autocommit=True) as conn:
+            for table in ("checkpoints", "checkpoint_blobs"):
+                row = conn.execute(
+                    f"SELECT count(*) FROM {table} WHERE thread_id = %s", [THREAD]
+                ).fetchone()
+                assert row is not None and row[0] > 0, f"the TTL job deleted from {table}"
+        # The next enable_ttl finishes the run and resumes TTL
+        saver.enable_ttl("1 second", "* * * * *")
+        assert "ttl_pause=true" not in ttl_options(url, "checkpoint_blobs")
 
 
 def delta_chain() -> list[tuple[Any, dict[str, str], list[tuple[str, Any]]]]:

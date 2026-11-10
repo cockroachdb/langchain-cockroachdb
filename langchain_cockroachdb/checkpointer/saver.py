@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import logging
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -48,6 +49,9 @@ from langchain_cockroachdb.checkpointer.base import (
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
 
 logger = logging.getLogger(__name__)
+
+# What enable_ttl waits with while TTL is paused; tests replace it
+_sleep = time.sleep
 
 Conn = _psycopg_conn.Conn
 
@@ -502,16 +506,16 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
     def _refresh_used_blobs(self, plan: _TTLPlan) -> None:
         """Bring forward the blob rows that checkpoints inside the interval use.
 
-        enable_ttl runs this once, before it changes the TTL settings, so the
-        blob rows of threads that are idle then live as long as their newest
-        checkpoints. It reads the checkpoints a page at a time in primary key
-        order, and updates the rows a page needs TTL_REFRESH_UPDATE_SIZE at a
-        time. Each read and each UPDATE is its own retried operation under
-        the policy's ddl_attempt_timeout, so no transaction grows with the
-        table. A row is brought forward to now only when it is older than its
-        newest checkpoint by more than the refresh window, so only rows left
-        unchanged that long are rewritten, and running a page twice changes
-        nothing more.
+        enable_ttl runs this once, while TTL is paused and after the wait, so
+        the blob rows of threads that are idle then live as long as their
+        newest checkpoints. It reads the checkpoints a page at a time in
+        primary key order, and updates the rows a page needs
+        TTL_REFRESH_UPDATE_SIZE at a time. Each read and each UPDATE is its
+        own retried operation under the policy's ddl_attempt_timeout, so no
+        transaction grows with the table. A row is brought forward to now
+        only when it is older than its newest checkpoint by more than the
+        refresh window, so only rows left unchanged that long are rewritten,
+        and running a page twice changes nothing more.
         """
         limit = max(1, self.TTL_REFRESH_BATCH_SIZE)
         started = self._refresh_started(plan, limit)
@@ -623,21 +627,27 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         and years are stored as days, 30 to a month and 365 to a year, so the
         interval has a fixed length.
 
-        When the TTL setting of checkpoint_blobs is to change, it first makes
-        one pass, so threads idle at that moment keep their state too: each
-        blob row that checkpoints inside the interval use, and that is older
-        than the newest of them by more than the refresh window, is brought
-        forward to now. Only rows left unchanged that long are rewritten. The
-        pass reads every checkpoint once, TTL_REFRESH_BATCH_SIZE at a time,
-        changes at most TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at
-        INFO when it starts and ends. Only then does it change the settings,
-        so a run that stops partway runs the pass again next time. A run
-        with the setting already in place skips it, but any other change
-        runs it, a longer interval too; to force it, call disable_ttl first.
-        On a large table, run it once from a single process before a
-        rollout. After upgrading from 0.5, run it again with the same
-        arguments, which adds the grace and covers threads idle since the
-        upgrade. Intervals over 106,751 days, the longest duration
+        When the TTL setting of checkpoint_blobs is to change, it writes the
+        new settings with TTL paused, so nothing is deleted, and waits
+        TTL_STATE_CACHE_SECONDS plus TTL_PAUSE_MARGIN_SECONDS, so that every
+        saver reads them and refreshes on its puts; savers refresh while TTL
+        is paused. Then it makes one pass, so threads idle at that moment
+        keep their state too: each blob row that checkpoints inside the
+        interval use, and that is older than the newest of them by more than
+        the refresh window, is brought forward to now. Only rows left
+        unchanged that long are rewritten. The pass reads every checkpoint
+        once, TTL_REFRESH_BATCH_SIZE at a time, changes at most
+        TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at INFO when it
+        starts and ends. Then it resumes TTL. So it blocks for about a minute
+        when the setting changes. With the same setting in place and
+        running, it only updates the cron and returns at once; any other
+        change makes the whole run, a longer interval too. A run that stops
+        partway leaves TTL paused, which deletes nothing, and the next run
+        finishes it, even with the same arguments; to force a pass, call
+        disable_ttl first. On a large table, run it once from a single
+        process before a rollout. After upgrading from 0.5, run it again with
+        the same arguments, which adds the grace and covers threads idle
+        since the upgrade. Intervals over 106,751 days, the longest duration
         CockroachDB keeps, are refused.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
@@ -655,15 +665,31 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         policy = schema_change_policy(self.retry_policy)
         try:
             before = self._retry(self._read_blob_ttl, label="read checkpoint TTL")
-            # Before the settings change: a run that stops partway leaves the
-            # old setting, so the next run refreshes again
-            if self._refresh_needed(before, plan):
-                self._refresh_used_blobs(plan)
-            for statement in plan.statements:
+            if not self._refresh_needed(before, plan):
+                # The same setting is in place and running; the cron may change
+                for statement in plan.statements:
+                    self._run_ddl(statement, "enable TTL", policy=policy)
+                return
+            # The new settings with TTL paused, so nothing is deleted yet
+            for statement in plan.paused:
                 self._run_ddl(statement, "enable TTL", policy=policy)
+            # Every saver reads them again and refreshes on its puts from then on
+            self._forget_ttl_state()
+            self._wait_for_savers(plan)
+            self._refresh_used_blobs(plan)
+            # checkpoint_blobs last, so a run that stops here is redone in full
+            for statement in plan.resume:
+                self._run_ddl(statement, "enable TTL", policy=policy)
+            self._pause_ended()
         finally:
             # Even a failed run may have changed a table
             self._forget_ttl_state()
+
+    def _wait_for_savers(self, plan: _TTLPlan) -> None:
+        """Wait, holding no connection, until every saver has read the TTL setting again."""
+        seconds = self._savers_wait()
+        self._pause_started(plan, seconds)
+        _sleep(seconds)
 
     def disable_ttl(self) -> None:
         """Disable CockroachDB row-level TTL on checkpoint tables.

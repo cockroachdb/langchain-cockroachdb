@@ -32,7 +32,9 @@ from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver, RetryPolicy
 from langchain_cockroachdb._psycopg_conn import mark_in_caller_transaction
+from langchain_cockroachdb.checkpointer import async_saver as async_saver_module
 from langchain_cockroachdb.checkpointer import base
+from langchain_cockroachdb.checkpointer import saver as saver_module
 from tests.unit.checkpointer_fakes import (
     FakeAsyncConnection,
     FakeAsyncPool,
@@ -88,6 +90,22 @@ def _forget_what_was_logged() -> Iterator[None]:
     yield
     base._LOGGED_TTL_SETTINGS.clear()
     base._LOGGED_TTL_READ_ERRORS.clear()
+
+
+@pytest.fixture(autouse=True)
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The seconds each enable_ttl waited while TTL was paused, without waiting."""
+    seconds: list[float] = []
+
+    def wait(duration: float) -> None:
+        seconds.append(duration)
+
+    async def await_wait(duration: float) -> None:
+        seconds.append(duration)
+
+    monkeypatch.setattr(saver_module, "_sleep", wait)
+    monkeypatch.setattr(async_saver_module, "_sleep", await_wait)
+    return seconds
 
 
 def rendered(expression: str) -> str:
@@ -520,32 +538,113 @@ async def enable_ttl(kind: str, saver: Any, interval: str, cron: str = "@daily")
         await saver.aenable_ttl(interval, cron)
 
 
+PAUSED_1_HOUR = [
+    "ALTER TABLE checkpoint_blobs SET ( ttl_expiration_expression = "
+    "$$(created_at + '1 hour' + CAST('1 hour' AS INTERVAL) / 10)$$, "
+    "ttl_job_cron = '@daily', ttl_pause = true );",
+    "ALTER TABLE checkpoints SET ( ttl_expiration_expression = "
+    "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily', ttl_pause = true );",
+    "ALTER TABLE checkpoint_writes SET ( ttl_expiration_expression = "
+    "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily', ttl_pause = true );",
+]
+RESUME = [
+    "ALTER TABLE checkpoints RESET (ttl_pause);",
+    "ALTER TABLE checkpoint_writes RESET (ttl_pause);",
+    "ALTER TABLE checkpoint_blobs RESET (ttl_pause);",
+]
+
+
 @KINDS
-async def test_enable_ttl_gives_blob_rows_a_grace_of_a_tenth_of_the_interval(kind: str) -> None:
+async def test_enable_ttl_pauses_waits_refreshes_and_resumes(kind: str, waits: list[float]) -> None:
     saver, used = saver_for(kind)
     await enable_ttl(kind, saver, "1 hour")
-    sent = ddl(used)
-    assert sent == [
-        "ALTER TABLE checkpoints SET ( ttl_expiration_expression = "
-        "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily' );",
-        "ALTER TABLE checkpoint_blobs SET ( ttl_expiration_expression = "
-        "$$(created_at + '1 hour' + CAST('1 hour' AS INTERVAL) / 10)$$, "
-        "ttl_job_cron = '@daily' );",
-        "ALTER TABLE checkpoint_writes SET ( ttl_expiration_expression = "
-        "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily' );",
-    ]
+    # The settings with TTL paused, checkpoint_blobs first, so blob rows stop
+    # expiring before anything else changes; checkpoint_blobs resumes last,
+    # so an unpaused checkpoint_blobs means a finished run. The blob rows get
+    # a grace of a tenth of the interval
+    assert ddl(used) == PAUSED_1_HOUR + RESUME
     calls = executed(used)
     # DDL takes no parameters, so the validated interval and cron are in the text
-    assert [params for s, params in calls if s.lstrip().startswith("ALTER")] == [None] * 3
-    # It reads the setting first. The fakes find no setting and no
-    # checkpoint, so it reads one empty page for its refresh, and only then
-    # changes the settings
+    assert [params for s, params in calls if s.lstrip().startswith("ALTER")] == [None] * 6
+    # It reads the setting first; the fakes find none and no checkpoint, so
+    # after the wait it reads one empty page for its refresh
     assert calls[0] == (base.SELECT_BLOB_TTL_SQL, ("checkpoint_blobs",))
-    assert calls[1] == (base.SELECT_CHECKPOINT_PAGE_SQL, ["1:00:00.000000", 500])
-    assert len(calls) == 5
+    assert calls[4] == (base.SELECT_CHECKPOINT_PAGE_SQL, ["1:00:00.000000", 500])
+    assert len(calls) == 8
+    # One wait for every saver to read the new setting: 60 seconds, plus 5
+    assert waits == [65.0]
     # What enable_ttl writes is what the saver parses
-    blob_expression = sent[1].split("$$")[1]
+    blob_expression = PAUSED_1_HOUR[0].split("$$")[1]
     assert base._parse_blob_ttl([rendered(blob_expression)], 10) == (SIX_MINUTES, None)
+
+
+@KINDS
+async def test_the_wait_follows_the_saver_cache_interval_and_margin(
+    kind: str, waits: list[float]
+) -> None:
+    saver, _ = saver_for(kind)
+    saver.TTL_STATE_CACHE_SECONDS = 7.0
+    saver.TTL_PAUSE_MARGIN_SECONDS = 2.0
+    await enable_ttl(kind, saver, "1 hour")
+    assert waits == [9.0]
+    assert base.TTL_PAUSE_MARGIN_SECONDS == CockroachDBSaver.TTL_PAUSE_MARGIN_SECONDS == 5.0
+
+
+@KINDS
+async def test_with_the_same_setting_in_place_enable_ttl_neither_waits_nor_pauses(
+    kind: str, waits: list[float]
+) -> None:
+    saver, used = saver_for(kind)
+    refresh = Pass(kind, saver, [[]])
+    Catalog(kind, saver, NEW_V26)
+    # The same expression, unpaused; only the cron changes
+    await enable_ttl(kind, saver, "1 hour", "@weekly")
+    assert waits == []
+    assert refresh.reads == []
+    assert ddl(used) == [
+        "ALTER TABLE checkpoints SET ( ttl_expiration_expression = "
+        "$$(created_at + '1 hour')$$, ttl_job_cron = '@weekly' );",
+        "ALTER TABLE checkpoint_blobs SET ( ttl_expiration_expression = "
+        "$$(created_at + '1 hour' + CAST('1 hour' AS INTERVAL) / 10)$$, "
+        "ttl_job_cron = '@weekly' );",
+        "ALTER TABLE checkpoint_writes SET ( ttl_expiration_expression = "
+        "$$(created_at + '1 hour')$$, ttl_job_cron = '@weekly' );",
+    ]
+
+
+@KINDS
+async def test_a_paused_setting_is_a_run_that_stopped_partway(
+    kind: str, waits: list[float]
+) -> None:
+    # As enable_ttl leaves it when it stops after pausing: the next run, with
+    # the same interval, waits, refreshes and resumes
+    saver, used = saver_for(kind)
+    refresh = Pass(kind, saver, [[]])
+    Catalog(kind, saver, [*NEW_V26, "ttl_pause=true"])
+    await enable_ttl(kind, saver, "1 hour")
+    assert waits == [65.0]
+    assert len(refresh.reads) == 1
+    assert ddl(used)[-3:] == RESUME
+
+
+def test_a_paused_setting_reads_as_paused() -> None:
+    assert base._ttl_paused([*NEW_V25, "ttl_pause=true"])
+    assert base._ttl_paused([*NEW_V26[:3], "ttl_pause=true", "schema_locked=true"])
+    assert not base._ttl_paused(NEW_V26)
+    assert not base._ttl_paused(None)
+    # The savers refresh while TTL is paused: the expression is the library's
+    assert base._parse_blob_ttl([*NEW_V26, "ttl_pause=true"], 10) == (SIX_MINUTES, None)
+
+
+@KINDS
+async def test_puts_refresh_while_ttl_is_paused(kind: str) -> None:
+    saver, used = saver_for(kind)
+    Catalog(kind, saver, [*NEW_V26, "ttl_pause=true"])
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    await put(kind, saver, checkpoint, new_versions)
+    assert refresh_params(used) == [
+        ["thread-1", "", [("facts", "1"), ("notes", "2")], SIX_MINUTES_SQL]
+    ]
 
 
 @KINDS
@@ -565,10 +664,10 @@ async def test_enable_ttl_stores_months_and_years_as_days(
     # could not cover them; days have a fixed length
     saver, used = saver_for(kind)
     await enable_ttl(kind, saver, interval)
-    sent = ddl(used)
-    assert f"$$(created_at + '{stored}')$$" in sent[0]
-    assert f"$$(created_at + '{stored}' + CAST('{stored}' AS INTERVAL) / 10)$$" in sent[1]
-    assert f"$$(created_at + '{stored}')$$" in sent[2]
+    blobs, checkpoints, writes = ddl(used)[:3]
+    assert f"$$(created_at + '{stored}' + CAST('{stored}' AS INTERVAL) / 10)$$" in blobs
+    assert f"$$(created_at + '{stored}')$$" in checkpoints
+    assert f"$$(created_at + '{stored}')$$" in writes
 
 
 @pytest.mark.parametrize(
@@ -782,7 +881,11 @@ async def test_enable_ttl_refreshes_page_by_page_until_a_page_is_short(
     # Each page starts after the last key of the one before
     assert refresh.reads == [(None, 3), (("t", "", "c0002"), 3), (("t", "", "c0005"), 3)]
     assert [len(params[0]) for params in refresh.updates] == [3, 3, 1]
-    started, finished = [r.getMessage() for r in caplog.records if r.name == base.__name__]
+    started, finished = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == base.__name__ and "orward" in r.getMessage()
+    ]
     assert "1 hour" in started and "3 at a time" in started
     assert "Blob rows brought forward: 7." in finished
 
@@ -883,19 +986,21 @@ class Stops:
 
 
 @KINDS
-async def test_a_refresh_that_stops_leaves_the_settings_so_the_next_run_refreshes_again(
+async def test_a_refresh_that_stops_leaves_ttl_paused_for_the_next_run_to_finish(
     kind: str,
 ) -> None:
     saver, used = saver_for(kind)
     Stops(kind, saver)
     with pytest.raises(RuntimeError, match="stopped"):
         await enable_ttl(kind, saver, "1 hour")
-    # No TTL setting changed, so the next run finds the old one and refreshes again
-    assert ddl(used) == []
+    # TTL stays paused, which deletes nothing: no table was unpaused
+    assert ddl(used) == PAUSED_1_HOUR
+    # The next run finds the paused setting, so it refreshes and resumes
+    Catalog(kind, saver, [*NEW_V26[:3], "ttl_pause=true"])
     refresh = Pass(kind, saver, [[]])
     await enable_ttl(kind, saver, "1 hour")
     assert len(refresh.reads) == 1
-    assert len(ddl(used)) == 3
+    assert ddl(used) == PAUSED_1_HOUR * 2 + RESUME
 
 
 @KINDS
