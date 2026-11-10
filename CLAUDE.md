@@ -80,7 +80,7 @@ COCKROACHDB_URL='cockroachdb://root@localhost:26257/defaultdb?sslmode=disable' \
 ```
 
 - The supported versions are CockroachDB v25.4 LTS and later. Test changes that touch SQL on v25.4 and on the latest v26.x, because their defaults differ (for example, `create_table_with_schema_locked`).
-- Four TTL expiration tests wait a few minutes for CockroachDB's TTL job. While iterating, skip them with `-k "not ttl_expiration"`.
+- Five TTL expiration tests wait a few minutes for CockroachDB's TTL job. While iterating, skip them with `-k "not ttl_expiration"`.
 - Fault tests make CockroachDB raise real errors through `crdb_internal.force_error`, `CANCEL SESSIONS` and held row locks. Look at `tests/integration/faults.py` before mocking anything.
 - Do not run two test processes against the same database at the same time. The suites share table names.
 
