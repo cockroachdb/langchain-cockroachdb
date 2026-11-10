@@ -408,11 +408,15 @@ Each row expires by its own `created_at`, which `setup()` adds to all three tabl
 - A checkpoint row, and the writes saved with it, expire `ttl_interval` after they were written. The older checkpoints of an active thread expire too, so its history gets shorter while its latest checkpoints stay.
 - A blob row holds one channel's value at one version. It is written once, when the channel changes, and every later checkpoint in which the channel kept that version uses the same row. A blob row expires `ttl_interval` plus a tenth of it after its `created_at`.
 
+`enable_ttl()` stores months and years as days, 30 to a month and 365 to a year, so `"1 month"` is stored as `"30 days"`. CockroachDB adds months and years by the calendar, and the same month added on two days a little apart can differ by up to 3 days, which no grace of a tenth could cover. An interval of fixed length keeps the guarantees below exact.
+
 A channel that has not changed since an early step, such as a profile set on the first turn, keeps its first blob row. So while TTL is on, each `put` brings `created_at` forward to now on the blob rows its checkpoint uses but does not write, once they are older than a tenth of the interval. It does this in the same transaction as the checkpoint row. The extra tenth is the grace: after a put, each blob row the new checkpoint uses expires no earlier than the checkpoint.
 
-So a thread keeps its whole state while it is active, and expires once it has been idle for `ttl_interval`. A blob row that no checkpoint uses any more stays at most a tenth of the interval longer than the checkpoints did. While TTL is on, a put that uses blob rows it does not write sends one more `UPDATE` in its transaction, and a blob row is rewritten at most once per tenth of the interval.
+Puts only cover threads that write. So when `enable_ttl()` turns TTL on or changes it, it first brings forward, once, the blob rows that the checkpoints inside the interval use, when they are older than a tenth of the interval. Threads that are idle at that moment keep their state too. This pass reads every checkpoint once, `TTL_REFRESH_BATCH_SIZE` (500) at a time, each page in its own short statement, and logs at INFO when it starts and when it ends, with the number of blob rows it brought forward. Only then does `enable_ttl()` change the settings, so a run that stops partway leaves the old ones, and the next run makes the pass again. On a large table the pass takes a while, so call `enable_ttl()` when you turn TTL on or change it. Called again with the setting already in place, it skips the pass.
 
-The saver learns whether TTL is on, and the interval, from the settings of `checkpoint_blobs` in the catalog. It reads them on the first put that needs them and keeps them for `TTL_STATE_CACHE_SECONDS` (60 seconds), so it sees a change another process makes within a minute. Its own `enable_ttl()` and `disable_ttl()` take effect for it at once.
+So once `enable_ttl()` has run, a thread keeps its whole state while it is active, and expires once it has been idle for `ttl_interval`. A blob row that no checkpoint uses any more stays at most a tenth of the interval longer than the checkpoints did. While TTL is on, a put that uses blob rows it does not write sends one more `UPDATE` in its transaction, and a blob row is rewritten at most once per tenth of the interval.
+
+The saver learns whether TTL is on, and the interval, from the settings of `checkpoint_blobs` in the catalog. It reads them on the first put that needs them and keeps them for `TTL_STATE_CACHE_SECONDS` (60 seconds), so it sees a change another process makes within a minute. Its own `enable_ttl()` and `disable_ttl()` take effect for it at once. When another process shortens the interval, a saver keeps using the old, longer refresh window for up to that minute, so lower an interval gradually. If the read fails with a database error that the retry policy does not retry, such as a missing privilege, puts go on without the refresh, the saver logs a WARNING once, and it reads again after the cache interval.
 
 ### How It Works
 
@@ -420,20 +424,20 @@ The saver learns whether TTL is on, and the interval, from the settings of `chec
 - CockroachDB runs a background job on the cron schedule. It deletes checkpoint and write rows whose `created_at + interval` has passed, and blob rows whose `created_at + interval + interval / 10` has.
 - `enable_ttl()` is idempotent. Calling it again updates the interval and cron.
 - `disable_ttl()` removes TTL from all three tables.
-- A TTL setting on `checkpoint_blobs` that `enable_ttl()` did not write, such as one set by hand, turns the refresh off. The saver logs that at INFO.
+- A TTL setting on `checkpoint_blobs` that `enable_ttl()` did not write, such as one set by hand, turns the refresh off. The saver logs that at INFO, once per process.
 
 !!! note
     TTL deletion is **eventual**: expired rows remain queryable until the background job runs. CockroachDB rate-limits deletions to minimize impact on foreground queries.
 
 ### Upgrading from 0.5
 
-In 0.5, blob rows got no grace, and puts did not refresh them. After upgrading, run `enable_ttl()` once more with the same interval and cron to add the grace. Until then, puts refresh blob rows, but an idle thread's blob rows can expire up to a tenth of the interval before its last checkpoint.
+In 0.5, blob rows got no grace, puts did not refresh them, and months and years were stored as written. After upgrading, run `enable_ttl()` once more with the same interval and cron. It adds the grace, stores months and years as days, and brings forward the blob rows of threads that have been idle since the upgrade. Until then, puts refresh blob rows, but with the 0.5 setting a thread that has written since the upgrade can lose blob rows up to a tenth of the interval before its last checkpoint expires, and a thread idle since the upgrade up to the whole interval before. A 0.5 setting in months or years is still read for the refresh, but only approximately.
 
 ### Graphs with DeltaChannel
 
 LangGraph's `DeltaChannel`, which Deep Agents uses for its messages and files, stores each step's change and a full snapshot only every so many steps. To load the state, the saver rebuilds such a channel from older checkpoints and their writes, back to the last snapshot. TTL still expires those older checkpoints by age, even while the thread is active. So for these graphs, pick a TTL longer than a thread stays active, or delete finished threads with `delete_thread()`.
 
-When the history of a delta channel stops at a missing checkpoint before its snapshot, `get_delta_channel_history` logs a WARNING. It names the thread and the missing checkpoint, and says that the state of those channels may be incomplete. What it returns is unchanged.
+When the history of a delta channel stops at a missing checkpoint before its snapshot, `get_delta_channel_history` logs a WARNING. It names the thread, its `checkpoint_ns` and the missing checkpoint, and says that the state of those channels may be incomplete. A saver logs each missing checkpoint once. What it returns is unchanged.
 
 ## Performance
 

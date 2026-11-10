@@ -24,12 +24,14 @@ from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
 
+import psycopg
 import pytest
 from langgraph.checkpoint.base import CheckpointTuple, empty_checkpoint
 from psycopg import errors as pg_errors
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from langchain_cockroachdb import AsyncCockroachDBSaver, CockroachDBSaver, RetryPolicy
+from langchain_cockroachdb._psycopg_conn import mark_in_caller_transaction
 from langchain_cockroachdb.checkpointer import base
 from tests.unit.checkpointer_fakes import (
     FakeAsyncConnection,
@@ -45,6 +47,9 @@ CONFIG: Any = {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
 BLOBS = CockroachDBSaver.UPSERT_CHECKPOINT_BLOBS_SQL
 CHECKPOINT = CockroachDBSaver.UPSERT_CHECKPOINTS_SQL
 SIX_MINUTES = timedelta(minutes=6)
+# The same as SQL gets it: a duration in hours, minutes and seconds, never
+# days, which CockroachDB adds by the calendar of the session's time zone
+SIX_MINUTES_SQL = "0:06:00.000000"
 
 # checkpoint_blobs' pg_class.reloptions after enable_ttl("1 hour"), as
 # CockroachDB v25.4.20 renders them: 0.5 wrote the expression without the
@@ -73,6 +78,16 @@ TTL_OFF = pytest.mark.parametrize(
 def _close_sockets() -> Iterator[None]:
     yield
     close_sockets()
+
+
+@pytest.fixture(autouse=True)
+def _forget_what_was_logged() -> Iterator[None]:
+    """Each test starts as a fresh process would, with nothing logged yet."""
+    base._LOGGED_TTL_SETTINGS.clear()
+    base._LOGGED_TTL_READ_ERRORS.clear()
+    yield
+    base._LOGGED_TTL_SETTINGS.clear()
+    base._LOGGED_TTL_READ_ERRORS.clear()
 
 
 def rendered(expression: str) -> str:
@@ -108,13 +123,19 @@ def saver_for(kind: str) -> tuple[Any, list[Any]]:
 class Catalog:
     """Stands in for the saver's read of checkpoint_blobs' reloptions, and counts the reads."""
 
-    def __init__(self, kind: str, saver: Any, reloptions: list[str] | None) -> None:
+    def __init__(
+        self, kind: str, saver: Any, reloptions: list[str] | None, error: Exception | None = None
+    ) -> None:
         self.reloptions = reloptions
+        # Raised by every read while set
+        self.error = error
         self.reads = 0
         saver._read_blob_ttl = self.read if kind == "sync" else self.aread
 
     def read(self) -> list[str] | None:
         self.reads += 1
+        if self.error is not None:
+            raise self.error
         return self.reloptions
 
     async def aread(self) -> list[str] | None:
@@ -214,7 +235,9 @@ async def test_a_put_refreshes_the_blob_rows_it_uses_but_does_not_write(kind: st
     ]
     # Used and not written: not "messages", which this put writes, not the
     # channels stored inline, and not "cleared", which has no value
-    assert refresh_params(used) == [["thread-1", "", [("facts", "1"), ("notes", "2")], SIX_MINUTES]]
+    assert refresh_params(used) == [
+        ["thread-1", "", [("facts", "1"), ("notes", "2")], SIX_MINUTES_SQL]
+    ]
 
 
 @KINDS
@@ -226,7 +249,7 @@ async def test_a_refresh_alone_commits_with_the_checkpoint_row(kind: str) -> Non
     await put(kind, saver, checkpoint, {})
     assert statements(used) == ["BEGIN", base.REFRESH_CHECKPOINT_BLOBS_SQL, CHECKPOINT, "COMMIT"]
     assert refresh_params(used) == [
-        ["thread-1", "", [("facts", "1"), ("notes", "2"), ("messages", "3")], SIX_MINUTES]
+        ["thread-1", "", [("facts", "1"), ("notes", "2"), ("messages", "3")], SIX_MINUTES_SQL]
     ]
 
 
@@ -325,6 +348,7 @@ def test_no_ttl_setting_means_no_refresh(reloptions: Any) -> None:
         rendered(old("1 hour 30 minutes")),
         # Two intervals
         rendered("(created_at + '1 hour' + CAST('2 hours' AS INTERVAL) / 10)"),
+        rendered("(created_at + '1 hour' + '2 hours'::INTERVAL / 10)"),
         rendered("(created_at + '1 hour' + CAST('1 hour' AS INTERVAL) / 0)"),
         rendered("(updated_at + '1 hour')"),
         "ttl_expiration_expression='expires_at'",
@@ -336,6 +360,17 @@ def test_a_setting_enable_ttl_did_not_write_means_no_refresh(setting: str) -> No
     window, foreign = base._parse_blob_ttl(["ttl='on'", setting, "ttl_job_cron='@daily'"], 10)
     assert window is None
     assert foreign == setting
+
+
+@pytest.mark.parametrize("interval", ["1 hour", "7 days", "30 days"])
+def test_parses_the_grace_written_with_a_double_colon_cast(interval: str) -> None:
+    # Hand-written, or copied from DDL that writes casts that way
+    colons = f"(created_at + '{interval}' + '{interval}'::INTERVAL / 10)"
+    cast_form = new(interval)
+    assert base._parse_blob_ttl([rendered(colons)], 10) == base._parse_blob_ttl(
+        [rendered(cast_form)], 10
+    )
+    assert base._parse_blob_ttl([rendered(colons)], 10)[0] is not None
 
 
 def test_ttl_expire_after_is_a_setting_enable_ttl_did_not_write() -> None:
@@ -396,8 +431,10 @@ async def test_enable_and_disable_ttl_make_the_next_put_read_the_catalog(
         getattr(saver, change)()
     else:
         await getattr(saver, f"a{change}")()
+    # enable_ttl reads the setting itself, to tell whether it changed
+    before = catalog.reads
     await put(kind, saver, checkpoint, new_versions)
-    assert catalog.reads == 2
+    assert catalog.reads == before + 1
 
 
 @KINDS
@@ -432,8 +469,9 @@ async def test_a_failed_enable_ttl_also_makes_the_next_put_read_the_catalog(
         else:
             await saver.aenable_ttl("1 hour")
     pool.factory = factory
+    before = catalog.reads
     await put(kind, saver, checkpoint, new_versions)
-    assert catalog.reads == 2
+    assert catalog.reads == before + 1
 
 
 @KINDS
@@ -458,21 +496,35 @@ async def test_a_ttl_setting_enable_ttl_did_not_write_is_logged_once_at_info(
     [record] = logged()
     assert record.levelno == logging.INFO
     assert "1 hour 30 minutes" in record.getMessage()
-    # Another setting the saver cannot use is logged too
+    # Once per process: another saver that reads the same setting stays quiet
+    other, _ = saver_for(kind)
+    Catalog(kind, other, ["ttl='on'", foreign])
+    await put(kind, other, checkpoint, new_versions)
+    assert len(logged()) == 1
+    # Another setting the savers cannot use is logged too
     catalog.reloptions = ["ttl='on'", "ttl_expire_after='01:00:00'"]
     await put(kind, saver, checkpoint, new_versions)
     assert len(logged()) == 2
     assert "ttl_expire_after" in logged()[1].getMessage()
 
 
+def ddl(used: list[Any]) -> list[str]:
+    """The DDL statements sent, with their whitespace made single spaces."""
+    return [" ".join(s.split()) for s in statements(used) if s.lstrip().startswith("ALTER")]
+
+
+async def enable_ttl(kind: str, saver: Any, interval: str, cron: str = "@daily") -> None:
+    if kind == "sync":
+        saver.enable_ttl(interval, cron)
+    else:
+        await saver.aenable_ttl(interval, cron)
+
+
 @KINDS
 async def test_enable_ttl_gives_blob_rows_a_grace_of_a_tenth_of_the_interval(kind: str) -> None:
     saver, used = saver_for(kind)
-    if kind == "sync":
-        saver.enable_ttl("1 hour", "@daily")
-    else:
-        await saver.aenable_ttl("1 hour", "@daily")
-    sent = [" ".join(statement.split()) for statement in statements(used)]
+    await enable_ttl(kind, saver, "1 hour")
+    sent = ddl(used)
     assert sent == [
         "ALTER TABLE checkpoints SET ( ttl_expiration_expression = "
         "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily' );",
@@ -482,11 +534,73 @@ async def test_enable_ttl_gives_blob_rows_a_grace_of_a_tenth_of_the_interval(kin
         "ALTER TABLE checkpoint_writes SET ( ttl_expiration_expression = "
         "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily' );",
     ]
+    calls = executed(used)
     # DDL takes no parameters, so the validated interval and cron are in the text
-    assert all(params is None for _, params in executed(used))
+    assert [params for s, params in calls if s.lstrip().startswith("ALTER")] == [None] * 3
+    # It reads the setting first. The fakes find no setting and no
+    # checkpoint, so it reads one empty page for its refresh, and only then
+    # changes the settings
+    assert calls[0] == (base.SELECT_BLOB_TTL_SQL, ("checkpoint_blobs",))
+    assert calls[1] == (base.SELECT_CHECKPOINT_PAGE_SQL, ["1:00:00.000000", 500])
+    assert len(calls) == 5
     # What enable_ttl writes is what the saver parses
     blob_expression = sent[1].split("$$")[1]
     assert base._parse_blob_ttl([rendered(blob_expression)], 10) == (SIX_MINUTES, None)
+
+
+@KINDS
+@pytest.mark.parametrize(
+    ("interval", "stored"),
+    [
+        ("1 month", "30 days"),
+        ("3 months", "90 days"),
+        ("1 year", "365 days"),
+        ("2 years", "730 days"),
+    ],
+)
+async def test_enable_ttl_stores_months_and_years_as_days(
+    kind: str, interval: str, stored: str
+) -> None:
+    # The calendar adds months by different numbers of days, so a grace
+    # could not cover them; days have a fixed length
+    saver, used = saver_for(kind)
+    await enable_ttl(kind, saver, interval)
+    sent = ddl(used)
+    assert f"$$(created_at + '{stored}')$$" in sent[0]
+    assert f"$$(created_at + '{stored}' + CAST('{stored}' AS INTERVAL) / 10)$$" in sent[1]
+    assert f"$$(created_at + '{stored}')$$" in sent[2]
+
+
+@pytest.mark.parametrize(
+    ("interval", "stored", "length", "window"),
+    [
+        ("1 hour", "1 hour", "1:00:00.000000", "0:06:00.000000"),
+        ("90 minutes", "90 minutes", "1:30:00.000000", "0:09:00.000000"),
+        ("7 days", "7 days", "168:00:00.000000", "16:48:00.000000"),
+        ("1 week", "1 week", "168:00:00.000000", "16:48:00.000000"),
+        ("30 days", "30 days", "720:00:00.000000", "72:00:00.000000"),
+        ("1 month", "30 days", "720:00:00.000000", "72:00:00.000000"),
+        ("1 year", "365 days", "8760:00:00.000000", "876:00:00.000000"),
+        ("3 seconds", "3 seconds", "0:00:03.000000", "0:00:00.300000"),
+    ],
+)
+def test_the_plan_binds_the_interval_and_window_as_durations(
+    interval: str, stored: str, length: str, window: str
+) -> None:
+    plan = CockroachDBSaver(FakePool())._ttl_plan(interval, "@daily")
+    assert (plan.stored, plan.interval, plan.window) == (stored, length, window)
+    assert plan.blob_expression == f"(created_at + '{stored}' + CAST('{stored}' AS INTERVAL) / 10)"
+
+
+@KINDS
+@pytest.mark.parametrize("interval", ["1 fortnight", "1 hour; DROP TABLE x", "999999999999 years"])
+async def test_enable_ttl_refuses_an_interval_before_any_statement(
+    kind: str, interval: str
+) -> None:
+    saver, used = saver_for(kind)
+    with pytest.raises(ValueError, match="Invalid ttl_interval"):
+        await enable_ttl(kind, saver, interval)
+    assert used == []
 
 
 @KINDS
@@ -501,6 +615,237 @@ async def test_enable_ttl_refuses_a_fraction_it_cannot_format(kind: str, fractio
         else:
             await saver.aenable_ttl("1 hour")
     assert used == []
+
+
+def test_the_refresh_pages_bind_every_value() -> None:
+    first = " ".join(base.SELECT_CHECKPOINT_PAGE_SQL.split())
+    after = " ".join(base.SELECT_CHECKPOINT_PAGE_AFTER_SQL.split())
+    select = (
+        "SELECT thread_id, checkpoint_ns, checkpoint_id, CASE WHEN created_at > now() - "
+        "CAST(%s AS INTERVAL) THEN checkpoint -> 'channel_versions' END AS channel_versions "
+        "FROM checkpoints "
+    )
+    order = "ORDER BY thread_id, checkpoint_ns, checkpoint_id LIMIT %s"
+    assert first == select + order
+    assert after == (
+        select + "WHERE (thread_id, checkpoint_ns, checkpoint_id) > (%s, %s, %s) " + order
+    )
+    assert " ".join(base.REFRESH_USED_BLOBS_SQL.split()) == (
+        "UPDATE checkpoint_blobs SET created_at = now() "
+        "WHERE (thread_id, checkpoint_ns, channel, version) = ANY(%s) "
+        "AND created_at < now() - CAST(%s AS INTERVAL)"
+    )
+    saver = CockroachDBSaver(FakePool())
+    assert saver._checkpoint_page(None, "1:00:00.000000", 500) == (
+        base.SELECT_CHECKPOINT_PAGE_SQL,
+        ["1:00:00.000000", 500],
+    )
+    assert saver._checkpoint_page(("t", "", "c9"), "1:00:00.000000", 500) == (
+        base.SELECT_CHECKPOINT_PAGE_AFTER_SQL,
+        ["1:00:00.000000", "t", "", "c9", 500],
+    )
+
+
+def test_a_page_yields_the_blob_rows_its_checkpoints_inside_the_interval_use() -> None:
+    page = [
+        {"thread_id": "t1", "checkpoint_ns": "", "checkpoint_id": "c1", "channel_versions": None},
+        {
+            "thread_id": "t1",
+            "checkpoint_ns": "",
+            "checkpoint_id": "c2",
+            "channel_versions": {"facts": "1", "messages": "2"},
+        },
+        {
+            "thread_id": "t1",
+            "checkpoint_ns": "",
+            "checkpoint_id": "c3",
+            "channel_versions": {"facts": "1", "messages": "3"},
+        },
+        {
+            "thread_id": "t2",
+            "checkpoint_ns": "sub",
+            "checkpoint_id": "c1",
+            "channel_versions": {"facts": "1"},
+        },
+    ]
+    # c1 of t1 is outside the interval; a version two checkpoints use counts once
+    assert CockroachDBSaver._used_blobs(page) == [
+        ("t1", "", "facts", "1"),
+        ("t1", "", "messages", "2"),
+        ("t1", "", "messages", "3"),
+        ("t2", "sub", "facts", "1"),
+    ]
+    assert CockroachDBSaver._page_end(page, None) == ("t2", "sub", "c1")
+    assert CockroachDBSaver._page_end([], ("t", "", "c")) == ("t", "", "c")
+
+
+class Pages:
+    """Stands in for the saver's pages of the refresh in enable_ttl."""
+
+    def __init__(self, kind: str, saver: Any, sizes: list[int], refreshed: int = 2) -> None:
+        self.sizes = list(sizes)
+        self.refreshed = refreshed
+        self.calls: list[Any] = []
+        saver._refresh_page = self.page if kind == "sync" else self.apage
+
+    def page(self, after: Any, plan: Any, limit: int) -> tuple[int, int, Any]:
+        self.calls.append((after, limit))
+        read = self.sizes.pop(0)
+        return read, self.refreshed, ("t", "", f"c{len(self.calls)}")
+
+    async def apage(self, after: Any, plan: Any, limit: int) -> tuple[int, int, Any]:
+        return self.page(after, plan, limit)
+
+
+@KINDS
+async def test_enable_ttl_refreshes_page_by_page_until_a_page_is_short(
+    kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    saver, _ = saver_for(kind)
+    saver.TTL_REFRESH_BATCH_SIZE = 3
+    pages = Pages(kind, saver, [3, 3, 1])
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    await enable_ttl(kind, saver, "1 hour")
+    # Each page starts after the last key of the one before
+    assert pages.calls == [(None, 3), (("t", "", "c1"), 3), (("t", "", "c2"), 3)]
+    started, finished = [r.getMessage() for r in caplog.records if r.name == base.__name__]
+    assert "1 hour" in started and "3 at a time" in started
+    assert "Blob rows brought forward: 6." in finished
+
+
+@KINDS
+@pytest.mark.parametrize("size", [0, -1])
+async def test_refresh_batch_sizes_below_one_count_as_one(kind: str, size: int) -> None:
+    saver, _ = saver_for(kind)
+    saver.TTL_REFRESH_BATCH_SIZE = size
+    pages = Pages(kind, saver, [1, 0])
+    await enable_ttl(kind, saver, "1 hour")
+    assert [limit for _, limit in pages.calls] == [1, 1]
+
+
+@KINDS
+async def test_enable_ttl_skips_the_refresh_when_the_setting_is_already_in_place(
+    kind: str,
+) -> None:
+    saver, _ = saver_for(kind)
+    pages = Pages(kind, saver, [0])
+    Catalog(kind, saver, NEW_V26)
+    # The same expression: puts have refreshed blob rows all along
+    await enable_ttl(kind, saver, "1 hour", "@weekly")
+    assert pages.calls == []
+    # Another interval needs the refresh, and so does a setting from 0.5
+    await enable_ttl(kind, saver, "2 hours")
+    assert len(pages.calls) == 1
+    Catalog(kind, saver, OLD_V26)
+    pages.sizes = [0]
+    await enable_ttl(kind, saver, "1 hour")
+    assert len(pages.calls) == 2
+
+
+@KINDS
+async def test_a_refresh_page_reads_then_updates_with_bound_values(kind: str) -> None:
+    # The fakes find no checkpoint, so the page sends no UPDATE
+    saver, used = saver_for(kind)
+    plan = saver._ttl_plan("1 hour", "@daily")
+    if kind == "sync":
+        result = saver._refresh_page(("t", "", "c"), plan, 50)
+    else:
+        result = await saver._refresh_page(("t", "", "c"), plan, 50)
+    assert result == (0, 0, ("t", "", "c"))
+    assert executed(used) == [
+        (base.SELECT_CHECKPOINT_PAGE_AFTER_SQL, ["1:00:00.000000", "t", "", "c", 50])
+    ]
+
+
+class Stops:
+    """A refresh page that fails, as when the run is stopped partway."""
+
+    def __init__(self, kind: str, saver: Any) -> None:
+        saver._refresh_page = self.page if kind == "sync" else self.apage
+
+    def page(self, *args: Any) -> Any:
+        raise RuntimeError("stopped")
+
+    async def apage(self, *args: Any) -> Any:
+        return self.page()
+
+
+@KINDS
+async def test_a_refresh_that_stops_leaves_the_settings_so_the_next_run_refreshes_again(
+    kind: str,
+) -> None:
+    saver, used = saver_for(kind)
+    Stops(kind, saver)
+    with pytest.raises(RuntimeError, match="stopped"):
+        await enable_ttl(kind, saver, "1 hour")
+    # No TTL setting changed, so the next run finds the old one and refreshes again
+    assert ddl(used) == []
+    pages = Pages(kind, saver, [0])
+    await enable_ttl(kind, saver, "1 hour")
+    assert len(pages.calls) == 1
+    assert len(ddl(used)) == 3
+
+
+@KINDS
+async def test_a_read_refused_by_the_database_leaves_puts_working_without_a_refresh(
+    kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A missing privilege, for example: the policy does not retry it
+    clock = fake_clock(monkeypatch)
+    saver, used = saver_for(kind)
+    catalog = Catalog(kind, saver, NEW_V26, pg_errors.InsufficientPrivilege("permission denied"))
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    caplog.set_level(logging.WARNING, logger=base.__name__)
+    await put(kind, saver, checkpoint, new_versions)
+    assert catalog.reads == 1
+    assert refresh_params(used) == []
+    [record] = [r for r in caplog.records if r.name == base.__name__]
+    assert record.levelno == logging.WARNING
+    assert "42501" in record.getMessage()
+    # "No refresh" is kept for the cache interval, like any answer
+    await put(kind, saver, checkpoint, new_versions)
+    assert catalog.reads == 1
+    # Then the saver reads again; the WARNING is logged once per process
+    clock[0] += saver.TTL_STATE_CACHE_SECONDS
+    await put(kind, saver, checkpoint, new_versions)
+    assert catalog.reads == 2
+    other, _ = saver_for(kind)
+    Catalog(kind, other, NEW_V26, pg_errors.InsufficientPrivilege("permission denied"))
+    await put(kind, other, checkpoint, new_versions)
+    assert len([r for r in caplog.records if r.name == base.__name__]) == 1
+    # Once a read works, puts refresh again
+    catalog.error = None
+    clock[0] += saver.TTL_STATE_CACHE_SECONDS
+    await put(kind, saver, checkpoint, new_versions)
+    assert len(refresh_params(used)) == 1
+
+
+def caller_transaction_error() -> Exception:
+    error = pg_errors.InsufficientPrivilege("permission denied")
+    mark_in_caller_transaction(error)
+    return error
+
+
+@KINDS
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Retried by the policy, and raised once it gives up
+        pg_errors.SerializationFailure("restart transaction"),
+        # No SQLSTATE: the connection, not the database
+        psycopg.OperationalError("connection lost"),
+        # Inside a transaction the caller opened, which the error aborted
+        caller_transaction_error(),
+    ],
+    ids=["retryable", "no-sqlstate", "caller-transaction"],
+)
+async def test_other_read_errors_fail_the_put(kind: str, error: Exception) -> None:
+    saver, used = saver_for(kind)
+    Catalog(kind, saver, NEW_V26, error)
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    with pytest.raises(type(error)):
+        await put(kind, saver, checkpoint, new_versions)
+    assert statements(used) == []
 
 
 def _config(checkpoint_id: str) -> Any:
@@ -607,9 +952,70 @@ async def test_a_walk_cut_by_a_missing_ancestor_logs_a_warning(
     assert "seed" not in result["tags"]
     [message] = warnings(caplog)
     assert "thread-1" in message
+    assert "checkpoint_ns ''" in message
     assert "0003" in message
     assert "items" in message and "tags" in message
     assert "incomplete" in message
+
+
+@KINDS
+async def test_a_cut_chain_is_logged_once_per_saver_and_missing_checkpoint(
+    kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    chain = _chain(8)
+    del chain["0003"]
+    saver = walker(kind, chain, monkeypatch, 256)
+    caplog.set_level(logging.WARNING)
+    # LangGraph rebuilds the state on every get_state and resumed run
+    for _ in range(3):
+        await history(kind, saver, "0007")
+    assert len(warnings(caplog)) == 1
+    # Another missing checkpoint is logged too
+    del chain["0005"]
+    await history(kind, saver, "0007")
+    assert len(warnings(caplog)) == 2
+    assert "0005" in warnings(caplog)[1]
+    # Another saver logs what it finds
+    await history(kind, walker(kind, chain, monkeypatch, 256), "0007")
+    assert len(warnings(caplog)) == 3
+
+
+@KINDS
+async def test_a_saver_forgets_the_cut_chains_it_logged_once_it_holds_too_many(
+    kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(base, "_CUT_CHAINS_REMEMBERED", 1)
+    first, second = _chain(4), _chain(4)
+    del first["0001"]
+    del second["0002"]
+    chains = {"first": first, "second": second}
+    current = ["first"]
+
+    def chain_now() -> dict[str, CheckpointTuple]:
+        return chains[current[0]]
+
+    saver = walker(kind, first, monkeypatch, 256)
+    if kind == "sync":
+        monkeypatch.setattr(saver, "get_tuple", lambda config: chain_now().get(_id(config)))
+        monkeypatch.setattr(
+            saver, "_fetch_chain_page", lambda start, limit: _chain_page(chain_now(), start, limit)
+        )
+    else:
+
+        async def aget_tuple(config: Any) -> Any:
+            return chain_now().get(_id(config))
+
+        async def fetch_chain_page(start: Any, limit: int) -> list[Any]:
+            return _chain_page(chain_now(), start, limit)
+
+        monkeypatch.setattr(saver, "aget_tuple", aget_tuple)
+        monkeypatch.setattr(saver, "_fetch_chain_page", fetch_chain_page)
+    caplog.set_level(logging.WARNING)
+    for name in ["first", "second", "first"]:
+        current[0] = name
+        await history(kind, saver, "0003")
+    # It remembers one cut at a time, so the first is logged again
+    assert len(warnings(caplog)) == 3
 
 
 @KINDS

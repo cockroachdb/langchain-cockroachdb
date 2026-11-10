@@ -3,11 +3,13 @@
 TTL expires each row by its own created_at. A blob row holds one channel
 version and is written once, so a channel that has not changed since an
 early step keeps an old blob row that every newer checkpoint uses. These
-tests age blob rows with SQL, as time would, and check that a put refreshes
-the ones its checkpoint uses, that enable_ttl gives blob rows a grace, and
-that the saver reads the TTL setting from the catalog. They delete expired
-rows the way the TTL job would, so they need not wait for it. Each test has
-a database of its own, since TTL is a table setting.
+tests age rows with SQL, as time would, and check that a put refreshes the
+blob rows its checkpoint uses, that enable_ttl gives blob rows a grace,
+stores months and years as days, and refreshes once the blob rows of
+threads idle when it runs, and that the saver reads the TTL setting from
+the catalog. They delete expired rows the way the TTL job would, so they
+need not wait for it. Each test has a database of its own, since TTL is a
+table setting.
 
 One slow test, skipped with -k "not ttl_expiration", keeps a thread active
 past a short interval while CockroachDB's TTL job runs.
@@ -117,22 +119,33 @@ class Thread:
         self.config = await self.saver.aput(config, checkpoint, {}, new_versions)
 
 
-def age(url: str, channel: str, interval: str) -> None:
-    """Make the thread's blob rows for ``channel`` look ``interval`` old, as time would."""
+def age(url: str, channel: str, interval: str, thread_id: str = THREAD) -> None:
+    """Make a thread's blob rows for ``channel`` look ``interval`` old, as time would."""
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(
             "UPDATE checkpoint_blobs SET created_at = now() - CAST(%s AS INTERVAL) "
             "WHERE thread_id = %s AND channel = %s",
-            [interval, THREAD, channel],
+            [interval, thread_id, channel],
         )
 
 
-def blob_age(url: str, channel: str) -> timedelta:
-    """How old the thread's one blob row for ``channel`` is."""
+def age_thread(url: str, thread_id: str, interval: str) -> None:
+    """Make all of a thread's rows look ``interval`` old: a thread idle that long."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+            conn.execute(
+                f"UPDATE {table} SET created_at = now() - CAST(%s AS INTERVAL) "
+                "WHERE thread_id = %s",
+                [interval, thread_id],
+            )
+
+
+def blob_age(url: str, channel: str, thread_id: str = THREAD) -> timedelta:
+    """How old a thread's one blob row for ``channel`` is."""
     with psycopg.connect(url, autocommit=True) as conn:
         rows = conn.execute(
             "SELECT now() - created_at FROM checkpoint_blobs WHERE thread_id = %s AND channel = %s",
-            [THREAD, channel],
+            [thread_id, channel],
         ).fetchall()
     [(found,)] = rows
     return found
@@ -319,6 +332,151 @@ async def test_async_another_processs_enable_ttl_is_seen_after_the_cache_interva
             assert blob_age(url, "facts") < timedelta(minutes=1)
 
 
+def write_idle_threads(url: str) -> None:
+    """Three threads written while TTL is off and idle since, as time has aged them.
+
+    "live" wrote its checkpoints just now, but its facts two hours ago.
+    "fresh" wrote its facts a minute ago. "gone" wrote everything three
+    hours ago, longer ago than the interval of one hour.
+    """
+    with CockroachDBSaver.from_conn_string(url) as writer:
+        for thread_id in ("gone", "live", "fresh"):
+            thread = Thread(writer, thread_id)
+            thread.put(facts=FACTS, messages=["hello"])
+            thread.put(messages=["hello", "hi"])
+    age(url, "facts", "2 hours", thread_id="live")
+    age(url, "facts", "1 minute", thread_id="fresh")
+    age_thread(url, "gone", "3 hours")
+
+
+def refresh_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == base.__name__ and r.getMessage().startswith("enable_ttl:")
+    ]
+
+
+def assert_idle_threads_kept(url: str, caplog: pytest.LogCaptureFixture) -> None:
+    """enable_ttl("1 hour") refreshed what the checkpoints inside the hour use, and only that."""
+    # Older than the refresh window of six minutes, and used by a checkpoint
+    # inside the interval: brought forward
+    assert blob_age(url, "facts", "live") < timedelta(minutes=1)
+    # Younger than the window: left alone, and still expires after its checkpoint
+    assert timedelta(minutes=1) <= blob_age(url, "facts", "fresh") < timedelta(minutes=6)
+    # A thread idle longer than the interval expires as a whole
+    assert blob_age(url, "facts", "gone") >= timedelta(hours=3)
+    started, finished = refresh_logs(caplog)
+    assert "1 hour" in started
+    assert finished.endswith("Blob rows brought forward: 1.")
+    # Without the refresh, the TTL job's first run deleted facts from the live thread
+    expire_like_the_ttl_job(url, "1 hour")
+    with CockroachDBSaver.from_conn_string(url) as reader:
+        live = reader.get_tuple({"configurable": {"thread_id": "live", "checkpoint_ns": ""}})
+    assert live is not None
+    assert live.checkpoint["channel_values"].get("facts") == FACTS
+
+
+@MODES
+def test_enable_ttl_keeps_the_blob_rows_of_threads_idle_when_it_runs(
+    libpq_url: str, mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        write_idle_threads(url)
+        with sync_saver(url, mode) as saver:
+            # Two checkpoints a page, so the six take several pages
+            saver.TTL_REFRESH_BATCH_SIZE = 2
+            saver.enable_ttl("1 hour")
+        assert_idle_threads_kept(url, caplog)
+
+
+@MODES
+async def test_async_enable_ttl_keeps_the_blob_rows_of_threads_idle_when_it_runs(
+    libpq_url: str, mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        write_idle_threads(url)
+        async with async_saver(url, mode) as saver:
+            saver.TTL_REFRESH_BATCH_SIZE = 2
+            await saver.aenable_ttl("1 hour")
+        assert_idle_threads_kept(url, caplog)
+
+
+def test_enable_ttl_refreshes_once_per_setting(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        # An empty table
+        saver.enable_ttl("1 hour")
+        started, finished = refresh_logs(caplog)
+        assert finished.endswith("Blob rows brought forward: 0.")
+        # The same setting, with another cron: nothing to refresh
+        caplog.clear()
+        saver.enable_ttl("1 hour", "@weekly")
+        assert refresh_logs(caplog) == []
+        # Another interval refreshes again
+        saver.enable_ttl("2 hours")
+        assert len(refresh_logs(caplog)) == 2
+
+
+async def test_async_enable_ttl_refreshes_once_per_setting(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        async with async_saver(url) as saver:
+            await saver.aenable_ttl("1 hour")
+            started, finished = refresh_logs(caplog)
+            assert finished.endswith("Blob rows brought forward: 0.")
+            caplog.clear()
+            await saver.aenable_ttl("1 hour", "@weekly")
+            assert refresh_logs(caplog) == []
+            await saver.aenable_ttl("2 hours")
+            assert len(refresh_logs(caplog)) == 2
+
+
+def test_enable_ttl_stores_a_month_as_30_days(libpq_url: str) -> None:
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        saver.enable_ttl("1 month", "@daily")
+        days = "e'(created_at + \\'30 days\\')'"
+        assert ttl_options(url, "checkpoints")[1] == f"ttl_expiration_expression={days}"
+        assert ttl_options(url, "checkpoint_writes")[1] == f"ttl_expiration_expression={days}"
+        assert ttl_options(url, "checkpoint_blobs")[1] == (
+            "ttl_expiration_expression="
+            "e'(created_at + \\'30 days\\' + CAST(\\'30 days\\' AS INTERVAL) / 10)'"
+        )
+        # The refresh window is three days
+        thread = Thread(saver)
+        thread.put(facts=FACTS, notes=NOTES, messages=["hello"])
+        age(url, "facts", "40 days")
+        age(url, "notes", "2 days")
+        thread.put(messages=["hello", "hi"])
+        assert blob_age(url, "facts") < timedelta(minutes=1)
+        assert timedelta(days=2) <= blob_age(url, "notes") < timedelta(days=3)
+
+
+def test_a_ttl_setting_written_by_0_5_still_refreshes(libpq_url: str) -> None:
+    # What 0.5's enable_ttl("1 hour") wrote: no grace on blob rows
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        with psycopg.connect(url, autocommit=True) as conn:
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                conn.execute(
+                    f"ALTER TABLE {table} SET (ttl_expiration_expression = "
+                    "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily')"
+                )
+        thread = Thread(saver)
+        thread.put(facts=FACTS, notes=NOTES, messages=["hello"])
+        age(url, "facts", "2 hours")
+        age(url, "notes", "1 minute")
+        thread.put(messages=["hello", "hi"])
+        # The window parsed from it is six minutes
+        assert blob_age(url, "facts") < timedelta(minutes=1)
+        assert timedelta(minutes=1) <= blob_age(url, "notes") < timedelta(minutes=6)
+
+
 def delta_chain() -> list[tuple[Any, dict[str, str], list[tuple[str, Any]]]]:
     """Three checkpoints, their new versions and their pending writes.
 
@@ -368,8 +526,11 @@ def test_a_delta_history_walk_cut_by_a_missing_ancestor_logs_a_warning(
         # The result is what the walk found before the gap, as before
         assert [write[2] for write in history["items"]["writes"]] == [["b"]]
         assert "seed" not in history["items"]
+        # Each load of the state walks again; the saver logs the gap once
+        saver.get_delta_channel_history(config=config, channels=["items"])
         [message] = warnings(caplog)
         assert THREAD in message and ids[0] in message and "items" in message
+        assert "checkpoint_ns ''" in message
 
 
 async def test_async_a_delta_history_walk_cut_by_a_missing_ancestor_logs_a_warning(
@@ -392,8 +553,10 @@ async def test_async_a_delta_history_walk_cut_by_a_missing_ancestor_logs_a_warni
             history = await saver.aget_delta_channel_history(config=config, channels=["items"])
             assert [write[2] for write in history["items"]["writes"]] == [["b"]]
             assert "seed" not in history["items"]
+            await saver.aget_delta_channel_history(config=config, channels=["items"])
             [message] = warnings(caplog)
             assert THREAD in message and ids[0] in message and "items" in message
+            assert "checkpoint_ns ''" in message
 
 
 class Profile(TypedDict, total=False):

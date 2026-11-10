@@ -41,6 +41,8 @@ from langchain_cockroachdb._psycopg_ops import PsycopgOps
 from langchain_cockroachdb.checkpointer.base import (
     BaseCockroachDBSaver,
     _DeltaHistoryWalk,
+    _duration,
+    _TTLPlan,
     connection_options,
 )
 from langchain_cockroachdb.retry import RetryPolicy, schema_change_policy
@@ -357,6 +359,7 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
                     break
             start = walk.next_start(start, page, limit)
             limit = max(1, min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE))
+        self._warn_cut_chain(walk)
         return walk.result()
 
     def _fetch_chain_page(
@@ -445,7 +448,9 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         # Only a put that uses blob rows it does not write needs the TTL setting
         candidates = self._refresh_candidates(checkpoint, blob_values, blob_versions)
         window = self._ttl_refresh_window() if candidates else None
-        refresh = None if window is None else (thread_id, checkpoint_ns, candidates, window)
+        refresh = (
+            None if window is None else (thread_id, checkpoint_ns, candidates, _duration(window))
+        )
 
         def write() -> None:
             with self._cursor(
@@ -468,12 +473,21 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
 
         The saver reads the TTL setting of checkpoint_blobs from the catalog
         when it has not read it for TTL_STATE_CACHE_SECONDS, or since its own
-        enable_ttl or disable_ttl ran.
+        enable_ttl or disable_ttl ran. If that read fails with a database
+        error that the retry policy does not retry, such as a missing
+        privilege, the put goes on without refreshing, and the saver logs a
+        WARNING and reads again after the cache interval.
         """
         state = self._fresh_ttl_state()
         if state is None:
-            reloptions = self._retry(self._read_blob_ttl, label="read checkpoint TTL")
-            state = self._keep_ttl_state(reloptions)
+            try:
+                reloptions = self._retry(self._read_blob_ttl, label="read checkpoint TTL")
+            except Exception as error:
+                if not self._skips_ttl_read(error):
+                    raise
+                state = self._ttl_read_failed(error)
+            else:
+                state = self._keep_ttl_state(reloptions)
         return state.window
 
     def _read_blob_ttl(self) -> builtins.list[str] | None:
@@ -484,6 +498,48 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
             cur.execute(self.SELECT_BLOB_TTL_SQL, ("checkpoint_blobs",))
             row = cur.fetchone()
         return None if row is None else row["reloptions"]
+
+    def _refresh_used_blobs(self, plan: _TTLPlan) -> None:
+        """Bring forward the blob rows that checkpoints inside the interval use.
+
+        enable_ttl runs this once, before it changes the TTL settings, so the
+        blob rows of threads that are idle then live as long as their
+        checkpoints. It
+        reads the checkpoints a page at a time in primary key order, each
+        page in its own retried operation, so no transaction grows with the
+        table. A row is brought forward only once it is older than the
+        refresh window, so a page that runs twice changes nothing more.
+        """
+        limit = max(1, self.TTL_REFRESH_BATCH_SIZE)
+        started = self._refresh_started(plan, limit)
+        after: tuple[str, str, str] | None = None
+        refreshed = 0
+        while True:
+            read, brought, after = self._retry(
+                partial(self._refresh_page, after, plan, limit), label="refresh checkpoint blobs"
+            )
+            refreshed += brought
+            if read < limit:
+                break
+        self._refresh_finished(refreshed, started)
+
+    def _refresh_page(
+        self, after: tuple[str, str, str] | None, plan: _TTLPlan, limit: int
+    ) -> tuple[int, int, tuple[str, str, str] | None]:
+        """Refresh the blob rows of one page: (checkpoints read, rows refreshed, the page's last key)."""
+        query, params = self._checkpoint_page(after, plan.interval, limit)
+        with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="refresh checkpoint blobs"
+        ) as cur:
+            cur.execute(query, params)
+            page = cur.fetchall()
+            used = self._used_blobs(page)
+            refreshed = 0
+            if used:
+                cur.execute(self.REFRESH_USED_BLOBS_SQL, (used, plan.window))
+                self._sync_pipeline()
+                refreshed = max(cur.rowcount, 0)
+        return len(page), refreshed, self._page_end(page, after)
 
     def put_writes(
         self,
@@ -553,9 +609,19 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         which hold channel values, expire a tenth of ttl_interval later
         (TTL_REFRESH_FRACTION), and each put brings forward those its
         checkpoint still uses. So a thread keeps its state while it is
-        active, and expires once it has been idle for ttl_interval. After
-        upgrading from 0.5, run it again with the same arguments to add that
-        grace to blob rows.
+        active, and expires once it has been idle for ttl_interval. Months
+        and years are stored as days, 30 to a month and 365 to a year, so the
+        interval has a fixed length.
+
+        When the TTL setting of checkpoint_blobs is to change, it first brings
+        forward, once, the blob rows that checkpoints inside the interval
+        use, so threads idle at that moment keep their state too. That reads
+        every checkpoint once, TTL_REFRESH_BATCH_SIZE at a time, and logs at
+        INFO when it starts and ends. Only then does it change the settings,
+        so a run that stops partway runs the pass again next time, and a run
+        with the setting already in place skips it. After upgrading from 0.5,
+        run it again with the same arguments, which adds the grace and covers
+        threads idle since the upgrade.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
@@ -568,10 +634,15 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
-        statements = self._enable_ttl_statements(ttl_interval, cron)
+        plan = self._ttl_plan(ttl_interval, cron)
         policy = schema_change_policy(self.retry_policy)
         try:
-            for statement in statements:
+            before = self._retry(self._read_blob_ttl, label="read checkpoint TTL")
+            # Before the settings change: a run that stops partway leaves the
+            # old setting, so the next run refreshes again
+            if self._refresh_needed(before, plan):
+                self._refresh_used_blobs(plan)
+            for statement in plan.statements:
                 self._run_ddl(statement, "enable TTL", policy=policy)
         finally:
             # Even a failed run may have changed a table
