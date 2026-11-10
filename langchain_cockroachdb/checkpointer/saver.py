@@ -508,8 +508,8 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         order, and updates the rows a page needs TTL_REFRESH_UPDATE_SIZE at a
         time. Each read and each UPDATE is its own retried operation under
         the policy's ddl_attempt_timeout, so no transaction grows with the
-        table. A row is brought forward to its newest checkpoint only when it
-        is older than that by more than the refresh window, so only rows left
+        table. A row is brought forward to now only when it is older than its
+        newest checkpoint by more than the refresh window, so only rows left
         unchanged that long are rewritten, and running a page twice changes
         nothing more.
         """
@@ -627,18 +627,18 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         one pass, so threads idle at that moment keep their state too: each
         blob row that checkpoints inside the interval use, and that is older
         than the newest of them by more than the refresh window, is brought
-        forward to when that checkpoint was written. Only rows left unchanged
-        that long are rewritten. The pass reads every checkpoint once,
-        TTL_REFRESH_BATCH_SIZE at a time, changes at most
-        TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at INFO when it
-        starts and ends. Only then does it change the settings, so a run that
-        stops partway runs the pass again next time. A run with the setting
-        already in place, or with only a longer interval, skips it; to force
-        it, call disable_ttl first. On a large table, run it once from a
-        single process before a rollout. After upgrading from 0.5, run it
-        again with the same arguments, which adds the grace and covers
-        threads idle since the upgrade. Intervals over 106,751 days, the
-        longest duration CockroachDB keeps, are refused.
+        forward to now. Only rows left unchanged that long are rewritten. The
+        pass reads every checkpoint once, TTL_REFRESH_BATCH_SIZE at a time,
+        changes at most TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at
+        INFO when it starts and ends. Only then does it change the settings,
+        so a run that stops partway runs the pass again next time. A run
+        with the setting already in place skips it, but any other change
+        runs it, a longer interval too; to force it, call disable_ttl first.
+        On a large table, run it once from a single process before a
+        rollout. After upgrading from 0.5, run it again with the same
+        arguments, which adds the grace and covers threads idle since the
+        upgrade. Intervals over 106,751 days, the longest duration
+        CockroachDB keeps, are refused.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is

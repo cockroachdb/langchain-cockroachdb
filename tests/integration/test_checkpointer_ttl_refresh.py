@@ -413,15 +413,15 @@ def test_enable_ttl_refreshes_once_per_setting(
         saver.enable_ttl("1 hour")
         started, finished = refresh_logs(caplog)
         assert finished.endswith("Blob rows brought forward: 0.")
-        # The same setting, with another cron, and a longer interval: the
-        # setting in place already covers them
+        # The same setting, with another cron: nothing to refresh
         caplog.clear()
         saver.enable_ttl("1 hour", "@weekly")
-        saver.enable_ttl("2 hours")
         assert refresh_logs(caplog) == []
-        # A shorter interval refreshes again
-        saver.enable_ttl("30 minutes")
+        # Any other interval refreshes again, a longer one too
+        saver.enable_ttl("2 hours")
         assert len(refresh_logs(caplog)) == 2
+        saver.enable_ttl("30 minutes")
+        assert len(refresh_logs(caplog)) == 4
 
 
 async def test_async_enable_ttl_refreshes_once_per_setting(
@@ -435,10 +435,11 @@ async def test_async_enable_ttl_refreshes_once_per_setting(
             assert finished.endswith("Blob rows brought forward: 0.")
             caplog.clear()
             await saver.aenable_ttl("1 hour", "@weekly")
-            await saver.aenable_ttl("2 hours")
             assert refresh_logs(caplog) == []
-            await saver.aenable_ttl("30 minutes")
+            await saver.aenable_ttl("2 hours")
             assert len(refresh_logs(caplog)) == 2
+            await saver.aenable_ttl("30 minutes")
+            assert len(refresh_logs(caplog)) == 4
 
 
 PROFILE = {"name": "Ada", "plan": "pro"}
@@ -487,13 +488,33 @@ def blob_times(url: str) -> dict[tuple[str, str], Any]:
     return {(channel, version): written for channel, version, written in rows}
 
 
-def newest_checkpoint(url: str) -> Any:
+def database_now(url: str) -> Any:
     with psycopg.connect(url, autocommit=True) as conn:
-        row = conn.execute(
-            "SELECT max(created_at) FROM checkpoints WHERE thread_id = 'six'"
-        ).fetchone()
+        row = conn.execute("SELECT now()").fetchone()
     assert row is not None
     return row[0]
+
+
+def assert_only_the_profile_was_refreshed(
+    url: str,
+    caplog: pytest.LogCaptureFixture,
+    before: dict[tuple[str, str], Any],
+    started: Any,
+    finished: Any,
+) -> dict[tuple[str, str], Any]:
+    """After enable_ttl("1 hour") on the six steps, with two checkpoints a page."""
+    after = blob_times(url)
+    # Only the profile: each messages row is used by the one checkpoint that
+    # wrote it, so it is within the window of its newest checkpoint
+    changed = {key for key in before if after[key] != before[key]}
+    assert {channel for channel, _ in changed} == {"profile"}
+    [profile] = changed
+    # Brought forward to the time of the pass, never back, and once though
+    # every page holds a checkpoint that uses it
+    assert started <= after[profile] <= finished
+    assert after[profile] > before[profile]
+    assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 1.")
+    return after
 
 
 @MODES
@@ -506,16 +527,12 @@ def test_enable_ttl_rewrites_only_blob_rows_left_unchanged_too_long(
         before = blob_times(url)
         assert len(before) == 7
         with sync_saver(url, mode) as saver:
+            saver.TTL_REFRESH_BATCH_SIZE = 2
+            started = database_now(url)
             saver.enable_ttl("1 hour")
-            after = blob_times(url)
-            # Only the profile: each messages row is used by the one checkpoint
-            # that wrote it. It is brought forward to the newest checkpoint
-            # that uses it, not to now
-            changed = {key for key in before if after[key] != before[key]}
-            assert {channel for channel, _ in changed} == {"profile"}
-            [profile] = changed
-            assert after[profile] == newest_checkpoint(url)
-            assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 1.")
+            after = assert_only_the_profile_was_refreshed(
+                url, caplog, before, started, database_now(url)
+            )
             # Run again, the pass changes nothing more
             saver._refresh_used_blobs(saver._ttl_plan("1 hour", "@daily"))
             assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 0.")
@@ -530,15 +547,41 @@ async def test_async_enable_ttl_rewrites_only_blob_rows_left_unchanged_too_long(
         write_six_steps(url)
         before = blob_times(url)
         async with async_saver(url) as saver:
+            saver.TTL_REFRESH_BATCH_SIZE = 2
+            started = database_now(url)
             await saver.aenable_ttl("1 hour")
-            after = blob_times(url)
-            changed = {key for key in before if after[key] != before[key]}
-            assert {channel for channel, _ in changed} == {"profile"}
-            [profile] = changed
-            assert after[profile] == newest_checkpoint(url)
+            after = assert_only_the_profile_was_refreshed(
+                url, caplog, before, started, database_now(url)
+            )
             await saver._refresh_used_blobs(saver._ttl_plan("1 hour", "@daily"))
             assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 0.")
             assert blob_times(url) == after
+
+
+def test_a_longer_interval_refreshes_rows_the_shorter_one_left_stale(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Lengthening runs the pass too.
+
+    With a one-day interval the pass leaves alone a thread idle for three
+    days: its rows have expired, but the TTL job, which runs on its cron,
+    has not deleted them yet. A thirty-day interval brings the thread back
+    inside, and the pass brings forward its profile, set sixty days ago.
+    """
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        with CockroachDBSaver.from_conn_string(url) as writer:
+            Thread(writer).put(profile=PROFILE, messages=["hello"])
+        age_thread(url, THREAD, "3 days")
+        age(url, "profile", "60 days")
+        with sync_saver(url) as saver:
+            saver.enable_ttl("1 day")
+            assert blob_age(url, "profile") >= timedelta(days=60)
+            saver.enable_ttl("30 days")
+        assert blob_age(url, "profile") < timedelta(minutes=1)
+        # Written with the checkpoint, so within the window of it
+        assert blob_age(url, "messages") >= timedelta(days=3)
+        assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 1.")
 
 
 def test_enable_ttl_refreshes_more_rows_than_one_update_takes(

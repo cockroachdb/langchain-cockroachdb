@@ -655,7 +655,7 @@ def test_the_refresh_statements_bind_every_value() -> None:
         select + "WHERE (thread_id, checkpoint_ns, checkpoint_id) > (%s, %s, %s) " + order
     )
     assert " ".join(base.REFRESH_USED_BLOBS_SQL.split()) == (
-        "UPDATE checkpoint_blobs AS b SET created_at = u.newest FROM unnest( "
+        "UPDATE checkpoint_blobs AS b SET created_at = now() FROM unnest( "
         "CAST(%s AS STRING[]), CAST(%s AS STRING[]), CAST(%s AS STRING[]), "
         "CAST(%s AS STRING[]), CAST(%s AS TIMESTAMPTZ[]) ) "
         "AS u (thread_id, checkpoint_ns, channel, version, newest) "
@@ -811,9 +811,10 @@ async def test_refresh_batch_sizes_below_one_count_as_one(kind: str, size: int) 
     [
         # The same expression: puts have refreshed blob rows all along
         (NEW_V26, "1 hour", False),
-        # Only lengthened: the old, smaller window holds within the new one
-        (NEW_V26, "2 hours", False),
-        (NEW_V26, "1 day", False),
+        # Lengthened: checkpoints the old setting expired but its job has not
+        # deleted yet come back inside the interval, with stale blob rows
+        (NEW_V26, "2 hours", True),
+        (NEW_V26, "1 day", True),
         # Shortened: rows within the old window may be outside the new one
         (NEW_V26, "30 minutes", True),
         # A setting from 0.5 had no grace; one not written by enable_ttl, or none
@@ -824,7 +825,7 @@ async def test_refresh_batch_sizes_below_one_count_as_one(kind: str, size: int) 
         (None, "1 hour", True),
     ],
 )
-async def test_enable_ttl_refreshes_only_when_the_setting_does_not_already_cover_it(
+async def test_enable_ttl_refreshes_unless_the_same_setting_is_in_place(
     kind: str, found: Any, interval: str, refreshes: bool
 ) -> None:
     saver, _ = saver_for(kind)

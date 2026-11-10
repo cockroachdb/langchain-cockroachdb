@@ -272,16 +272,17 @@ SELECT_CHECKPOINT_PAGE_AFTER_SQL = _CHECKPOINT_PAGE_SQL.format(
     after="WHERE (thread_id, checkpoint_ns, checkpoint_id) > (%s, %s, %s)"
 )
 
-# Brings each blob row forward to when the newest checkpoint inside the TTL
-# interval that uses it was written, when it is older than that by more than
-# the refresh window: what a put of that checkpoint would have done. Only
-# rows left unchanged that long are rewritten, and none ends up newer than
-# its newest checkpoint. Run again, it changes nothing more. CockroachDB
-# gives every array of a multi-array unnest one type unless each is cast.
-# Params: arrays of thread_id, checkpoint_ns, channel, version and the
-# newest checkpoint's created_at, then the window.
+# Brings forward to now each blob row that is older than the newest
+# checkpoint inside the TTL interval that uses it by more than the refresh
+# window. Only rows left unchanged that long are rewritten. Setting them to
+# now rather than to that checkpoint's time keeps a thread that writes while
+# the pass runs, before puts refresh, exposed only for as long as the pass
+# runs. Run again, it changes nothing more. CockroachDB gives every array of
+# a multi-array unnest one type unless each is cast. Params: arrays of
+# thread_id, checkpoint_ns, channel, version and the newest checkpoint's
+# created_at, then the window.
 REFRESH_USED_BLOBS_SQL = """
-    UPDATE checkpoint_blobs AS b SET created_at = u.newest
+    UPDATE checkpoint_blobs AS b SET created_at = now()
     FROM unnest(
         CAST(%s AS STRING[]), CAST(%s AS STRING[]), CAST(%s AS STRING[]),
         CAST(%s AS STRING[]), CAST(%s AS TIMESTAMPTZ[])
@@ -723,26 +724,14 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
         """Whether enable_ttl refreshes blob rows before it changes the settings.
 
         ``before`` is the reloptions of checkpoint_blobs as enable_ttl found
-        them. No refresh when they already hold this expression: enable_ttl
-        refreshes before it writes an expression, so a refresh has finished,
-        and puts have refreshed blob rows since. Nor when they hold an
-        expression with the grace that this one only lengthens: every blob
-        row is then within the old window of its newest checkpoint, so within
-        the new, longer one too.
+        them. Only when they already hold this very expression is there no
+        refresh: enable_ttl refreshes before it writes an expression, so a
+        refresh has finished, and puts have refreshed blob rows since. Any
+        other change refreshes, a longer interval too. TTL deletes expired
+        rows only when its job gets to them, so a longer interval can bring
+        back checkpoints whose blob rows the old setting had already expired.
         """
-        expression = _blob_expression(before)
-        if expression is None:
-            return True
-        if expression == plan.blob_expression:
-            return False
-        setting = _expression_setting(expression)
-        if setting is None:
-            return True
-        length, divisor = setting
-        if divisor is None:
-            # The 0.5 expression, with no grace
-            return True
-        return length > plan.interval or length / divisor > plan.window
+        return _blob_expression(before) != plan.blob_expression
 
     def _checkpoint_page(
         self, after: tuple[str, str, str] | None, plan: _TTLPlan, limit: int
