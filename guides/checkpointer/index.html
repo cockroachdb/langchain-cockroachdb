@@ -24,7 +24,7 @@
         
       
       
-      <link rel="icon" href="../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/favicon.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
@@ -98,8 +98,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href="../.." title="langchain-cockroachdb" class="md-header__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -388,8 +387,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href="../.." title="langchain-cockroachdb" class="md-nav__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     langchain-cockroachdb
@@ -1195,10 +1193,43 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#what-ttl-expires" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What TTL Expires
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#how-it-works" class="md-nav__link">
     <span class="md-ellipsis">
       
         How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#upgrading-from-05" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upgrading from 0.5
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#graphs-with-deltachannel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Graphs with DeltaChannel
       
     </span>
   </a>
@@ -1663,6 +1694,34 @@
     
   
     Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/memory-reconciliation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Reconciliation
   
 
     
@@ -2551,10 +2610,43 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#what-ttl-expires" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What TTL Expires
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#how-it-works" class="md-nav__link">
     <span class="md-ellipsis">
       
         How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#upgrading-from-05" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upgrading from 0.5
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#graphs-with-deltachannel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Graphs with DeltaChannel
       
     </span>
   </a>
@@ -3052,7 +3144,7 @@ application-level idempotency or reconciliation.</p>
 <a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">with</span> <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">)</span> <span class="k">as</span> <span class="n">saver</span><span class="p">:</span>
 <a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
 <a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>
-<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>    <span class="c1"># Expire checkpoints older than 30 days, clean up daily</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>    <span class="c1"># Expire threads idle for 30 days, clean up daily</span>
 <a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>    <span class="n">saver</span><span class="o">.</span><span class="n">enable_ttl</span><span class="p">(</span><span class="n">ttl_interval</span><span class="o">=</span><span class="s2">"30 days"</span><span class="p">,</span> <span class="n">cron</span><span class="o">=</span><span class="s2">"@daily"</span><span class="p">)</span>
 <a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>
 <a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a><span class="c1"># Async</span>
@@ -3064,18 +3156,46 @@ application-level idempotency or reconciliation.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="n">saver</span><span class="o">.</span><span class="n">disable_ttl</span><span class="p">()</span>       <span class="c1"># sync</span>
 <a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">await</span> <span class="n">saver</span><span class="o">.</span><span class="n">adisable_ttl</span><span class="p">()</span>  <span class="c1"># async</span>
 </code></pre></div>
+<h3 id="what-ttl-expires">What TTL Expires<a class="headerlink" href="#what-ttl-expires" title="Permanent link">&para;</a></h3>
+<p>Each row expires by its own <code>created_at</code>, which <code>setup()</code> adds to all three tables with <code>DEFAULT now()</code>.</p>
+<ul>
+<li>A checkpoint row, and the writes saved with it, expire <code>ttl_interval</code> after they were written. The older checkpoints of an active thread expire too, so its history gets shorter while its latest checkpoints stay.</li>
+<li>A blob row holds one channel's value at one version. It is written once, when the channel changes, and every later checkpoint in which the channel kept that version uses the same row. A blob row expires <code>ttl_interval</code> plus a tenth of it after its <code>created_at</code>.</li>
+</ul>
+<p><code>enable_ttl()</code> stores months and years as days, 30 to a month and 365 to a year, so <code>"1 month"</code> is stored as <code>"30 days"</code>. CockroachDB adds months and years by the calendar, and the same month added on two days a little apart can differ by up to 3 days, which no grace of a tenth could cover. An interval of fixed length keeps the guarantees below exact.</p>
+<p>A channel that has not changed since an early step, such as a profile set on the first turn, keeps its first blob row. So while TTL is on, each <code>put</code> brings <code>created_at</code> forward to now on the blob rows its checkpoint uses but does not write, once they are older than a tenth of the interval. It does this in the same transaction as the checkpoint row. The extra tenth is the grace: after a put, each blob row the new checkpoint uses expires no earlier than the checkpoint.</p>
+<p>Puts only cover threads that write, and only once their saver knows that TTL is on. So when <code>enable_ttl()</code> turns TTL on or changes it, it does four things:</p>
+<ol>
+<li>It writes the new settings with TTL paused (<code>ttl_pause</code>): they are in place, but CockroachDB's TTL job deletes nothing.</li>
+<li>It waits <code>TTL_STATE_CACHE_SECONDS</code> (10 seconds) plus <code>TTL_PAUSE_MARGIN_SECONDS</code> (5 seconds), about 15 seconds, so that every saver reads the new setting and the puts already under way finish. If the retry policy's <code>attempt_timeout</code> is longer than the margin, it waits that instead of the margin, since one attempt can last that long. Savers refresh while TTL is paused, so from then on every put refreshes. One narrow case remains: a put that decided before the wait, and took longer than the margin to commit, counting any wait for a pooled connection, can miss its refresh. A thread that writes that way and then stays idle can lose a blob row the pass left alone. Changing the setting when few threads are active avoids it.</li>
+<li>It makes one pass over the checkpoints. For each blob row that the checkpoints inside the interval use, it finds the newest of those checkpoints. If the row is older than that checkpoint by more than a tenth of the interval, the pass brings its <code>created_at</code> forward to now. So threads that are idle keep their state too.</li>
+<li>It reads the setting of <code>checkpoint_blobs</code> again and resumes TTL, <code>checkpoint_blobs</code> last. If another run has written a different setting meanwhile, it leaves TTL paused for that run to resume, and logs that at INFO.</li>
+</ol>
+<p>Only rows left unchanged that long are rewritten, so the pass does not rewrite the table: the messages a thread changes every step have rows that only their own checkpoints use. The pass reads every checkpoint once, <code>TTL_REFRESH_BATCH_SIZE</code> (500) at a time, and changes at most <code>TTL_REFRESH_UPDATE_SIZE</code> (100) rows per <code>UPDATE</code>. Each read and each <code>UPDATE</code> is its own short statement, retried on its own under the retry policy's <code>ddl_attempt_timeout</code>. <code>enable_ttl()</code> logs at INFO when it pauses TTL, when the pass starts and ends, with the number of blob rows it brought forward, and when it resumes TTL.</p>
+<p>So whenever the setting changes, <code>enable_ttl()</code> blocks for about 15 seconds on a table of any size, plus the time the pass takes. That includes the first call after upgrading from 0.5. Called again with the same setting in place and running, it returns at once, after updating the cron. Any other change makes the whole run, a longer interval too: TTL deletes expired rows only when its job gets to them, so a longer interval can bring back checkpoints whose blob rows the old setting had already expired. If your processes call <code>enable_ttl()</code> as they start and their startup probes are tight, run it once from a single process or a one-off job before the rollout. The calls they then make find the same setting in place and return at once.</p>
+<p>Use one interval in every process, and change it from one process. If two runs with different intervals overlap, each resumes TTL only if its own setting is still in place, so the run that wrote last resumes it.</p>
+<p>After TTL resumes, CockroachDB may skip its next scheduled TTL job once, with "found a recent schema change". That delays deletion by one cron period.</p>
+<p>A run that stops before it resumes TTL leaves it paused, which deletes nothing. A run that stops during the resume statements leaves only <code>checkpoint_blobs</code> paused, since it resumes last. Then checkpoints and writes expire again while blob rows stay, which only leaves behind blob rows that no checkpoint uses. Either way, run <code>enable_ttl()</code> again: it takes a paused setting for a run that did not finish, so it waits, makes the pass and resumes TTL, even with the same interval. While TTL is paused, CockroachDB's scheduled TTL job fails with "ttl jobs on table ... are currently paused" and deletes nothing. A saver that finds TTL on <code>checkpoint_blobs</code> paused logs a WARNING, once per process each time it is paused. It says that TTL deletes nothing while paused, and that if no <code>enable_ttl()</code> run is under way, one stopped before it finished, so run <code>enable_ttl()</code> again. Savers log it during a run too. <code>enable_ttl()</code> cannot tell how a setting in place got there, so after a setting written by hand or with copied DDL, or data imported while TTL was on, call <code>disable_ttl()</code> and then <code>enable_ttl()</code> to make it run the pass.</p>
+<p>So once <code>enable_ttl()</code> has run, a thread keeps its whole state while it is active, and expires once it has been idle for <code>ttl_interval</code>. A blob row that no checkpoint uses any more stays at most a tenth of the interval longer than the checkpoints did. A row that the pass in <code>enable_ttl()</code> brought forward can stay up to about one interval longer than its thread, once. While TTL is on, a put that uses blob rows it does not write sends one more <code>UPDATE</code> in its transaction, and a blob row is rewritten at most once per tenth of the interval.</p>
+<p>The saver learns whether TTL is on, and the interval, from the settings of <code>checkpoint_blobs</code> in the catalog. It reads them on the first put that needs them and keeps them for <code>TTL_STATE_CACHE_SECONDS</code> (10 seconds), counted from when the read started, so it sees a change another process makes within 10 seconds. That is at most one small catalog read per saver every 10 seconds, made only by puts that use blob rows they do not write. Each attempt of a put decides again whether to refresh, so a retry made after the saver learns that TTL is on refreshes too. Its own <code>enable_ttl()</code> and <code>disable_ttl()</code> take effect for it at once. <code>enable_ttl()</code> waits its own saver's <code>TTL_STATE_CACHE_SECONDS</code> for every saver, so keep that value the same in every process. If the read fails with a database error that the retry policy does not retry, such as a missing privilege, puts go on without the refresh, the saver logs a WARNING once, and it reads again after the cache interval.</p>
 <h3 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h3>
 <ul>
-<li><code>setup()</code> adds a <code>created_at TIMESTAMPTZ</code> column (with <code>DEFAULT now()</code>) to all three checkpoint tables via migration.</li>
-<li><code>enable_ttl()</code> uses CockroachDB's <code>ttl_expiration_expression</code> (recommended over <code>ttl_expire_after</code> to avoid full table rewrites).</li>
-<li>CockroachDB runs a background job on the specified cron schedule to delete rows where <code>created_at + interval</code> is in the past.</li>
-<li><code>enable_ttl()</code> is idempotent -- calling it again updates the interval and cron.</li>
-<li><code>disable_ttl()</code> removes TTL from all three tables.</li>
+<li><code>enable_ttl()</code> uses CockroachDB's <code>ttl_expiration_expression</code>, which avoids the full table rewrite that <code>ttl_expire_after</code> causes.</li>
+<li>CockroachDB runs a background job on the cron schedule. It deletes checkpoint and write rows whose <code>created_at + interval</code> has passed, and blob rows whose <code>created_at + interval + interval / 10</code> has.</li>
+<li><code>enable_ttl()</code> is idempotent. Calling it again updates the interval and cron.</li>
+<li><code>enable_ttl()</code> refuses an interval longer than 106,751 days, about 292 years. That is the longest duration CockroachDB keeps, and the pass binds the interval as one.</li>
+<li><code>disable_ttl()</code> removes TTL from all three tables, a pause included.</li>
+<li>A TTL setting on <code>checkpoint_blobs</code> that <code>enable_ttl()</code> did not write, such as one set by hand, turns the refresh off. The saver logs that at INFO, once per process.</li>
 </ul>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>TTL deletion is <strong>eventual</strong> -- expired rows remain queryable until the background job runs. CockroachDB rate-limits deletions to minimize impact on foreground queries.</p>
+<p>TTL deletion is <strong>eventual</strong>: expired rows remain queryable until the background job runs. CockroachDB rate-limits deletions to minimize impact on foreground queries.</p>
 </div>
+<h3 id="upgrading-from-05">Upgrading from 0.5<a class="headerlink" href="#upgrading-from-05" title="Permanent link">&para;</a></h3>
+<p>In 0.5, blob rows got no grace, puts did not refresh them, and months and years were stored as written. After upgrading, run <code>enable_ttl()</code> once more with the same interval and cron. It adds the grace, stores months and years as days, and brings forward the blob rows of threads that have been idle since the upgrade, pausing TTL while it does. It blocks for about 15 seconds plus the pass, so if startup probes are tight, run it once from a single process or a one-off job before the rollout. Until then, puts refresh blob rows, but with the 0.5 setting a thread that has written since the upgrade can lose blob rows up to a tenth of the interval before its last checkpoint expires, and a thread idle since the upgrade up to the whole interval before. A 0.5 setting in months or years is still read for the refresh, but only approximately.</p>
+<h3 id="graphs-with-deltachannel">Graphs with DeltaChannel<a class="headerlink" href="#graphs-with-deltachannel" title="Permanent link">&para;</a></h3>
+<p>LangGraph's <code>DeltaChannel</code>, which Deep Agents uses for its messages and files, stores each step's change and a full snapshot only every so many steps. To load the state, the saver rebuilds such a channel from older checkpoints and their writes, back to the last snapshot. TTL still expires those older checkpoints by age, even while the thread is active. So for these graphs, pick a TTL longer than a thread stays active, or delete finished threads with <code>delete_thread()</code>.</p>
+<p>When the history of a delta channel stops at a missing checkpoint before its snapshot, <code>get_delta_channel_history</code> logs a WARNING. It names the thread, its <code>checkpoint_ns</code> and the missing checkpoint, and says that the state of those channels may be incomplete. A saver logs each missing checkpoint once. What it returns is unchanged.</p>
 <h2 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h2>
 <p>The CockroachDB checkpointer includes several performance optimizations over the base PostgresSaver approach:</p>
 <h3 id="separate-lightweight-queries">Separate Lightweight Queries<a class="headerlink" href="#separate-lightweight-queries" title="Permanent link">&para;</a></h3>

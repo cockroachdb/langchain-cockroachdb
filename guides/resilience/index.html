@@ -24,7 +24,7 @@
         
       
       
-      <link rel="icon" href="../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/favicon.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
@@ -98,8 +98,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href="../.." title="langchain-cockroachdb" class="md-header__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -388,8 +387,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href="../.." title="langchain-cockroachdb" class="md-nav__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     langchain-cockroachdb
@@ -1304,6 +1302,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/memory-reconciliation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Reconciliation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2136,7 +2162,7 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">policy</span> <span class="o">=</span> <span class="n">RetryPolicy</span><span class="p">(</span><span class="o">**</span><span class="p">{</span><span class="s2">"max_attempts"</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span> <span class="s2">"retryable_sqlstates"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"40001"</span><span class="p">,</span> <span class="s2">"40003"</span><span class="p">,</span> <span class="s2">"57P01"</span><span class="p">]})</span>
 </code></pre></div>
 <p>The older <code>retry_max_attempts</code>, <code>retry_initial_backoff</code>, <code>retry_max_backoff</code>, <code>retry_backoff_multiplier</code> and <code>retry_jitter</code> arguments still work as shorthand.</p>
-<p>TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE <code>0A000</code>. Several processes running checkpointer <code>enable_ttl</code> or <code>disable_ttl</code>, or store <code>setup()</code> with a TTL configuration or <code>disable_ttl</code>, at once can hit it. These TTL statements are idempotent, so they retry that error under your policy (<code>schema_change_policy</code>), even if your <code>retry_on</code> would refuse it. <code>max_attempts=1</code> turns this off. The code and phrase are <code>SCHEMA_CHANGE_BUSY_SQLSTATE</code> and <code>SCHEMA_CHANGE_BUSY_MESSAGES</code>, and <code>is_schema_change_busy()</code> checks an error.</p>
+<p>TTL changes get one more rule. CockroachDB v25.4 refuses to change a table's TTL settings while another schema change on that table runs, with SQLSTATE <code>0A000</code>. Several processes running checkpointer <code>enable_ttl</code> or <code>disable_ttl</code>, or store <code>setup()</code> with a TTL configuration or <code>disable_ttl</code>, at once can hit it, and so can a store <code>setup()</code> that meets another process's migration backfilling the table. These TTL statements are idempotent, so they retry that error (<code>schema_change_policy</code>), even if your <code>retry_on</code> would refuse it. The other schema change can take far longer than a transient error takes to clear, such as a column backfill or a vector index build, so this error has a budget of its own: each TTL statement retries it for up to <code>SCHEMA_CHANGE_BUSY_SECONDS</code> (600, ten minutes) of wall time from the first such error, as long as the store's <code>setup()</code> waits for another process's migration (<code>SCHEMA_CHANGE_SETTLE_SECONDS</code>). A store <code>setup()</code> can wait one such budget for each table whose TTL it changes, on top of that wait. The pauses grow as your backoff does, from the default initial backoff if yours has none, at least doubling, up to <code>SCHEMA_CHANGE_BUSY_MAX_BACKOFF</code> seconds (3). Other errors keep your policy's attempts and backoff, counted apart from it, and a <code>RetryPolicy</code> subclass keeps its <code>is_retryable</code> and <code>delay</code> overrides for them (not overrides of <code>run</code> or <code>arun</code>). <code>max_attempts=1</code> turns every retry off. The code and phrase are <code>SCHEMA_CHANGE_BUSY_SQLSTATE</code> and <code>SCHEMA_CHANGE_BUSY_MESSAGES</code>, and <code>is_schema_change_busy()</code> checks an error.</p>
 <h2 id="idempotency">Idempotency<a class="headerlink" href="#idempotency" title="Permanent link">&para;</a></h2>
 <p>A <code>40001</code> means the transaction did not commit. After a <code>40003</code> or a dropped connection it may have. Retrying is only safe when running the work twice has the same effect as running it once, and every write the library makes is built that way: vector inserts are UPSERTs, deletes are deletes, chat messages carry ids chosen before the first attempt and are written with <code>ON CONFLICT DO NOTHING</code>, checkpoints are UPSERTs, and schema changes use <code>IF [NOT] EXISTS</code>.</p>
 <p>For your own code, <code>async_retry_with_backoff</code> and <code>sync_retry_with_backoff</code> use the same rules. If the work is not idempotent, retry serialization failures only:</p>
@@ -2197,6 +2223,13 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>WARNING langchain_cockroachdb.retry: Retrying insert into public.resilience_1ceb80 after SerializationFailure (SQLSTATE 40001): restart transaction: demo fault 40001 (attempt 1 of 6 failed, next try in 0.10s)
 </code></pre></div>
 <p>and one more when it gives up. Raise that logger's level to hide them, or route them to your metrics.</p>
+<p>Waits for another schema change log less often. A TTL change that meets another schema change on its table logs one WARNING on its first retry, then at most one every <code>SCHEMA_CHANGE_PROGRESS_SECONDS</code> (60), with how long it has waited, and one when it gives up:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>WARNING langchain_cockroachdb.retry: Retrying store TTL setup after FeatureNotSupported (SQLSTATE 0A000): cannot modify TTL settings while another schema change on the table is being processed: another schema change on the table is still running (attempt 1 failed, 0s of up to 600s waited, next try in 0.09s)
+</code></pre></div>
+<p>A store <code>setup()</code> that waits for another process's migration logs on the store's logger: an INFO line when it starts, a WARNING once it has waited <code>SCHEMA_CHANGE_QUIET_SECONDS</code> (30), then one every minute with how long it has waited and what it still waits for (the columns, or schema change jobs that SHOW JOBS shows on the table), and an INFO line when it ends. The WARNING reads:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>WARNING langchain_cockroachdb.store.store: setup() has waited 31s for another process to apply migration 2 to public.store: its columns are not public yet, and SHOW JOBS shows 1 schema change job on the table. Check SHOW JOBS for the schema change job. setup() waits up to 600 seconds in all.
+</code></pre></div>
+<p>When no job applies the migration and that <code>setup()</code> applies the migration itself, it logs that at INFO.</p>
 <h2 id="trying-it">Trying it<a class="headerlink" href="#trying-it" title="Permanent link">&para;</a></h2>
 <p><code>examples/resilience.py</code> makes CockroachDB raise real <code>40001</code>, <code>40003</code> and <code>57P01</code> errors and kills pooled connections while the vector store, chat history and checkpointer keep working.</p>
 

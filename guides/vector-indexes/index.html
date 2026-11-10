@@ -24,7 +24,7 @@
         
       
       
-      <link rel="icon" href="../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/favicon.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
@@ -98,8 +98,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href="../.." title="langchain-cockroachdb" class="md-header__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -388,8 +387,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href="../.." title="langchain-cockroachdb" class="md-nav__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     langchain-cockroachdb
@@ -917,6 +915,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#filtered-search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Filtered Search
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#query-time-tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1068,10 +1077,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#1-create-index-after-bulk-insert" class="md-nav__link">
+  <a href="#1-create-the-index-before-writes-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        1. Create Index After Bulk Insert
+        1. Create the Index Before Writes Start
       
     </span>
   </a>
@@ -1079,10 +1088,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#2-use-prefix-columns-for-multi-tenancy" class="md-nav__link">
+  <a href="#2-use-the-namespace-as-the-prefix-column-for-multi-tenancy" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2. Use Prefix Columns for Multi-Tenancy
+        2. Use the Namespace as the Prefix Column for Multi-Tenancy
       
     </span>
   </a>
@@ -1581,6 +1590,34 @@
     
   
     Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/memory-reconciliation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Reconciliation
   
 
     
@@ -2275,6 +2312,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#filtered-search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Filtered Search
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#query-time-tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2426,10 +2474,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#1-create-index-after-bulk-insert" class="md-nav__link">
+  <a href="#1-create-the-index-before-writes-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        1. Create Index After Bulk Insert
+        1. Create the Index Before Writes Start
       
     </span>
   </a>
@@ -2437,10 +2485,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#2-use-prefix-columns-for-multi-tenancy" class="md-nav__link">
+  <a href="#2-use-the-namespace-as-the-prefix-column-for-multi-tenancy" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2. Use Prefix Columns for Multi-Tenancy
+        2. Use the Namespace as the Prefix Column for Multi-Tenancy
       
     </span>
   </a>
@@ -2596,7 +2644,8 @@
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
 </code></pre></div>
 <p>This creates:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">VECTOR</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span><span class="p">(</span><span class="n">embedding</span><span class="p">);</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">VECTOR</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">documents_embedding_vector_idx</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">ON</span><span class="w"> </span><span class="k">public</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="p">(</span><span class="n">embedding</span><span class="w"> </span><span class="n">vector_cosine_ops</span><span class="p">);</span>
 </code></pre></div></p>
 <h3 id="specify-distance-strategy">Specify Distance Strategy<a class="headerlink" href="#specify-distance-strategy" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CSPANNIndex</span><span class="p">,</span> <span class="n">DistanceStrategy</span>
@@ -2633,87 +2682,87 @@
 </code></pre></div>
 <h2 id="multi-tenant-indexes">Multi-Tenant Indexes<a class="headerlink" href="#multi-tenant-indexes" title="Permanent link">&para;</a></h2>
 <h3 id="prefix-columns">Prefix Columns<a class="headerlink" href="#prefix-columns" title="Permanent link">&para;</a></h3>
-<p>Create indexes with prefix columns for tenant isolation:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Assume table has tenant_id column as first column</span>
+<p>An index can have prefix columns before its vector column. They come only from <code>prefix_columns</code>, never from the order of the table's columns:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># The table was created with namespace_column="namespace"</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">prefix_columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"namespace"</span><span class="p">])</span>
 </code></pre></div>
-<p><strong>CockroachDB will automatically use prefix columns if:</strong>
-1. Table has non-vector columns before embedding column
-2. Query filters on those columns</p>
-<p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1">-- Table structure</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span><span class="p">(</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span><span class="n">tenant_id</span><span class="w"> </span><span class="n">UUID</span><span class="p">,</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">    </span><span class="n">collection_id</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">,</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="n">UUID</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">    </span><span class="n">content</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">,</span>
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">    </span><span class="n">embedding</span><span class="w"> </span><span class="n">VECTOR</span><span class="p">(</span><span class="mi">1536</span><span class="p">),</span>
-<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">    </span><span class="n">metadata</span><span class="w"> </span><span class="n">JSONB</span>
-<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="p">);</span>
-<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>
-<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="c1">-- Index with prefix columns</span>
-<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">VECTOR</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span><span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span><span class="w"> </span><span class="n">collection_id</span><span class="p">,</span><span class="w"> </span><span class="n">embedding</span><span class="p">);</span>
+<p>This creates:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">VECTOR</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">documents_embedding_vector_idx</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">ON</span><span class="w"> </span><span class="k">public</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span><span class="w"> </span><span class="n">embedding</span><span class="w"> </span><span class="n">vector_cosine_ops</span><span class="p">);</span>
 </code></pre></div></p>
+<p>CockroachDB uses such an index only for a search that constrains every prefix column to a value, with <code>=</code> or <code>IN</code>. A store created with <code>namespace="tenant-a"</code> adds <code>namespace = 'tenant-a'</code> to each of its searches, so an index whose only prefix column is the namespace serves them, with or without a metadata filter. A store without a namespace constrains no column, so it cannot use an index with prefix columns. The store never constrains a column other than the namespace.</p>
+<p>A key in <code>filter</code> is a filter on the JSON metadata column, not a prefix column, even when it has the name of a column.</p>
 <p><strong>Benefits:</strong>
-- Each tenant's vectors are colocated
-- Filters on prefix columns use index efficiently
-- Better performance for multi-tenant apps</p>
+- Each tenant's vectors are stored together in the index
+- A search reads only its own tenant's part of the index</p>
+<h2 id="filtered-search">Filtered Search<a class="headerlink" href="#filtered-search" title="Permanent link">&para;</a></h2>
+<p>CockroachDB uses a vector index only when every filter of the search matches the index's prefix columns. A metadata filter never does. So when the filter sits next to <code>ORDER BY distance LIMIT k</code>, CockroachDB scans the table and ranks every row that passes.</p>
+<p>When the table has a usable index (see below), a search with a <code>filter</code> works in steps instead:</p>
+<ol>
+<li>It takes the nearest rows from the index, with no filter: twice <code>k</code> plus one, and at least 41, which costs the index about the same as fewer (on a 20,000-row table, a window of 41 read about 10% more rows than a window of 9, in the same time). For a namespaced store, the namespace is the index's prefix column, so the index reads only that namespace.</li>
+<li>It applies the filter to those rows and keeps the <code>k</code> nearest that pass. Steps 1 and 2 are one statement.</li>
+<li>When fewer than <code>k</code> rows pass, matches may lie beyond the window, so the store runs the exact search: the statement every filtered search ran before 0.6.0, which filters before it ranks. When no row passes, it always does. When some do, it skips the exact search only if the window held every row of the table or namespace, since the short result is then the whole answer.</li>
+</ol>
+<p>A filter that most rows near the query pass is served by the index alone, in one statement. A selective filter often needs the exact search as well, which costs the scan it always did, plus the short indexed read before it. The exact search returns only the store's namespace, but its plan can scan the whole table to find those rows.</p>
+<p>A result that comes from the window is approximate, as every index search is: the index can miss a near neighbor, and the beam size sets how often (see <a href="#beam-size">Beam Size</a>). Before 0.6.0, filtered searches scanned and were always exact.</p>
+<p>A usable index:</p>
+<ul>
+<li>is on the store's embedding column;</li>
+<li>has the operator class of the store's distance strategy (see <a href="#index-opclasses">Index Opclasses</a>);</li>
+<li>has no prefix column for a store without a namespace, and the namespace column as its only prefix column for a namespaced store.</li>
+</ul>
+<p>A namespaced store also needs the primary key or another index to lead with the namespace column, so that counting the namespace's rows does not scan the table. <code>ainit_vectorstore_table</code> creates that index with the namespace column. A table without one keeps the exact search.</p>
+<p>The store reads the table's indexes with <code>SHOW CREATE TABLE</code> on its first filtered search. The engine keeps the answer for every store with the same table, embedding column, distance strategy and namespace column, so an application that builds a store per request, one per tenant for example, reads it once per table, not once per request. It is read again once <code>VECTOR_INDEX_REFRESH_SECONDS</code> (60) have passed, so an index that another process creates is used within a minute, and right after an index is applied or dropped through any store on the engine. Without a filter, or without a usable index, a search runs the same single statement as before.</p>
+<p>This covers <code>similarity_search</code> and its variants, max marginal relevance search and the vector leg of hybrid search, in the sync and async stores. In MMR search the candidate pool, <code>fetch_k</code>, takes the place of <code>k</code>. In hybrid search, so does its pool: <code>fetch_k</code>, or <code>max(4 * k, 20)</code> without it.</p>
 <h2 id="query-time-tuning">Query-Time Tuning<a class="headerlink" href="#query-time-tuning" title="Permanent link">&para;</a></h2>
 <h3 id="beam-size">Beam Size<a class="headerlink" href="#beam-size" title="Permanent link">&para;</a></h3>
-<p>Adjust accuracy/speed tradeoff at query time:</p>
+<p>The beam size sets how much of the index a search explores. CockroachDB's default, the <code>vector_search_beam_size</code> session setting, is 32. Pass <code>query_options</code> to change it for one search:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CSPANNQueryOptions</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1"># Higher beam = more accurate, slower</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="n">query_options</span> <span class="o">=</span> <span class="n">CSPANNQueryOptions</span><span class="p">(</span><span class="n">beam_size</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span>
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="c1"># Lower beam = faster, less accurate</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="n">query_options</span> <span class="o">=</span> <span class="n">CSPANNQueryOptions</span><span class="p">(</span><span class="n">beam_size</span><span class="o">=</span><span class="mi">50</span><span class="p">)</span>
-<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>
-<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="c1"># Apply to search</span>
-<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
-<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>    <span class="s2">"query"</span><span class="p">,</span>
-<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>    <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
-<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a>    <span class="c1"># TODO: Pass query_options when implemented</span>
-<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="p">)</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1"># A larger beam: more accurate, slower</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="s2">"query"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">query_options</span><span class="o">=</span><span class="n">CSPANNQueryOptions</span><span class="p">(</span><span class="n">beam_size</span><span class="o">=</span><span class="mi">64</span><span class="p">)</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="p">)</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="c1"># A smaller beam: faster, less accurate</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>    <span class="s2">"query"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">query_options</span><span class="o">=</span><span class="n">CSPANNQueryOptions</span><span class="p">(</span><span class="n">beam_size</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
+<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="p">)</span>
 </code></pre></div>
-<p>Currently set via session:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">async</span> <span class="k">with</span> <span class="n">engine</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">connect</span><span class="p">()</span> <span class="k">as</span> <span class="n">conn</span><span class="p">:</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    <span class="k">await</span> <span class="n">conn</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">text</span><span class="p">(</span><span class="s2">"SET vector_search_beam_size = 200"</span><span class="p">))</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>    <span class="c1"># Run queries</span>
-</code></pre></div></p>
+<p>The store sets it with <code>SET LOCAL</code> in the search's own transaction, so it never stays on a pooled connection. The MMR methods take <code>query_options=</code> too.</p>
 <p><strong>Guidelines:</strong>
-- Default: 100 (good balance)
-- High accuracy: 200-500
-- Low latency: 25-50
-- Production: 100-200</p>
+- Start with the default, 32
+- If results miss near neighbors, try 64, then 128
+- If latency matters more than recall, try 16
+- Check recall against an exact search on a sample of real queries</p>
 <h2 id="index-management">Index Management<a class="headerlink" href="#index-management" title="Permanent link">&para;</a></h2>
 <h3 id="drop-index">Drop Index<a class="headerlink" href="#drop-index" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">adrop_vector_index</span><span class="p">()</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">adrop_vector_index</span><span class="p">()</span>
 </code></pre></div>
 <p>Or by name:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">index_name</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">index_name</span><span class="p">;</span>
 </code></pre></div></p>
 <h3 id="check-index-status">Check Index Status<a class="headerlink" href="#check-index-status" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">async</span> <span class="k">with</span> <span class="n">engine</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">connect</span><span class="p">()</span> <span class="k">as</span> <span class="n">conn</span><span class="p">:</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="kn">from</span><span class="w"> </span><span class="nn">sqlalchemy</span><span class="w"> </span><span class="kn">import</span> <span class="n">text</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">conn</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>        <span class="n">text</span><span class="p">(</span><span class="s2">"""</span>
-<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="s2">            SELECT indexname, indexdef </span>
-<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="s2">            FROM pg_indexes </span>
-<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="s2">            WHERE tablename = 'documents'</span>
-<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="s2">        """</span><span class="p">)</span>
-<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>    <span class="p">)</span>
-<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>    <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">result</span><span class="p">:</span>
-<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Definition: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">async</span> <span class="k">with</span> <span class="n">engine</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">connect</span><span class="p">()</span> <span class="k">as</span> <span class="n">conn</span><span class="p">:</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>    <span class="kn">from</span><span class="w"> </span><span class="nn">sqlalchemy</span><span class="w"> </span><span class="kn">import</span> <span class="n">text</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">conn</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>        <span class="n">text</span><span class="p">(</span><span class="s2">"""</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="s2">            SELECT indexname, indexdef </span>
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="s2">            FROM pg_indexes </span>
+<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="s2">            WHERE tablename = 'documents'</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="s2">        """</span><span class="p">)</span>
+<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a>    <span class="p">)</span>
+<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a>    <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">result</span><span class="p">:</span>
+<a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Definition: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 </code></pre></div>
 <h3 id="rebuild-index">Rebuild Index<a class="headerlink" href="#rebuild-index" title="Permanent link">&para;</a></h3>
 <p>Indexes are maintained automatically, but if needed:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Drop and recreate</span>
-<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">adrop_vector_index</span><span class="p">()</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="c1"># Drop and recreate</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">adrop_vector_index</span><span class="p">()</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="performance-comparison">Performance Comparison<a class="headerlink" href="#performance-comparison" title="Permanent link">&para;</a></h2>
 <h3 id="small-dataset-1000-vectors">Small Dataset (1,000 vectors)<a class="headerlink" href="#small-dataset-1000-vectors" title="Permanent link">&para;</a></h3>
@@ -2760,12 +2809,12 @@
 <td>5-10x faster</td>
 </tr>
 <tr>
-<td>Index + beam=50</td>
+<td>Index, beam below the default 32</td>
 <td>5-15ms</td>
 <td>Fast but less accurate</td>
 </tr>
 <tr>
-<td>Index + beam=200</td>
+<td>Index, beam above the default 32</td>
 <td>15-40ms</td>
 <td>More accurate</td>
 </tr>
@@ -2833,33 +2882,34 @@
 <p>Indexes created by earlier versions for COSINE or INNER_PRODUCT are <code>vector_l2_ops</code> and are not used by those searches. Drop them with <code>await vectorstore.adrop_vector_index()</code> and apply again. <code>aapply_vector_index</code> logs a warning when it finds a mismatched opclass, different prefix columns, or a partition size other than one you set. Applying the same index again logs nothing.</p>
 </div>
 <h2 id="best-practices">Best Practices<a class="headerlink" href="#best-practices" title="Permanent link">&para;</a></h2>
-<h3 id="1-create-index-after-bulk-insert">1. Create Index After Bulk Insert<a class="headerlink" href="#1-create-index-after-bulk-insert" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="c1"># Insert data first</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">(</span><span class="n">large_list_of_texts</span><span class="p">)</span>
-<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>
-<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="c1"># Then create index</span>
-<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
-<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
+<h3 id="1-create-the-index-before-writes-start">1. Create the Index Before Writes Start<a class="headerlink" href="#1-create-the-index-before-writes-start" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Create the table, then the index while the table is empty</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">await</span> <span class="n">engine</span><span class="o">.</span><span class="n">ainit_vectorstore_table</span><span class="p">(</span><span class="s2">"documents"</span><span class="p">,</span> <span class="n">vector_dimension</span><span class="o">=</span><span class="mi">1536</span><span class="p">)</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">CSPANNIndex</span><span class="p">())</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="c1"># Then write</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aadd_texts</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span>
 </code></pre></div>
-<p>Building index on existing data is faster than incremental updates.</p>
-<h3 id="2-use-prefix-columns-for-multi-tenancy">2. Use Prefix Columns for Multi-Tenancy<a class="headerlink" href="#2-use-prefix-columns-for-multi-tenancy" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># Structure table with tenant_id first</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="c1"># Then create index - it will use prefix automatically</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">()</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>
-<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="c1"># Queries with tenant filter will be fast</span>
-<a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
-<a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>    <span class="s2">"query"</span><span class="p">,</span>
-<a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a>    <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
-<a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a>    <span class="nb">filter</span><span class="o">=</span><span class="p">{</span><span class="s2">"tenant_id"</span><span class="p">:</span> <span class="s2">"tenant-123"</span><span class="p">}</span>  <span class="c1"># Uses index prefix</span>
-<a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a><span class="p">)</span>
+<p>Building an index on a table that already holds data starts a backfill, and CockroachDB blocks writes to the table until the backfill ends. This is a known limitation of vector indexes. On a table that takes writes all the time, create the index before the writes start. To index a table that already holds data, choose a time when its writes can pause.</p>
+<h3 id="2-use-the-namespace-as-the-prefix-column-for-multi-tenancy">2. Use the Namespace as the Prefix Column for Multi-Tenancy<a class="headerlink" href="#2-use-the-namespace-as-the-prefix-column-for-multi-tenancy" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="c1"># One store per tenant, on a table created with namespace_column="namespace"</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="n">store</span> <span class="o">=</span> <span class="n">AsyncCockroachDBVectorStore</span><span class="p">(</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="n">embeddings</span><span class="o">=</span><span class="n">embeddings</span><span class="p">,</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">collection_name</span><span class="o">=</span><span class="s2">"documents"</span><span class="p">,</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>    <span class="n">namespace</span><span class="o">=</span><span class="s2">"tenant-123"</span><span class="p">,</span>
+<a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="p">)</span>
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">CSPANNIndex</span><span class="p">(),</span> <span class="n">prefix_columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"namespace"</span><span class="p">])</span>
+<a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a>
+<a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="c1"># The index reads only tenant-123's vectors; the filter applies to them</span>
+<a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span><span class="s2">"query"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="nb">filter</span><span class="o">=</span><span class="p">{</span><span class="s2">"category"</span><span class="p">:</span> <span class="s2">"news"</span><span class="p">})</span>
 </code></pre></div>
+<p>A key in <code>filter</code>, such as <code>"tenant_id"</code>, filters the JSON metadata. It never uses an index prefix.</p>
 <h3 id="3-monitor-and-tune-beam-size">3. Monitor and Tune Beam Size<a class="headerlink" href="#3-monitor-and-tune-beam-size" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># Start with default (100)</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="c1"># Monitor query latency</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="c1"># If too slow: reduce beam (50-75)</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="c1"># If accuracy issues: increase beam (150-200)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># Start with the default, 32</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="c1"># Monitor query latency and recall</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="c1"># If too slow: try 16</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="c1"># If results miss near neighbors: try 64, then 128</span>
 </code></pre></div>
 <h3 id="4-consider-workload-balance">4. Consider Workload Balance<a class="headerlink" href="#4-consider-workload-balance" title="Permanent link">&para;</a></h3>
 <table>
@@ -2872,55 +2922,58 @@
 <tbody>
 <tr>
 <td>Read-heavy</td>
-<td>Create index immediately</td>
+<td>Create the index right away</td>
 </tr>
 <tr>
 <td>Write-heavy</td>
-<td>Delay index creation</td>
+<td>Create the index on the empty table, before writes start: building it on a table that holds data blocks writes until the backfill ends</td>
 </tr>
 <tr>
 <td>Balanced</td>
-<td>Create index, monitor performance</td>
+<td>Create the index early, and monitor performance</td>
 </tr>
 </tbody>
 </table>
 <h3 id="5-index-before-production">5. Index Before Production<a class="headerlink" href="#5-index-before-production" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1"># Development: test without index first</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="c1"># Staging: create index, benchmark</span>
-<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="c1"># Production: deploy with index</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># Development: test without index first</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="c1"># Staging: create index, benchmark</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="c1"># Production: deploy with index</span>
 </code></pre></div>
 <h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&para;</a></h2>
 <h3 id="index-not-being-used">Index Not Being Used<a class="headerlink" href="#index-not-being-used" title="Permanent link">&para;</a></h3>
 <p>Check query plan:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span>
-<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">embedding</span><span class="w"> </span><span class="o">&lt;=&gt;</span><span class="w"> </span><span class="s1">'[...]'</span><span class="w"> </span><span class="k">LIMIT</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">documents</span><span class="w"> </span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">embedding</span><span class="w"> </span><span class="o">&lt;=&gt;</span><span class="w"> </span><span class="s1">'[...]'</span><span class="w"> </span><span class="k">LIMIT</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
 </code></pre></div></p>
 <p>If index not used:
 - Check distance operator matches index opclass
+- Check that the query constrains every prefix column to a value; a metadata filter alone never uses the index (see <a href="#filtered-search">Filtered Search</a>)
 - Verify table statistics are up to date
-- Ensure CockroachDB version supports vector indexes (23.1+)</p>
+- Use CockroachDB v25.4 or later, the oldest version this library supports</p>
 <h3 id="slow-index-creation">Slow Index Creation<a class="headerlink" href="#slow-index-creation" title="Permanent link">&para;</a></h3>
 <p>Large datasets take time:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>
-<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
-<a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
-<a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a><span class="n">elapsed</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span>
-<a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index created in </span><span class="si">{</span><span class="n">elapsed</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">s"</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>
+<a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
+<a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="n">elapsed</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span>
+<a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index created in </span><span class="si">{</span><span class="n">elapsed</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">s"</span><span class="p">)</span>
 </code></pre></div></p>
 <p><strong>Typical times:</strong>
 - 10K vectors: 1-5s
 - 100K vectors: 10-30s
 - 1M vectors: 1-5 minutes</p>
 <h3 id="accuracy-issues">Accuracy Issues<a class="headerlink" href="#accuracy-issues" title="Permanent link">&para;</a></h3>
-<p>Increase beam size:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="k">SET</span><span class="w"> </span><span class="n">vector_search_beam_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span><span class="p">;</span>
+<p>Increase the beam size above the default of 32:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">asimilarity_search</span><span class="p">(</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>    <span class="s2">"query"</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">query_options</span><span class="o">=</span><span class="n">CSPANNQueryOptions</span><span class="p">(</span><span class="n">beam_size</span><span class="o">=</span><span class="mi">64</span><span class="p">)</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="p">)</span>
 </code></pre></div></p>
 <p>Or adjust partition sizes:
-<div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">(</span>
-<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>    <span class="n">min_partition_size</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>   <span class="c1"># Smaller = more accurate</span>
-<a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a>    <span class="n">max_partition_size</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>  <span class="c1"># Smaller = more accurate</span>
-<a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">(</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>    <span class="n">min_partition_size</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>   <span class="c1"># Smaller = more accurate</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a>    <span class="n">max_partition_size</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>  <span class="c1"># Smaller = more accurate</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="p">)</span>
 </code></pre></div></p>
 <h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
 <ul>

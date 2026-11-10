@@ -24,7 +24,7 @@
         
       
       
-      <link rel="icon" href="../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/favicon.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
@@ -98,8 +98,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href="../.." title="langchain-cockroachdb" class="md-header__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -388,8 +387,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href="../.." title="langchain-cockroachdb" class="md-nav__button md-logo" aria-label="langchain-cockroachdb" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../../assets/cockroachlabs-icon-dark-bg.svg" alt="logo">
 
     </a>
     langchain-cockroachdb
@@ -1245,6 +1243,199 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#keeping-memories-true" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keeping Memories True
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Keeping Memories True">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#turning-it-on" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Turning It On
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reconciling-a-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reconciling a Memory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#candidates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Candidates
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#policies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Policies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-two-step-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The Two-Step Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#waiting-for-a-person" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Waiting for a Person
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        History
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#forgetting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Forgetting
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#provenance-and-valid-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provenance and Valid Time
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#confirmation-aware-expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Confirmation-Aware Expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrent-reconciles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrent Reconciles
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-scan-limit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The Scan Limit
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#conditional-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Conditional Writes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#retries-and-rebuilt-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries and Rebuilt Results
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tools-for-an-agent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools for an Agent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#upgrading-from-05" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upgrading From 0.5
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#differences-from-postgresstore" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1547,6 +1738,34 @@
     
   
     Long-Term Memory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/memory-reconciliation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Reconciliation
   
 
     
@@ -2457,6 +2676,199 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#keeping-memories-true" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keeping Memories True
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Keeping Memories True">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#turning-it-on" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Turning It On
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reconciling-a-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reconciling a Memory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#candidates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Candidates
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#policies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Policies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-two-step-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The Two-Step Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#waiting-for-a-person" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Waiting for a Person
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        History
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#forgetting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Forgetting
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#provenance-and-valid-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provenance and Valid Time
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#confirmation-aware-expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Confirmation-Aware Expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrent-reconciles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrent Reconciles
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-scan-limit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The Scan Limit
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#conditional-writes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Conditional Writes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#retries-and-rebuilt-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries and Rebuilt Results
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tools-for-an-agent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools for an Agent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#upgrading-from-05" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upgrading From 0.5
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#differences-from-postgresstore" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2503,6 +2915,7 @@
 <h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
 <p>A LangGraph checkpointer keeps the state of one thread, which is short-term memory. A store keeps what every thread can read, which is long-term memory. <code>CockroachDBStore</code> and <code>AsyncCockroachDBStore</code> implement LangGraph's <code>BaseStore</code>, so they work wherever LangGraph takes a store: <code>create_agent(store=...)</code>, <code>StateGraph.compile(store=...)</code> and Deep Agents.</p>
 <p>The API follows <code>PostgresStore</code> from <a href="https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres">langgraph-checkpoint-postgres</a>: <code>from_conn_string</code>, <code>setup()</code>, the <code>index</code> and <code>ttl</code> arguments and the TTL sweeper methods work the same way. What this store adds or does differently is listed in <a href="#differences-from-postgresstore">Differences from PostgresStore</a>.</p>
+<p>Memories can stop being true. <a href="#keeping-memories-true">Keeping Memories True</a> shows how the store settles a new memory against the ones it may conflict with, keeps a history of old versions with their provenance, lets expiry follow confirmations, and keeps two writers from losing an update.</p>
 <h2 id="installation">Installation<a class="headerlink" href="#installation" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span>langchain-cockroachdb
 </code></pre></div>
@@ -2606,6 +3019,16 @@
 <td>Expiry settings, see <a href="#ttl">TTL</a></td>
 </tr>
 <tr>
+<td><code>history</code></td>
+<td><code>None</code></td>
+<td>Version history: <code>True</code>, or a <code>HistoryConfig</code> such as <code>{"ttl_days": 365}</code>. See <a href="#history">History</a></td>
+</tr>
+<tr>
+<td><code>reconcile_scan_limit</code></td>
+<td><code>2000</code></td>
+<td>The most vectors a namespace may hold for its similar candidates to be ranked exactly. See <a href="#the-scan-limit">The Scan Limit</a></td>
+</tr>
+<tr>
 <td><code>retry_policy</code></td>
 <td><code>RetryPolicy()</code></td>
 <td>How operations retry</td>
@@ -2638,7 +3061,7 @@
 </tbody>
 </table>
 <h3 id="your-own-pool-or-connection">Your Own Pool or Connection<a class="headerlink" href="#your-own-pool-or-connection" title="Permanent link">&para;</a></h3>
-<p>The constructor takes a psycopg connection or a <code>psycopg_pool</code> pool, plus <code>pipe</code>, <code>index</code>, <code>ttl</code>, <code>retry_policy</code>, <code>table_name</code> and <code>schema</code>. The connection or pool must use autocommit and <code>dict_row</code>. One pool can serve the store and the checkpointer:</p>
+<p>The constructor takes a psycopg connection or a <code>psycopg_pool</code> pool, plus <code>pipe</code>, <code>index</code>, <code>ttl</code>, <code>history</code>, <code>reconcile_scan_limit</code>, <code>retry_policy</code>, <code>table_name</code> and <code>schema</code>. The connection or pool must use autocommit and <code>dict_row</code>. One pool can serve the store and the checkpointer:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg.rows</span><span class="w"> </span><span class="kn">import</span> <span class="n">dict_row</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">psycopg_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConnectionPool</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
@@ -2661,9 +3084,9 @@
 <p><code>AsyncCockroachDBStore</code> sends <code>aget</code>, <code>aput</code>, <code>asearch</code> and its other awaited calls through LangGraph's <code>AsyncBatchedBaseStore</code> queue. The queue runs one <code>abatch</code> at a time and merges the ops queued in the same event loop tick into one batch. So a larger pool does not run those calls in parallel, though it still replaces broken connections. Direct <code>abatch</code> calls, and <code>batch</code> calls from other threads, run concurrently on a pool.</p>
 <p>Create an <code>AsyncCockroachDBStore</code> inside a running event loop. Its sync methods (<code>get</code>, <code>put</code> and the others) are for other threads while that loop runs. They run the async methods on it, so <code>get</code>, <code>put</code>, <code>search</code>, <code>delete</code> and <code>list_namespaces</code> join the same queue. Called from the loop's own thread they raise <code>asyncio.InvalidStateError</code>. If the loop is closed or not running, or the call comes from a forked child process, they raise <code>RuntimeError</code> instead of waiting forever, as the sync methods of <code>AsyncCockroachDBSaver</code> do.</p>
 <h2 id="retries-and-atomic-writes">Retries and Atomic Writes<a class="headerlink" href="#retries-and-atomic-writes" title="Permanent link">&para;</a></h2>
-<p>Every call retries transient CockroachDB errors under the store's <code>RetryPolicy</code>. Pass <code>retry_policy=</code> to change it; see <a href="../resilience/">Retries and Resilience</a> for the fields. Every write is an UPSERT, a DELETE, or an UPDATE that pushes back an expiry. Each is safe to run twice, so a retry after an ambiguous result is safe.</p>
+<p>Every call retries transient CockroachDB errors under the store's <code>RetryPolicy</code>. Pass <code>retry_policy=</code> to change it; see <a href="../resilience/">Retries and Resilience</a> for the fields. Every write is an UPSERT, a DELETE, an UPDATE that pushes back an expiry or confirms a memory, or an INSERT into history that skips versions already there. Each is safe to run twice, so a retry after an ambiguous result is safe. For the rare windows where a retry after a lost commit cannot tell its own earlier commit from another writer's work, see <a href="#retries-and-rebuilt-results">Retries and Rebuilt Results</a> in the reconciliation section.</p>
 <p>A <code>batch()</code> call validates every op and serializes every value before any statement runs. It then runs its reads, one round trip each for its gets, its searches and its listings, and commits all its puts and deletes together in one transaction. Semantic searches under a namespace add a round trip before the searches, and sometimes one after them, as <a href="#how-searches-use-the-index">How Searches Use the Index</a> explains. Embeddings are computed once, before the first attempt, so a retry does not call the embedding model again. When one batch puts the same key twice, the last put wins.</p>
-<p>On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table. The TTL step of <code>setup()</code>, <code>disable_ttl()</code> and <code>adisable_ttl()</code> retry that error, as described in <a href="../resilience/#configuring-retries">Configuring retries</a>.</p>
+<p>On CockroachDB v25.4, a TTL change can meet a schema change that another process runs on the same table, such as a vector index another <code>setup()</code> builds over many vectors. The TTL steps of <code>setup()</code>, <code>disable_ttl()</code> and <code>adisable_ttl()</code> retry that error for up to ten minutes by default, for each table, as described in <a href="../resilience/#configuring-retries">Configuring retries</a>. <code>setup()</code> also reads each table's TTL settings first and changes them only when they differ, so the processes that start after the first one change nothing.</p>
 <h2 id="namespaces-and-items">Namespaces and Items<a class="headerlink" href="#namespaces-and-items" title="Permanent link">&para;</a></h2>
 <p>An item is a JSON object, addressed by a namespace (a tuple of labels) and a key. LangGraph's <code>BaseStore</code> requires every label to be a non-empty string without <code>.</code>, in every store, and reserves <code>"langgraph"</code> as the first label. This store keeps a namespace as its labels joined with <code>.</code>, as PostgresStore does, and checks the labels again for ops passed straight to <code>batch()</code>.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">),</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">,</span> <span class="s2">"stars"</span><span class="p">:</span> <span class="mi">5</span><span class="p">})</span>
@@ -2801,7 +3224,7 @@
 <p>Each embedded text is one vector row, so an item can have several. Putting an item again replaces all its vectors, and deleting it deletes them. A search returns each item once, with the score of its best match. Higher scores are better: the score is <code>1 - distance</code> for cosine, and the negated distance for <code>l2</code> and <code>inner_product</code>. Results are ordered by score, then by namespace and key.</p>
 <h3 id="how-searches-use-the-index">How Searches Use the Index<a class="headerlink" href="#how-searches-use-the-index" title="Permanent link">&para;</a></h3>
 <p>The vector index has the namespace as a prefix column, because most memory searches name one user's namespace. A search with a <code>query</code> under a namespace prefix runs in two steps. First a short read lists the namespaces at or under the prefix that have vectors. Then the ranked search runs on the index, limited to those namespaces. For one user's namespace that list has one entry, so the search reads only that namespace's part of the index.</p>
-<p>The index finds approximate nearest neighbors, which <code>beam_size</code> tunes. It gives the search a window of candidate vectors, twice as many as the page needs, and the filter and the expiry check then apply to those candidates. A selective filter, or many expired items that the TTL job has not deleted yet, can leave fewer matches in the window than the page asks for. Then the search runs a second, exact query over the namespaces the first step found: it applies the filter and the expiry check first, ranks every match and returns that page instead. A short first page counts as exact only when the index returned every vector those namespaces hold, which the store checks with a count of their vectors that stops at the window's size. That is the usual case when the namespaces hold fewer vectors than the window. A small <code>beam_size</code> or small partitions can cap what the index returns, and then the second query runs as well. For one user's memories the second query reads little, but it costs a round trip.</p>
+<p>The index finds approximate nearest neighbors, which <code>beam_size</code> tunes. It gives the search a window of candidate vectors, twice as many as the page needs and at least 41, which cost the index about the same as fewer. The filter and the expiry check then apply to those candidates. A selective filter, or many expired items that the TTL job has not deleted yet, can leave fewer matches in the window than the page asks for. Then the search runs a second, exact query over the namespaces the first step found: it applies the filter and the expiry check first, ranks every match and returns that page instead. A short first page counts as exact only when the index returned every vector those namespaces hold, which the store checks with a count of their vectors that stops at the window's size. That is the usual case when the namespaces hold fewer vectors than the window. A small <code>beam_size</code> or small partitions can cap what the index returns, and then the second query runs as well. For one user's memories the second query reads little, but it costs a round trip.</p>
 <p>Some searches skip the index and rank every match exactly in one query: a search of the whole store, with an empty prefix; every search of a store with <code>flat</code> set, which skips the first step too; and a search under a prefix where more than 1000 namespaces have vectors (<code>MAX_SEARCH_NAMESPACES</code> in <code>langchain_cockroachdb.store.sql</code>). Like PostgresStore, they apply the filter and the expiry check before they rank.</p>
 <p><code>beam_size</code> is applied to each search with <code>SET LOCAL</code>, inside the search's own transaction, so it does not stay on a pooled connection.</p>
 <p>Expired items are never returned, but their vectors stay in the table until the TTL job or <code>sweep_ttl()</code> deletes them, and until then they take up places in the window. With TTLs of minutes and the default hourly job, they can fill it, and more searches then need the second query. Set <code>sweep_interval_minutes</code> (or <code>ttl_job_cron</code>) lower when TTLs are minutes.</p>
@@ -2895,7 +3318,7 @@
 </tbody>
 </table>
 <h3 id="the-ttl-job">The TTL Job<a class="headerlink" href="#the-ttl-job" title="Permanent link">&para;</a></h3>
-<p>CockroachDB deletes expired rows itself, with <a href="https://www.cockroachlabs.com/docs/stable/row-level-ttl">row-level TTL</a>. With a <code>ttl</code> configuration, <code>setup()</code> sets <code>ttl_expiration_expression</code> to the <code>expires_at</code> column on the items table, and on the vectors table when there is an index. The job runs on the cron that <code>sweep_interval_minutes</code> gives, or <code>ttl_job_cron</code>, and hourly (<code>@hourly</code>) by default. A changed <code>sweep_interval_minutes</code> or <code>ttl_job_cron</code> takes effect at the next <code>setup()</code>. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.</p>
+<p>CockroachDB deletes expired rows itself, with <a href="https://www.cockroachlabs.com/docs/stable/row-level-ttl">row-level TTL</a>. With a <code>ttl</code> configuration, <code>setup()</code> sets <code>ttl_expiration_expression</code> to the <code>expires_at</code> column on the items table, and on the vectors table when there is an index. The job runs on the cron that <code>sweep_interval_minutes</code> gives, or <code>ttl_job_cron</code>, and hourly (<code>@hourly</code>) by default. A changed <code>sweep_interval_minutes</code> or <code>ttl_job_cron</code> takes effect at the next <code>setup()</code>, which leaves settings that already match alone. Rows without an expiry are never deleted. Vector rows carry their item's expiry, so they expire with it.</p>
 <p>The job runs on a schedule, so an expired item stays in the table until a run deletes it. Reads, searches and listings leave expired items out anyway, because <code>omit_expired</code> is on by default. That holds even for a store built without <code>ttl</code>, since another process may write items with an expiry to the same tables. Pass <code>ttl={"omit_expired": False}</code> to see expired items until the job deletes them. Their vectors stay as well, and make semantic searches run their second query more often, so with TTLs of minutes set <code>sweep_interval_minutes</code> lower than the default hour, as <a href="#how-searches-use-the-index">How Searches Use the Index</a> explains.</p>
 <h3 id="refresh-on-read">Refresh on Read<a class="headerlink" href="#refresh-on-read" title="Permanent link">&para;</a></h3>
 <p>With <code>refresh_on_read</code>, a <code>get</code> or a <code>search</code> sets the expiry of the items it returns to now plus their TTL. Only items that have a TTL change, and vectors are refreshed with their item. The refresh is an UPDATE inside the read statement, so reading items that have a TTL is also a write. For memory that is read very often, set <code>refresh_on_read</code> to <code>False</code> or use a longer TTL. One call can decide for itself with <code>refresh_ttl</code>:</p>
@@ -2919,7 +3342,8 @@
 <h2 id="deleting-a-namespace">Deleting a Namespace<a class="headerlink" href="#deleting-a-namespace" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">deleted</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">delete_namespace</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">))</span>  <span class="c1"># async: await store.adelete_namespace(...)</span>
 </code></pre></div>
-<p><code>delete_namespace</code> deletes every item in a namespace and its descendants, with their vectors, and returns the number of items deleted. <code>("user", "alice")</code> covers <code>("user", "alice", "memories")</code> but not <code>("user", "alice2")</code>. It runs as one statement, so it commits completely or not at all. If a retry follows a commit whose result was lost, the count is that of the retry, usually 0. An empty prefix raises <code>InvalidNamespaceError</code>. <code>BaseStore</code> has no such method; it is specific to this store.</p>
+<p><code>delete_namespace</code> deletes every item in a namespace and its descendants, with their vectors and any history they have, and returns the number of items deleted. <code>("user", "alice")</code> covers <code>("user", "alice", "memories")</code> but not <code>("user", "alice2")</code>. It runs as one statement, so it commits completely or not at all. If a retry follows a commit whose result was lost, the count is that of the retry, usually 0. An empty prefix raises <code>InvalidNamespaceError</code>. <code>BaseStore</code> has no such method; it is specific to this store.</p>
+<p>A store created without history also deletes the namespace's rows in a history table left from when history was on, as <a href="#forgetting">Forgetting</a> explains. A role that did not run <code>setup()</code> then needs SELECT and DELETE on that table. Without them the whole call fails with a permission error and deletes nothing, rather than forget only part of the namespace.</p>
 <h2 id="tables">Tables<a class="headerlink" href="#tables" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -2931,11 +3355,15 @@
 <tbody>
 <tr>
 <td><code>store</code></td>
-<td>Items: <code>prefix</code> (the namespace), <code>key</code>, <code>value</code> (JSONB), <code>created_at</code>, <code>updated_at</code>, <code>expires_at</code> and <code>ttl_minutes</code></td>
+<td>Items: <code>prefix</code> (the namespace), <code>key</code>, <code>value</code> (JSONB), <code>created_at</code>, <code>updated_at</code>, <code>expires_at</code> and <code>ttl_minutes</code>, and from migration 2 <code>version</code>, <code>provenance</code>, <code>confirmed_at</code>, <code>confirmations</code>, <code>write_id</code>, <code>valid_at</code> and <code>confirm_id</code></td>
 </tr>
 <tr>
 <td><code>store_vectors</code></td>
 <td>One row per embedded text, with the item's expiry. Created only with <code>index</code></td>
+</tr>
+<tr>
+<td><code>store_history</code></td>
+<td>Old versions of items: <code>prefix</code>, <code>key</code>, <code>version</code>, <code>value</code>, <code>provenance</code>, <code>valid_at</code>, <code>invalid_at</code>, <code>written_at</code>, <code>ended_at</code>, <code>reason</code>, <code>superseded_by</code>, <code>confirmations</code>, <code>confirmed_at</code>, <code>write_id</code> and <code>expires_at</code>. Created only with <code>history</code></td>
 </tr>
 <tr>
 <td><code>store_migrations</code></td>
@@ -2943,7 +3371,7 @@
 </tr>
 </tbody>
 </table>
-<p><code>table_name="memories"</code> names the tables <code>memories</code>, <code>memories_vectors</code> and <code>memories_migrations</code>, so several stores can share a database. <code>schema=</code> puts them in another schema, which must exist. The default schema is <code>public</code>.</p>
+<p><code>table_name="memories"</code> names the tables <code>memories</code>, <code>memories_vectors</code>, <code>memories_history</code> and <code>memories_migrations</code>, so several stores can share a database. <code>schema=</code> puts them in another schema, which must exist. The default schema is <code>public</code>.</p>
 <p>The store creates plain tables, with no multi-region locality such as <code>REGIONAL BY ROW</code> or <code>GLOBAL</code>. You can set one yourself with <code>ALTER TABLE</code>; <code>setup()</code> leaves it as you set it.</p>
 <h2 id="use-with-langgraph">Use with LangGraph<a class="headerlink" href="#use-with-langgraph" title="Permanent link">&para;</a></h2>
 <h3 id="with-create_agent">With create_agent<a class="headerlink" href="#with-create_agent" title="Permanent link">&para;</a></h3>
@@ -3092,6 +3520,542 @@
 </code></pre></div>
 <p>Files under <code>/memories/</code> go to the store and outlive the thread. Other files stay in the thread's state. Deep Agents accepts <code>.</code> in namespace labels, but LangGraph's <code>BaseStore</code> rejects such a label with <code>InvalidNamespaceError</code> in every store, <code>InMemoryStore</code> and <code>PostgresStore</code> included. Build labels from ids without dots: replace the dots in an email address, for example.</p>
 <p>This snippet was checked against the Deep Agents documentation (deepagents 0.5 and later), not run in this project's tests.</p>
+<h2 id="keeping-memories-true">Keeping Memories True<a class="headerlink" href="#keeping-memories-true" title="Permanent link">&para;</a></h2>
+<p>Semantic search finds memories that are similar to a query, not memories that are still true. A preference the user changed months ago can keep steering an agent, and two memories saved under different keys can contradict each other unnoticed. The store has methods that help keep memory true. They find the memories a new one may conflict with, let your code decide what to do with each, apply the decision in one serializable transaction, and keep a history of what the agent believed, when, and why.</p>
+<p>Deciding what contradicts what stays with your application, which may use rules or an LLM. The store never calls an LLM itself.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reconcile</code></td>
+<td>Writes a memory and settles the memories it may conflict with, under a policy, in one transaction</td>
+</tr>
+<tr>
+<td><code>find_conflicts</code></td>
+<td>Finds the memories a new one may conflict with, without writing anything</td>
+</tr>
+<tr>
+<td><code>resolve</code></td>
+<td>Applies a decision about what <code>find_conflicts</code> found, if nothing it depends on changed since</td>
+</tr>
+<tr>
+<td><code>record</code></td>
+<td>Reads a memory with its version, provenance, valid time and confirmations</td>
+</tr>
+<tr>
+<td><code>confirm</code></td>
+<td>Marks a memory as confirmed: renews its expiry and counts the confirmation</td>
+</tr>
+<tr>
+<td><code>put_if</code>, <code>delete_if</code></td>
+<td>Write or delete a memory only if it is still the one you read</td>
+</tr>
+<tr>
+<td><code>history</code></td>
+<td>Lists the old versions of a memory, or of every memory in a namespace, on a store with history</td>
+</tr>
+<tr>
+<td><code>purge</code></td>
+<td>Removes a memory with its vectors and its history</td>
+</tr>
+</tbody>
+</table>
+<p><code>AsyncCockroachDBStore</code> has each of them as a coroutine with an <code>a</code> prefix: <code>areconcile</code>, <code>afind_conflicts</code>, <code>aresolve</code>, <code>arecord</code>, <code>aconfirm</code>, <code>aput_if</code>, <code>adelete_if</code>, <code>ahistory</code> and <code>apurge</code>. They run on the caller's event loop, not through the store's batch queue, so on a pool they run concurrently. The types and the built-in policies are imported from <code>langchain_cockroachdb.store</code>. <a href="../../examples/memory-reconciliation/"><code>examples/memory_reconciliation.py</code></a> runs through all of this with a scripted judge.</p>
+<h3 id="turning-it-on">Turning It On<a class="headerlink" href="#turning-it-on" title="Permanent link">&para;</a></h3>
+<p><code>setup()</code> adds the columns these methods need to the items table. To keep old versions, pass <code>history=True</code>, or a <code>HistoryConfig</code> such as <code>{"ttl_days": 365}</code> that gives them a TTL, and <code>setup()</code> creates the history table too.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAIEmbeddings</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>
+<a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBStore</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a>
+<a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a><span class="k">with</span> <span class="n">CockroachDBStore</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span>
+<a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a>    <span class="n">DB_URI</span><span class="p">,</span>
+<a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a>    <span class="n">index</span><span class="o">=</span><span class="p">{</span>
+<a id="__codelineno-19-8" name="__codelineno-19-8" href="#__codelineno-19-8"></a>        <span class="s2">"dims"</span><span class="p">:</span> <span class="mi">1536</span><span class="p">,</span>
+<a id="__codelineno-19-9" name="__codelineno-19-9" href="#__codelineno-19-9"></a>        <span class="s2">"embed"</span><span class="p">:</span> <span class="n">OpenAIEmbeddings</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"text-embedding-3-small"</span><span class="p">),</span>
+<a id="__codelineno-19-10" name="__codelineno-19-10" href="#__codelineno-19-10"></a>        <span class="s2">"fields"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+<a id="__codelineno-19-11" name="__codelineno-19-11" href="#__codelineno-19-11"></a>    <span class="p">},</span>
+<a id="__codelineno-19-12" name="__codelineno-19-12" href="#__codelineno-19-12"></a>    <span class="n">ttl</span><span class="o">=</span><span class="p">{</span><span class="s2">"default_ttl"</span><span class="p">:</span> <span class="mi">60</span> <span class="o">*</span> <span class="mi">24</span> <span class="o">*</span> <span class="mi">30</span><span class="p">,</span> <span class="s2">"refresh_on_read"</span><span class="p">:</span> <span class="kc">False</span><span class="p">},</span>
+<a id="__codelineno-19-13" name="__codelineno-19-13" href="#__codelineno-19-13"></a>    <span class="n">history</span><span class="o">=</span><span class="p">{</span><span class="s2">"ttl_days"</span><span class="p">:</span> <span class="mi">365</span><span class="p">},</span>
+<a id="__codelineno-19-14" name="__codelineno-19-14" href="#__codelineno-19-14"></a><span class="p">)</span> <span class="k">as</span> <span class="n">store</span><span class="p">:</span>
+<a id="__codelineno-19-15" name="__codelineno-19-15" href="#__codelineno-19-15"></a>    <span class="n">store</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+</code></pre></div>
+<p>The examples below use this <code>store</code>, one after another. A store upgraded from 0.5 needs <code>setup()</code> once, as <a href="#upgrading-from-05">Upgrading From 0.5</a> explains.</p>
+<h3 id="reconciling-a-memory">Reconciling a Memory<a class="headerlink" href="#reconciling-a-memory" title="Permanent link">&para;</a></h3>
+<p>A slot names the fact a memory states. Here each value's <code>"slot"</code> field holds it, and <code>slot="slot"</code> tells <code>reconcile</code> which field to compare, so a new seat preference finds the old one, with or without an index:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb.store</span><span class="w"> </span><span class="kn">import</span> <span class="n">first_of</span><span class="p">,</span> <span class="n">skip_duplicates</span><span class="p">,</span> <span class="n">supersede_same_slot</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>
+<a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a><span class="n">memories</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="n">policy</span> <span class="o">=</span> <span class="n">first_of</span><span class="p">(</span><span class="n">skip_duplicates</span><span class="p">(),</span> <span class="n">supersede_same_slot</span><span class="p">())</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a>
+<a id="__codelineno-20-6" name="__codelineno-20-6" href="#__codelineno-20-6"></a><span class="n">store</span><span class="o">.</span><span class="n">reconcile</span><span class="p">(</span>
+<a id="__codelineno-20-7" name="__codelineno-20-7" href="#__codelineno-20-7"></a>    <span class="n">memories</span><span class="p">,</span> <span class="s2">"seat-1"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"slot"</span><span class="p">:</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">},</span> <span class="n">slot</span><span class="o">=</span><span class="s2">"slot"</span><span class="p">,</span> <span class="n">policy</span><span class="o">=</span><span class="n">policy</span>
+<a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a><span class="p">)</span>
+<a id="__codelineno-20-9" name="__codelineno-20-9" href="#__codelineno-20-9"></a><span class="n">aisle</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">reconcile</span><span class="p">(</span>
+<a id="__codelineno-20-10" name="__codelineno-20-10" href="#__codelineno-20-10"></a>    <span class="n">memories</span><span class="p">,</span>
+<a id="__codelineno-20-11" name="__codelineno-20-11" href="#__codelineno-20-11"></a>    <span class="kc">None</span><span class="p">,</span>  <span class="c1"># a new uuid4 key</span>
+<a id="__codelineno-20-12" name="__codelineno-20-12" href="#__codelineno-20-12"></a>    <span class="p">{</span><span class="s2">"slot"</span><span class="p">:</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers aisle seats now"</span><span class="p">},</span>
+<a id="__codelineno-20-13" name="__codelineno-20-13" href="#__codelineno-20-13"></a>    <span class="n">slot</span><span class="o">=</span><span class="s2">"slot"</span><span class="p">,</span>
+<a id="__codelineno-20-14" name="__codelineno-20-14" href="#__codelineno-20-14"></a>    <span class="n">policy</span><span class="o">=</span><span class="n">policy</span><span class="p">,</span>
+<a id="__codelineno-20-15" name="__codelineno-20-15" href="#__codelineno-20-15"></a>    <span class="n">provenance</span><span class="o">=</span><span class="p">{</span><span class="s2">"source"</span><span class="p">:</span> <span class="s2">"chat"</span><span class="p">,</span> <span class="s2">"thread"</span><span class="p">:</span> <span class="s2">"thread-7"</span><span class="p">},</span>
+<a id="__codelineno-20-16" name="__codelineno-20-16" href="#__codelineno-20-16"></a><span class="p">)</span>
+<a id="__codelineno-20-17" name="__codelineno-20-17" href="#__codelineno-20-17"></a><span class="nb">print</span><span class="p">(</span><span class="n">aisle</span><span class="o">.</span><span class="n">new</span><span class="p">,</span> <span class="n">aisle</span><span class="o">.</span><span class="n">version</span><span class="p">,</span> <span class="n">aisle</span><span class="o">.</span><span class="n">superseded</span><span class="p">)</span>  <span class="c1"># written 1 ('seat-1',)</span>
+</code></pre></div>
+<p><code>reconcile</code> reads the candidates inside its transaction and calls the policy with the new memory, as a <code>Proposal</code>, and the candidates. It applies the <code>Decision</code> the policy returns, then commits. There is no default policy, so <code>reconcile</code> never removes a memory your code did not decide to remove.</p>
+<p>It returns a <code>ReconcileResult</code>. <code>key</code> is the new memory's key, and <code>new</code> says whether it was <code>"written"</code>, <code>"skipped"</code> or <code>"superseded"</code>. <code>version</code> is the version written, or None. <code>superseded</code>, <code>deleted</code>, <code>confirmed</code> and <code>kept</code> list the candidates by what the decision did with them.</p>
+<p><code>reconcile</code> also takes <code>slot</code>, <code>threshold</code>, <code>limit</code> and <code>filter</code>, which <a href="#candidates">Candidates</a> describes, <code>provenance</code> and <code>valid_at</code>, which <a href="#provenance-and-valid-time">Provenance and Valid Time</a> describes, and <code>index</code> and <code>ttl</code>, as <code>put</code> does. The value's index fields are embedded once, before the first attempt.</p>
+<h3 id="candidates">Candidates<a class="headerlink" href="#candidates" title="Permanent link">&para;</a></h3>
+<p>Candidates are live memories in the new memory's namespace, not in its descendants. A memory is a candidate for one of three reasons, strongest first:</p>
+<table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>The memory</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>"key"</code></td>
+<td>Is under the new memory's key, whatever <code>filter</code> says</td>
+</tr>
+<tr>
+<td><code>"slot"</code></td>
+<td>Holds the same value in the <code>slot</code> field, compared as JSON. This needs no index</td>
+</tr>
+<tr>
+<td><code>"similar"</code></td>
+<td>Has a vector that scores at or above <code>threshold</code> against the new memory's, on a store with an index</td>
+</tr>
+</tbody>
+</table>
+<p>The slot is a top-level field of the value that holds a string, number or boolean. Candidates come strongest reason first, then best score, then key. <code>limit</code> (default 10) caps the similar ones. Key and slot matches come on top of it, and <code>limit=0</code> keeps only them. <code>filter</code> narrows the slot and similar candidates by value, as in <code>search</code>. Expired memories are never candidates, and finding candidates never pushes back an expiry.</p>
+<p>Each <code>Candidate</code> has the memory as <code>item</code>, a <code>SearchItem</code> with its <code>score</code>, along with its <code>reason</code>, <code>version</code>, <code>valid_at</code>, <code>provenance</code>, <code>confirmed_at</code> and <code>confirmations</code>. <code>key</code> and <code>score</code> are shortcuts. A key or slot match carries its best score when it has vectors, and None otherwise.</p>
+<p>Scores come from the store's score function, as in <code>search</code>: 1 minus the distance on a cosine store, and the negated distance on an <code>l2</code> or <code>inner_product</code> store. On a cosine store <code>threshold</code> defaults to 0.8 and must lie between -1 and 1. On an <code>l2</code> or <code>inner_product</code> store no default fits, so pass one. The new memory is embedded as a document, with <code>embed_documents</code>, while <code>search</code> embeds its query with <code>embed_query</code>. Some models embed the two differently, so search scores are a poor guide here. Pick <code>threshold</code> from the scores that <code>find_conflicts</code> gives memories you know to be related.</p>
+<p>In a namespace with many vectors, similar candidates come from the C-SPANN index instead of an exact scan, as <a href="#the-scan-limit">The Scan Limit</a> explains.</p>
+<h3 id="policies">Policies<a class="headerlink" href="#policies" title="Permanent link">&para;</a></h3>
+<p>A policy is a function of the <code>Proposal</code> and the candidates that returns a <code>Decision</code>. <code>Policy</code> is its type. The built-in policies are explicit about what they supersede:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>What it decides</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>supersede_same_slot()</code></td>
+<td>Skips the new memory if the memory under its key has a later valid time. Otherwise, if a slot candidate's valid time is later than the new memory's, records the new memory as superseded by the latest such candidate and keeps the rest. If none is later, supersedes every slot candidate</td>
+</tr>
+<tr>
+<td><code>skip_duplicates(threshold=0.97)</code></td>
+<td>Skips a new memory, one whose key holds no live memory, if a candidate has an equal value or scores at or above <code>threshold</code>, and confirms the best such candidate. With a <code>slot</code>, only candidates in the same slot count: a repeat outside the slot states another fact, so it lets the next policy supersede an older memory in the slot. Saving a live memory's value again under its key skips it and confirms that memory. Any other value under a live key is an update, which it never skips: it writes the new memory and keeps everything, so <code>first_of</code> tries the next policy</td>
+</tr>
+<tr>
+<td><code>supersede_similar(threshold=0.9)</code></td>
+<td>Works like <code>supersede_same_slot</code>, for the slot candidates and the candidates that score at or above <code>threshold</code>. Like it, it skips the new memory if the memory under its key has a later valid time, whatever that memory scores. It is blunt: similar is not contradictory</td>
+</tr>
+<tr>
+<td><code>keep_all()</code></td>
+<td>Writes the new memory and keeps every candidate</td>
+</tr>
+<tr>
+<td><code>first_of(*policies)</code></td>
+<td>Tries the policies in order and uses the first decision that does more than write the new memory and keep everything. A decision whose actions only <code>KEEP</code> candidates keeps everything too</td>
+</tr>
+</tbody>
+</table>
+<p>Confirming a duplicate instead of writing it again is how repeated observations reinforce a fact instead of piling up.</p>
+<p>A <code>Decision</code> says what to do with the new memory and with each candidate:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>new</code></td>
+<td><code>"write"</code>, the default, writes the new memory. <code>"skip"</code> writes nothing. <code>"superseded"</code> records it as already superseded by a candidate whose fact is newer: with history on it goes straight into history, and without history it is skipped</td>
+</tr>
+<tr>
+<td><code>superseded_by</code></td>
+<td>With <code>"superseded"</code>, the key of that candidate. The decision must keep or confirm it</td>
+</tr>
+<tr>
+<td><code>actions</code></td>
+<td>Maps candidate keys to an <code>Action</code>, or to its value such as <code>"delete"</code>. A candidate left out is kept</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>With history</th>
+<th>Without history</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KEEP</code></td>
+<td>Leaves the memory as it is</td>
+<td>The same</td>
+</tr>
+<tr>
+<td><code>SUPERSEDE</code></td>
+<td>Ends the memory as superseded by the new one, at the new memory's <code>valid_at</code> if one was given or else at the write, and keeps it in history</td>
+<td>Deletes the memory and its vectors</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td>Ends the memory as deleted, at the write, and keeps it in history</td>
+<td>Deletes the memory and its vectors</td>
+</tr>
+<tr>
+<td><code>CONFIRM</code></td>
+<td>Sets <code>confirmed_at</code>, counts the confirmation and renews the expiry from the memory's own TTL. The version and <code>updated_at</code> stay as they are</td>
+<td>The same</td>
+</tr>
+</tbody>
+</table>
+<p>A decision that does not fit its candidates raises <code>ValueError</code> before anything is written, for example:</p>
+<ul>
+<li>an action for a key that is not a candidate;</li>
+<li>an action other than <code>KEEP</code> for the memory the new one overwrites;</li>
+<li><code>SUPERSEDE</code> while skipping the new memory (use <code>DELETE</code>);</li>
+<li>a <code>superseded_by</code> that is not a kept or confirmed candidate.</li>
+</ul>
+<p>Your own policy can use anything the candidates carry. This one weighs confidence from provenance:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb.store</span><span class="w"> </span><span class="kn">import</span> <span class="n">Action</span><span class="p">,</span> <span class="n">Decision</span>
+<a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a>
+<a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a>
+<a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a><span class="k">def</span><span class="w"> </span><span class="nf">trust_confidence</span><span class="p">(</span><span class="n">proposal</span><span class="p">,</span> <span class="n">candidates</span><span class="p">):</span>
+<a id="__codelineno-21-5" name="__codelineno-21-5" href="#__codelineno-21-5"></a><span class="w">    </span><span class="sd">"""Supersede the memories in the same slot, unless one comes from a more confident source."""</span>
+<a id="__codelineno-21-6" name="__codelineno-21-6" href="#__codelineno-21-6"></a>    <span class="n">confidence</span> <span class="o">=</span> <span class="p">(</span><span class="n">proposal</span><span class="o">.</span><span class="n">provenance</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"confidence"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<a id="__codelineno-21-7" name="__codelineno-21-7" href="#__codelineno-21-7"></a>    <span class="n">same_slot</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">candidates</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">reason</span> <span class="o">==</span> <span class="s2">"slot"</span><span class="p">]</span>
+<a id="__codelineno-21-8" name="__codelineno-21-8" href="#__codelineno-21-8"></a>    <span class="k">if</span> <span class="nb">any</span><span class="p">((</span><span class="n">c</span><span class="o">.</span><span class="n">provenance</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"confidence"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">confidence</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">same_slot</span><span class="p">):</span>
+<a id="__codelineno-21-9" name="__codelineno-21-9" href="#__codelineno-21-9"></a>        <span class="k">return</span> <span class="n">Decision</span><span class="p">(</span><span class="n">new</span><span class="o">=</span><span class="s2">"skip"</span><span class="p">)</span>
+<a id="__codelineno-21-10" name="__codelineno-21-10" href="#__codelineno-21-10"></a>    <span class="k">return</span> <span class="n">Decision</span><span class="p">(</span><span class="n">actions</span><span class="o">=</span><span class="p">{</span><span class="n">c</span><span class="o">.</span><span class="n">key</span><span class="p">:</span> <span class="n">Action</span><span class="o">.</span><span class="n">SUPERSEDE</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">same_slot</span><span class="p">})</span>
+<a id="__codelineno-21-11" name="__codelineno-21-11" href="#__codelineno-21-11"></a>
+<a id="__codelineno-21-12" name="__codelineno-21-12" href="#__codelineno-21-12"></a>
+<a id="__codelineno-21-13" name="__codelineno-21-13" href="#__codelineno-21-13"></a><span class="n">store</span><span class="o">.</span><span class="n">reconcile</span><span class="p">(</span>
+<a id="__codelineno-21-14" name="__codelineno-21-14" href="#__codelineno-21-14"></a>    <span class="n">memories</span><span class="p">,</span>
+<a id="__codelineno-21-15" name="__codelineno-21-15" href="#__codelineno-21-15"></a>    <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-21-16" name="__codelineno-21-16" href="#__codelineno-21-16"></a>    <span class="p">{</span><span class="s2">"slot"</span><span class="p">:</span> <span class="s2">"home_city"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Lives in Porto"</span><span class="p">},</span>
+<a id="__codelineno-21-17" name="__codelineno-21-17" href="#__codelineno-21-17"></a>    <span class="n">slot</span><span class="o">=</span><span class="s2">"slot"</span><span class="p">,</span>
+<a id="__codelineno-21-18" name="__codelineno-21-18" href="#__codelineno-21-18"></a>    <span class="n">policy</span><span class="o">=</span><span class="n">trust_confidence</span><span class="p">,</span>
+<a id="__codelineno-21-19" name="__codelineno-21-19" href="#__codelineno-21-19"></a>    <span class="n">provenance</span><span class="o">=</span><span class="p">{</span><span class="s2">"source"</span><span class="p">:</span> <span class="s2">"chat"</span><span class="p">,</span> <span class="s2">"confidence"</span><span class="p">:</span> <span class="mf">0.9</span><span class="p">},</span>
+<a id="__codelineno-21-20" name="__codelineno-21-20" href="#__codelineno-21-20"></a><span class="p">)</span>
+</code></pre></div>
+<p>A policy runs inside the transaction, and again on every retry, so it must be fast and deterministic. A slow one holds the transaction open and can run past the attempt timeout. A policy must never use the store, directly or through another thread, since the store holds its connection while the policy runs. A direct call raises <code>RuntimeError</code> at once, and a call handed to another thread can deadlock a store on a single connection. If the policy raises, the transaction rolls back and the exception propagates unchanged, without a retry.</p>
+<p>Policies are plain functions on the async store too. <code>areconcile</code> refuses an <code>async def</code> policy with <code>ValueError</code>, before any I/O. A decision that needs async work, such as an LLM call, belongs in the two-step flow below. On the async store the policy runs on the event loop, which runs nothing else meanwhile. A policy that waits there for store work done through another thread, or through <code>asyncio.run_coroutine_threadsafe</code>, blocks the loop. Nothing can detect that, and the store's hang guard cannot fire while the loop is blocked. All of this holds for a <code>confirm</code> TTL function as well.</p>
+<h3 id="the-two-step-flow">The Two-Step Flow<a class="headerlink" href="#the-two-step-flow" title="Permanent link">&para;</a></h3>
+<p>An LLM call, or a person, is too slow to wait for inside a transaction. <code>find_conflicts</code> takes the arguments of <code>reconcile</code> except the policy. It reads the candidates without writing anything and returns a <code>Conflicts</code>: the new memory as a <code>Proposal</code>, its <code>candidates</code>, and the <code>target_version</code> and <code>target_updated_at</code> of the memory under the new key. Your code decides while no transaction is open. Then <code>resolve(conflicts, decision)</code> applies the decision in one transaction, as <code>reconcile</code> applies a policy's. It writes the memory that <code>find_conflicts</code> planned, with the embedding computed then, so the flow embeds once.</p>
+<p>Here an LLM decides through structured output. Any chat model that supports <code>with_structured_output</code> works:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Literal</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a>
+<a id="__codelineno-22-3" name="__codelineno-22-3" href="#__codelineno-22-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain.chat_models</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_chat_model</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4" href="#__codelineno-22-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span><span class="p">,</span> <span class="n">Field</span>
+<a id="__codelineno-22-5" name="__codelineno-22-5" href="#__codelineno-22-5"></a>
+<a id="__codelineno-22-6" name="__codelineno-22-6" href="#__codelineno-22-6"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb.store</span><span class="w"> </span><span class="kn">import</span> <span class="n">Conflicts</span><span class="p">,</span> <span class="n">ConflictsChanged</span><span class="p">,</span> <span class="n">Decision</span><span class="p">,</span> <span class="n">ReconcileResult</span>
+<a id="__codelineno-22-7" name="__codelineno-22-7" href="#__codelineno-22-7"></a>
+<a id="__codelineno-22-8" name="__codelineno-22-8" href="#__codelineno-22-8"></a>
+<a id="__codelineno-22-9" name="__codelineno-22-9" href="#__codelineno-22-9"></a><span class="k">class</span><span class="w"> </span><span class="nc">Verdict</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<a id="__codelineno-22-10" name="__codelineno-22-10" href="#__codelineno-22-10"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">description</span><span class="o">=</span><span class="s2">"The key of an existing memory"</span><span class="p">)</span>
+<a id="__codelineno-22-11" name="__codelineno-22-11" href="#__codelineno-22-11"></a>    <span class="n">action</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"keep"</span><span class="p">,</span> <span class="s2">"supersede"</span><span class="p">,</span> <span class="s2">"delete"</span><span class="p">,</span> <span class="s2">"confirm"</span><span class="p">]</span>
+<a id="__codelineno-22-12" name="__codelineno-22-12" href="#__codelineno-22-12"></a>
+<a id="__codelineno-22-13" name="__codelineno-22-13" href="#__codelineno-22-13"></a>
+<a id="__codelineno-22-14" name="__codelineno-22-14" href="#__codelineno-22-14"></a><span class="k">class</span><span class="w"> </span><span class="nc">Judgement</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<a id="__codelineno-22-15" name="__codelineno-22-15" href="#__codelineno-22-15"></a><span class="w">    </span><span class="sd">"""What to do with a new memory and the existing memories it may conflict with."""</span>
+<a id="__codelineno-22-16" name="__codelineno-22-16" href="#__codelineno-22-16"></a>
+<a id="__codelineno-22-17" name="__codelineno-22-17" href="#__codelineno-22-17"></a>    <span class="n">new</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"write"</span><span class="p">,</span> <span class="s2">"skip"</span><span class="p">,</span> <span class="s2">"superseded"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+<a id="__codelineno-22-18" name="__codelineno-22-18" href="#__codelineno-22-18"></a>        <span class="n">description</span><span class="o">=</span><span class="s2">"Write the new memory, skip it as a repeat, or record it as superseded"</span>
+<a id="__codelineno-22-19" name="__codelineno-22-19" href="#__codelineno-22-19"></a>    <span class="p">)</span>
+<a id="__codelineno-22-20" name="__codelineno-22-20" href="#__codelineno-22-20"></a>    <span class="n">superseded_by</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+<a id="__codelineno-22-21" name="__codelineno-22-21" href="#__codelineno-22-21"></a>        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">"With new='superseded', the key of the newer memory"</span>
+<a id="__codelineno-22-22" name="__codelineno-22-22" href="#__codelineno-22-22"></a>    <span class="p">)</span>
+<a id="__codelineno-22-23" name="__codelineno-22-23" href="#__codelineno-22-23"></a>    <span class="n">verdicts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Verdict</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+<a id="__codelineno-22-24" name="__codelineno-22-24" href="#__codelineno-22-24"></a>
+<a id="__codelineno-22-25" name="__codelineno-22-25" href="#__codelineno-22-25"></a>
+<a id="__codelineno-22-26" name="__codelineno-22-26" href="#__codelineno-22-26"></a><span class="n">judge</span> <span class="o">=</span> <span class="n">init_chat_model</span><span class="p">(</span><span class="s2">"openai:gpt-4o-mini"</span><span class="p">)</span><span class="o">.</span><span class="n">with_structured_output</span><span class="p">(</span><span class="n">Judgement</span><span class="p">)</span>
+<a id="__codelineno-22-27" name="__codelineno-22-27" href="#__codelineno-22-27"></a>
+<a id="__codelineno-22-28" name="__codelineno-22-28" href="#__codelineno-22-28"></a><span class="n">INSTRUCTIONS</span> <span class="o">=</span> <span class="s2">"""You keep a user's memories true. Given a new memory and existing ones,</span>
+<a id="__codelineno-22-29" name="__codelineno-22-29" href="#__codelineno-22-29"></a><span class="s2">supersede the memories the new one replaces, delete the ones that were wrong, and keep the rest.</span>
+<a id="__codelineno-22-30" name="__codelineno-22-30" href="#__codelineno-22-30"></a><span class="s2">If an existing memory says the same thing, skip the new one and confirm that memory.</span>
+<a id="__codelineno-22-31" name="__codelineno-22-31" href="#__codelineno-22-31"></a><span class="s2">If an existing memory is newer and contradicts the new one, record the new one as superseded."""</span>
+<a id="__codelineno-22-32" name="__codelineno-22-32" href="#__codelineno-22-32"></a>
+<a id="__codelineno-22-33" name="__codelineno-22-33" href="#__codelineno-22-33"></a>
+<a id="__codelineno-22-34" name="__codelineno-22-34" href="#__codelineno-22-34"></a><span class="k">def</span><span class="w"> </span><span class="nf">describe</span><span class="p">(</span><span class="n">conflicts</span><span class="p">:</span> <span class="n">Conflicts</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-22-35" name="__codelineno-22-35" href="#__codelineno-22-35"></a><span class="w">    </span><span class="sd">"""The new memory and its candidates, for the model to read."""</span>
+<a id="__codelineno-22-36" name="__codelineno-22-36" href="#__codelineno-22-36"></a>    <span class="n">new</span> <span class="o">=</span> <span class="n">conflicts</span><span class="o">.</span><span class="n">proposal</span>
+<a id="__codelineno-22-37" name="__codelineno-22-37" href="#__codelineno-22-37"></a>    <span class="n">lines</span> <span class="o">=</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"New memory, true as of </span><span class="si">{</span><span class="n">new</span><span class="o">.</span><span class="n">valid_at</span><span class="si">:</span><span class="s2">%Y-%m-%d</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">new</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s1">'text'</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">]</span>
+<a id="__codelineno-22-38" name="__codelineno-22-38" href="#__codelineno-22-38"></a>    <span class="n">lines</span> <span class="o">+=</span> <span class="p">[</span>
+<a id="__codelineno-22-39" name="__codelineno-22-39" href="#__codelineno-22-39"></a>        <span class="sa">f</span><span class="s2">"Existing memory </span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">key</span><span class="si">}</span><span class="s2">, true as of </span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">valid_at</span><span class="si">:</span><span class="s2">%Y-%m-%d</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s1">'text'</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
+<a id="__codelineno-22-40" name="__codelineno-22-40" href="#__codelineno-22-40"></a>        <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">conflicts</span><span class="o">.</span><span class="n">candidates</span>
+<a id="__codelineno-22-41" name="__codelineno-22-41" href="#__codelineno-22-41"></a>    <span class="p">]</span>
+<a id="__codelineno-22-42" name="__codelineno-22-42" href="#__codelineno-22-42"></a>    <span class="k">return</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">lines</span><span class="p">)</span>
+<a id="__codelineno-22-43" name="__codelineno-22-43" href="#__codelineno-22-43"></a>
+<a id="__codelineno-22-44" name="__codelineno-22-44" href="#__codelineno-22-44"></a>
+<a id="__codelineno-22-45" name="__codelineno-22-45" href="#__codelineno-22-45"></a><span class="k">def</span><span class="w"> </span><span class="nf">remember</span><span class="p">(</span><span class="n">namespace</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">attempts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ReconcileResult</span><span class="p">:</span>
+<a id="__codelineno-22-46" name="__codelineno-22-46" href="#__codelineno-22-46"></a>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">attempts</span><span class="p">):</span>
+<a id="__codelineno-22-47" name="__codelineno-22-47" href="#__codelineno-22-47"></a>        <span class="n">conflicts</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">find_conflicts</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="n">text</span><span class="p">})</span>
+<a id="__codelineno-22-48" name="__codelineno-22-48" href="#__codelineno-22-48"></a>        <span class="n">decision</span> <span class="o">=</span> <span class="n">Decision</span><span class="p">()</span>  <span class="c1"># nothing to compare with: write it</span>
+<a id="__codelineno-22-49" name="__codelineno-22-49" href="#__codelineno-22-49"></a>        <span class="k">if</span> <span class="n">conflicts</span><span class="o">.</span><span class="n">candidates</span><span class="p">:</span>
+<a id="__codelineno-22-50" name="__codelineno-22-50" href="#__codelineno-22-50"></a>            <span class="n">judgement</span> <span class="o">=</span> <span class="n">judge</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span>
+<a id="__codelineno-22-51" name="__codelineno-22-51" href="#__codelineno-22-51"></a>                <span class="p">[</span>
+<a id="__codelineno-22-52" name="__codelineno-22-52" href="#__codelineno-22-52"></a>                    <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">INSTRUCTIONS</span><span class="p">},</span>
+<a id="__codelineno-22-53" name="__codelineno-22-53" href="#__codelineno-22-53"></a>                    <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">describe</span><span class="p">(</span><span class="n">conflicts</span><span class="p">)},</span>
+<a id="__codelineno-22-54" name="__codelineno-22-54" href="#__codelineno-22-54"></a>                <span class="p">]</span>
+<a id="__codelineno-22-55" name="__codelineno-22-55" href="#__codelineno-22-55"></a>            <span class="p">)</span>
+<a id="__codelineno-22-56" name="__codelineno-22-56" href="#__codelineno-22-56"></a>            <span class="n">decision</span> <span class="o">=</span> <span class="n">Decision</span><span class="p">(</span>
+<a id="__codelineno-22-57" name="__codelineno-22-57" href="#__codelineno-22-57"></a>                <span class="n">new</span><span class="o">=</span><span class="n">judgement</span><span class="o">.</span><span class="n">new</span><span class="p">,</span>
+<a id="__codelineno-22-58" name="__codelineno-22-58" href="#__codelineno-22-58"></a>                <span class="n">superseded_by</span><span class="o">=</span><span class="n">judgement</span><span class="o">.</span><span class="n">superseded_by</span> <span class="k">if</span> <span class="n">judgement</span><span class="o">.</span><span class="n">new</span> <span class="o">==</span> <span class="s2">"superseded"</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-22-59" name="__codelineno-22-59" href="#__codelineno-22-59"></a>                <span class="n">actions</span><span class="o">=</span><span class="p">{</span><span class="n">verdict</span><span class="o">.</span><span class="n">key</span><span class="p">:</span> <span class="n">verdict</span><span class="o">.</span><span class="n">action</span> <span class="k">for</span> <span class="n">verdict</span> <span class="ow">in</span> <span class="n">judgement</span><span class="o">.</span><span class="n">verdicts</span><span class="p">},</span>
+<a id="__codelineno-22-60" name="__codelineno-22-60" href="#__codelineno-22-60"></a>            <span class="p">)</span>
+<a id="__codelineno-22-61" name="__codelineno-22-61" href="#__codelineno-22-61"></a>        <span class="k">try</span><span class="p">:</span>
+<a id="__codelineno-22-62" name="__codelineno-22-62" href="#__codelineno-22-62"></a>            <span class="k">return</span> <span class="n">store</span><span class="o">.</span><span class="n">resolve</span><span class="p">(</span><span class="n">conflicts</span><span class="p">,</span> <span class="n">decision</span><span class="p">)</span>
+<a id="__codelineno-22-63" name="__codelineno-22-63" href="#__codelineno-22-63"></a>        <span class="k">except</span> <span class="n">ConflictsChanged</span><span class="p">:</span>
+<a id="__codelineno-22-64" name="__codelineno-22-64" href="#__codelineno-22-64"></a>            <span class="k">pass</span>  <span class="c1"># a memory changed while the model decided: look again</span>
+<a id="__codelineno-22-65" name="__codelineno-22-65" href="#__codelineno-22-65"></a>    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"The memories kept changing while deciding about </span><span class="si">{</span><span class="n">text</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<a id="__codelineno-22-66" name="__codelineno-22-66" href="#__codelineno-22-66"></a>
+<a id="__codelineno-22-67" name="__codelineno-22-67" href="#__codelineno-22-67"></a>
+<a id="__codelineno-22-68" name="__codelineno-22-68" href="#__codelineno-22-68"></a><span class="n">remember</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"No longer allergic to peanuts"</span><span class="p">)</span>
+</code></pre></div>
+<p><code>Decision</code> takes the action names as strings and rejects an unknown <code>new</code>. A decision that does not fit the candidates, such as one that names a key that is not a candidate, makes <code>resolve</code> raise <code>ValueError</code> before any I/O, so you can ask the model again. With <code>AsyncCockroachDBStore</code>, call <code>afind_conflicts</code>, <code>await judge.ainvoke(...)</code> and <code>aresolve</code>.</p>
+<p>In its transaction, before it writes, <code>resolve</code> checks that nothing the decision depends on has changed. The memory under the new key, and every candidate the decision supersedes, deletes, confirms or names in <code>superseded_by</code>, must still have the version and <code>updated_at</code> that <code>find_conflicts</code> read. A memory written, deleted or expired since counts as changed, and so does a live memory under the new key where there was none. A 0.5 store that writes the same table sets <code>updated_at</code> without bumping the version, so its writes count too. <code>resolve</code> then raises <code>ConflictsChanged</code>, whose <code>keys</code> name the memories that changed. It writes nothing and does not retry: run <code>find_conflicts</code> again and decide again. Candidates the decision keeps are not checked. A confirmation in between never counts, since confirming changes neither the version nor <code>updated_at</code>.</p>
+<p><code>resolve</code> raises <code>ValueError</code> before any I/O for:</p>
+<ul>
+<li>a <code>Conflicts</code> that did not come from <code>find_conflicts</code> on a store with the same table and index, such as one built by hand;</li>
+<li>a <code>Conflicts</code> whose proposal changed after <code>find_conflicts</code>, in its namespace, key, value, slot, slot value, provenance or valid time. <code>resolve</code> writes the memory planned then, so it refuses rather than drop the edit. A person who edits the memory in an approval step must call <code>find_conflicts</code> again with the edited memory;</li>
+<li>a <code>Conflicts</code> whose candidates were edited after <code>find_conflicts</code>, and a decision that does not fit them.</li>
+</ul>
+<p>If a resolve of the same <code>Conflicts</code> already committed, as when an error left its outcome unknown and you call <code>resolve</code> again, the new call writes nothing. It returns the first result, rebuilt from the stored rows, with <code>already_applied=True</code>, whatever decision it was given. <a href="#retries-and-rebuilt-results">Retries and Rebuilt Results</a> says what the rows can prove.</p>
+<h3 id="waiting-for-a-person">Waiting for a Person<a class="headerlink" href="#waiting-for-a-person" title="Permanent link">&para;</a></h3>
+<p>A <code>Conflicts</code> and a <code>Decision</code> can wait in graph state while a person decides, for example across a LangGraph <code>interrupt()</code>. The checkpointer's serializer must then rebuild the store's types. From langgraph-checkpoint 4.0.1, the serializer logs a warning for each type that is not on its msgpack allowlist, and refuses it when <code>LANGGRAPH_STRICT_MSGPACK=true</code> is set. A refused type comes back as a plain dict, so a <code>Conflicts</code> loses the plan that <code>resolve</code> needs, and <code>resolve</code> refuses it. <code>RECONCILE_SERDE_TYPES</code>, from <code>langchain_cockroachdb.store</code>, lists every class a reconcile value holds, in the form <code>allowed_msgpack_modules</code> takes. Give the checkpointer a serializer that allows them:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TypedDict</span>
+<a id="__codelineno-23-2" name="__codelineno-23-2" href="#__codelineno-23-2"></a>
+<a id="__codelineno-23-3" name="__codelineno-23-3" href="#__codelineno-23-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langgraph.checkpoint.serde.jsonplus</span><span class="w"> </span><span class="kn">import</span> <span class="n">JsonPlusSerializer</span>
+<a id="__codelineno-23-4" name="__codelineno-23-4" href="#__codelineno-23-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langgraph.graph</span><span class="w"> </span><span class="kn">import</span> <span class="n">START</span><span class="p">,</span> <span class="n">StateGraph</span>
+<a id="__codelineno-23-5" name="__codelineno-23-5" href="#__codelineno-23-5"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langgraph.types</span><span class="w"> </span><span class="kn">import</span> <span class="n">Command</span><span class="p">,</span> <span class="n">interrupt</span>
+<a id="__codelineno-23-6" name="__codelineno-23-6" href="#__codelineno-23-6"></a>
+<a id="__codelineno-23-7" name="__codelineno-23-7" href="#__codelineno-23-7"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb</span><span class="w"> </span><span class="kn">import</span> <span class="n">CockroachDBSaver</span>
+<a id="__codelineno-23-8" name="__codelineno-23-8" href="#__codelineno-23-8"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain_cockroachdb.store</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+<a id="__codelineno-23-9" name="__codelineno-23-9" href="#__codelineno-23-9"></a>    <span class="n">RECONCILE_SERDE_TYPES</span><span class="p">,</span>
+<a id="__codelineno-23-10" name="__codelineno-23-10" href="#__codelineno-23-10"></a>    <span class="n">Conflicts</span><span class="p">,</span>
+<a id="__codelineno-23-11" name="__codelineno-23-11" href="#__codelineno-23-11"></a>    <span class="n">Decision</span><span class="p">,</span>
+<a id="__codelineno-23-12" name="__codelineno-23-12" href="#__codelineno-23-12"></a>    <span class="n">ReconcileResult</span><span class="p">,</span>
+<a id="__codelineno-23-13" name="__codelineno-23-13" href="#__codelineno-23-13"></a><span class="p">)</span>
+<a id="__codelineno-23-14" name="__codelineno-23-14" href="#__codelineno-23-14"></a>
+<a id="__codelineno-23-15" name="__codelineno-23-15" href="#__codelineno-23-15"></a>
+<a id="__codelineno-23-16" name="__codelineno-23-16" href="#__codelineno-23-16"></a><span class="k">class</span><span class="w"> </span><span class="nc">Review</span><span class="p">(</span><span class="n">TypedDict</span><span class="p">,</span> <span class="n">total</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+<a id="__codelineno-23-17" name="__codelineno-23-17" href="#__codelineno-23-17"></a>    <span class="n">text</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-23-18" name="__codelineno-23-18" href="#__codelineno-23-18"></a>    <span class="n">conflicts</span><span class="p">:</span> <span class="n">Conflicts</span>
+<a id="__codelineno-23-19" name="__codelineno-23-19" href="#__codelineno-23-19"></a>    <span class="n">result</span><span class="p">:</span> <span class="n">ReconcileResult</span>
+<a id="__codelineno-23-20" name="__codelineno-23-20" href="#__codelineno-23-20"></a>
+<a id="__codelineno-23-21" name="__codelineno-23-21" href="#__codelineno-23-21"></a>
+<a id="__codelineno-23-22" name="__codelineno-23-22" href="#__codelineno-23-22"></a><span class="k">def</span><span class="w"> </span><span class="nf">find</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">Review</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Review</span><span class="p">:</span>
+<a id="__codelineno-23-23" name="__codelineno-23-23" href="#__codelineno-23-23"></a>    <span class="n">value</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"slot"</span><span class="p">:</span> <span class="s2">"home_city"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="n">state</span><span class="p">[</span><span class="s2">"text"</span><span class="p">]}</span>
+<a id="__codelineno-23-24" name="__codelineno-23-24" href="#__codelineno-23-24"></a>    <span class="k">return</span> <span class="p">{</span><span class="s2">"conflicts"</span><span class="p">:</span> <span class="n">store</span><span class="o">.</span><span class="n">find_conflicts</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="s2">"slot"</span><span class="p">)}</span>
+<a id="__codelineno-23-25" name="__codelineno-23-25" href="#__codelineno-23-25"></a>
+<a id="__codelineno-23-26" name="__codelineno-23-26" href="#__codelineno-23-26"></a>
+<a id="__codelineno-23-27" name="__codelineno-23-27" href="#__codelineno-23-27"></a><span class="k">def</span><span class="w"> </span><span class="nf">decide</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">Review</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Review</span><span class="p">:</span>
+<a id="__codelineno-23-28" name="__codelineno-23-28" href="#__codelineno-23-28"></a>    <span class="n">decision</span> <span class="o">=</span> <span class="n">interrupt</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s2">"conflicts"</span><span class="p">])</span>  <span class="c1"># resumes with the person's Decision</span>
+<a id="__codelineno-23-29" name="__codelineno-23-29" href="#__codelineno-23-29"></a>    <span class="k">return</span> <span class="p">{</span><span class="s2">"result"</span><span class="p">:</span> <span class="n">store</span><span class="o">.</span><span class="n">resolve</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s2">"conflicts"</span><span class="p">],</span> <span class="n">decision</span><span class="p">)}</span>
+<a id="__codelineno-23-30" name="__codelineno-23-30" href="#__codelineno-23-30"></a>
+<a id="__codelineno-23-31" name="__codelineno-23-31" href="#__codelineno-23-31"></a>
+<a id="__codelineno-23-32" name="__codelineno-23-32" href="#__codelineno-23-32"></a><span class="n">builder</span> <span class="o">=</span> <span class="n">StateGraph</span><span class="p">(</span><span class="n">Review</span><span class="p">)</span>
+<a id="__codelineno-23-33" name="__codelineno-23-33" href="#__codelineno-23-33"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_node</span><span class="p">(</span><span class="s2">"find"</span><span class="p">,</span> <span class="n">find</span><span class="p">)</span>
+<a id="__codelineno-23-34" name="__codelineno-23-34" href="#__codelineno-23-34"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_node</span><span class="p">(</span><span class="s2">"decide"</span><span class="p">,</span> <span class="n">decide</span><span class="p">)</span>
+<a id="__codelineno-23-35" name="__codelineno-23-35" href="#__codelineno-23-35"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_edge</span><span class="p">(</span><span class="n">START</span><span class="p">,</span> <span class="s2">"find"</span><span class="p">)</span>
+<a id="__codelineno-23-36" name="__codelineno-23-36" href="#__codelineno-23-36"></a><span class="n">builder</span><span class="o">.</span><span class="n">add_edge</span><span class="p">(</span><span class="s2">"find"</span><span class="p">,</span> <span class="s2">"decide"</span><span class="p">)</span>
+<a id="__codelineno-23-37" name="__codelineno-23-37" href="#__codelineno-23-37"></a>
+<a id="__codelineno-23-38" name="__codelineno-23-38" href="#__codelineno-23-38"></a><span class="n">serde</span> <span class="o">=</span> <span class="n">JsonPlusSerializer</span><span class="p">(</span><span class="n">allowed_msgpack_modules</span><span class="o">=</span><span class="n">RECONCILE_SERDE_TYPES</span><span class="p">)</span>
+<a id="__codelineno-23-39" name="__codelineno-23-39" href="#__codelineno-23-39"></a><span class="k">with</span> <span class="n">CockroachDBSaver</span><span class="o">.</span><span class="n">from_conn_string</span><span class="p">(</span><span class="n">DB_URI</span><span class="p">,</span> <span class="n">serde</span><span class="o">=</span><span class="n">serde</span><span class="p">)</span> <span class="k">as</span> <span class="n">checkpointer</span><span class="p">:</span>
+<a id="__codelineno-23-40" name="__codelineno-23-40" href="#__codelineno-23-40"></a>    <span class="n">checkpointer</span><span class="o">.</span><span class="n">setup</span><span class="p">()</span>
+<a id="__codelineno-23-41" name="__codelineno-23-41" href="#__codelineno-23-41"></a>    <span class="n">graph</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">checkpointer</span><span class="o">=</span><span class="n">checkpointer</span><span class="p">)</span>
+<a id="__codelineno-23-42" name="__codelineno-23-42" href="#__codelineno-23-42"></a>    <span class="n">config</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"configurable"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"thread_id"</span><span class="p">:</span> <span class="s2">"review-1"</span><span class="p">}}</span>
+<a id="__codelineno-23-43" name="__codelineno-23-43" href="#__codelineno-23-43"></a>    <span class="n">graph</span><span class="o">.</span><span class="n">invoke</span><span class="p">({</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Lives in Lisbon now"</span><span class="p">},</span> <span class="n">config</span><span class="p">)</span>  <span class="c1"># stops at the interrupt</span>
+<a id="__codelineno-23-44" name="__codelineno-23-44" href="#__codelineno-23-44"></a>
+<a id="__codelineno-23-45" name="__codelineno-23-45" href="#__codelineno-23-45"></a>    <span class="c1"># Later, perhaps in another process: a person looks at the candidates and decides</span>
+<a id="__codelineno-23-46" name="__codelineno-23-46" href="#__codelineno-23-46"></a>    <span class="n">conflicts</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">get_state</span><span class="p">(</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">values</span><span class="p">[</span><span class="s2">"conflicts"</span><span class="p">]</span>
+<a id="__codelineno-23-47" name="__codelineno-23-47" href="#__codelineno-23-47"></a>    <span class="n">decision</span> <span class="o">=</span> <span class="n">Decision</span><span class="p">(</span><span class="n">actions</span><span class="o">=</span><span class="p">{</span><span class="n">c</span><span class="o">.</span><span class="n">key</span><span class="p">:</span> <span class="s2">"supersede"</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">conflicts</span><span class="o">.</span><span class="n">candidates</span><span class="p">})</span>
+<a id="__codelineno-23-48" name="__codelineno-23-48" href="#__codelineno-23-48"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">graph</span><span class="o">.</span><span class="n">invoke</span><span class="p">(</span><span class="n">Command</span><span class="p">(</span><span class="n">resume</span><span class="o">=</span><span class="n">decision</span><span class="p">),</span> <span class="n">config</span><span class="p">)[</span><span class="s2">"result"</span><span class="p">])</span>
+</code></pre></div>
+<p>The constant covers <code>Conflicts</code> with what it keeps for <code>resolve</code>, <code>Decision</code>, <code>ReconcileResult</code>, <code>ConditionalWrite</code>, <code>MemoryRecord</code> and <code>MemoryVersion</code>. With a list of types, the serializer refuses every other type that is not built in, so add your own state types to it, as in <code>[*RECONCILE_SERDE_TYPES, ("my_app.state", "Ticket")]</code>. Before langgraph-checkpoint 4.0.1, <code>JsonPlusSerializer</code> has no <code>allowed_msgpack_modules</code> argument, and passing it raises TypeError, so leave it out there. Those releases, back to 2.1.2, the oldest this package supports, rebuild every type.</p>
+<h3 id="history">History<a class="headerlink" href="#history" title="Permanent link">&para;</a></h3>
+<p>With history on, every write that ends a version keeps it, in the same transaction: a <code>put</code> that overwrites a memory (reason <code>"overwritten"</code>), a <code>delete</code> (<code>"deleted"</code>) and a supersede (<code>"superseded"</code>, with <code>superseded_by</code>). That includes plain <code>put</code> and <code>delete</code>, so LangMem-style tools, which write through them and keep no history of their own, get version history from the store.</p>
+<p><code>history(namespace, key, limit=20, offset=0)</code> returns the old versions of a memory, newest first, as <code>MemoryVersion</code>s. The live version is not one of them: <code>get</code> or <code>record</code> returns it.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a><span class="k">for</span> <span class="n">version</span> <span class="ow">in</span> <span class="n">store</span><span class="o">.</span><span class="n">history</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"seat-1"</span><span class="p">):</span>
+<a id="__codelineno-24-2" name="__codelineno-24-2" href="#__codelineno-24-2"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">version</span><span class="o">.</span><span class="n">version</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">reason</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">superseded_by</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3" href="#__codelineno-24-3"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  true from"</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">valid_at</span><span class="p">,</span> <span class="s2">"to"</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">invalid_at</span><span class="p">,</span> <span class="s2">"per"</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">provenance</span><span class="p">)</span>
+<a id="__codelineno-24-4" name="__codelineno-24-4" href="#__codelineno-24-4"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  stored from"</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">written_at</span><span class="p">,</span> <span class="s2">"to"</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">ended_at</span><span class="p">)</span>
+</code></pre></div>
+<p>Each version has its <code>key</code>, <code>value</code> and <code>provenance</code>; <code>valid_at</code> and <code>invalid_at</code>, when its fact was true; <code>written_at</code> and <code>ended_at</code>, when the store held it; its <code>reason</code>; <code>superseded_by</code>; and <code>confirmations</code> and <code>confirmed_at</code>, the confirmations it had when it ended. A key's versions are numbered across its live row and its history, so a key written again after a delete carries on from its last version. <code>history</code> raises <code>ValueError</code> on a store without history.</p>
+<p>Without a key, <code>history(namespace)</code> lists the old versions of every memory in the namespace, not in its descendants. They come newest first by <code>ended_at</code>, then by key, then highest version first, so pages are stable, and <code>limit</code> and <code>offset</code> page through them. This is how to find the old versions of memories that <code>reconcile</code> saved under keys the store generated. Each version names its <code>key</code> and <code>superseded_by</code>, so you can group versions by a field of their value, or follow <code>superseded_by</code> to the memory that replaced each one. Here is a timeline of what the store held for each slot:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
+<a id="__codelineno-25-2" name="__codelineno-25-2" href="#__codelineno-25-2"></a>
+<a id="__codelineno-25-3" name="__codelineno-25-3" href="#__codelineno-25-3"></a><span class="n">timeline</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="nb">list</span><span class="p">)</span>
+<a id="__codelineno-25-4" name="__codelineno-25-4" href="#__codelineno-25-4"></a><span class="k">for</span> <span class="n">version</span> <span class="ow">in</span> <span class="n">store</span><span class="o">.</span><span class="n">history</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">100</span><span class="p">):</span>
+<a id="__codelineno-25-5" name="__codelineno-25-5" href="#__codelineno-25-5"></a>    <span class="n">timeline</span><span class="p">[</span><span class="n">version</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"slot"</span><span class="p">)]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">version</span><span class="p">)</span>
+<a id="__codelineno-25-6" name="__codelineno-25-6" href="#__codelineno-25-6"></a><span class="k">for</span> <span class="n">slot</span><span class="p">,</span> <span class="n">versions</span> <span class="ow">in</span> <span class="n">timeline</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<a id="__codelineno-25-7" name="__codelineno-25-7" href="#__codelineno-25-7"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">slot</span><span class="p">)</span>
+<a id="__codelineno-25-8" name="__codelineno-25-8" href="#__codelineno-25-8"></a>    <span class="k">for</span> <span class="n">version</span> <span class="ow">in</span> <span class="n">versions</span><span class="p">:</span>
+<a id="__codelineno-25-9" name="__codelineno-25-9" href="#__codelineno-25-9"></a>        <span class="nb">print</span><span class="p">(</span><span class="s2">" "</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">ended_at</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">reason</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span> <span class="n">version</span><span class="o">.</span><span class="n">superseded_by</span><span class="p">)</span>
+</code></pre></div>
+<p><code>history(namespace)</code> reads the namespace's whole history to sort it, which suits per-user namespaces like this one. For a namespace with a very large history, page with <code>limit</code> and <code>offset</code>: each page comes back small, though each call still reads the whole history.</p>
+<p>Turn history on for every store that writes the same table, and only once every writer runs 0.6.0. A store with history off numbers a key it creates from 1, without looking at the key's history, and so does a 0.5 writer. If history already holds a version 1 of that key, the next archive of the new version 1 is dropped, since history keeps one row per version. A 0.5 writer also never archives, so the versions it overwrites or deletes are not kept.</p>
+<p><code>ttl_days</code> dates each version when it is archived. Versions archived without it never expire, and changing it does not re-date versions already archived. <code>history</code> leaves out versions past their TTL, even before CockroachDB's TTL job deletes them.</p>
+<p>TTL expiry is not recorded in history: CockroachDB's TTL job deletes expired rows directly. For an audit trail that includes expiry, a <a href="https://www.cockroachlabs.com/docs/stable/change-data-capture-overview">changefeed</a> on the items table captures those deletes.</p>
+<h3 id="forgetting">Forgetting<a class="headerlink" href="#forgetting" title="Permanent link">&para;</a></h3>
+<p>On a store with history, <code>delete</code> is a soft delete: the memory leaves the items table, and the version it ends stays in history. <code>purge</code> removes a memory for good. One statement deletes the item, its vectors and its history, and <code>purge</code> returns whether anything was deleted. <code>delete_namespace</code> deletes the history under the prefix too, with the items and vectors.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"passport"</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Passport number X1234567"</span><span class="p">})</span>
+<a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a><span class="n">store</span><span class="o">.</span><span class="n">delete</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"passport"</span><span class="p">)</span>
+<a id="__codelineno-26-3" name="__codelineno-26-3" href="#__codelineno-26-3"></a><span class="nb">print</span><span class="p">([</span><span class="n">v</span><span class="o">.</span><span class="n">reason</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">store</span><span class="o">.</span><span class="n">history</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"passport"</span><span class="p">)])</span>  <span class="c1"># ['deleted']</span>
+<a id="__codelineno-26-4" name="__codelineno-26-4" href="#__codelineno-26-4"></a><span class="n">store</span><span class="o">.</span><span class="n">purge</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"passport"</span><span class="p">)</span>  <span class="c1"># True: the item, its vectors and its history</span>
+<a id="__codelineno-26-5" name="__codelineno-26-5" href="#__codelineno-26-5"></a><span class="n">store</span><span class="o">.</span><span class="n">delete_namespace</span><span class="p">((</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"bob"</span><span class="p">))</span>  <span class="c1"># bob's items, vectors and history</span>
+</code></pre></div>
+<p><code>purge</code> forgets one key. A memory that <code>reconcile</code> or <code>resolve</code> superseded keeps its own key in history, so forgetting a fact together with the versions it replaced means purging each of those keys. <code>history(namespace)</code> lists them, and a superseded version's <code>superseded_by</code> names the memory that replaced it. To forget everything a namespace holds, such as all of one user's memories, use <code>delete_namespace</code>.</p>
+<p><code>delete_namespace</code> also deletes history on a store created without history, when the history table exists, so a store that kept history before leaves nothing of the namespace behind. A role that did not run <code>setup()</code> needs SELECT and DELETE on that table for this, even with history off. <code>purge</code> raises <code>ValueError</code> on a store without history, where <code>delete</code> already removes a memory and its vectors. To purge one key's leftover history after turning history off, call <code>purge</code> on a store created with <code>history=True</code> for the same table.</p>
+<h3 id="provenance-and-valid-time">Provenance and Valid Time<a class="headerlink" href="#provenance-and-valid-time" title="Permanent link">&para;</a></h3>
+<p>Provenance is any JSON object that says where a memory came from, such as a source, a confidence or a thread. <code>reconcile</code>, <code>find_conflicts</code> and <code>put_if</code> take it as <code>provenance</code>, and the store keeps it in its own column. It does not affect embeddings, filters or <code>Item.value</code>. Policies see it on candidates, <code>history</code> returns it for each version, and <code>record</code> returns it with the live memory:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a><span class="n">record</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="n">aisle</span><span class="o">.</span><span class="n">key</span><span class="p">)</span>
+<a id="__codelineno-27-2" name="__codelineno-27-2" href="#__codelineno-27-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">record</span><span class="o">.</span><span class="n">version</span><span class="p">,</span> <span class="n">record</span><span class="o">.</span><span class="n">provenance</span><span class="p">,</span> <span class="n">record</span><span class="o">.</span><span class="n">valid_at</span><span class="p">,</span> <span class="n">record</span><span class="o">.</span><span class="n">confirmations</span><span class="p">)</span>
+<a id="__codelineno-27-3" name="__codelineno-27-3" href="#__codelineno-27-3"></a><span class="c1"># 1 {'source': 'chat', 'thread': 'thread-7'} 2026-10-29 09:12:31.123456+00:00 0</span>
+</code></pre></div>
+<p>A plain <code>put</code> writes no provenance and no valid time, so a put over a memory clears both. With history on, the version it ends keeps them.</p>
+<p>A memory's valid time is when its fact became true, as opposed to when the store learned it. An agent that extracts memories from an old conversation passes the conversation's time as <code>valid_at</code>, a timezone-aware datetime. Without one, the valid time comes from the database's clock, never the client's: <code>now()</code>, read with the candidates, or the latest candidate's <code>updated_at</code> if that is later, so a correction never looks older than the fact it corrects. The memory then stores no valid time and is valid from its <code>updated_at</code>, like a memory from a plain <code>put</code>.</p>
+<p><code>supersede_same_slot</code> and <code>supersede_similar</code> compare valid times, so a fact that arrives late cannot replace a newer one. Here an agent reads a conversation from 2024, after the aisle preference was stored:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1" href="#__codelineno-28-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span><span class="p">,</span> <span class="n">timezone</span>
+<a id="__codelineno-28-2" name="__codelineno-28-2" href="#__codelineno-28-2"></a>
+<a id="__codelineno-28-3" name="__codelineno-28-3" href="#__codelineno-28-3"></a><span class="n">late</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">reconcile</span><span class="p">(</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4" href="#__codelineno-28-4"></a>    <span class="n">memories</span><span class="p">,</span>
+<a id="__codelineno-28-5" name="__codelineno-28-5" href="#__codelineno-28-5"></a>    <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-28-6" name="__codelineno-28-6" href="#__codelineno-28-6"></a>    <span class="p">{</span><span class="s2">"slot"</span><span class="p">:</span> <span class="s2">"seat"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Prefers window seats"</span><span class="p">},</span>
+<a id="__codelineno-28-7" name="__codelineno-28-7" href="#__codelineno-28-7"></a>    <span class="n">slot</span><span class="o">=</span><span class="s2">"slot"</span><span class="p">,</span>
+<a id="__codelineno-28-8" name="__codelineno-28-8" href="#__codelineno-28-8"></a>    <span class="n">policy</span><span class="o">=</span><span class="n">supersede_same_slot</span><span class="p">(),</span>
+<a id="__codelineno-28-9" name="__codelineno-28-9" href="#__codelineno-28-9"></a>    <span class="n">valid_at</span><span class="o">=</span><span class="n">datetime</span><span class="p">(</span><span class="mi">2024</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">tzinfo</span><span class="o">=</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">),</span>
+<a id="__codelineno-28-10" name="__codelineno-28-10" href="#__codelineno-28-10"></a><span class="p">)</span>
+<a id="__codelineno-28-11" name="__codelineno-28-11" href="#__codelineno-28-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">late</span><span class="o">.</span><span class="n">new</span><span class="p">)</span>  <span class="c1"># superseded</span>
+</code></pre></div>
+<p>With history on, the late fact goes straight into history, superseded by the aisle preference. Its version there is true from May 2024 until the aisle preference became true. Without history it is skipped, and <code>new</code> is <code>"skipped"</code>.</p>
+<p>Only these two policies compare valid times. A late fact under a key whose live memory is newer is skipped, not recorded, since a memory cannot be superseded by the memory under its own key.</p>
+<h3 id="confirmation-aware-expiry">Confirmation-Aware Expiry<a class="headerlink" href="#confirmation-aware-expiry" title="Permanent link">&para;</a></h3>
+<p><code>confirm(namespace, key)</code> marks a live memory as confirmed: <code>confirmed_at</code> becomes now, <code>confirmations</code> goes up by one, and the memory's expiry, with its vectors', is renewed from its own TTL. It returns False when no live memory has the key. Confirming changes neither the version nor <code>updated_at</code>, so it never invalidates a pending <code>find_conflicts</code>, and it adds no history.</p>
+<p>Confirmations belong to the fact, not the key. A write that changes a memory's value, through <code>put</code>, <code>reconcile</code>, <code>resolve</code> or <code>put_if</code>, starts <code>confirmations</code> and <code>confirmed_at</code> again from none, while saving the same value again keeps them. With history on, the version it ends keeps its count. A memory that expired counts as gone, so a write over it starts from none too.</p>
+<p><code>ttl</code> sets the expiry instead: a number of minutes, None for no expiry, or a function of the <code>MemoryRecord</code> that returns either. The function gets the memory as the confirm's transaction read it, before this confirmation counts:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1" href="#__codelineno-29-1"></a><span class="n">DAY</span> <span class="o">=</span> <span class="mi">60</span> <span class="o">*</span> <span class="mi">24</span>  <span class="c1"># minutes</span>
+<a id="__codelineno-29-2" name="__codelineno-29-2" href="#__codelineno-29-2"></a>
+<a id="__codelineno-29-3" name="__codelineno-29-3" href="#__codelineno-29-3"></a>
+<a id="__codelineno-29-4" name="__codelineno-29-4" href="#__codelineno-29-4"></a><span class="k">def</span><span class="w"> </span><span class="nf">longer_each_time</span><span class="p">(</span><span class="n">record</span><span class="p">):</span>
+<a id="__codelineno-29-5" name="__codelineno-29-5" href="#__codelineno-29-5"></a><span class="w">    </span><span class="sd">"""30 days, doubled for each earlier confirmation, at most a year."""</span>
+<a id="__codelineno-29-6" name="__codelineno-29-6" href="#__codelineno-29-6"></a>    <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="mi">30</span> <span class="o">*</span> <span class="n">DAY</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="n">record</span><span class="o">.</span><span class="n">confirmations</span><span class="p">,</span> <span class="mi">365</span> <span class="o">*</span> <span class="n">DAY</span><span class="p">)</span>
+<a id="__codelineno-29-7" name="__codelineno-29-7" href="#__codelineno-29-7"></a>
+<a id="__codelineno-29-8" name="__codelineno-29-8" href="#__codelineno-29-8"></a>
+<a id="__codelineno-29-9" name="__codelineno-29-9" href="#__codelineno-29-9"></a><span class="n">store</span><span class="o">.</span><span class="n">confirm</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="n">aisle</span><span class="o">.</span><span class="n">key</span><span class="p">,</span> <span class="n">ttl</span><span class="o">=</span><span class="n">longer_each_time</span><span class="p">)</span>  <span class="c1"># True</span>
+</code></pre></div>
+<p>A TTL function runs inside the transaction, like a policy, so the rules for policies apply to it.</p>
+<p>Retrieval is not confirmation. <code>record</code> and <code>find_conflicts</code> never push back an expiry, while <code>get</code> and <code>search</code> do when <code>refresh_on_read</code> is on, as it is by default. For expiry that follows confirmations rather than reads, build the store with <code>refresh_on_read</code> set to <code>False</code>, as in <a href="#turning-it-on">Turning It On</a>, or pass <code>refresh_ttl=False</code> to reads. <code>skip_duplicates</code> confirms the memory that a new one repeats, so a fact the user keeps stating stays.</p>
+<h3 id="concurrent-reconciles">Concurrent Reconciles<a class="headerlink" href="#concurrent-reconciles" title="Permanent link">&para;</a></h3>
+<p>The candidate read and the writes of a reconcile share one serializable transaction. If another writer changes what a policy saw, one of the two transactions retries, and its policy sees the other's write. So two agents that reconcile contradictory memories in one namespace, with a policy that supersedes, end with exactly one live fact. For similar candidates this holds up to the scan limit, as <a href="#the-scan-limit">The Scan Limit</a> explains next.</p>
+<h3 id="the-scan-limit">The Scan Limit<a class="headerlink" href="#the-scan-limit" title="Permanent link">&para;</a></h3>
+<p><code>reconcile_scan_limit</code> is a store setting, 2000 by default, passed to the constructor or to <code>from_conn_string</code>. A namespace with at most that many vectors has every one of them ranked exactly, read by primary key. Serializable isolation covers that whole read, so a concurrent insert into the namespace makes one of the two transactions retry.</p>
+<p>The slot read is not bounded by the scan limit. With a <code>slot</code>, the store finds the slot matches by scanning the namespace's live items, since no index covers slot values, so that read grows with the namespace whatever the limit says.</p>
+<p>A namespace with more vectors takes its similar candidates from a window of the C-SPANN index, as a search does. A concurrent insert into a partition that the index search did not read is then seen only by the next reconcile. The window makes room for the vectors of the key and slot matches, which are candidates already. A selective <code>filter</code>, or expired memories, can still fill it and hide a match beyond it. When the window shows that this may have happened, the store ranks every vector of the namespace in one more round trip.</p>
+<h3 id="conditional-writes">Conditional Writes<a class="headerlink" href="#conditional-writes" title="Permanent link">&para;</a></h3>
+<p>Two threads that read the same memory and both write it back with <code>put</code> lose one of the updates without a word. <code>put_if</code> writes only if the live memory under the key still has the version and <code>updated_at</code> of <code>expected</code>, the <code>MemoryRecord</code> you read with <code>record</code>. On a mismatch it writes nothing and returns <code>applied=False</code> with <code>current</code>, the live memory as its transaction read it, or None if there is none. Merge with it, and write again:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1" href="#__codelineno-30-1"></a><span class="n">record</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">memories</span><span class="p">,</span> <span class="s2">"airlines"</span><span class="p">)</span>
+<a id="__codelineno-30-2" name="__codelineno-30-2" href="#__codelineno-30-2"></a><span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3" href="#__codelineno-30-3"></a>    <span class="n">names</span> <span class="o">=</span> <span class="n">record</span><span class="o">.</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"airlines"</span><span class="p">]</span> <span class="k">if</span> <span class="n">record</span> <span class="k">else</span> <span class="p">[]</span>
+<a id="__codelineno-30-4" name="__codelineno-30-4" href="#__codelineno-30-4"></a>    <span class="n">airlines</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">({</span><span class="o">*</span><span class="n">names</span><span class="p">,</span> <span class="s2">"KLM"</span><span class="p">})</span>
+<a id="__codelineno-30-5" name="__codelineno-30-5" href="#__codelineno-30-5"></a>    <span class="n">result</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">put_if</span><span class="p">(</span>
+<a id="__codelineno-30-6" name="__codelineno-30-6" href="#__codelineno-30-6"></a>        <span class="n">memories</span><span class="p">,</span>
+<a id="__codelineno-30-7" name="__codelineno-30-7" href="#__codelineno-30-7"></a>        <span class="s2">"airlines"</span><span class="p">,</span>
+<a id="__codelineno-30-8" name="__codelineno-30-8" href="#__codelineno-30-8"></a>        <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="s2">"Flies with "</span> <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">airlines</span><span class="p">),</span> <span class="s2">"airlines"</span><span class="p">:</span> <span class="n">airlines</span><span class="p">},</span>
+<a id="__codelineno-30-9" name="__codelineno-30-9" href="#__codelineno-30-9"></a>        <span class="n">expected</span><span class="o">=</span><span class="n">record</span><span class="p">,</span>
+<a id="__codelineno-30-10" name="__codelineno-30-10" href="#__codelineno-30-10"></a>    <span class="p">)</span>
+<a id="__codelineno-30-11" name="__codelineno-30-11" href="#__codelineno-30-11"></a>    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">applied</span><span class="p">:</span>
+<a id="__codelineno-30-12" name="__codelineno-30-12" href="#__codelineno-30-12"></a>        <span class="k">break</span>
+<a id="__codelineno-30-13" name="__codelineno-30-13" href="#__codelineno-30-13"></a>    <span class="n">record</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">current</span>  <span class="c1"># another writer got there first: merge with its memory</span>
+</code></pre></div>
+<p>A conflict is an expected outcome here, so it is returned, not raised. <code>expected=None</code> writes only if no live memory has the key, so a memory is created once, as in the first pass of this loop. An expired memory counts as absent. On a match <code>put_if</code> writes as <code>put</code> does, in the transaction that checked, with <code>provenance</code> and <code>valid_at</code> if given, and with history on it keeps the version it replaces. The result is a <code>ConditionalWrite</code> with <code>applied</code>, <code>key</code>, <code>version</code> (the version written, or None), <code>current</code> and <code>already_applied</code>.</p>
+<p><code>delete_if(namespace, key, expected=record)</code> deletes the same way. Its <code>applied=True</code> means the memory matched <code>expected</code> and this call deleted it, or, after an attempt of the call that may have committed, that the memory is gone and was this call's to delete.</p>
+<p>Both are safe to retry, and a retry never reports a false conflict. If an attempt commits and its result is lost, the next attempt reports <code>applied=True</code>. <code>put_if</code> finds its own write id on the memory, which a confirmation in between leaves in place, and sets <code>already_applied</code>. <code>delete_if</code> finds the memory gone, and sets <code>already_applied</code> when its own history row proves the delete, which needs history on. If another writer changed the memory between the lost commit and the retry, the retry reports a conflict, with that writer's memory, or None, as <code>current</code>: that is the current state. Both are single-key calls, outside <code>batch</code>, since LangGraph's batch operations cannot carry a precondition.</p>
+<h3 id="retries-and-rebuilt-results">Retries and Rebuilt Results<a class="headerlink" href="#retries-and-rebuilt-results" title="Permanent link">&para;</a></h3>
+<p>Every method here retries transient errors under the store's <code>RetryPolicy</code>, like every other store call. Each <code>reconcile</code> and <code>resolve</code> picks a write id before its first attempt and marks the rows it writes with it, and the memories it confirms with it as their confirmation id. <code>confirm</code> marks a memory with a confirmation id of its own and leaves its write id alone, so a confirmation that lands between a lost commit and the retry of a write does not disturb the retry. An attempt can commit and still lose its result on the way back, as when the connection drops while the COMMIT's answer travels. The retry then finds the rows with its write id, writes nothing, and returns the result rebuilt from those rows, with <code>already_applied=True</code>. A rebuilt result lists only what the stored rows prove:</p>
+<ul>
+<li><code>kept</code> is empty, and on a store without history so are <code>superseded</code> and <code>deleted</code>, since such a store keeps no trace of what it removed.</li>
+<li>A written memory that another writer replaced before the retry gives <code>new="written"</code> with <code>version=None</code>, when a history row proves the write: the version it overwrote, or a memory it superseded.</li>
+<li>A write to a new key that superseded, deleted and confirmed nothing, and that another writer replaced between the lost commit and the retry, leaves no trace, so the retry runs it again. Otherwise the rebuilt result says <code>new="skipped"</code> with the keys it confirmed or deleted, although the memory was written and then replaced.</li>
+<li>Without history, a decision that skipped the new memory or recorded it as superseded, and otherwise only deleted or superseded candidates, leaves no row either, and runs again after a lost commit.</li>
+<li>A <code>confirm</code> call, or a confirm-only <code>reconcile</code> or <code>resolve</code>, whose commit was lost can count twice if another confirmation of the same memory lands before the retry.</li>
+<li>A create-only <code>put_if(expected=None)</code> whose commit was lost can create the memory again if another writer deleted it before the retry.</li>
+<li>On a store without history, calling <code>resolve</code> again after an error escaped it, as when its retries ran out, can raise <code>ConflictsChanged</code> for the keys its own earlier call removed. <code>find_conflicts</code> then shows the current state.</li>
+</ul>
+<h3 id="tools-for-an-agent">Tools for an Agent<a class="headerlink" href="#tools-for-an-agent" title="Permanent link">&para;</a></h3>
+<p>With <code>create_agent</code>, a <code>remember</code> tool can reconcile what the model wants to save, under a topic the model names. Recall stays a plain search, since superseded memories are no longer live. <code>remember</code> lets the store generate the keys, so a <code>past_memories</code> tool reads the old versions with <code>history(namespace)</code> and keeps those about the topic:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1" href="#__codelineno-31-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">langchain.tools</span><span class="w"> </span><span class="kn">import</span> <span class="n">ToolRuntime</span><span class="p">,</span> <span class="n">tool</span>
+<a id="__codelineno-31-2" name="__codelineno-31-2" href="#__codelineno-31-2"></a>
+<a id="__codelineno-31-3" name="__codelineno-31-3" href="#__codelineno-31-3"></a><span class="n">POLICY</span> <span class="o">=</span> <span class="n">first_of</span><span class="p">(</span><span class="n">skip_duplicates</span><span class="p">(),</span> <span class="n">supersede_same_slot</span><span class="p">())</span>
+<a id="__codelineno-31-4" name="__codelineno-31-4" href="#__codelineno-31-4"></a>
+<a id="__codelineno-31-5" name="__codelineno-31-5" href="#__codelineno-31-5"></a>
+<a id="__codelineno-31-6" name="__codelineno-31-6" href="#__codelineno-31-6"></a><span class="nd">@tool</span>
+<a id="__codelineno-31-7" name="__codelineno-31-7" href="#__codelineno-31-7"></a><span class="k">def</span><span class="w"> </span><span class="nf">remember</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">topic</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">[</span><span class="n">Context</span><span class="p">,</span> <span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-31-8" name="__codelineno-31-8" href="#__codelineno-31-8"></a><span class="w">    </span><span class="sd">"""Save a fact about the user. topic names what it is about, such as "seat" or "home_city"."""</span>
+<a id="__codelineno-31-9" name="__codelineno-31-9" href="#__codelineno-31-9"></a>    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="p">,</span> <span class="n">CockroachDBStore</span><span class="p">)</span>
+<a id="__codelineno-31-10" name="__codelineno-31-10" href="#__codelineno-31-10"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-31-11" name="__codelineno-31-11" href="#__codelineno-31-11"></a>    <span class="n">result</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">reconcile</span><span class="p">(</span>
+<a id="__codelineno-31-12" name="__codelineno-31-12" href="#__codelineno-31-12"></a>        <span class="n">namespace</span><span class="p">,</span>
+<a id="__codelineno-31-13" name="__codelineno-31-13" href="#__codelineno-31-13"></a>        <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-31-14" name="__codelineno-31-14" href="#__codelineno-31-14"></a>        <span class="p">{</span><span class="s2">"topic"</span><span class="p">:</span> <span class="n">topic</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="n">text</span><span class="p">},</span>
+<a id="__codelineno-31-15" name="__codelineno-31-15" href="#__codelineno-31-15"></a>        <span class="n">slot</span><span class="o">=</span><span class="s2">"topic"</span><span class="p">,</span>
+<a id="__codelineno-31-16" name="__codelineno-31-16" href="#__codelineno-31-16"></a>        <span class="n">policy</span><span class="o">=</span><span class="n">POLICY</span><span class="p">,</span>
+<a id="__codelineno-31-17" name="__codelineno-31-17" href="#__codelineno-31-17"></a>        <span class="n">provenance</span><span class="o">=</span><span class="p">{</span><span class="s2">"source"</span><span class="p">:</span> <span class="s2">"chat"</span><span class="p">,</span> <span class="s2">"thread"</span><span class="p">:</span> <span class="n">runtime</span><span class="o">.</span><span class="n">config</span><span class="p">[</span><span class="s2">"configurable"</span><span class="p">][</span><span class="s2">"thread_id"</span><span class="p">]},</span>
+<a id="__codelineno-31-18" name="__codelineno-31-18" href="#__codelineno-31-18"></a>    <span class="p">)</span>
+<a id="__codelineno-31-19" name="__codelineno-31-19" href="#__codelineno-31-19"></a>    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">new</span> <span class="o">!=</span> <span class="s2">"written"</span><span class="p">:</span>
+<a id="__codelineno-31-20" name="__codelineno-31-20" href="#__codelineno-31-20"></a>        <span class="k">return</span> <span class="sa">f</span><span class="s2">"Already known: </span><span class="si">{</span><span class="n">text</span><span class="si">}</span><span class="s2">"</span>
+<a id="__codelineno-31-21" name="__codelineno-31-21" href="#__codelineno-31-21"></a>    <span class="k">return</span> <span class="sa">f</span><span class="s2">"Saved: </span><span class="si">{</span><span class="n">text</span><span class="si">}</span><span class="s2">"</span> <span class="o">+</span> <span class="p">(</span><span class="sa">f</span><span class="s2">", replacing </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">superseded</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">superseded</span> <span class="k">else</span> <span class="s2">""</span><span class="p">)</span>
+<a id="__codelineno-31-22" name="__codelineno-31-22" href="#__codelineno-31-22"></a>
+<a id="__codelineno-31-23" name="__codelineno-31-23" href="#__codelineno-31-23"></a>
+<a id="__codelineno-31-24" name="__codelineno-31-24" href="#__codelineno-31-24"></a><span class="nd">@tool</span>
+<a id="__codelineno-31-25" name="__codelineno-31-25" href="#__codelineno-31-25"></a><span class="k">def</span><span class="w"> </span><span class="nf">recall</span><span class="p">(</span><span class="n">query</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">[</span><span class="n">Context</span><span class="p">,</span> <span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-31-26" name="__codelineno-31-26" href="#__codelineno-31-26"></a><span class="w">    </span><span class="sd">"""Search the user's memories."""</span>
+<a id="__codelineno-31-27" name="__codelineno-31-27" href="#__codelineno-31-27"></a>    <span class="k">assert</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+<a id="__codelineno-31-28" name="__codelineno-31-28" href="#__codelineno-31-28"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-31-29" name="__codelineno-31-29" href="#__codelineno-31-29"></a>    <span class="n">items</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-31-30" name="__codelineno-31-30" href="#__codelineno-31-30"></a>    <span class="k">return</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s2">"text"</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"No memories found."</span>
+<a id="__codelineno-31-31" name="__codelineno-31-31" href="#__codelineno-31-31"></a>
+<a id="__codelineno-31-32" name="__codelineno-31-32" href="#__codelineno-31-32"></a>
+<a id="__codelineno-31-33" name="__codelineno-31-33" href="#__codelineno-31-33"></a><span class="nd">@tool</span>
+<a id="__codelineno-31-34" name="__codelineno-31-34" href="#__codelineno-31-34"></a><span class="k">def</span><span class="w"> </span><span class="nf">past_memories</span><span class="p">(</span><span class="n">topic</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">runtime</span><span class="p">:</span> <span class="n">ToolRuntime</span><span class="p">[</span><span class="n">Context</span><span class="p">,</span> <span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<a id="__codelineno-31-35" name="__codelineno-31-35" href="#__codelineno-31-35"></a><span class="w">    </span><span class="sd">"""List what the user used to say about a topic, newest first."""</span>
+<a id="__codelineno-31-36" name="__codelineno-31-36" href="#__codelineno-31-36"></a>    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="p">,</span> <span class="n">CockroachDBStore</span><span class="p">)</span>
+<a id="__codelineno-31-37" name="__codelineno-31-37" href="#__codelineno-31-37"></a>    <span class="n">namespace</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="n">runtime</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="s2">"memories"</span><span class="p">)</span>
+<a id="__codelineno-31-38" name="__codelineno-31-38" href="#__codelineno-31-38"></a>    <span class="n">lines</span> <span class="o">=</span> <span class="p">[</span>
+<a id="__codelineno-31-39" name="__codelineno-31-39" href="#__codelineno-31-39"></a>        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">version</span><span class="o">.</span><span class="n">ended_at</span><span class="si">:</span><span class="s2">%Y-%m-%d</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">version</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="s1">'text'</span><span class="p">]</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">version</span><span class="o">.</span><span class="n">reason</span><span class="si">}</span><span class="s2">)"</span>
+<a id="__codelineno-31-40" name="__codelineno-31-40" href="#__codelineno-31-40"></a>        <span class="k">for</span> <span class="n">version</span> <span class="ow">in</span> <span class="n">runtime</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">history</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span>
+<a id="__codelineno-31-41" name="__codelineno-31-41" href="#__codelineno-31-41"></a>        <span class="k">if</span> <span class="n">version</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"topic"</span><span class="p">)</span> <span class="o">==</span> <span class="n">topic</span>
+<a id="__codelineno-31-42" name="__codelineno-31-42" href="#__codelineno-31-42"></a>    <span class="p">]</span>
+<a id="__codelineno-31-43" name="__codelineno-31-43" href="#__codelineno-31-43"></a>    <span class="k">return</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">lines</span><span class="p">)</span> <span class="ow">or</span> <span class="sa">f</span><span class="s2">"No earlier memories about </span><span class="si">{</span><span class="n">topic</span><span class="si">}</span><span class="s2">."</span>
+</code></pre></div>
+<p><code>Context</code> is the one from <a href="#with-create_agent">With create_agent</a>. <code>past_memories</code> needs a store with history on. With <code>AsyncCockroachDBStore</code>, write the tools as async functions that call <code>areconcile</code>, <code>asearch</code> and <code>ahistory</code>. Tools that know only <code>BaseStore</code> write through plain <code>put</code> and <code>delete</code>, and still get history on a store with history on.</p>
+<h3 id="upgrading-from-05">Upgrading From 0.5<a class="headerlink" href="#upgrading-from-05" title="Permanent link">&para;</a></h3>
+<p><code>setup()</code> applies migration 2, which adds the columns these methods use to the items table in one statement: <code>version</code>, <code>provenance</code>, <code>confirmed_at</code>, <code>confirmations</code>, <code>write_id</code>, <code>valid_at</code> and <code>confirm_id</code>. Until it runs, the store works as 0.5 did, and the new methods raise <code>ValueError</code> asking for <code>setup()</code>. With history off and these methods unused, the store behaves as in 0.5 apart from the new columns. During a rolling upgrade, 0.5 writers do not bump the version but do set <code>updated_at</code>, which is why <code>resolve</code>, <code>put_if</code> and <code>delete_if</code> check both.</p>
+<p>On a large table, run <code>setup()</code> once from a single process before rolling out 0.6.0. The backfill of the new columns takes longer the more items the table holds, and the processes that start meanwhile then find migration 2 in place.</p>
+<p>Several processes can still run <code>setup()</code> at once, as when pods restart into 0.6.0 together. One of them backfills the new columns. CockroachDB answers the same statement from the others at once, before the columns exist, so each of them waits until the columns are public and SHOW JOBS shows no schema change job on the table, for up to <code>SCHEMA_CHANGE_SETTLE_SECONDS</code> (10 minutes), before it records migration 2. A store that finds migration 2 recorded can then write the new columns right away. Two cases leave the columns alone to decide: SHOW JOBS shows a role without admin only its own jobs, and it can cut a long qualified table name from a job's description. If no job applies the migration, as when a peer's migration failed, the waiting <code>setup()</code> applies it itself and logs that at INFO. The wait logs as described in <a href="../resilience/#watching-retries">Watching retries</a>. If it runs out, <code>setup()</code> raises <code>TimeoutError</code> saying what remained, and running it again waits again. This wait comes on top of the TTL steps, each of which can wait out another schema change on its table for up to ten minutes.</p>
+<p>0.5 writers know nothing of history or confirmations. They never archive what they overwrite or delete. One that re-creates a deleted key starts it again at version 1, which history then cannot keep, since it already holds a version 1 of that key. So turn history on only once every writer runs 0.6.0. A 0.5 write that changes a value also leaves its confirmations as they were.</p>
+<p>A 0.5 writer leaves a row's write id alone too. If a plain <code>put</code> commits and its result is lost, and a 0.5 writer writes the same key before the put's retry, the retry finds its own write id on the row and leaves the 0.5 value, but writes its own vectors over the 0.5 writer's. That needs both the rolling-upgrade window and a lost commit. The next write of the key replaces both.</p>
+<p>An application role that did not run <code>setup()</code> needs SELECT, INSERT, UPDATE and DELETE on the items and vectors tables, and on the history table when history is on:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1" href="#__codelineno-32-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">INSERT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">,</span><span class="w"> </span><span class="k">DELETE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">store_vectors</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">app</span><span class="p">;</span>
+<a id="__codelineno-32-2" name="__codelineno-32-2" href="#__codelineno-32-2"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">INSERT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">,</span><span class="w"> </span><span class="k">DELETE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">store_history</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">app</span><span class="p">;</span><span class="w">  </span><span class="c1">-- with history</span>
+<a id="__codelineno-32-3" name="__codelineno-32-3" href="#__codelineno-32-3"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">store_migrations</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">app</span><span class="p">;</span>
+</code></pre></div>
+<p>With history off, the role still needs SELECT and DELETE on a history table that exists, left from when history was on: <code>delete_namespace</code> deletes the namespace's rows there, and without those grants it fails as a whole rather than forget only part of the namespace.</p>
+<p>The store reads the migrations table to learn whether migration 2 is in place. Without SELECT on it, or without a migrations table, as when the tables were created without <code>setup()</code>, the store looks for migration 2's columns on the items table instead. Those can show up a moment before every node uses them, so on a multi-node cluster one write can fail in the seconds after <code>setup()</code> applies migration 2. Run <code>setup()</code> before rolling out 0.6.0, or grant SELECT on the migrations table, to avoid that. Without that grant, the first store call that runs inside a transaction the caller opened also gets the permission error, once per store. Only the grant avoids it.</p>
 <h2 id="differences-from-postgresstore">Differences from PostgresStore<a class="headerlink" href="#differences-from-postgresstore" title="Permanent link">&para;</a></h2>
 <ol>
 <li><strong>Expiry on the server.</strong> CockroachDB's row-level TTL job deletes expired items, so no sweeper thread is needed. Expired items are left out of reads, searches and listings by default (<code>omit_expired</code> is on).</li>
@@ -3104,10 +4068,12 @@
 <li><strong>Warnings and checks.</strong> A <code>query</code> on a store without <code>index</code> logs a WARNING. Changing the index configuration after <code>setup()</code> raises an error or logs a warning, as described in <a href="#changing-the-index-configuration">Changing the Index Configuration</a>.</li>
 <li><strong><code>disable_ttl</code> and <code>drop_vector_index</code>.</strong> <code>disable_ttl()</code> and <code>adisable_ttl()</code> remove the table TTL setting, and <code>drop_vector_index()</code> and <code>adrop_vector_index()</code> drop the vector index so that <code>setup()</code> can build it again, for example with another distance.</li>
 <li><strong>No <code>deserializer</code>.</strong> psycopg decodes JSONB values before the store sees them, so the store does not take PostgresStore's <code>deserializer=</code> argument. To transform values as they are read, wrap <code>get</code> and <code>search</code>.</li>
+<li><strong>Keeping memories true.</strong> <code>reconcile</code>, <code>find_conflicts</code>, <code>resolve</code>, <code>record</code>, <code>confirm</code>, <code>put_if</code>, <code>delete_if</code>, <code>history</code> and <code>purge</code>, and their async forms, as described in <a href="#keeping-memories-true">Keeping Memories True</a>. They are additional methods: <code>BaseStore</code> and <code>Item</code> are unchanged.</li>
 </ol>
 <h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../../examples/long-term-memory/">Long-Term Memory Example</a> - The runnable example, step by step</li>
+<li><a href="../../examples/memory-reconciliation/">Memory Reconciliation Example</a> - Reconcile, history, confirm and conditional writes, step by step</li>
 <li><a href="../../api/store/">API Reference</a> - Every class, method and setting</li>
 <li><a href="../checkpointer/">Checkpointer Guide</a> - Short-term memory for LangGraph threads</li>
 <li><a href="../resilience/">Retries and Resilience</a> - Retry settings and hang guards</li>
