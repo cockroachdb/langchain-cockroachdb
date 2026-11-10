@@ -1,14 +1,20 @@
 """Tests for store SQL statement building."""
 
+import re
+from datetime import datetime, timezone
+
 import pytest
 
 from langchain_cockroachdb.indexes import DistanceStrategy
 from langchain_cockroachdb.store.config import ResolvedIndex
 from langchain_cockroachdb.store.sql import (
+    HISTORY_TTL_CRON,
     MAX_SEARCH_NAMESPACES,
+    MIGRATION_RECONCILE,
     NAMESPACES,
     QUERY_VECTOR,
     StoreSQL,
+    TTLChange,
     bind,
 )
 
@@ -35,6 +41,62 @@ def _make_index(
     )
 
 
+def candidate_statements(sql: StoreSQL) -> list[tuple[str, list]]:
+    """Every statement that finds candidates or reads a record, in each of its forms."""
+    return [
+        sql.now(),
+        sql.key_slot_candidates("a.b", "k1", slot_field=None, slot_value_json=None, filter=None),
+        sql.key_slot_candidates(
+            "a.b", "k1", slot_field="seat", slot_value_json='"x"', filter={"x": 1, "y": {"$gt": 2}}
+        ),
+        *(
+            sql.similar_candidates(
+                "a.b",
+                threshold=0.8,
+                limit=3,
+                filter={"x": 1},
+                scan=scan,  # type: ignore[arg-type]
+                over_fetch=7,
+                exclude=["k1", "k2"],
+            )
+            for scan in ("exact", "index")
+        ),
+        sql.candidate_scores("a.b", ["k1", "k2"]),
+        sql.namespace_vector_count("a.b", 2001),
+        sql.record("a.b", "k1"),
+    ]
+
+
+WHEN = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+
+def reconcile_statements(sql: StoreSQL) -> list[tuple[str, list]]:
+    """Every statement that reconcile writes or reads beyond the candidates, in each form."""
+    return [
+        sql.upsert_items(
+            [("a.b", "k1", "{}", None, None, None)], write_id="w", history=True, return_version=True
+        ),
+        sql.history_insert_superseded(
+            "a.b",
+            "k1",
+            value_json="{}",
+            provenance_json='{"source": "chat"}',
+            valid_at=WHEN,
+            invalid_at=WHEN,
+            superseded_by="k2",
+            write_id="w",
+            ttl_days=30.0,
+        ),
+        sql.confirm("a.b", "k1", confirm_id="w"),
+        sql.confirm("a.b", "k1", confirm_id="w", ttl=60.0),
+        sql.confirm("a.b", "k1", confirm_id="w", ttl=None),
+        sql.confirm_check("a.b", "k1", confirm_id="w"),
+        sql.applied_items("a.b", ["k1", "k2"], write_id="w"),
+        sql.applied_history("a.b", ["k1", "k2"], write_id="w"),
+        sql.tokens("a.b", ["k1", "k2"]),
+    ]
+
+
 def test_identifiers_are_validated():
     """StoreSQL validates identifiers and raises ValueError for invalid ones."""
     with pytest.raises(ValueError, match="Invalid"):
@@ -45,20 +107,20 @@ def test_identifiers_are_validated():
 
 
 def test_vector_statements_are_separate_and_idempotent():
-    """migrations() returns only 2 statements; vector_statements() is separate."""
-    # Without index: migrations has 2 statements, vector_statements is empty
+    """migrations() returns only 3 statements; vector_statements() is separate."""
+    # Without index: migrations has 3 statements, vector_statements is empty
     sql_no_index = StoreSQL("public", "store", index=None)
-    assert len(sql_no_index.migrations()) == 2
+    assert len(sql_no_index.migrations()) == 3
     assert len(sql_no_index.vector_statements()) == 0
 
-    # With index (not flat): migrations still has 2, vector_statements has 2
+    # With index (not flat): migrations still has 3, vector_statements has 2
     sql_with_index = StoreSQL("public", "store", index=_make_index())
-    assert len(sql_with_index.migrations()) == 2
+    assert len(sql_with_index.migrations()) == 3
     assert len(sql_with_index.vector_statements()) == 2
 
-    # With flat index: migrations has 2, vector_statements has 1 (no index statement)
+    # With flat index: migrations has 3, vector_statements has 1 (no index statement)
     sql_flat = StoreSQL("public", "store", index=_make_index(flat=True))
-    assert len(sql_flat.migrations()) == 2
+    assert len(sql_flat.migrations()) == 3
     assert len(sql_flat.vector_statements()) == 1
 
     # All vector statements must have IF NOT EXISTS
@@ -180,6 +242,33 @@ def test_no_cast_shorthand():
     )
     assert "::" not in query_sql
 
+    assert "::" not in sql.create_history_table()
+    for change in (sql.history_ttl_change(), *sql.ttl_changes("@hourly")):
+        assert "::" not in change.statement
+        assert "::" not in change.applied[0]
+    for query_sql, _ in (
+        sql.archive(
+            "a",
+            ["k1"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id="w",
+            ttl_days=1.0,
+        ),
+        sql.history_versions("a", "k1", limit=1, offset=0),
+        sql.history_versions("a", None, limit=1, offset=0),
+        sql.history_exists(),
+        sql.reconcile_columns_exist(),
+        sql.reconcile_migration_recorded(),
+        sql.purge("a", "k1"),
+        sql.delete_namespace(["a"], history=True),
+        sql.upsert_items([("a", "k1", "{}", None, None, None)], write_id="w", history=True),
+        *candidate_statements(sql),
+        *reconcile_statements(sql),
+    ):
+        assert "::" not in query_sql
+
 
 def test_get():
     """get() builds SELECT with prefix and key list."""
@@ -271,6 +360,162 @@ def test_upsert_items():
     # Check params: prefix, key, value, ttl for each row
     assert params[:4] == ["a", "k1", '{"x": 1}', 60.0]
     assert params[4:8] == ["a", "k2", '{"x": 2}', None]
+
+
+def test_migration_2_adds_the_reconcile_columns_in_one_statement() -> None:
+    statements = StoreSQL("public", "store").migrations()
+    assert len(statements) == 3
+    migration = statements[MIGRATION_RECONCILE]
+    assert migration.startswith("ALTER TABLE public.store ")
+    for column in (
+        "version INT8 NOT NULL DEFAULT 1",
+        "provenance JSONB",
+        "confirmed_at TIMESTAMPTZ",
+        "confirmations INT8 NOT NULL DEFAULT 0",
+        "write_id UUID",
+        "valid_at TIMESTAMPTZ",
+        "confirm_id UUID",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column}" in migration
+    # One statement, so it is one schema change
+    assert migration.count(";") == 1 and migration.endswith(";")
+
+
+def test_the_column_check_binds_the_items_table_and_migration_2_columns() -> None:
+    sql = StoreSQL("memory", "facts")
+    query, params = sql.reconcile_columns_exist()
+    assert query == (
+        "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
+        "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)"
+    )
+    columns = [
+        "version",
+        "provenance",
+        "confirmed_at",
+        "confirmations",
+        "write_id",
+        "valid_at",
+        "confirm_id",
+    ]
+    assert params == [7, "memory.facts", columns]
+    for value in ("memory", "facts", *columns):
+        assert value not in query
+    # The check requires exactly the columns migration 2 adds
+    migration = sql.migrations()[MIGRATION_RECONCILE]
+    assert re.findall(r"ADD COLUMN IF NOT EXISTS (\w+) ", migration) == columns
+
+
+def test_the_migrations_check_binds_the_migration_it_needs() -> None:
+    query, params = StoreSQL("memory", "facts").reconcile_migration_recorded()
+    assert query == "SELECT EXISTS (SELECT 1 FROM memory.facts_migrations WHERE v >= %s) AS ready"
+    assert params == [MIGRATION_RECONCILE]
+
+
+def test_upsert_with_a_write_id_bumps_the_version_only_for_a_new_write() -> None:
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [("user.a", "k", '{"text": "x"}', None, '{"source": "user"}', None)], write_id="w-1"
+    )
+    assert "version = public.store.version + 1" in sql
+    assert "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id" in sql
+    assert "w-1" in params and '{"source": "user"}' in params
+    assert "w-1" not in sql and "user" not in sql
+
+
+def test_upsert_with_a_write_id_binds_every_value() -> None:
+    when = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [
+            ("a", "k1", '{"x": 1}', 60.0, '{"source": "chat"}', when),
+            ("a", "k2", '{"x": 2}', None, None, None),
+        ],
+        write_id="w-2",
+    )
+    # The write id's placeholder is in the outer SELECT, before the rows'
+    assert params == [
+        "w-2",
+        *("a", "k1", '{"x": 1}', 60.0, '{"source": "chat"}', when),
+        *("a", "k2", '{"x": 2}', None, None, None),
+    ]
+    assert sql.count("%s") == len(params)
+    assert "CAST(%s AS UUID)" in sql
+    assert "CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at" in sql
+    assert "::" not in sql
+
+    builder = StoreSQL("public", "store")
+    with pytest.raises(ValueError, match="6 fields with a write id, got 4"):
+        builder.upsert_items([("a", "k", "{}", None)], write_id="w-3")  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="4 fields without a write id, got 6"):
+        builder.upsert_items([("a", "k", "{}", None, None, None)])
+
+
+def test_an_upsert_that_changes_the_value_starts_its_confirmations_again() -> None:
+    # Confirmations belong to the fact, not the key. A write of another value
+    # resets them, and an exact re-save of the live value keeps them. A memory
+    # that expired counts as gone, so a write over it starts from none too
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    same = (
+        "public.store.value = EXCLUDED.value AND "
+        "(public.store.expires_at IS NULL OR public.store.expires_at > now())"
+    )
+    for history in (False, True):
+        query, params = sql.upsert_items(rows, write_id="w-1", history=history)
+        assert (
+            f"    confirmations = CASE WHEN {same} THEN public.store.confirmations ELSE 0 END,\n"
+            f"    confirmed_at = CASE WHEN {same} THEN public.store.confirmed_at ELSE NULL END\n"
+            "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id"
+        ) in query
+        # The last confirmation's id stays, so a confirm retried after it
+        # committed still finds it and counts nothing again
+        assert "confirm_id" not in query
+        assert params == ["w-1", *rows[0]]
+        assert query.count("%s") == len(params)
+
+
+def test_upsert_without_a_write_id_is_the_0_5_statement() -> None:
+    sql, _ = StoreSQL("public", "store").upsert_items([("user.a", "k", "{}", None)])
+    assert "version" not in sql and "write_id" not in sql and "provenance" not in sql
+
+
+def test_upsert_without_a_write_id_keeps_the_0_5_1_text() -> None:
+    """Until setup() applies migration 2, puts send the 0.5.1 statement byte for byte."""
+    sql, params = StoreSQL("public", "store").upsert_items(
+        [("user.a", "k", "{}", None), ("user.a", "j", "{}", 5.0)]
+    )
+    assert sql == (
+        "INSERT INTO public.store (prefix, key, value, expires_at, ttl_minutes)\n"
+        "SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes\n"
+        "FROM (SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes\n"
+        "    UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), CAST(%s AS JSONB), CAST(%s AS DECIMAL)) AS rows_to_insert\n"
+        "ON CONFLICT (prefix, key) DO UPDATE SET\n"
+        "    value = EXCLUDED.value,\n"
+        "    updated_at = now(),\n"
+        "    expires_at = EXCLUDED.expires_at,\n"
+        "    ttl_minutes = EXCLUDED.ttl_minutes"
+    )
+    assert params == ["user.a", "k", "{}", None, "user.a", "j", "{}", 5.0]
+
+
+def test_an_update_never_moves_updated_at_back() -> None:
+    # now() is fixed when a transaction starts. A transaction pushed past a
+    # later writer could give the key an updated_at older than the version
+    # it replaces, so the update keeps the later of the two
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    query, params = sql.upsert_items(rows, write_id="w-1")
+    assert "\n    updated_at = GREATEST(now(), public.store.updated_at),\n" in query
+    assert "updated_at = now()" not in query
+    assert params == ["w-1", *rows[0]]
+    # With history the floor also takes in the key's history, through
+    # EXCLUDED.updated_at (see the test below)
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True)
+    assert "\n    updated_at = GREATEST(EXCLUDED.updated_at, public.store.updated_at),\n" in query
+    assert "updated_at = now()" not in query
+    assert params == ["w-1", *rows[0]]
+    # Until setup() applies migration 2, puts still send the 0.5.1 statement
+    plain, _ = sql.upsert_items([("user.a", "k", "{}", None)])
+    assert "\n    updated_at = now(),\n" in plain
+    assert "GREATEST" not in plain
 
 
 def test_delete_items():
@@ -448,17 +693,34 @@ def test_sweep():
     assert len(sweeps) == 1
 
 
-def test_ttl_statements():
-    """ttl_statements() builds ALTER TABLE SET for TTL configuration."""
-    sql = StoreSQL("public", "store", index=_make_index())
-    stmts = sql.ttl_statements("@hourly")
+TTL_READ = (
+    "SELECT COALESCE(reloptions @> CAST(%s AS STRING[]), false) AS applied\n"
+    "FROM pg_catalog.pg_class WHERE oid = to_regclass(%s)"
+)
 
-    # With index: items and vectors
-    assert len(stmts) == 2
-    for stmt in stmts:
-        assert "ALTER TABLE" in stmt
-        assert "SET (ttl_expiration_expression" in stmt
-        assert "@hourly" in stmt
+
+def test_ttl_changes_set_each_table_and_read_its_settings_first():
+    """ttl_changes() pairs each table's ALTER TABLE SET with the read that can skip it."""
+    sql = StoreSQL("public", "store", index=_make_index())
+    items, vectors = sql.ttl_changes("*/5 * * * *")
+    wanted = ["ttl_expiration_expression='expires_at'", "ttl_job_cron='*/5 * * * *'"]
+    assert items == TTLChange(
+        "ALTER TABLE public.store SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '*/5 * * * *');",
+        (TTL_READ, [wanted, "public.store"]),
+    )
+    assert vectors == TTLChange(
+        "ALTER TABLE public.store_vectors SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '*/5 * * * *');",
+        (TTL_READ, [wanted, "public.store_vectors"]),
+    )
+    # Without an index there is no vectors table
+    [only] = StoreSQL("app", "mem").ttl_changes("@daily")
+    assert only.statement.startswith("ALTER TABLE app.mem SET ")
+    assert only.applied[1] == [
+        ["ttl_expiration_expression='expires_at'", "ttl_job_cron='@daily'"],
+        "app.mem",
+    ]
 
 
 def test_disable_ttl_statements():
@@ -485,11 +747,11 @@ def test_upsert_empty_rows_raises():
 
 
 def test_ttl_cron_validation():
-    """ttl_statements should reject cron with single quote."""
+    """ttl_changes should reject cron with single quote."""
     sql = StoreSQL("public", "store", index=None)
 
     with pytest.raises(ValueError, match="single quote"):
-        sql.ttl_statements("0 0 * * *'; DROP TABLE")
+        sql.ttl_changes("0 0 * * *'; DROP TABLE")
 
 
 def test_every_builder_has_one_param_per_placeholder():
@@ -570,6 +832,34 @@ def test_every_builder_has_one_param_per_placeholder():
     # delete_namespace
     query_sql, params = sql.delete_namespace(["a", "b", "c"])
     assert query_sql.count("%s") == len(params)
+    query_sql, params = sql.delete_namespace(["a", "b", "c"], history=True)
+    assert query_sql.count("%s") == len(params)
+
+    # history
+    query_sql, params = sql.archive(
+        "a.b.c",
+        ["k1", "k2"],
+        reason="deleted",
+        superseded_by=None,
+        invalid_at=None,
+        write_id="w",
+        ttl_days=None,
+    )
+    assert query_sql.count("%s") == len(params)
+    for query_sql, params in (
+        sql.history_versions("a.b.c", "k1", limit=3, offset=1),
+        sql.history_versions("a.b.c", None, limit=3, offset=1),
+        sql.history_exists(),
+        sql.reconcile_columns_exist(),
+        sql.reconcile_migration_recorded(),
+        sql.purge("a.b.c", "k1"),
+        sql.upsert_items([("a.b.c", "k1", "{}", None, None, None)], write_id="w", history=True),
+        *candidate_statements(sql),
+        *reconcile_statements(sql),
+        *reconcile_statements(StoreSQL("public", "store")),
+        *(change.applied for change in (sql.history_ttl_change(), *sql.ttl_changes("@hourly"))),
+    ):
+        assert query_sql.count("%s") == len(params)
 
     # sweep
     sweeps = sql.sweep()
@@ -747,4 +1037,736 @@ def test_vector_index_statements():
     )
     assert sql.show_create_vectors() == (
         "SELECT create_statement FROM [SHOW CREATE TABLE app.mem_vectors]"
+    )
+
+
+# The history table's columns, in order, as setup() creates them
+HISTORY_COLUMNS = [
+    "prefix TEXT NOT NULL",
+    "key TEXT NOT NULL",
+    "version INT8 NOT NULL",
+    "value JSONB NOT NULL",
+    "provenance JSONB",
+    "valid_at TIMESTAMPTZ NOT NULL",
+    "invalid_at TIMESTAMPTZ",
+    "written_at TIMESTAMPTZ NOT NULL",
+    "ended_at TIMESTAMPTZ NOT NULL",
+    "reason TEXT NOT NULL",
+    "superseded_by TEXT",
+    "confirmations INT8 NOT NULL DEFAULT 0",
+    "confirmed_at TIMESTAMPTZ",
+    "write_id UUID",
+    "expires_at TIMESTAMPTZ",
+]
+
+
+def test_history_table_statement() -> None:
+    sql = StoreSQL("app", "mem")
+    assert sql.history == "app.mem_history"
+    lines = sql.create_history_table().splitlines()
+    assert lines[0] == "CREATE TABLE IF NOT EXISTS app.mem_history ("
+    assert lines[-1] == ");"
+    assert [line.strip().rstrip(",") for line in lines[1:-1]] == [
+        *HISTORY_COLUMNS,
+        "PRIMARY KEY (prefix, key, version)",
+    ]
+
+
+def test_history_ttl_change_runs_hourly_and_reads_the_settings_first() -> None:
+    sql = StoreSQL("public", "store")
+    assert HISTORY_TTL_CRON == "@hourly"
+    # Each archived row carries its own expires_at, so the days are not in the DDL
+    assert sql.history_ttl_change() == TTLChange(
+        "ALTER TABLE public.store_history SET "
+        "(ttl_expiration_expression = 'expires_at', ttl_job_cron = '@hourly');",
+        (
+            TTL_READ,
+            [
+                ["ttl_expiration_expression='expires_at'", "ttl_job_cron='@hourly'"],
+                "public.store_history",
+            ],
+        ),
+    )
+
+
+def test_archive_statement_binds_everything() -> None:
+    sql = StoreSQL("public", "store")
+    when = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    write_id = "8d6f1c9e-0000-4000-8000-000000000001"
+    query, params = sql.archive(
+        "user.alice",
+        ["seat-key", "food-key"],
+        reason="overwritten",
+        superseded_by="newer-key",
+        invalid_at=when,
+        write_id=write_id,
+        ttl_days=30.0,
+    )
+    for value in ("user.alice", "seat-key", "food-key", "overwritten", "newer-key", write_id):
+        assert value not in query
+    assert query.startswith(
+        "INSERT INTO public.store_history (prefix, key, version, value, provenance, valid_at, "
+        "invalid_at, written_at, ended_at, reason, superseded_by, confirmations, confirmed_at, "
+        "write_id, expires_at)\n"
+    )
+    # The version ends with the confirmations it had, which a write that
+    # changes the value takes from the live row
+    assert "CAST(%s AS STRING), CAST(%s AS STRING), confirmations, confirmed_at," in query
+    assert "\nFROM public.store\n" in query
+    assert "ON CONFLICT (prefix, key, version) DO NOTHING" in query
+    # Only live rows, and not the rows this batch already wrote
+    assert "(expires_at IS NULL OR expires_at > now())" in query
+    assert "write_id IS DISTINCT FROM CAST(%s AS UUID)" in query
+    assert "COALESCE(valid_at, updated_at)" in query
+    assert query.count("%s") == len(params)
+    assert "::" not in query
+    assert params == [
+        when,
+        "overwritten",
+        "newer-key",
+        write_id,
+        30.0,
+        "user.alice",
+        ["seat-key", "food-key"],
+        write_id,
+    ]
+
+    # No invalid time means now, and no ttl_days means no expiry: both bind NULL
+    _, params = sql.archive(
+        "user.alice",
+        ["seat-key"],
+        reason="deleted",
+        superseded_by=None,
+        invalid_at=None,
+        write_id=write_id,
+        ttl_days=None,
+    )
+    assert params == [None, "deleted", None, write_id, None, "user.alice", ["seat-key"], write_id]
+
+
+def test_history_reads_bind_the_key_and_skip_expired_versions() -> None:
+    sql = StoreSQL("public", "store")
+    query, params = sql.history_versions("user.alice", "seat-key", limit=5, offset=2)
+    # Each row names its key, as a row of a namespace's history must
+    assert query.startswith(
+        "SELECT key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, "
+        "reason, superseded_by, confirmed_at, confirmations\n"
+    )
+    assert "FROM public.store_history\n" in query
+    assert "prefix = %s AND key = %s" in query
+    assert "(expires_at IS NULL OR expires_at > now())" in query
+    assert query.endswith("ORDER BY version DESC\nLIMIT %s OFFSET %s")
+    assert params == ["user.alice", "seat-key", 5, 2]
+
+    # The schema check asks for the history table by its validated name
+    query, params = sql.history_exists()
+    assert query == "SELECT to_regclass(%s) IS NOT NULL AS ready"
+    assert params == ["public.store_history"]
+
+
+def test_a_namespace_history_read_binds_the_prefix_and_orders_stable_pages() -> None:
+    sql = StoreSQL("public", "store")
+    query, params = sql.history_versions("user.alice", None, limit=5, offset=10)
+    assert query.startswith("SELECT key, version, value, ")
+    assert "FROM public.store_history\n" in query
+    # Exactly the namespace, as the key form reads it: no key condition, and
+    # no range over the namespace's descendants
+    assert "\nWHERE prefix = %s AND (expires_at IS NULL OR expires_at > now())\n" in query
+    assert "key =" not in query and "prefix >=" not in query
+    # Newest first, then by key, then highest version first. History's primary
+    # key is (prefix, key, version), so no two rows of a namespace tie
+    assert query.endswith("ORDER BY ended_at DESC, key, version DESC\nLIMIT %s OFFSET %s")
+    assert params == ["user.alice", 5, 10]
+
+    for paging, name in (
+        ({"limit": -1, "offset": 0}, "limit"),
+        ({"limit": 1, "offset": -1}, "offset"),
+    ):
+        with pytest.raises(ValueError, match=f"{name} must be non-negative"):
+            sql.history_versions("user.alice", None, **paging)
+
+
+def test_purge_deletes_the_item_its_vectors_and_history_in_one_statement() -> None:
+    query, params = StoreSQL("public", "store", index=_make_index()).purge("user.alice", "k1")
+    assert query.startswith("WITH deleted_items AS (")
+    for table in ("public.store", "public.store_vectors", "public.store_history"):
+        assert f"DELETE FROM {table} WHERE prefix = %s AND key = %s RETURNING 1" in query
+    assert query.rstrip().endswith("AS removed")
+    assert params == ["user.alice", "k1"] * 3
+
+    # Without an index there are no vectors to delete
+    query, params = StoreSQL("public", "store").purge("user.alice", "k1")
+    assert "store_vectors" not in query
+    assert params == ["user.alice", "k1"] * 2
+
+
+def test_delete_namespace_with_history_deletes_its_history_too() -> None:
+    sql = StoreSQL("public", "store", index=_make_index())
+    without = sql.delete_namespace(["a", "b"])
+    query, params = sql.delete_namespace(["a", "b"], history=True)
+    assert "DELETE FROM public.store_history\n" in query
+    # The same prefix condition as the items, in the same statement
+    assert query.count("(prefix = %s OR (prefix >= %s AND prefix < %s))") == 3
+    assert query.endswith("RETURNING key")
+    assert params == ["a.b", "a.b.", "a.b/"] * 3
+    assert sql.delete_namespace(["a", "b"], history=False) == without
+
+    query, params = StoreSQL("public", "store").delete_namespace(["a"], history=True)
+    assert query.startswith("WITH deleted_history AS (")
+    assert "store_vectors" not in query
+    assert params == ["a", "a.", "a/"] * 2
+
+
+def test_upsert_with_history_continues_versions_after_the_history() -> None:
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True)
+    # A new version is one more than the larger of the key's live version and
+    # its highest version in history, for a new row and an update alike. So a
+    # key written again after a delete, or after a fact recorded straight into
+    # history, never reuses a version it has there
+    assert (
+        "GREATEST(\n"
+        "        COALESCE((SELECT i.version FROM public.store AS i "
+        "WHERE i.prefix = rows_to_insert.prefix AND i.key = rows_to_insert.key), 0),\n"
+        "        COALESCE(kh.version, 0)\n"
+        "    ) + 1"
+    ) in query
+    assert (
+        "FROM (SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
+        "CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes, "
+        "CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at) AS rows_to_insert\n"
+        "CROSS JOIN LATERAL (\n"
+        "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+        "    FROM public.store_history AS h\n"
+        "    WHERE h.prefix = rows_to_insert.prefix AND h.key = rows_to_insert.key\n"
+        ") AS kh\n"
+        "ON CONFLICT (prefix, key) DO UPDATE SET\n"
+    ) in query
+    assert "version = EXCLUDED.version" in query
+    assert "version = public.store.version + 1" not in query
+    assert "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id" in query
+    assert query.count("%s") == len(params)
+    assert params == ["w-1", *rows[0]]
+    # Without history the statement is the one Task 1 sends
+    without = sql.upsert_items(rows, write_id="w-1")[0]
+    assert "store_history" not in without
+    assert "version = public.store.version + 1" in without
+    with pytest.raises(ValueError, match="write id"):
+        sql.upsert_items([("user.a", "k", "{}", None)], history=True)
+
+
+def test_with_history_a_version_never_starts_before_the_key_history_ended() -> None:
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    query, params = sql.upsert_items(rows, write_id="w-1", history=True, return_version=True)
+    # A new row, as when the key is written again after a delete, starts no
+    # earlier than the latest end of a version in the key's history. Its
+    # created_at is the same, so a new row is still never updated after it
+    # was created
+    assert query.startswith(
+        "INSERT INTO public.store (prefix, key, value, expires_at, ttl_minutes, provenance, "
+        "valid_at, write_id, version, created_at, updated_at)\n"
+    )
+    assert (
+        "    ) + 1,\n    GREATEST(now(), kh.ended_at), GREATEST(now(), kh.ended_at)\nFROM ("
+    ) in query
+    # An update takes in the history too, through EXCLUDED.updated_at, so a
+    # late fact recorded under the live key never ends after the next version
+    # starts
+    assert "    updated_at = GREATEST(EXCLUDED.updated_at, public.store.updated_at),\n" in query
+    # The version and both floors come from one read of the history table,
+    # and no value is formatted into the text
+    assert query.count("public.store_history") == 1
+    assert params == ["w-1", *rows[0]]
+    assert query.count("%s") == len(params)
+
+    # Without history the new row keeps the column defaults, from now()
+    plain, _ = sql.upsert_items(rows, write_id="w-1")
+    assert "created_at" not in plain and "EXCLUDED.updated_at" not in plain
+    assert "kh." not in plain
+
+
+def test_upsert_can_return_the_written_version() -> None:
+    sql = StoreSQL("public", "store")
+    rows = [("user.a", "k", '{"text": "x"}', None, None, None)]
+    for history in (False, True):
+        query, params = sql.upsert_items(rows, write_id="w-1", history=history, return_version=True)
+        # A row the guard leaves as it is returns nothing
+        assert query.endswith(
+            "WHERE public.store.write_id IS DISTINCT FROM EXCLUDED.write_id\nRETURNING version"
+        )
+        assert params == ["w-1", *rows[0]]
+        plain = sql.upsert_items(rows, write_id="w-1", history=history)[0]
+        assert "RETURNING" not in plain
+        assert query == plain + "\nRETURNING version"
+    # The 0.5 statement has no version to return
+    with pytest.raises(ValueError, match="write id"):
+        sql.upsert_items([("user.a", "k", "{}", None)], return_version=True)
+
+
+def test_archive_never_ends_a_version_before_it_began() -> None:
+    query, params = StoreSQL("public", "store").archive(
+        "user.alice",
+        ["k"],
+        reason="overwritten",
+        superseded_by=None,
+        invalid_at=WHEN,
+        write_id="w-1",
+        ttl_days=None,
+    )
+    # A fact written with an explicit valid time older than the version it
+    # replaces would otherwise record an interval that ends before it starts
+    assert (
+        "GREATEST(COALESCE(CAST(%s AS TIMESTAMPTZ), now()), COALESCE(valid_at, updated_at))"
+        in query
+    )
+    assert params[0] == WHEN
+
+
+def test_no_history_row_ends_before_it_was_written() -> None:
+    sql = StoreSQL("public", "store")
+    query, _ = sql.archive(
+        "user.alice",
+        ["k"],
+        reason="overwritten",
+        superseded_by=None,
+        invalid_at=None,
+        write_id="w-1",
+        ttl_days=None,
+    )
+    # written_at is the version's updated_at. A transaction pushed past the
+    # writer of that version still has the now() it started with, which can
+    # be earlier, so ended_at is the later of the two
+    assert "\n    updated_at, GREATEST(now(), updated_at),\n" in query
+    # A late fact recorded straight into history is written and ended at one
+    # time, never before the key's live row was written or its history ended
+    late, _ = sql.history_insert_superseded(
+        "user.alice",
+        "late-key",
+        value_json="{}",
+        provenance_json=None,
+        valid_at=WHEN,
+        invalid_at=WHEN,
+        superseded_by="newer-key",
+        write_id="w-1",
+        ttl_days=None,
+    )
+    assert (
+        "GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),"
+    ) in late
+
+
+def test_history_insert_superseded_binds_everything() -> None:
+    sql = StoreSQL("public", "store")
+    write_id = "8d6f1c9e-0000-4000-8000-000000000002"
+    late = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    query, params = sql.history_insert_superseded(
+        "user.alice",
+        "late-key",
+        value_json='{"text": "Prefers aisle seats"}',
+        provenance_json='{"source": "old chat"}',
+        valid_at=late,
+        invalid_at=WHEN,
+        superseded_by="newer-key",
+        write_id=write_id,
+        ttl_days=30.0,
+    )
+    for value in (
+        "user.alice",
+        "late-key",
+        "aisle",
+        "old chat",
+        "newer-key",
+        write_id,
+        "'superseded'",
+    ):
+        assert value not in query
+    assert query.startswith("INSERT INTO public.store_history (")
+    # The version follows the key's live version and its highest version in
+    # history, as the upsert numbers them. The key's row in the items table and
+    # its history are each read once, for the version and the floor below
+    assert (
+        "SELECT p.prefix, p.key,\n"
+        "    GREATEST(\n"
+        "        COALESCE(i.version, 0),\n"
+        "        COALESCE(kh.version, 0)\n"
+        "    ) + 1,\n"
+    ) in query
+    assert (
+        ") AS p\n"
+        "LEFT JOIN public.store AS i ON i.prefix = p.prefix AND i.key = p.key\n"
+        "CROSS JOIN LATERAL (\n"
+        "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+        "    FROM public.store_history AS h\n"
+        "    WHERE h.prefix = p.prefix AND h.key = p.key\n"
+        ") AS kh\n"
+        "WHERE NOT EXISTS (\n"
+    ) in query
+    # Never invalid before it became valid. The store held it for no time,
+    # written and ended at once, never before the key's live row was written
+    # or a version in its history ended
+    assert (
+        "GREATEST(p.invalid_at, p.valid_at),\n"
+        "    GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),\n"
+    ) in query
+    # Inserted once per write id, whatever version a second run would compute.
+    # The reason is part of the guard, so the same write's archive of the
+    # memory under this key, as when it deletes it, never stands in for the
+    # late fact, whatever order the statements run in
+    assert (
+        "WHERE NOT EXISTS (\n"
+        "    SELECT 1 FROM public.store_history AS h\n"
+        "    WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id\n"
+        "        AND h.reason = p.reason\n"
+        ")"
+    ) in query
+    assert query.endswith("ON CONFLICT (prefix, key, version) DO NOTHING")
+    assert query.count("%s") == len(params)
+    assert params == [
+        "user.alice",
+        "late-key",
+        '{"text": "Prefers aisle seats"}',
+        '{"source": "old chat"}',
+        late,
+        WHEN,
+        "superseded",
+        "newer-key",
+        write_id,
+        30.0,
+    ]
+
+
+CONFIRM_ITEM = (
+    "UPDATE public.store SET confirmed_at = now(), confirmations = confirmations + 1,\n"
+    "    confirm_id = CAST(%s AS UUID),\n"
+    "    expires_at = COALESCE(now() + ttl_minutes * INTERVAL '1 minute', expires_at)\n"
+    "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
+    "    AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
+)
+
+
+def test_confirm_binds_everything_and_keeps_version_and_updated_at() -> None:
+    confirm_id = "8d6f1c9e-0000-4000-8000-000000000003"
+    # Without an index only the item changes. Its expiry is renewed from its
+    # own TTL, and a memory without one keeps none. The confirmation sets and
+    # checks its own id, and leaves the write id of the write that put the
+    # value there alone
+    query, params = StoreSQL("public", "store").confirm("user.alice", "k", confirm_id=confirm_id)
+    assert query == CONFIRM_ITEM
+    assert params == [confirm_id, "user.alice", "k", confirm_id]
+    for column in ("version", "updated_at", "value", "write_id"):
+        assert f"{column} =" not in query
+    assert "write_id" not in query
+
+    # With an index the vectors' expiry is renewed in the same statement, and
+    # only when the item is confirmed: the CTE reads the item as it was
+    sql = StoreSQL("public", "store", index=_make_index())
+    query, params = sql.confirm("user.alice", "k", confirm_id=confirm_id)
+    assert query == (
+        "WITH renewed AS (\n"
+        "    UPDATE public.store_vectors SET expires_at = now() + ttl_minutes * INTERVAL '1 minute'\n"
+        "    WHERE prefix = %s AND key = %s AND ttl_minutes IS NOT NULL AND EXISTS (\n"
+        "        SELECT 1 FROM public.store\n"
+        "        WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
+        "            AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)\n"
+        "    )\n"
+        "    RETURNING key\n"
+        ")\n" + CONFIRM_ITEM
+    )
+    assert params == ["user.alice", "k", "user.alice", "k", confirm_id] + [
+        confirm_id,
+        "user.alice",
+        "k",
+        confirm_id,
+    ]
+
+    # A new TTL is set on the item and its vectors, and None removes the expiry
+    for ttl in (60.0, None):
+        query, params = sql.confirm("user.alice", "k", confirm_id=confirm_id, ttl=ttl)
+        assert query.startswith(
+            "WITH renewed AS (\n"
+            "    UPDATE public.store_vectors SET ttl_minutes = CAST(%s AS DECIMAL),\n"
+            "        expires_at = now() + CAST(%s AS DECIMAL) * INTERVAL '1 minute'\n"
+            "    WHERE prefix = %s AND key = %s AND EXISTS (\n"
+        )
+        assert query.endswith(
+            "    confirm_id = CAST(%s AS UUID),\n"
+            "    ttl_minutes = CAST(%s AS DECIMAL),\n"
+            "    expires_at = now() + CAST(%s AS DECIMAL) * INTERVAL '1 minute'\n"
+            "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
+            "    AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
+        )
+        assert params == [ttl, ttl, "user.alice", "k", "user.alice", "k", confirm_id] + [
+            confirm_id,
+            ttl,
+            ttl,
+            "user.alice",
+            "k",
+            confirm_id,
+        ]
+
+
+def test_applied_reads_look_up_only_the_named_keys() -> None:
+    sql = StoreSQL("public", "store")
+    # Primary key lookups of the keys a retry names, never a scan of the
+    # namespace, and only rows that carry the call's id as their write id,
+    # written by it, or as their confirm id, confirmed by it, live or not
+    assert sql.applied_items("user.alice", ["k", "old"], write_id="w-1") == (
+        "SELECT key, version, write_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS written,\n"
+        "    confirm_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS confirmed\n"
+        "FROM public.store\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+        "    AND (write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))",
+        ["w-1", "w-1", "user.alice", ["k", "old"], "w-1", "w-1"],
+    )
+    # History's primary key is (prefix, key, version): each key's versions only
+    assert sql.applied_history("user.alice", ["k", "old"], write_id="w-1") == (
+        "SELECT key, reason FROM public.store_history\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)",
+        ["user.alice", ["k", "old"], "w-1"],
+    )
+
+
+def test_tokens_read_the_version_and_update_of_live_rows_by_key() -> None:
+    # resolve compares both: a 0.5.x writer sets updated_at but not the
+    # version. An expired row counts as gone, and the read pushes back no expiry
+    assert StoreSQL("public", "store").tokens("user.alice", ["k", "old"]) == (
+        "SELECT key, version, updated_at FROM public.store\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+        "    AND (expires_at IS NULL OR expires_at > now())",
+        ["user.alice", ["k", "old"]],
+    )
+
+
+def test_delete_namespace_without_history_keeps_the_0_5_1_text() -> None:
+    """With no history table to clear, delete_namespace sends the 0.5.1 statement."""
+    condition = "(prefix = %s OR (prefix >= %s AND prefix < %s))"
+    assert StoreSQL("public", "store").delete_namespace(["user", "a"]) == (
+        f"DELETE FROM public.store\nWHERE {condition}\nRETURNING key",
+        ["user.a", "user.a.", "user.a/"],
+    )
+    assert StoreSQL("public", "store", index=_make_index()).delete_namespace(["user", "a"]) == (
+        "WITH deleted_vectors AS (\n"
+        "    DELETE FROM public.store_vectors\n"
+        f"    WHERE {condition}\n"
+        "    RETURNING key\n"
+        ")\n"
+        f"DELETE FROM public.store\nWHERE {condition}\nRETURNING key",
+        ["user.a", "user.a.", "user.a/"] * 2,
+    )
+
+
+CANDIDATE_COLUMNS = (
+    "key, value, created_at, updated_at, version, COALESCE(valid_at, updated_at) AS valid_at, "
+    "provenance, confirmed_at, confirmations, confirm_id"
+)
+
+
+def test_key_slot_candidates_bind_the_slot() -> None:
+    """The target comes by its key alone; slot matches compare the bound slot field and value.
+
+    The filter narrows the slot matches only, and expired rows never come back.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    query_sql, params = sql.key_slot_candidates(
+        "user.alice",
+        "k",
+        slot_field="slot-field-xyz",
+        slot_value_json='"slot-value-xyz"',
+        filter={"source": "chat"},
+    )
+    assert "slot-field-xyz" not in query_sql and "slot-value-xyz" not in query_sql
+    assert "chat" not in query_sql and "alice" not in query_sql
+    assert query_sql.startswith(f"SELECT {CANDIDATE_COLUMNS}\nFROM public.store\n")
+    assert (
+        "WHERE prefix = %s AND (key = %s OR (value -> %s = CAST(%s AS JSONB) "
+        "AND value -> %s = CAST(%s AS JSONB)))"
+    ) in query_sql
+    assert query_sql.rstrip().endswith("AND (expires_at IS NULL OR expires_at > now())")
+    assert params == ["user.alice", "k", "slot-field-xyz", '"slot-value-xyz"', "source", '"chat"']
+    assert query_sql.count("%s") == len(params)
+
+    # Without a slot only the target is read, and the filter does not apply to it
+    query_sql, params = sql.key_slot_candidates(
+        "user.alice", "k", slot_field=None, slot_value_json=None, filter={"source": "chat"}
+    )
+    assert "WHERE prefix = %s AND key = %s\n" in query_sql
+    assert "->" not in query_sql
+    assert params == ["user.alice", "k"]
+
+    with pytest.raises(ValueError, match="Unknown filter operator"):
+        sql.key_slot_candidates(
+            "a", "k", slot_field="seat", slot_value_json='"x"', filter={"x": {"$bad": 1}}
+        )
+
+
+def test_similar_candidates_exact_and_index_shapes() -> None:
+    """The exact form ranks every vector of the namespace; the index form keeps a window.
+
+    Both skip the excluded keys, filter, check expiry and keep the scores at
+    or above the threshold, best first, up to the limit. The index form also
+    reports the window's size, its lowest score and the namespace's vectors,
+    for needs_exact_candidates.
+    """
+    sql = StoreSQL("public", "store", index=_make_index())
+    kwargs = {"threshold": 0.8, "limit": 5, "filter": {"x": 1}, "over_fetch": 11}
+    exact_sql, exact_params = sql.similar_candidates(
+        "user.alice",
+        scan="exact",
+        exclude=["k", "s"],
+        **kwargs,  # type: ignore[arg-type]
+    )
+    ranked, outer = exact_sql.split("\n)\nSELECT ", 1)
+    assert ranked.startswith("WITH ranked AS (")
+    assert "JOIN public.store AS i ON v.prefix = i.prefix AND v.key = i.key" in ranked
+    assert (
+        "WHERE v.prefix = %s AND NOT (v.key = ANY(CAST(%s AS STRING[]))) "
+        "AND i.value -> %s = CAST(%s AS JSONB) AND (i.expires_at IS NULL OR i.expires_at > now())"
+    ) in ranked
+    assert "min(v.embedding <=> CAST(%s AS VECTOR)) AS distance" in ranked
+    assert "GROUP BY i.prefix, i.key" in ranked
+    # No inner LIMIT on the vectors, so no vector index can serve it
+    assert "LIMIT" not in ranked and "ORDER BY" not in ranked
+    assert outer.endswith(
+        "1 - distance AS score\nFROM ranked\nWHERE 1 - distance >= CAST(%s AS FLOAT8)\n"
+        "ORDER BY score DESC, key\nLIMIT %s"
+    )
+    assert exact_params == [QUERY_VECTOR, "user.alice", ["k", "s"], "x", "1", 0.8, 5]
+    assert exact_sql.count("%s") == len(exact_params)
+
+    index_sql, index_params = sql.similar_candidates(
+        "user.alice",
+        scan="index",
+        exclude=["k", "s"],
+        **kwargs,  # type: ignore[arg-type]
+    )
+    nearest, rest = index_sql.split("\n),\nwindow_stats AS (\n", 1)
+    # The window orders by distance with a LIMIT, which the C-SPANN index serves,
+    # and has no other filter
+    assert nearest.startswith("WITH nearest AS (")
+    assert "FROM public.store_vectors\n    WHERE prefix = %s\n" in nearest
+    assert nearest.endswith("ORDER BY embedding <=> CAST(%s AS VECTOR)\n    LIMIT %s")
+    assert "expires_at" not in nearest and "value" not in nearest and "ANY(" not in nearest
+    # The window's size and lowest score, over every vector in it: before the
+    # filter, the expiry check and the excluded keys. And the namespace's
+    # vectors, counted from the primary key up to over_fetch, which tells a
+    # window the index cut short
+    stats, rest = rest.split("\n),\nbest AS (\n", 1)
+    assert stats == (
+        "    SELECT count(*) AS window_size, min(1 - distance) AS lowest_score, (\n"
+        "        SELECT count(*) FROM (\n"
+        "            SELECT 1 FROM public.store_vectors WHERE prefix = %s LIMIT %s\n"
+        "        ) AS c\n"
+        "    ) AS namespace_vectors\n"
+        "    FROM nearest"
+    )
+    best, rest = rest.split("\n),\nhits AS (\n", 1)
+    assert "JOIN public.store AS i ON r.prefix = i.prefix AND r.key = i.key" in best
+    assert (
+        "WHERE NOT (i.key = ANY(CAST(%s AS STRING[]))) AND i.value -> %s = CAST(%s AS JSONB) "
+        "AND (i.expires_at IS NULL OR i.expires_at > now())"
+    ) in best
+    assert "SELECT DISTINCT ON (i.key)" in best and "ORDER BY i.key, r.distance" in best
+    hits, outer = rest.split("\n)\nSELECT ", 1)
+    assert hits.endswith(
+        "    FROM best\n    WHERE 1 - distance >= CAST(%s AS FLOAT8)\n"
+        "    ORDER BY score DESC, key\n    LIMIT %s"
+    )
+    # Every row carries the window's figures. Without a candidate one row
+    # still does, with NULL candidate columns
+    assert outer == (
+        "h.key, h.value, h.created_at, h.updated_at, h.version, h.valid_at, h.provenance, "
+        "h.confirmed_at, h.confirmations, h.confirm_id, h.score, w.window_size, w.lowest_score, "
+        "w.namespace_vectors\n"
+        "FROM window_stats AS w\nLEFT JOIN hits AS h ON TRUE\nORDER BY h.score DESC, h.key"
+    )
+    assert index_params == [
+        QUERY_VECTOR,
+        "user.alice",
+        QUERY_VECTOR,
+        11,
+        "user.alice",
+        11,
+        ["k", "s"],
+        "x",
+        "1",
+        0.8,
+        5,
+    ]
+    assert index_sql.count("%s") == len(index_params)
+
+    # An l2 store scores by the negated distance, as search does
+    l2 = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    for scan in ("exact", "index"):
+        l2_sql, _ = l2.similar_candidates(
+            "a",
+            scan=scan,  # type: ignore[arg-type]
+            exclude=[],
+            **kwargs,  # type: ignore[arg-type]
+        )
+        assert "<->" in l2_sql and "<=>" not in l2_sql
+        assert "-distance AS score" in l2_sql and "WHERE -distance >= CAST(%s AS FLOAT8)" in l2_sql
+        assert ("min(-distance) AS lowest_score" in l2_sql) == (scan == "index")
+
+    with pytest.raises(ValueError, match="scan"):
+        sql.similar_candidates("a", scan="fast", exclude=[], **kwargs)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="limit"):
+        sql.similar_candidates(
+            "a", threshold=0.8, limit=-1, filter=None, scan="exact", over_fetch=1, exclude=[]
+        )
+    with pytest.raises(ValueError, match="index"):
+        StoreSQL("public", "store").similar_candidates("a", scan="exact", exclude=[], **kwargs)  # type: ignore[arg-type]
+
+
+def test_candidate_scores_count_record_and_now_bind_everything() -> None:
+    sql = StoreSQL("public", "store", index=_make_index())
+
+    # The key and slot candidates are scored by their vectors alone: primary
+    # key lookups, no threshold and no filter
+    query_sql, params = sql.candidate_scores("user.alice", ["k", "s"])
+    assert query_sql == (
+        "SELECT key, 1 - min(embedding <=> CAST(%s AS VECTOR)) AS score\n"
+        "FROM public.store_vectors\n"
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+        "GROUP BY key"
+    )
+    assert params == [QUERY_VECTOR, "user.alice", ["k", "s"]]
+    l2 = StoreSQL("public", "store", index=_make_index(distance=DistanceStrategy.EUCLIDEAN))
+    assert "-min(embedding <-> CAST(%s AS VECTOR)) AS score" in l2.candidate_scores("a", ["k"])[0]
+
+    # The namespace's own vectors, counted up to the cap from the primary key
+    query_sql, params = sql.namespace_vector_count("user.alice", 2001)
+    assert query_sql == (
+        "SELECT count(*) AS n FROM (\n"
+        "    SELECT 1 FROM public.store_vectors WHERE prefix = %s LIMIT %s\n"
+        ") AS c"
+    )
+    assert params == ["user.alice", 2001]
+
+    # A record is one live row with its metadata. It never pushes back the expiry
+    query_sql, params = sql.record("user.alice", "k")
+    assert query_sql == (
+        f"SELECT {CANDIDATE_COLUMNS}\nFROM public.store\n"
+        "WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"
+    )
+    assert params == ["user.alice", "k"]
+    assert "UPDATE" not in query_sql
+
+    assert sql.now() == ("SELECT now() AS now", [])
+
+    for builder in (
+        lambda s: s.candidate_scores("a", ["k"]),
+        lambda s: s.namespace_vector_count("a", 1),
+    ):
+        with pytest.raises(ValueError, match="index"):
+            builder(StoreSQL("public", "store"))
+
+
+def test_confirm_check_finds_a_live_row_that_carries_the_confirm_id() -> None:
+    sql = StoreSQL("public", "store", index=None)
+    assert sql.confirm_check("user.alice", "key-1", confirm_id="confirm-id-123") == (
+        "SELECT 1 FROM public.store WHERE prefix = %s AND key = %s "
+        "AND (expires_at IS NULL OR expires_at > now()) AND confirm_id = CAST(%s AS UUID)",
+        ["user.alice", "key-1", "confirm-id-123"],
     )

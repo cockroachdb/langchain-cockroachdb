@@ -1,6 +1,7 @@
 """Vector index abstractions for CockroachDB C-SPANN indexes."""
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -153,38 +154,151 @@ class CSPANNQueryOptions:
 
 @dataclass
 class _ExistingVectorIndex:
-    """A vector index as SHOW CREATE TABLE renders it."""
+    """A vector index as SHOW CREATE TABLE renders it.
+
+    ``definition`` is its line up to the end of the WITH options.
+    ``columns`` are its prefix columns, then its vector column, unquoted and
+    in lower case. ``opclass`` is the vector column's operator class, and
+    vector_l2_ops, the default, when none is shown (v25.4.14 and v26.3.4
+    always show one). ``partial`` is set for an index with a WHERE clause.
+    ``visible`` is cleared for an index that is NOT VISIBLE or only partly
+    visible to the optimizer.
+    """
 
     definition: str
     columns: list[str]
     options: dict[str, str]
+    name: str = ""
+    opclass: str = "vector_l2_ops"
+    partial: bool = False
+    visible: bool = True
+
+
+# A vector index line of SHOW CREATE TABLE, such as
+# VECTOR INDEX idx ("tenant", ns, embedding vector_cosine_ops) WITH
+# (min_partition_size=10, max_partition_size=50), on every supported
+# version. Names that need quotes come back quoted, with a quote inside
+# doubled. After the columns and options, a partial index shows
+# WHERE <predicate>, and an index the optimizer may skip shows NOT VISIBLE
+# or VISIBILITY <fraction>.
+_VECTOR_INDEX_LINE = re.compile(
+    r'^(?P<definition>\s*VECTOR INDEX (?P<name>"(?:[^"]|"")+"|[^\s"(]+) '
+    r"\((?P<columns>[^)]*)\)(?: WITH \((?P<options>[^)]*)\))?)(?P<rest>.*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+# The primary key or a forward index of SHOW CREATE TABLE, such as
+# CONSTRAINT docs_pkey PRIMARY KEY (id ASC) or
+# UNIQUE INDEX docs_ns_idx (namespace ASC, id ASC) STORING (content). Vector
+# and inverted index lines start with another word, so they do not match.
+_KEY_LINE = re.compile(
+    r'^\s*(?:CONSTRAINT (?:"(?:[^"]|"")+"|[^\s"(]+) PRIMARY KEY|'
+    r'(?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|[^\s"(]+)) '
+    r"\((?P<columns>[^)]*)\)(?P<rest>.*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _unquote(name: str) -> str:
+    if len(name) > 1 and name.startswith('"') and name.endswith('"'):
+        return name[1:-1].replace('""', '"')
+    return name
+
+
+def _column_parts(columns: str) -> list[list[str]]:
+    """Each column of an index's column list, split into its name and what follows."""
+    return [part.split() for part in columns.split(",") if part.strip()]
+
+
+def _is_partial(rest: str) -> bool:
+    """Whether the end of an index line has a WHERE clause."""
+    return re.search(r"\bWHERE\b", rest, re.IGNORECASE) is not None
+
+
+def _is_visible(rest: str) -> bool:
+    """Whether the end of an index line leaves the index fully visible to the optimizer."""
+    return re.search(r"\b(?:NOT VISIBLE|VISIBILITY)\b", rest, re.IGNORECASE) is None
+
+
+def _vector_indexes(create_statement: str) -> list[_ExistingVectorIndex]:
+    """Every vector index in a SHOW CREATE TABLE statement, in the order shown."""
+    found = []
+    for match in _VECTOR_INDEX_LINE.finditer(create_statement):
+        parts = _column_parts(match.group("columns"))
+        options = {}
+        for option in (match.group("options") or "").split(","):
+            key, sep, value = option.partition("=")
+            if sep:
+                options[key.strip().lower()] = value.strip()
+        rest = match.group("rest")
+        found.append(
+            _ExistingVectorIndex(
+                definition=match.group("definition"),
+                columns=[part[0].strip('"').lower() for part in parts],
+                options=options,
+                name=_unquote(match.group("name")),
+                opclass=parts[-1][1].lower() if parts and len(parts[-1]) > 1 else "vector_l2_ops",
+                partial=_is_partial(rest),
+                visible=_is_visible(rest),
+            )
+        )
+    return found
+
+
+def _index_leads_with(create_statement: str, column: str) -> bool:
+    """Whether the primary key or a forward index has ``column`` as its first column.
+
+    Such an index serves ``column = value`` with a LIMIT without a scan of
+    the table. A partial index, or one the optimizer may skip, does not
+    count, nor does a vector or inverted index.
+    """
+    wanted = column.lower()
+    for match in _KEY_LINE.finditer(create_statement):
+        parts = _column_parts(match.group("columns"))
+        rest = match.group("rest")
+        if (
+            parts
+            and parts[0][0].strip('"').lower() == wanted
+            and not _is_partial(rest)
+            and _is_visible(rest)
+        ):
+            return True
+    return False
 
 
 def _find_vector_index(create_statement: str, name: str) -> _ExistingVectorIndex | None:
     """Find the vector index ``name`` in a SHOW CREATE TABLE statement.
 
-    SHOW CREATE TABLE renders a line such as
-    ``VECTOR INDEX idx ("tenant", ns, embedding vector_cosine_ops) WITH
-    (min_partition_size=10, max_partition_size=50)`` on every supported
-    version. Column names that are keywords come back quoted. Returns None
-    when no such line exists.
+    Names compare without regard to case. Returns None when the table has no
+    vector index of that name.
     """
-    match = re.search(
-        rf'^\s*VECTOR INDEX "?{re.escape(name)}"? \((?P<columns>[^)]*)\)'
-        r"(?: WITH \((?P<options>[^)]*)\))?",
-        create_statement,
-        re.MULTILINE | re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    columns = [
-        part.split()[0].strip('"').lower()
-        for part in match.group("columns").split(",")
-        if part.strip()
-    ]
-    options = {}
-    for option in (match.group("options") or "").split(","):
-        key, sep, value = option.partition("=")
-        if sep:
-            options[key.strip().lower()] = value.strip()
-    return _ExistingVectorIndex(match.group(0), columns, options)
+    wanted = name.lower()
+    for index in _vector_indexes(create_statement):
+        if index.name.lower() == wanted:
+            return index
+    return None
+
+
+def _usable_vector_index(
+    create_statement: str, *, column: str, opclass: str, prefix: Sequence[str]
+) -> str | None:
+    """The name of a vector index that can serve a filtered search, or None.
+
+    CockroachDB uses a vector index only when each of its prefix columns is
+    constrained to a value, and accelerates a search with filters only when
+    the filters match prefix columns. So the index must be on ``column``
+    with ``opclass``, and its prefix columns must be exactly ``prefix``: none
+    for a search of the whole table, the namespace column for a namespaced
+    store. A partial index, or one the optimizer may skip, does not count.
+    """
+    wanted = [*(name.lower() for name in prefix), column.lower()]
+    for index in _vector_indexes(create_statement):
+        if (
+            index.columns == wanted
+            and index.opclass == opclass.lower()
+            and not index.partial
+            and index.visible
+        ):
+            return index.name
+    return None

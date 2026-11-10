@@ -52,16 +52,20 @@ print(f"Speedup: {no_index_time/with_index_time:.1f}x")
 ## Query-Time Tuning
 
 ```python
-# Adjust beam size for accuracy/speed tradeoff
-async with engine.engine.connect() as conn:
-    # Higher beam = more accurate, slower
-    await conn.execute(text("SET vector_search_beam_size = 200"))
-    results = await vectorstore.asimilarity_search("query", k=10)
-    
-    # Lower beam = faster, less accurate
-    await conn.execute(text("SET vector_search_beam_size = 50"))
-    results = await vectorstore.asimilarity_search("query", k=10)
+from langchain_cockroachdb import CSPANNQueryOptions
+
+# The default beam size is 32. A larger beam is more accurate and slower
+results = await vectorstore.asimilarity_search(
+    "query", k=10, query_options=CSPANNQueryOptions(beam_size=64)
+)
+
+# A smaller beam is faster and less accurate
+results = await vectorstore.asimilarity_search(
+    "query", k=10, query_options=CSPANNQueryOptions(beam_size=16)
+)
 ```
+
+The store sets the beam size with `SET LOCAL` in the search's own transaction. A `SET` on a connection you open yourself does not reach the store's searches, which run on connections from the pool.
 
 ## Next Steps
 

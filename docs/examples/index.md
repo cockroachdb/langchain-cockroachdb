@@ -45,6 +45,7 @@ All examples are available in the [`examples/`](https://github.com/cockroachdb/l
 | Example | Description | Features |
 |---------|-------------|----------|
 | [long_term_memory.py](long-term-memory.md) | Agent memory across threads | Semantic search, TTL, `delete_namespace` |
+| [memory_reconciliation.py](memory-reconciliation.md) | Keeping memories true | `reconcile`, `find_conflicts` and `resolve`, history, `confirm`, `put_if` |
 
 ### Multi-Tenancy
 

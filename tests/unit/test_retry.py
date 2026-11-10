@@ -1,7 +1,10 @@
 """Unit tests for retry classification and RetryPolicy."""
 
 import asyncio
+import dataclasses
 import logging
+import math
+from collections.abc import Sequence
 
 import psycopg
 import pytest
@@ -10,15 +13,24 @@ from psycopg_pool import PoolTimeout
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.exc import TimeoutError as SAPoolTimeout
 
+import langchain_cockroachdb
+from langchain_cockroachdb import retry as retry_module
 from langchain_cockroachdb.retry import (
     DEFAULT_RETRY_POLICY,
+    DEFINITE_ABORT_SQLSTATES,
     RETRYABLE_SQLSTATES,
+    SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_BUSY_SECONDS,
     SCHEMA_CHANGE_BUSY_SQLSTATE,
+    SCHEMA_CHANGE_PROGRESS_SECONDS,
+    SCHEMA_CHANGE_QUIET_SECONDS,
+    SCHEMA_CHANGE_SETTLE_SECONDS,
     RetryPolicy,
     async_retry_with_backoff,
     get_sqlstate,
     is_retryable_error,
     is_schema_change_busy,
+    may_have_committed,
     resolve_retry_policy,
     schema_change_policy,
     sync_retry_with_backoff,
@@ -275,6 +287,42 @@ class TestGetSqlstate:
         a, b = RuntimeError("a"), RuntimeError("b")
         a.__cause__, b.__cause__ = b, a
         assert get_sqlstate(a) is None
+
+
+class TestMayHaveCommitted:
+    def test_the_definite_aborts_are_serialization_failures_and_deadlocks(self) -> None:
+        assert frozenset({"40001", "40P01"}) == DEFINITE_ABORT_SQLSTATES
+
+    @pytest.mark.parametrize("code", sorted(DEFINITE_ABORT_SQLSTATES))
+    @pytest.mark.parametrize("shape", list(SHAPES))
+    def test_a_definite_abort_did_not_commit(self, code: str, shape: str) -> None:
+        assert may_have_committed(SHAPES[shape](server_error(code))) is False
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            server_error("40003", "result is ambiguous"),
+            server_error("57P01"),
+            server_error("08006"),
+            wrapped(server_error("40003")),
+            # A lost connection, as when the hang guard shuts the socket down
+            psycopg.OperationalError("server closed the connection unexpectedly"),
+            RuntimeError("anything else"),
+        ],
+        ids=["40003", "57P01", "08006", "wrapped 40003", "lost connection", "other"],
+    )
+    def test_any_other_error_may_have_committed(self, error: BaseException) -> None:
+        assert may_have_committed(error) is True
+
+    def test_a_definite_abort_seen_only_as_context_does_not_count(self) -> None:
+        # As get_sqlstate, the classifier follows causes, not unrelated context
+        try:
+            try:
+                raise server_error("40001")
+            except psycopg.Error:
+                raise ValueError("unrelated")  # noqa: B904
+        except ValueError as error:
+            assert may_have_committed(error) is True
 
 
 class TestRetryPolicy:
@@ -745,6 +793,68 @@ BUSY_MESSAGE = (
 )
 
 
+def busy() -> psycopg.Error:
+    """The error v25.4 raises for a TTL change during another schema change."""
+    return server_error("0A000", BUSY_MESSAGE)
+
+
+class FakeClock:
+    """Stands in for the time module in retry: monotonic() returns ``now``."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """A fake clock for the busy error's budget, which is wall time."""
+    fake = FakeClock()
+    monkeypatch.setattr(retry_module, "time", fake)
+    return fake
+
+
+def failing_run(
+    policy: RetryPolicy,
+    errors: Sequence[BaseException],
+    clock: FakeClock | None = None,
+    took: float = 0.0,
+) -> tuple[int, list[float], BaseException]:
+    """The calls, the pauses and the final error of ``policy.run`` on a failing attempt.
+
+    Each attempt raises the next of ``errors``, and the last one again until
+    the policy gives up. The pauses are recorded instead of slept. With a
+    ``clock``, each pause moves it on, and so does each attempt, by ``took``.
+    """
+    calls = 0
+    pauses: list[float] = []
+
+    def attempt() -> None:
+        nonlocal calls
+        calls += 1
+        if clock is not None:
+            clock.now += took
+        raise errors[min(calls, len(errors)) - 1]
+
+    def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+        if clock is not None:
+            clock.now += seconds
+
+    with pytest.raises(psycopg.Error) as info:
+        policy.run(attempt, label="ttl", sleep=sleep)
+    return calls, pauses, info.value
+
+
+class Sentinel(RetryPolicy):
+    """A RetryPolicy subclass whose own backoff is a sentinel value."""
+
+    def delay(self, retry_number: int, *, rand=None) -> float:  # type: ignore[override]
+        return 0.123
+
+
 class TestSchemaChangePolicy:
     def test_busy_error_needs_the_code_and_the_phrase(self) -> None:
         assert SCHEMA_CHANGE_BUSY_SQLSTATE == "0A000"
@@ -781,20 +891,197 @@ class TestSchemaChangePolicy:
         assert never.is_retryable(server_error("0A000", BUSY_MESSAGE))
         assert not never.is_retryable(server_error("40001"))
 
-    def test_one_attempt_turns_the_retry_off(self) -> None:
-        calls = 0
+    def test_one_attempt_turns_every_retry_off(self) -> None:
+        policy = schema_change_policy(RetryPolicy(max_attempts=1))
+        for error in (busy(), server_error("40001")):
+            calls, pauses, raised = failing_run(policy, [error])
+            assert (calls, pauses, raised) == (1, [], error)
 
-        def busy() -> None:
+    def test_a_refusing_can_retry_stops_the_busy_retry_at_once(self) -> None:
+        calls = 0
+        pauses: list[float] = []
+
+        def attempt() -> None:
             nonlocal calls
             calls += 1
-            raise server_error("0A000", BUSY_MESSAGE)
+            raise busy()
 
         with pytest.raises(psycopg.Error):
-            schema_change_policy(RetryPolicy(max_attempts=1)).run(busy, label="ttl")
-        assert calls == 1
-        calls = 0
-        with pytest.raises(psycopg.Error):
-            schema_change_policy(RetryPolicy(max_attempts=3, initial_backoff=0.0)).run(
-                busy, label="ttl"
+            schema_change_policy(RetryPolicy()).run(
+                attempt, label="ttl", can_retry=lambda error: False, sleep=pauses.append
             )
-        assert calls == 3
+        assert (calls, pauses) == (1, [])
+
+    def test_the_busy_error_has_a_budget_of_its_own(self, clock: FakeClock) -> None:
+        # Waiting for another schema change outlasts a transient error, so the
+        # busy error is retried past the policy's own max_attempts, for up to
+        # SCHEMA_CHANGE_BUSY_SECONDS of wall time from the first busy error
+        policy = schema_change_policy(RetryPolicy(max_attempts=3, initial_backoff=0.1, jitter=0.0))
+        calls, pauses, _ = failing_run(policy, [busy()], clock)
+        assert calls == len(pauses) + 1 > 3
+        assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+        # Its backoff grows as the policy's does, up to SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+        # and the last pause ends with the budget
+        assert pauses[:5] == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6])
+        assert set(pauses[5:-1]) == {SCHEMA_CHANGE_BUSY_MAX_BACKOFF}
+        assert 0 < pauses[-1] <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+
+    def test_the_busy_budget_is_wall_time(self, clock: FakeClock) -> None:
+        # Attempts that take time use up the budget as the pauses do
+        policy = schema_change_policy(RetryPolicy(jitter=0.0))
+        calls, pauses, _ = failing_run(policy, [busy()], clock, took=1.0)
+        # The first busy error came after the first attempt's second. The run
+        # gives up at the first busy error at or past the deadline
+        waited = clock.now - 1001.0
+        assert SCHEMA_CHANGE_BUSY_SECONDS <= waited <= SCHEMA_CHANGE_BUSY_SECONDS + 1.0
+        assert sum(pauses) + (calls - 1) * 1.0 == pytest.approx(waited)
+        assert sum(pauses) < SCHEMA_CHANGE_BUSY_SECONDS
+
+    def test_a_constant_backoff_policy_does_not_hammer_the_server(self, clock: FakeClock) -> None:
+        # With a multiplier of 1, pauses of 0.05 s would take 12,000 attempts
+        # to fill ten minutes. The busy error's backoff at least doubles
+        policy = schema_change_policy(
+            RetryPolicy(initial_backoff=0.05, max_backoff=0.05, backoff_multiplier=1.0, jitter=0.0)
+        )
+        calls, pauses, _ = failing_run(policy, [busy()], clock)
+        assert pauses[:4] == pytest.approx([0.05, 0.1, 0.2, 0.4])
+        assert max(pauses) == SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+        assert calls < 250
+        assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+
+    def test_the_busy_budget_matches_the_settle_wait(self, clock: FakeClock) -> None:
+        # A TTL change waits out a schema change as long as setup() waits for
+        # another process's migration: ten minutes of wall time, whatever the
+        # jitter does to the pauses
+        assert SCHEMA_CHANGE_BUSY_SECONDS == SCHEMA_CHANGE_SETTLE_SECONDS == 600
+        assert SCHEMA_CHANGE_BUSY_MAX_BACKOFF == 3
+        calls, pauses, _ = failing_run(schema_change_policy(RetryPolicy()), [busy()], clock)
+        assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+        assert max(pauses) <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF
+        assert 200 < calls < 450
+
+    def test_other_errors_keep_the_policys_own_attempts_and_backoff(self, clock: FakeClock) -> None:
+        policy = schema_change_policy(
+            RetryPolicy(max_attempts=3, initial_backoff=0.1, max_backoff=0.15, jitter=0.0)
+        )
+        transient = server_error("40001")
+        assert failing_run(policy, [transient]) == (3, [0.1, 0.15], transient)
+        # Busy errors first do not use up the transient error's attempts, and
+        # each kind backs off from its own start
+        calls, pauses, raised = failing_run(policy, [busy()] * 5 + [transient], clock)
+        assert (calls, raised) == (8, transient)
+        assert pauses == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 0.1, 0.15])
+        # Transient errors first do not use up the busy error's budget either
+        clock.now = 1000.0
+        calls, pauses, raised = failing_run(policy, [transient] * 2 + [busy()], clock)
+        assert is_schema_change_busy(raised)
+        assert pauses[:2] == [0.1, 0.15]
+        assert sum(pauses[2:]) == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+        # An error the policy does not retry is raised at once, after busy errors too
+        syntax = server_error("42601")
+        calls, _, raised = failing_run(policy, [busy(), syntax], clock)
+        assert (calls, raised) == (2, syntax)
+
+    def test_a_subclass_keeps_its_own_behavior(self, clock: FakeClock) -> None:
+        # Every error but the busy one, and every delay, is the user's policy's
+        policy = schema_change_policy(Sentinel(max_attempts=3, jitter=0.0))
+        assert policy.delay(0) == 0.123
+        transient = server_error("40001")
+        assert failing_run(policy, [transient]) == (3, [0.123, 0.123], transient)
+        # The busy error keeps the budget of its own
+        calls, pauses, _ = failing_run(policy, [busy()], clock)
+        assert pauses[:3] == pytest.approx([0.1, 0.2, 0.4])
+        assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+
+    def test_replace_keeps_the_two_halves_together(self, clock: FakeClock) -> None:
+        # Deriving with dataclasses.replace changes the user's policy too, so
+        # every error follows the new fields
+        policy = schema_change_policy(RetryPolicy(jitter=0.0))
+        transient = server_error("40001")
+        one = dataclasses.replace(policy, max_attempts=1)
+        for error in (transient, busy()):
+            assert failing_run(one, [error], clock)[:2] == (1, [])
+        three = dataclasses.replace(policy, max_attempts=3)
+        assert failing_run(three, [transient])[0] == 3
+        slow = dataclasses.replace(policy, initial_backoff=1.0)
+        assert failing_run(slow, [transient])[1] == pytest.approx([1.0, 2.0, 4.0, 8.0])
+        assert slow.delay(0) == 1.0
+        # A subclass stays a subclass
+        sentinel = dataclasses.replace(schema_change_policy(Sentinel(jitter=0.0)), max_attempts=2)
+        assert failing_run(sentinel, [transient]) == (2, [0.123], transient)
+
+    def test_the_busy_budget_can_be_set(self, clock: FakeClock) -> None:
+        policy = schema_change_policy(
+            RetryPolicy(initial_backoff=0.1, jitter=0.0), seconds=2.0, max_backoff=0.5
+        )
+        calls, pauses, _ = failing_run(policy, [busy()], clock)
+        assert (calls, pauses) == (7, pytest.approx([0.1, 0.2, 0.4, 0.5, 0.5, 0.3]))
+        # A policy without backoff still pauses for a busy schema change, from
+        # RetryPolicy's default initial backoff
+        eager = schema_change_policy(RetryPolicy(initial_backoff=0.0, jitter=0.0), seconds=1.0)
+        assert failing_run(eager, [busy()], clock)[1] == pytest.approx([0.1, 0.2, 0.4, 0.3])
+        # A backoff cap below the policy's initial backoff gives way to it
+        slow = schema_change_policy(RetryPolicy(initial_backoff=2.0, jitter=0.0), max_backoff=0.5)
+        assert set(failing_run(slow, [busy()], clock)[1]) == {2.0}
+        # No seconds, no busy retries
+        none = schema_change_policy(RetryPolicy(), seconds=0)
+        assert failing_run(none, [busy()], clock)[:2] == (1, [])
+        for seconds in (-1.0, math.nan, math.inf):
+            with pytest.raises(ValueError, match="seconds"):
+                schema_change_policy(RetryPolicy(), seconds=seconds)
+        for max_backoff in (-0.1, math.nan, math.inf):
+            with pytest.raises(ValueError, match="max_backoff"):
+                schema_change_policy(RetryPolicy(), max_backoff=max_backoff)
+
+    async def test_async_runs_keep_the_same_budgets(self, clock: FakeClock) -> None:
+        policy = schema_change_policy(RetryPolicy(max_attempts=2, initial_backoff=0.0))
+        for error in (busy(), server_error("40001")):
+            clock.now = 1000.0
+            calls = 0
+
+            async def attempt(error: BaseException = error) -> None:
+                nonlocal calls
+                calls += 1
+                raise error
+
+            async def fake_sleep(seconds: float) -> None:
+                clock.now += seconds
+
+            with pytest.raises(psycopg.Error):
+                await policy.arun(attempt, label="ttl", sleep=fake_sleep)
+            if is_schema_change_busy(error):
+                assert clock.now - 1000.0 == pytest.approx(SCHEMA_CHANGE_BUSY_SECONDS)
+            else:
+                assert calls == 2
+
+    def test_busy_retries_log_at_most_once_a_minute(
+        self, clock: FakeClock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        assert SCHEMA_CHANGE_PROGRESS_SECONDS == 60
+        policy = schema_change_policy(RetryPolicy(jitter=0.0))
+        with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.retry"):
+            calls, _, _ = failing_run(policy, [busy()], clock)
+        messages = [record.getMessage() for record in caplog.records]
+        retries = [m for m in messages if m.startswith("Retrying ttl")]
+        # The first retry, then one a minute, then the give-up line
+        assert "attempt 1 failed" in retries[0]
+        assert "another schema change on the table is still running" in retries[0]
+        assert len(retries) == 10
+        waited = [float(m.split(" of up to ")[0].rsplit(", ", 1)[1].rstrip("s")) for m in retries]
+        gaps = [later - earlier for earlier, later in zip(waited, waited[1:], strict=False)]
+        assert all(gap >= SCHEMA_CHANGE_PROGRESS_SECONDS for gap in gaps)
+        assert messages[-1].startswith(f"Giving up on ttl after {calls} attempts and 600s")
+        assert len(messages) == len(retries) + 1
+
+    def test_the_budget_defaults_are_exported(self) -> None:
+        assert (SCHEMA_CHANGE_QUIET_SECONDS, SCHEMA_CHANGE_PROGRESS_SECONDS) == (30, 60)
+        for name in (
+            "SCHEMA_CHANGE_BUSY_SECONDS",
+            "SCHEMA_CHANGE_BUSY_MAX_BACKOFF",
+            "SCHEMA_CHANGE_SETTLE_SECONDS",
+            "SCHEMA_CHANGE_QUIET_SECONDS",
+            "SCHEMA_CHANGE_PROGRESS_SECONDS",
+        ):
+            assert name in langchain_cockroachdb.__all__
+            assert getattr(langchain_cockroachdb, name) == globals()[name]
+        assert not hasattr(langchain_cockroachdb, "SCHEMA_CHANGE_BUSY_ATTEMPTS")

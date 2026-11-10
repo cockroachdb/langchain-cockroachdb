@@ -1,6 +1,9 @@
 """LangChain integration for CockroachDB with native vector support."""
 
-from langchain_cockroachdb.async_vectorstore import AsyncCockroachDBVectorStore
+from langchain_cockroachdb.async_vectorstore import (
+    VECTOR_INDEX_REFRESH_SECONDS,
+    AsyncCockroachDBVectorStore,
+)
 from langchain_cockroachdb.chat_message_histories import CockroachDBChatMessageHistory
 from langchain_cockroachdb.checkpointer import AsyncCockroachDBSaver, CockroachDBSaver
 from langchain_cockroachdb.engine import CockroachDBEngine
@@ -14,8 +17,13 @@ from langchain_cockroachdb.retry import (
     NON_TRANSIENT_MESSAGES,
     RETRYABLE_SQLSTATE_CLASSES,
     RETRYABLE_SQLSTATES,
+    SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
     SCHEMA_CHANGE_BUSY_MESSAGES,
+    SCHEMA_CHANGE_BUSY_SECONDS,
     SCHEMA_CHANGE_BUSY_SQLSTATE,
+    SCHEMA_CHANGE_PROGRESS_SECONDS,
+    SCHEMA_CHANGE_QUIET_SECONDS,
+    SCHEMA_CHANGE_SETTLE_SECONDS,
     TRANSIENT_MESSAGES,
     UNCATEGORIZED_SQLSTATES,
     RetryPolicy,
@@ -41,6 +49,7 @@ __all__ = [
     "CSPANNIndex",
     "CSPANNQueryOptions",
     "DistanceStrategy",
+    "VECTOR_INDEX_REFRESH_SECONDS",
     "FusionType",
     "HybridSearchConfig",
     "CockroachDBChatMessageHistory",
@@ -62,8 +71,13 @@ __all__ = [
     "NON_TRANSIENT_MESSAGES",
     "SCHEMA_CHANGE_BUSY_SQLSTATE",
     "SCHEMA_CHANGE_BUSY_MESSAGES",
+    "SCHEMA_CHANGE_BUSY_MAX_BACKOFF",
+    "SCHEMA_CHANGE_BUSY_SECONDS",
+    "SCHEMA_CHANGE_SETTLE_SECONDS",
+    "SCHEMA_CHANGE_QUIET_SECONDS",
+    "SCHEMA_CHANGE_PROGRESS_SECONDS",
     "is_schema_change_busy",
     "schema_change_policy",
 ]
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"

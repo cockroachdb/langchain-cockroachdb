@@ -10,9 +10,13 @@ Adapted from langgraph-checkpoint-postgres for CockroachDB compatibility:
 
 from __future__ import annotations
 
+import logging
 import random
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -29,8 +33,42 @@ from psycopg.types.json import Jsonb
 
 # Imported here too, where the savers have always found it
 from langchain_cockroachdb._connection import connection_options  # noqa: F401
+from langchain_cockroachdb._psycopg_conn import in_caller_transaction
+from langchain_cockroachdb.retry import RetryPolicy, _describe, get_sqlstate
+
+logger = logging.getLogger(__name__)
 
 MetadataInput = dict[str, Any] | None
+
+# Row-level TTL. A blob row holds one channel version and is written once,
+# so its created_at is when that version was first written, and every later
+# checkpoint whose channel kept that version uses it. With TTL on, a put
+# brings created_at forward on the blob rows its checkpoint uses but does
+# not write, once they are older than the refresh window: the TTL interval
+# divided by TTL_REFRESH_FRACTION. enable_ttl gives blob rows that window as
+# a grace past the interval, so a blob row expires no earlier than the
+# newest checkpoint that uses it. When the setting changes, enable_ttl
+# writes it with TTL paused, waits until every saver has read it, brings
+# forward, once, the blob rows that checkpoints inside the interval use, so
+# threads idle then keep theirs too, and resumes TTL.
+TTL_REFRESH_FRACTION = 10
+# Seconds a saver uses what it read about TTL from the catalog, counted from
+# when the read started. After that, the next put that needs it reads it
+# again, so a change another process makes is seen within this time. The
+# saver's own enable_ttl and disable_ttl make it read again at once.
+# enable_ttl waits this long while TTL is paused, so it is kept short. That
+# costs at most one read every 10 seconds per saver, made only by puts that
+# use blob rows they do not write.
+TTL_STATE_CACHE_SECONDS = 10.0
+# Seconds enable_ttl waits on top of TTL_STATE_CACHE_SECONDS after it writes
+# a new setting with TTL paused, so that puts already under way when the
+# savers' caches ran out have finished before the refresh starts. The retry
+# policy's attempt_timeout takes its place when that is longer.
+TTL_PAUSE_MARGIN_SECONDS = 5.0
+# Checkpoints that one statement of the refresh in enable_ttl reads
+TTL_REFRESH_BATCH_SIZE = 500
+# Blob rows that one UPDATE of the refresh in enable_ttl changes at most
+TTL_REFRESH_UPDATE_SIZE = 100
 
 # Schema migrations. Position in list = version number.
 # CockroachDB differences from PostgresSaver:
@@ -89,21 +127,47 @@ MIGRATIONS = [
     """ALTER TABLE checkpoint_writes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();""",
 ]
 
-# SQL templates for enabling TTL on checkpoint tables.
-# Uses ttl_expiration_expression (recommended) to avoid full table rewrites.
-ENABLE_TTL_SQL = [
-    """ALTER TABLE checkpoints SET (
+# The TTL expression enable_ttl writes on checkpoint_blobs: blob rows expire
+# the refresh window after the interval. CockroachDB cannot type an untyped
+# literal divided by a number, hence the CAST. It keeps the expression as
+# written, and the savers parse it back from the catalog, so it stays on one
+# line.
+BLOB_TTL_EXPRESSION = "(created_at + '{interval}' + CAST('{interval}' AS INTERVAL) / {fraction})"
+
+# SQL templates for enabling TTL on checkpoint tables, one statement per
+# table. Uses ttl_expiration_expression (recommended) to avoid full table
+# rewrites. DDL takes no bound parameters, so the validated interval and
+# cron are formatted in, TTL_REFRESH_FRACTION as the fraction, and either
+# nothing or _TTL_PAUSE as {pause}.
+_CHECKPOINTS_TTL_SQL = """ALTER TABLE checkpoints SET (
         ttl_expiration_expression = $$(created_at + '{interval}')$$,
-        ttl_job_cron = '{cron}'
-    );""",
+        ttl_job_cron = '{cron}'{pause}
+    );"""
+_BLOBS_TTL_SQL = (
     """ALTER TABLE checkpoint_blobs SET (
+        ttl_expiration_expression = $$"""
+    + BLOB_TTL_EXPRESSION
+    + """$$,
+        ttl_job_cron = '{cron}'{pause}
+    );"""
+)
+_WRITES_TTL_SQL = """ALTER TABLE checkpoint_writes SET (
         ttl_expiration_expression = $$(created_at + '{interval}')$$,
-        ttl_job_cron = '{cron}'
-    );""",
-    """ALTER TABLE checkpoint_writes SET (
-        ttl_expiration_expression = $$(created_at + '{interval}')$$,
-        ttl_job_cron = '{cron}'
-    );""",
+        ttl_job_cron = '{cron}'{pause}
+    );"""
+_TTL_PAUSE = ",\n        ttl_pause = true"
+ENABLE_TTL_SQL = [_CHECKPOINTS_TTL_SQL, _BLOBS_TTL_SQL, _WRITES_TTL_SQL]
+# The same settings with TTL paused: configured, but its job deletes
+# nothing. checkpoint_blobs goes first, so blob rows stop expiring before
+# anything else changes.
+PAUSE_TTL_SQL = [_BLOBS_TTL_SQL, _CHECKPOINTS_TTL_SQL, _WRITES_TTL_SQL]
+# Lets the TTL job delete again. checkpoint_blobs goes last: enable_ttl
+# takes an unpaused setting there for a finished run, so the other tables
+# must be unpaused before it.
+RESUME_TTL_SQL = [
+    "ALTER TABLE checkpoints RESET (ttl_pause);",
+    "ALTER TABLE checkpoint_writes RESET (ttl_pause);",
+    "ALTER TABLE checkpoint_blobs RESET (ttl_pause);",
 ]
 
 DISABLE_TTL_SQL = [
@@ -194,6 +258,65 @@ UPSERT_CHECKPOINT_BLOBS_SQL = """
     ON CONFLICT (thread_id, checkpoint_ns, channel, version) DO NOTHING
 """
 
+# Brings created_at forward on the blob rows a new checkpoint uses but does
+# not write, when they are older than the refresh window, so TTL keeps them
+# as long as the checkpoint. A put sends it in the transaction that writes
+# the checkpoint row. Run again, it changes nothing more.
+# Params: thread_id, checkpoint_ns, the (channel, version) pairs, the window.
+REFRESH_CHECKPOINT_BLOBS_SQL = """
+    UPDATE checkpoint_blobs SET created_at = now()
+    WHERE thread_id = %s
+        AND checkpoint_ns = %s
+        AND (channel, version) = ANY(%s)
+        AND created_at < now() - CAST(%s AS INTERVAL)
+"""
+
+# A table's storage parameters, its TTL settings among them, as CockroachDB
+# renders them: key='value'. No row when the table does not exist.
+SELECT_BLOB_TTL_SQL = """
+    SELECT reloptions FROM pg_catalog.pg_class WHERE oid = to_regclass(%s)
+"""
+
+# One page of checkpoints in primary key order, for the refresh enable_ttl
+# runs: when each was written, and the channel versions of each checkpoint
+# still inside the TTL interval, NULL for the others. Paging by key keeps
+# every statement small, whatever the table holds. Params: the interval, the
+# last key of the page before (in the second form only), the page size.
+_CHECKPOINT_PAGE_SQL = """
+    SELECT thread_id, checkpoint_ns, checkpoint_id, created_at,
+        CASE WHEN created_at > now() - CAST(%s AS INTERVAL)
+            THEN checkpoint -> 'channel_versions' END AS channel_versions
+    FROM checkpoints
+    {after}
+    ORDER BY thread_id, checkpoint_ns, checkpoint_id
+    LIMIT %s
+"""
+SELECT_CHECKPOINT_PAGE_SQL = _CHECKPOINT_PAGE_SQL.format(after="")
+SELECT_CHECKPOINT_PAGE_AFTER_SQL = _CHECKPOINT_PAGE_SQL.format(
+    after="WHERE (thread_id, checkpoint_ns, checkpoint_id) > (%s, %s, %s)"
+)
+
+# Brings forward to now each blob row that is older than the newest
+# checkpoint inside the TTL interval that uses it by more than the refresh
+# window. Only rows left unchanged that long are rewritten. enable_ttl runs it
+# after every saver has read the new setting, so puts made while it runs
+# refresh their own rows. Run again, it changes nothing more. CockroachDB gives every array of
+# a multi-array unnest one type unless each is cast. Params: arrays of
+# thread_id, checkpoint_ns, channel, version and the newest checkpoint's
+# created_at, then the window.
+REFRESH_USED_BLOBS_SQL = """
+    UPDATE checkpoint_blobs AS b SET created_at = now()
+    FROM unnest(
+        CAST(%s AS STRING[]), CAST(%s AS STRING[]), CAST(%s AS STRING[]),
+        CAST(%s AS STRING[]), CAST(%s AS TIMESTAMPTZ[])
+    ) AS u (thread_id, checkpoint_ns, channel, version, newest)
+    WHERE b.thread_id = u.thread_id
+        AND b.checkpoint_ns = u.checkpoint_ns
+        AND b.channel = u.channel
+        AND b.version = u.version
+        AND b.created_at < u.newest - CAST(%s AS INTERVAL)
+"""
+
 UPSERT_CHECKPOINTS_SQL = """
     INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
     VALUES (%s, %s, %s, %s, %s, %s)
@@ -245,6 +368,223 @@ WITH RECURSIVE chain (checkpoint_id, parent_checkpoint_id, depth) AS (
 SELECT checkpoint_id FROM chain ORDER BY depth
 """
 
+# An interval enable_ttl takes, such as '7 days'
+_TTL_INTERVAL = re.compile(
+    r"^(?P<amount>\d+)\s+"
+    r"(?P<unit>microsecond|millisecond|second|minute|hour|day|week|month|year)s?$"
+)
+# The length of each unit, to divide an interval as CockroachDB divides it
+# for the grace: a month counts 30 days and a year 12 months. Since enable_ttl
+# stores months and years as days, only a setting from 0.5 still holds them.
+_TTL_UNITS = {
+    "microsecond": timedelta(microseconds=1),
+    "millisecond": timedelta(milliseconds=1),
+    "second": timedelta(seconds=1),
+    "minute": timedelta(minutes=1),
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+    "week": timedelta(weeks=1),
+    "month": timedelta(days=30),
+    "year": timedelta(days=360),
+}
+# The days enable_ttl stores for a month and a year, so the interval it
+# stores has a fixed length. CockroachDB adds months and years by the
+# calendar, and the same months added a few days apart can differ by up to 3
+# days, so a grace could not cover them.
+_TTL_FIXED_DAYS = {"month": 30, "year": 365}
+# The expressions enable_ttl writes on checkpoint_blobs: with the grace since
+# 0.6, and without it before. The grace may also read '<interval>'::INTERVAL.
+_BLOB_TTL_WITH_GRACE = re.compile(
+    r"\(created_at \+ '(?P<interval>[^']*)' \+ "
+    r"(?:CAST\('(?P<cast>[^']*)' AS INTERVAL\)|'(?P<colons>[^']*)'::INTERVAL)"
+    r" / (?P<fraction>[1-9][0-9]*)\)"
+)
+_BLOB_TTL_WITHOUT_GRACE = re.compile(r"\(created_at \+ '(?P<interval>[^']*)'\)")
+_TTL_EXPRESSION_KEY = "ttl_expiration_expression="
+# The backslash escapes of an escape string, other than \xHH
+_SQL_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+# What every saver in the process has logged, so each is logged once: a TTL
+# setting enable_ttl did not write, by (table, setting), and a failed read of
+# the setting, by (table, SQLSTATE)
+_LOGGED_TTL_SETTINGS: set[tuple[str, str]] = set()
+_LOGGED_TTL_READ_ERRORS: set[tuple[str, str]] = set()
+# The tables a saver in the process has found paused by enable_ttl, logged
+# once per pause: a table leaves the set when a saver finds it unpaused
+_LOGGED_TTL_PAUSED: set[str] = set()
+# The most cut DeltaChannel chains a saver remembers having logged. When it
+# has logged this many, it forgets them and starts again.
+_CUT_CHAINS_REMEMBERED = 4096
+# The longest duration CockroachDB keeps. It holds the hours, minutes and
+# seconds of an interval as int64 nanoseconds, and longer duration text
+# wraps to a negative interval with no error: about 106,751 days.
+_LONGEST_DURATION = timedelta(microseconds=(2**63 - 1) // 1000)
+
+
+def _fixed_interval(ttl_interval: str) -> str:
+    """``ttl_interval`` with months and years written as days, so its length is fixed."""
+    found = _TTL_INTERVAL.match(ttl_interval)
+    days = None if found is None else _TTL_FIXED_DAYS.get(found["unit"])
+    if found is None or days is None:
+        return ttl_interval
+    return f"{int(found['amount']) * days} days"
+
+
+def _interval_length(interval: str) -> timedelta | None:
+    """How long an interval that enable_ttl takes is, or None if it is not one.
+
+    Raises:
+        OverflowError: If it is too long for a timedelta.
+    """
+    found = _TTL_INTERVAL.match(interval)
+    if found is None:
+        return None
+    return _TTL_UNITS[found["unit"]] * int(found["amount"])
+
+
+def _duration(length: timedelta) -> str:
+    """``length`` as interval text in hours, minutes and seconds, never days.
+
+    CockroachDB adds days by the calendar of the session's time zone, where a
+    day can last 23 or 25 hours, and adds hours as hours.
+    """
+    micros = length // timedelta(microseconds=1)
+    seconds, micros = divmod(micros, 1_000_000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02}:{seconds:02}.{micros:06}"
+
+
+def _sql_string(literal: str) -> str | None:
+    """The text of a string literal as CockroachDB renders it in reloptions, or None.
+
+    A string with a quote or another character to escape is rendered as an
+    escape string, e'...', with backslash escapes; any other as '...'.
+    """
+    if len(literal) >= 3 and literal.startswith("e'") and literal.endswith("'"):
+        return re.sub(
+            r"\\(x[0-9a-fA-F]{2}|.)",
+            lambda m: chr(int(m[1][1:], 16)) if len(m[1]) == 3 else _SQL_ESCAPES.get(m[1], m[1]),
+            literal[2:-1],
+            flags=re.DOTALL,
+        )
+    if len(literal) >= 2 and literal.startswith("'") and literal.endswith("'"):
+        return literal[1:-1].replace("''", "'")
+    return None
+
+
+def _expression_setting(expression: str) -> tuple[timedelta, int | None] | None:
+    """The interval of an expression enable_ttl wrote, and the divisor of its grace.
+
+    The divisor is None for the expression without the grace, as 0.5 wrote
+    it. Returns None for any other expression, and for an interval too long
+    for a timedelta.
+    """
+    found = _BLOB_TTL_WITH_GRACE.fullmatch(expression)
+    divisor: int | None = None
+    if found is not None:
+        again = found["cast"] if found["cast"] is not None else found["colons"]
+        if again != found["interval"]:
+            return None
+        divisor = int(found["fraction"])
+    else:
+        found = _BLOB_TTL_WITHOUT_GRACE.fullmatch(expression)
+        if found is None:
+            return None
+    try:
+        length = _interval_length(found["interval"])
+    except OverflowError:
+        return None
+    return None if length is None else (length, divisor)
+
+
+def _refresh_window(expression: str, fraction: int) -> timedelta | None:
+    """The refresh window of an expression enable_ttl wrote, or None for any other.
+
+    With the grace, its divisor sets the window, so the window never exceeds
+    the grace in effect. Without it, ``fraction`` does.
+    """
+    setting = _expression_setting(expression)
+    if setting is None:
+        return None
+    length, divisor = setting
+    try:
+        window = length / (fraction if divisor is None else divisor)
+    except ArithmeticError:
+        # A saver's fraction of 0
+        return None
+    return window if window <= _LONGEST_DURATION else None
+
+
+def _parse_blob_ttl(
+    reloptions: Sequence[str] | None, fraction: int
+) -> tuple[timedelta | None, str | None]:
+    """What the TTL setting of checkpoint_blobs means for puts.
+
+    ``reloptions`` is the table's pg_class.reloptions. For an expression
+    enable_ttl wrote, returns the refresh window and None: with the grace,
+    its divisor sets the window, and without it, as 0.5 wrote it,
+    ``fraction`` does. Returns None and None when TTL is off, and None and
+    the setting when TTL is on with a setting enable_ttl did not write.
+    """
+    option = _expression_option(reloptions)
+    if option is None:
+        ttl = [o for o in reloptions or [] if o.startswith("ttl")]
+        return (None, ", ".join(ttl)) if "ttl='on'" in ttl else (None, None)
+    text = _sql_string(option[len(_TTL_EXPRESSION_KEY) :])
+    window = None if text is None else _refresh_window(text, fraction)
+    return (window, None) if window is not None else (None, option)
+
+
+def _expression_option(reloptions: Sequence[str] | None) -> str | None:
+    """The ttl_expiration_expression entry of a table's reloptions, as rendered, or None."""
+    return next((o for o in reloptions or [] if o.startswith(_TTL_EXPRESSION_KEY)), None)
+
+
+def _blob_expression(reloptions: Sequence[str] | None) -> str | None:
+    """The TTL expression in a table's reloptions, as written, or None."""
+    option = _expression_option(reloptions)
+    return None if option is None else _sql_string(option[len(_TTL_EXPRESSION_KEY) :])
+
+
+def _ttl_paused(reloptions: Sequence[str] | None) -> bool:
+    """Whether a table's reloptions pause its TTL job.
+
+    CockroachDB v25.4 and v26 show the pause as ttl_pause=true, and drop the
+    entry when it is reset or set to false.
+    """
+    return "ttl_pause=true" in (reloptions or [])
+
+
+@dataclass(frozen=True)
+class _TTLState:
+    """What a saver read about TTL on checkpoint_blobs, and when, by monotonic().
+
+    ``window`` is the refresh window, or None when puts refresh nothing.
+    ``read_at`` is when the read started, since what it found may be that old.
+    """
+
+    window: timedelta | None
+    read_at: float
+
+
+@dataclass(frozen=True)
+class _TTLPlan:
+    """What enable_ttl writes, and what its refresh needs.
+
+    ``statements`` set the TTL settings, ``paused`` set them with TTL paused,
+    and ``resume`` unpause it. ``stored`` is the interval as stored, with
+    months and years as days. ``interval`` is its length, and ``window`` the
+    refresh window.
+    """
+
+    statements: tuple[str, ...]
+    paused: tuple[str, ...]
+    resume: tuple[str, ...]
+    blob_expression: str
+    stored: str
+    interval: timedelta
+    window: timedelta
+
 
 class _DeltaHistoryWalk:
     """Collect DeltaChannel history over ancestors visited newest first.
@@ -259,6 +599,8 @@ class _DeltaHistoryWalk:
         self.collected: dict[str, list[Any]] = {c: [] for c in self.channels}
         self.seed: dict[str, Any] = {}
         self.remaining = set(self.channels)
+        # The missing ancestor the walk stopped at while channels had no seed
+        self.cut: RunnableConfig | None = None
 
     def visit(self, tup: CheckpointTuple) -> None:
         if tup.pending_writes:
@@ -269,6 +611,26 @@ class _DeltaHistoryWalk:
             if channel in tup.checkpoint["channel_values"]:
                 self.seed[channel] = tup.checkpoint["channel_values"][channel]
                 self.remaining.discard(channel)
+
+    def next_start(
+        self, start: RunnableConfig, page: Sequence[CheckpointTuple], limit: int
+    ) -> RunnableConfig | None:
+        """Where the next page of ancestors starts, or None when the walk is over.
+
+        ``page`` is what the page that began at ``start`` held. A full page
+        goes on from the parent of its last checkpoint. A shorter one ends
+        the chain: at the root, or at an ancestor that is missing, as when
+        row-level TTL deleted it. When the chain ends at a missing ancestor
+        while a channel still has no seed, the history of that channel is
+        cut: ``cut`` keeps the missing ancestor, for the saver to log. The
+        result stays what the walk found.
+        """
+        if not self.remaining:
+            return None
+        if page and len(page) == limit:
+            return page[-1].parent_config
+        self.cut = page[-1].parent_config if page else start
+        return None
 
     def result(self) -> dict[str, Any]:
         history: dict[str, Any] = {}
@@ -294,7 +656,14 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     SELECT_WRITES_BATCH_SQL = SELECT_WRITES_BATCH_SQL
     SELECT_PENDING_SENDS_SQL = SELECT_PENDING_SENDS_SQL
     ENABLE_TTL_SQL = ENABLE_TTL_SQL
+    PAUSE_TTL_SQL = PAUSE_TTL_SQL
+    RESUME_TTL_SQL = RESUME_TTL_SQL
     DISABLE_TTL_SQL = DISABLE_TTL_SQL
+    SELECT_BLOB_TTL_SQL = SELECT_BLOB_TTL_SQL
+    REFRESH_CHECKPOINT_BLOBS_SQL = REFRESH_CHECKPOINT_BLOBS_SQL
+    SELECT_CHECKPOINT_PAGE_SQL = SELECT_CHECKPOINT_PAGE_SQL
+    SELECT_CHECKPOINT_PAGE_AFTER_SQL = SELECT_CHECKPOINT_PAGE_AFTER_SQL
+    REFRESH_USED_BLOBS_SQL = REFRESH_USED_BLOBS_SQL
     MIGRATIONS = MIGRATIONS
     UPSERT_CHECKPOINT_BLOBS_SQL = UPSERT_CHECKPOINT_BLOBS_SQL
     UPSERT_CHECKPOINTS_SQL = UPSERT_CHECKPOINTS_SQL
@@ -307,7 +676,27 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     # Sizes below 1 count as 1.
     DELTA_HISTORY_PAGE_SIZE = 256
     DELTA_HISTORY_FIRST_PAGE = 16
+    # With TTL on, the refresh window, and the grace enable_ttl gives blob
+    # rows, are the TTL interval divided by this whole number
+    TTL_REFRESH_FRACTION = TTL_REFRESH_FRACTION
+    # Seconds the saver uses what it read about TTL before it reads it again.
+    # enable_ttl waits this saver's value for all of them, so keep it the
+    # same in every process.
+    TTL_STATE_CACHE_SECONDS = TTL_STATE_CACHE_SECONDS
+    # Seconds enable_ttl waits on top of that while TTL is paused
+    TTL_PAUSE_MARGIN_SECONDS = TTL_PAUSE_MARGIN_SECONDS
+    # Checkpoints one statement of the refresh in enable_ttl reads, and blob
+    # rows one of its UPDATEs changes at most. Sizes below 1 count as 1.
+    TTL_REFRESH_BATCH_SIZE = TTL_REFRESH_BATCH_SIZE
+    TTL_REFRESH_UPDATE_SIZE = TTL_REFRESH_UPDATE_SIZE
     supports_pipeline: bool
+    retry_policy: RetryPolicy
+    # What the saver last read about TTL on checkpoint_blobs; None to read it
+    _ttl_state: _TTLState | None = None
+    # The cut DeltaChannel chains the saver has logged, as (thread_id,
+    # checkpoint_ns, missing checkpoint_id). Made on first use, so a subclass
+    # with an __init__ of its own needs nothing.
+    _cut_chains_logged: set[tuple[str, str, str]]
 
     def _chain_page_params(self, start: RunnableConfig, limit: int) -> dict[str, Any]:
         configurable = start["configurable"]
@@ -329,10 +718,7 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     @staticmethod
     def _validate_ttl_params(ttl_interval: str, cron: str) -> None:
         """Validate TTL parameters to prevent SQL injection."""
-        if not re.match(
-            r"^[\d]+\s+(microsecond|millisecond|second|minute|hour|day|week|month|year)s?$",
-            ttl_interval,
-        ):
+        if not _TTL_INTERVAL.match(ttl_interval):
             raise ValueError(
                 f"Invalid ttl_interval: {ttl_interval!r}. "
                 "Must be like '7 days', '30 days', '1 hour', etc."
@@ -342,6 +728,303 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                 f"Invalid cron: {cron!r}. "
                 "Must be a valid cron expression like '@daily', '* * * * *', etc."
             )
+
+    def _ttl_plan(self, ttl_interval: str, cron: str) -> _TTLPlan:
+        """What enable_ttl writes, after validating what goes in it, before any I/O.
+
+        Months and years are stored as days, 30 to a month and 365 to a year,
+        so the stored interval has a fixed length.
+
+        Raises:
+            ValueError: If the interval, the cron or TTL_REFRESH_FRACTION is invalid.
+        """
+        self._validate_ttl_params(ttl_interval, cron)
+        fraction = self.TTL_REFRESH_FRACTION
+        if isinstance(fraction, bool) or not isinstance(fraction, int) or fraction < 1:
+            raise ValueError(
+                f"Invalid TTL_REFRESH_FRACTION: {fraction!r}. Must be a whole number of at least 1."
+            )
+        stored = _fixed_interval(ttl_interval)
+        try:
+            length = _interval_length(stored)
+        except OverflowError:
+            length = None
+        # The refresh binds the interval as a duration, which CockroachDB
+        # would wrap to a negative one past this
+        if length is None or length > _LONGEST_DURATION:
+            raise ValueError(
+                f"Invalid ttl_interval: {ttl_interval!r}. Must be at most "
+                f"{_LONGEST_DURATION.days} days, the longest duration CockroachDB keeps."
+            )
+        values = {"interval": stored, "cron": cron, "fraction": fraction}
+        return _TTLPlan(
+            statements=tuple(sql.format(**values, pause="") for sql in self.ENABLE_TTL_SQL),
+            paused=tuple(sql.format(**values, pause=_TTL_PAUSE) for sql in self.PAUSE_TTL_SQL),
+            resume=tuple(self.RESUME_TTL_SQL),
+            blob_expression=BLOB_TTL_EXPRESSION.format(**values),
+            stored=stored,
+            interval=length,
+            window=length / fraction,
+        )
+
+    @staticmethod
+    def _refresh_needed(before: Sequence[str] | None, plan: _TTLPlan) -> bool:
+        """Whether enable_ttl pauses TTL, waits, refreshes blob rows and resumes it.
+
+        ``before`` is the reloptions of checkpoint_blobs as enable_ttl found
+        them. Only when they already hold this very expression, unpaused, is
+        there nothing to do: enable_ttl unpauses only after its refresh, so a
+        refresh has finished, and puts have refreshed blob rows since. A
+        paused expression is a run that stopped partway. Any other change
+        refreshes, a longer interval too: TTL deletes expired rows only when
+        its job gets to them, so a longer interval can bring back checkpoints
+        whose blob rows the old setting had already expired.
+        """
+        return _blob_expression(before) != plan.blob_expression or _ttl_paused(before)
+
+    def _savers_wait(self) -> float:
+        """Seconds enable_ttl waits while TTL is paused, before it refreshes.
+
+        TTL_STATE_CACHE_SECONDS, so that every saver has read the new
+        setting and refreshes on its puts, plus a margin for puts already
+        under way: TTL_PAUSE_MARGIN_SECONDS, or the retry policy's
+        attempt_timeout when that is longer, since an attempt can last that
+        long.
+        """
+        margin = max(self.TTL_PAUSE_MARGIN_SECONDS, self.retry_policy.attempt_timeout or 0.0)
+        return max(0.0, self.TTL_STATE_CACHE_SECONDS + margin)
+
+    @staticmethod
+    def _resume_allowed(current: Sequence[str] | None, plan: _TTLPlan) -> bool:
+        """Whether enable_ttl may resume TTL, given checkpoint_blobs' reloptions now.
+
+        Only while the expression is still the one this run wrote. If
+        another run has written its own since, that run resumes TTL when it
+        has finished, and this one leaves it paused, logging that at INFO.
+        The same goes when disable_ttl has turned TTL off meanwhile.
+        """
+        found = _blob_expression(current)
+        if found == plan.blob_expression:
+            return True
+        logger.info(
+            "enable_ttl: the TTL setting of checkpoint_blobs changed while this run ran. "
+            "It wrote %s and now finds %s, so it leaves the resume to the run that changed "
+            "the setting. Use one interval, and change it from one process.",
+            plan.blob_expression,
+            "no TTL expression" if found is None else found,
+        )
+        return False
+
+    @staticmethod
+    def _pause_started(plan: _TTLPlan, seconds: float) -> None:
+        logger.info(
+            "enable_ttl: TTL is paused with the new setting (%s). Waiting %g seconds so "
+            "every saver reads it and refreshes on its puts, then refreshing blob rows.",
+            plan.stored,
+            seconds,
+        )
+
+    @staticmethod
+    def _pause_ended() -> None:
+        logger.info("enable_ttl: TTL resumed.")
+
+    def _checkpoint_page(
+        self, after: tuple[str, str, str] | None, plan: _TTLPlan, limit: int
+    ) -> tuple[str, list[Any]]:
+        """The statement and parameters that read the page of checkpoints after ``after``."""
+        interval = _duration(plan.interval)
+        if after is None:
+            return self.SELECT_CHECKPOINT_PAGE_SQL, [interval, limit]
+        return self.SELECT_CHECKPOINT_PAGE_AFTER_SQL, [interval, *after, limit]
+
+    @staticmethod
+    def _used_blobs(
+        page: Sequence[Mapping[str, Any]],
+    ) -> list[tuple[str, str, str, str, datetime]]:
+        """The blob rows that the page's checkpoints inside the interval use, each once.
+
+        As (thread_id, checkpoint_ns, channel, version, newest), where newest
+        is when the newest of those checkpoints that uses the row was
+        written. Sorted by row, so that two refreshes at once update rows in
+        the same order.
+        """
+        newest: dict[tuple[str, str, str, str], datetime] = {}
+        for row in page:
+            for channel, version in (row["channel_versions"] or {}).items():
+                key = (row["thread_id"], row["checkpoint_ns"], channel, str(version))
+                if key not in newest or row["created_at"] > newest[key]:
+                    newest[key] = row["created_at"]
+        return [(*key, written) for key, written in sorted(newest.items())]
+
+    def _refresh_batches(
+        self, used: list[tuple[str, str, str, str, datetime]], plan: _TTLPlan
+    ) -> list[list[Any]]:
+        """The parameters of each UPDATE that refreshes ``used``, TTL_REFRESH_UPDATE_SIZE rows each."""
+        size = max(1, self.TTL_REFRESH_UPDATE_SIZE)
+        window = _duration(plan.window)
+        return [
+            [*(list(column) for column in zip(*used[start : start + size], strict=True)), window]
+            for start in range(0, len(used), size)
+        ]
+
+    @staticmethod
+    def _page_end(
+        page: Sequence[Mapping[str, Any]], after: tuple[str, str, str] | None
+    ) -> tuple[str, str, str] | None:
+        """The key the next page starts after."""
+        if not page:
+            return after
+        last = page[-1]
+        return (last["thread_id"], last["checkpoint_ns"], last["checkpoint_id"])
+
+    @staticmethod
+    def _refresh_started(plan: _TTLPlan, limit: int) -> float:
+        """Log that enable_ttl's refresh starts, and return when, by monotonic()."""
+        logger.info(
+            "enable_ttl: bringing forward the blob rows that checkpoints written in the last %s "
+            "use, so TTL keeps them as long as those checkpoints. This reads each checkpoint "
+            "once, %d at a time, and rewrites only blob rows left unchanged for longer than the "
+            "refresh window.",
+            plan.stored,
+            limit,
+        )
+        return monotonic()
+
+    @staticmethod
+    def _refresh_finished(refreshed: int, started: float) -> None:
+        logger.info(
+            "enable_ttl: finished in %.1f seconds. Blob rows brought forward: %d.",
+            monotonic() - started,
+            refreshed,
+        )
+
+    @staticmethod
+    def _refresh_candidates(
+        checkpoint: Checkpoint, blob_values: dict[str, Any], blob_versions: ChannelVersions
+    ) -> list[tuple[str, str]]:
+        """The blob rows a checkpoint uses but its put does not write, as (channel, version).
+
+        They hold the channels stored as blobs, not inline, whose version did
+        not change in this put.
+        """
+        versions = checkpoint["channel_versions"]
+        return [
+            (channel, cast(str, versions[channel]))
+            for channel in blob_values
+            if channel not in blob_versions and channel in versions
+        ]
+
+    def _fresh_ttl_state(self) -> _TTLState | None:
+        """What the saver read about TTL, or None when it must read it again."""
+        state = self._ttl_state
+        if state is None or monotonic() - state.read_at >= self.TTL_STATE_CACHE_SECONDS:
+            return None
+        return state
+
+    @staticmethod
+    def _ttl_read_starts() -> float:
+        """When a read of the TTL setting starts, by monotonic().
+
+        What the read finds may be as old as its start, so the saver keeps
+        it for the cache interval from then, not from when the read returned.
+        """
+        return monotonic()
+
+    def _keep_ttl_state(self, reloptions: Sequence[str] | None, read_at: float) -> _TTLState:
+        """Keep what the saver read about TTL on checkpoint_blobs, for the cache interval.
+
+        A TTL setting that enable_ttl did not write turns the refresh off. It
+        is logged at INFO once per process. A setting of enable_ttl's that is
+        paused is logged at WARNING once per process each time it is found
+        paused, since TTL deletes nothing until a run resumes it.
+        """
+        window, foreign = _parse_blob_ttl(reloptions, self.TTL_REFRESH_FRACTION)
+        if foreign is not None and ("checkpoint_blobs", foreign) not in _LOGGED_TTL_SETTINGS:
+            _LOGGED_TTL_SETTINGS.add(("checkpoint_blobs", foreign))
+            logger.info(
+                "checkpoint_blobs has a row-level TTL setting that enable_ttl did not write "
+                "(%s). Puts do not refresh the blob rows that new checkpoints still use, so TTL "
+                "can delete values that an active thread still uses. Run enable_ttl to replace "
+                "the setting.",
+                foreign,
+            )
+        if window is None or not _ttl_paused(reloptions):
+            _LOGGED_TTL_PAUSED.discard("checkpoint_blobs")
+        elif "checkpoint_blobs" not in _LOGGED_TTL_PAUSED:
+            _LOGGED_TTL_PAUSED.add("checkpoint_blobs")
+            logger.warning(
+                "TTL on checkpoint_blobs is paused by enable_ttl, so TTL deletes nothing until "
+                "an enable_ttl run resumes it. Puts still refresh blob rows. If no enable_ttl "
+                "run is under way, one stopped before it finished: run enable_ttl again to "
+                "finish it."
+            )
+        return self._set_ttl_state(window, read_at)
+
+    def _skips_ttl_read(self, error: BaseException) -> bool:
+        """Whether a put goes on without the TTL setting after reading it failed with ``error``.
+
+        Only after a database error that the retry policy does not retry,
+        such as a missing privilege, and not inside a transaction the caller
+        opened, which the error has aborted. Other errors are raised, as the
+        put's own statements would raise them.
+        """
+        return (
+            get_sqlstate(error) is not None
+            and not self.retry_policy.is_retryable(error)
+            and not in_caller_transaction(error)
+        )
+
+    def _ttl_read_failed(self, error: BaseException, read_at: float) -> _TTLState:
+        """Keep "no refresh" for the cache interval, and log a WARNING once per process."""
+        key = ("checkpoint_blobs", get_sqlstate(error) or "")
+        if key not in _LOGGED_TTL_READ_ERRORS:
+            _LOGGED_TTL_READ_ERRORS.add(key)
+            logger.warning(
+                "Cannot read the row-level TTL setting of checkpoint_blobs (%s). Until a read "
+                "works, puts do not refresh the blob rows that new checkpoints still use, so if "
+                "TTL is on it can delete values that an active thread still uses. The saver "
+                "reads again every %g seconds.",
+                _describe(error),
+                self.TTL_STATE_CACHE_SECONDS,
+            )
+        return self._set_ttl_state(None, read_at)
+
+    def _set_ttl_state(self, window: timedelta | None, read_at: float) -> _TTLState:
+        state = _TTLState(window, read_at)
+        self._ttl_state = state
+        return state
+
+    def _forget_ttl_state(self) -> None:
+        """Make the next put that needs the TTL setting read it again."""
+        self._ttl_state = None
+
+    def _warn_cut_chain(self, walk: _DeltaHistoryWalk) -> None:
+        """Log a WARNING when ``walk`` stopped at a missing ancestor, once per such ancestor."""
+        if walk.cut is None:
+            return
+        configurable = walk.cut["configurable"]
+        key = (
+            str(configurable["thread_id"]),
+            str(configurable.get("checkpoint_ns", "")),
+            str(configurable.get("checkpoint_id")),
+        )
+        logged = getattr(self, "_cut_chains_logged", None)
+        if logged is None:
+            logged = self._cut_chains_logged = set()
+        if key in logged:
+            return
+        if len(logged) >= _CUT_CHAINS_REMEMBERED:
+            logged.clear()
+        logged.add(key)
+        logger.warning(
+            "The DeltaChannel history of thread %s (checkpoint_ns %r) stops at checkpoint %s, "
+            "which is missing, before a snapshot of %s, so the state of those channels may be "
+            "incomplete. Row-level TTL deletes old checkpoints by age: pick a TTL longer than "
+            "such threads stay active, or delete finished threads with delete_thread. This "
+            "saver logs each missing checkpoint once.",
+            *key,
+            ", ".join(sorted(walk.remaining)),
+        )
 
     def _get_channel_version_pairs(self, checkpoint: dict[str, Any]) -> list[tuple[str, str]]:
         """Extract (channel, version) pairs from checkpoint's channel_versions."""

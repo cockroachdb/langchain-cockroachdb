@@ -1,0 +1,665 @@
+"""Reconcile types, policies and decision validation for the CockroachDB store.
+
+Provides types and built-in policies for memory reconciliation: finding
+candidates a new memory may conflict with and deciding which to keep, supersede,
+delete or confirm.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Literal
+
+from langgraph.store.base import Item, SearchItem
+
+
+class Action(str, Enum):
+    """Action to take on a candidate memory."""
+
+    KEEP = "keep"
+    SUPERSEDE = "supersede"
+    DELETE = "delete"
+    CONFIRM = "confirm"
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """A new memory being reconciled against existing candidates.
+
+    Attributes:
+        namespace: Namespace tuple.
+        key: Memory key.
+        value: Memory value as JSON-serializable dict.
+        slot: Slot field name, or None.
+        slot_value: Value of the slot field.
+        provenance: Provenance metadata, or None.
+        valid_at: When the fact became true (timezone aware).
+    """
+
+    namespace: tuple[str, ...]
+    key: str
+    value: dict[str, Any]
+    slot: str | None
+    slot_value: Any
+    provenance: dict[str, Any] | None
+    valid_at: datetime
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        object.__setattr__(self, "namespace", tuple(self.namespace))
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A live memory that may conflict with a proposal.
+
+    Attributes:
+        item: SearchItem with the candidate's data and optional score.
+        reason: Why this is a candidate (key, slot, or similar).
+        version: Version number of this memory.
+        valid_at: When the fact became true.
+        provenance: Provenance metadata, or None.
+        confirmed_at: When its current value was last confirmed, or None.
+        confirmations: Number of confirmations of its current value.
+    """
+
+    item: SearchItem
+    reason: Literal["key", "slot", "similar"]
+    version: int
+    valid_at: datetime
+    provenance: dict[str, Any] | None
+    confirmed_at: datetime | None
+    confirmations: int
+
+    @property
+    def key(self) -> str:
+        """The candidate's key."""
+        return self.item.key
+
+    @property
+    def score(self) -> float | None:
+        """The candidate's similarity score, or None for key and slot matches."""
+        return self.item.score
+
+
+@dataclass(frozen=True)
+class Decision:
+    """Policy decision on what to do with the proposal and candidates.
+
+    Attributes:
+        new: What to do with the new memory (write, skip, or superseded).
+        superseded_by: Key that superseded the proposal, or None.
+        actions: Mapping from candidate key to an Action, or its value such
+            as "delete" (missing means KEEP). None means no actions.
+    """
+
+    new: Literal["write", "skip", "superseded"] = "write"
+    superseded_by: str | None = None
+    actions: Mapping[str, Action] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # A decision from an LLM judge or a person may say anything. One it
+        # cannot mean fails here, before any validation or write
+        if self.new not in ("write", "skip", "superseded"):
+            raise ValueError(
+                f"Decision new must be 'write', 'skip' or 'superseded', got {self.new!r}"
+            )
+        # Null actions, common in an LLM judge's JSON, are no actions
+        actions: object = {} if self.actions is None else self.actions
+        if not isinstance(actions, Mapping):
+            raise ValueError(
+                "Decision actions must map candidate keys to actions, or be None, "
+                f"got {type(actions).__name__}"
+            )
+        # Keep a copy whose values are Actions, also when they are given as
+        # their values, as in an LLM judge's JSON or from a checkpoint
+        # serializer that does not allow Action. Anything else raises ValueError
+        object.__setattr__(
+            self, "actions", {key: Action(action) for key, action in actions.items()}
+        )
+
+    def action(self, key: str) -> Action:
+        """Return the action for a candidate key (KEEP if not specified)."""
+        return self.actions.get(key, Action.KEEP)
+
+    def acts(self) -> bool:
+        """Return True if this decision does more than just write and keep all.
+
+        An action of KEEP keeps the candidate, as leaving it out does, so it
+        does not count.
+        """
+        return self.new != "write" or any(a != Action.KEEP for a in self.actions.values())
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """What a reconcile or resolve did.
+
+    An attempt can commit and still lose its result on the way back, as
+    when the connection drops while the COMMIT's answer travels. The retry
+    then finds the rows that carry its write id, writes nothing, and
+    returns a result rebuilt from those rows, with ``already_applied`` set.
+    A rebuilt result lists only what the rows prove: ``kept`` is empty, and
+    ``superseded`` and ``deleted`` come from the history rows the write
+    created, so a store without history, which keeps no trace of what it
+    removed, reports them empty too. A confirmation of the new memory
+    before the retry leaves the write's proof on it. If another writer
+    replaced the new memory before the retry, the history row of the
+    version the write overwrote, or of a memory it superseded, still proves
+    the write: the result says "written", but its version is None. A
+    rebuilt result lists keys in key order; a normal one in the order of the
+    candidates.
+
+    Attributes:
+        key: The new memory's key, whether it was written or not.
+        new: What happened to the new memory: "written", "skipped", or
+            "superseded" when it went straight into history because a
+            newer fact supersedes it. A store without history skips such a
+            memory, and the result says "skipped".
+        version: The version written, or None when nothing was written. A
+            rebuilt result also has None for a written memory that another
+            writer replaced before the retry.
+        superseded: Keys of the candidates the new memory superseded.
+        deleted: Keys of the candidates deleted.
+        confirmed: Keys of the candidates confirmed.
+        kept: Keys of the candidates kept. The memory under the new key is
+            not kept when the new memory overwrote it.
+        already_applied: Whether an earlier attempt had already committed,
+            so the result was rebuilt from the stored rows.
+    """
+
+    key: str
+    new: Literal["written", "skipped", "superseded"]
+    version: int | None
+    superseded: tuple[str, ...]
+    deleted: tuple[str, ...]
+    confirmed: tuple[str, ...]
+    kept: tuple[str, ...]
+    already_applied: bool = False
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        for name in ("superseded", "deleted", "confirmed", "kept"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
+
+@dataclass(frozen=True)
+class MemoryVersion:
+    """A historical version of a memory.
+
+    Attributes:
+        namespace: Namespace tuple.
+        key: Memory key.
+        version: Version number.
+        value: Memory value.
+        provenance: Provenance metadata, or None.
+        valid_at: When the fact became true.
+        invalid_at: When the fact became invalid, or None.
+        written_at: When the store wrote this version.
+        ended_at: When the store replaced this version.
+        reason: Why this version ended (overwritten, superseded, deleted).
+        superseded_by: Key that superseded this version, or None.
+        confirmed_at: When this version was last confirmed, or None.
+        confirmations: How many times this version was confirmed. They
+            belong to the version's fact: a write that changes the value
+            starts the next version from none.
+    """
+
+    namespace: tuple[str, ...]
+    key: str
+    version: int
+    value: dict[str, Any]
+    provenance: dict[str, Any] | None
+    valid_at: datetime
+    invalid_at: datetime | None
+    written_at: datetime
+    ended_at: datetime
+    reason: Literal["overwritten", "superseded", "deleted"]
+    superseded_by: str | None
+    confirmed_at: datetime | None
+    confirmations: int
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists
+        object.__setattr__(self, "namespace", tuple(self.namespace))
+
+
+@dataclass(frozen=True)
+class MemoryRecord:
+    """A live memory with its reconciliation metadata.
+
+    Attributes:
+        item: The memory's Item.
+        version: Version number.
+        provenance: Provenance metadata, or None.
+        valid_at: When the fact became true.
+        confirmed_at: When its current value was last confirmed, or None.
+        confirmations: Number of confirmations of its current value. A write
+            that changes the value starts them again from none.
+    """
+
+    item: Item
+    version: int
+    provenance: dict[str, Any] | None
+    valid_at: datetime
+    confirmed_at: datetime | None
+    confirmations: int
+
+
+@dataclass(frozen=True)
+class ConditionalWrite:
+    """What put_if or delete_if did.
+
+    A conflict is an expected outcome of a conditional write, so it is
+    returned, not raised: ``applied`` is False and ``current`` holds the
+    live memory, for the application to merge, write again with, reject,
+    or show to the user.
+
+    Attributes:
+        applied: Whether the write applied: the live memory was the one
+            expected, or there was none when None was expected. A retried
+            delete_if that finds the memory gone also counts as applied.
+        key: The memory's key.
+        version: The version put_if wrote, or None after a delete or a
+            conflict.
+        current: On a conflict, the live memory as the write's transaction
+            read it, or None if no live memory has the key. None when the
+            write applied.
+        already_applied: Whether an earlier attempt of the same call had
+            already committed the write, whose result was lost, as the row
+            or history row that carries its write id proves.
+    """
+
+    applied: bool
+    key: str
+    version: int | None
+    current: MemoryRecord | None
+    already_applied: bool = False
+
+
+@dataclass(frozen=True)
+class Conflicts:
+    """What find_conflicts found: a new memory and the memories it may conflict with.
+
+    Nothing is written yet. resolve() applies a decision about them in one
+    transaction, once it has checked that the target and every candidate
+    the decision names still have the version and updated_at they had here.
+
+    Attributes:
+        proposal: The new memory, with its key and valid time.
+        candidates: The live memories it may conflict with, strongest
+            reason first, then best score, then key.
+        target_version: The version of the live memory under the new
+            memory's key, or None if there is none.
+        target_updated_at: When that memory was last written, or None.
+    """
+
+    proposal: Proposal
+    candidates: tuple[Candidate, ...]
+    target_version: int | None
+    target_updated_at: datetime | None
+    # The store's plan for the write, a ConflictsState from base.py: which
+    # store made it, the item, its vectors and the versions resolve() checks.
+    # Left out of repr and comparison. Typed Any because base.py imports this
+    # module, so typing.get_type_hints can still resolve every field
+    _state: Any = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # A LangGraph checkpoint gives tuples back as lists, as when a
+        # Conflicts waits in graph state for a person to decide
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+
+
+class ConflictsChanged(Exception):
+    """Raised by resolve() when what a decision depends on changed after find_conflicts.
+
+    The transaction that found the change wrote nothing. Run find_conflicts
+    again and decide again.
+
+    Attributes:
+        keys: The keys whose memory was written, deleted or expired since,
+            or that have a live memory where find_conflicts found none: the
+            new memory's key first, then the candidates in their order.
+    """
+
+    def __init__(self, keys: tuple[str, ...]) -> None:
+        self.keys = tuple(keys)
+        key_list = ", ".join(self.keys)
+        super().__init__(f"Conflicts changed for keys: {key_list}")
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Pickle rebuilds an exception from its args, which hold the message,
+        # not the keys. Rebuild it from the keys, with the rest of its state
+        return (type(self), (self.keys,), self.__dict__)
+
+
+# These class paths are kept stable. A LangGraph checkpoint stores each object
+# under its class's module and name, so moving or renaming one of the classes
+# below would make checkpoints saved before the change give that object back
+# as a plain dict, and resolve() refuses a Conflicts whose plan comes back so.
+# A test checks that every entry names its class's own module and name.
+RECONCILE_SERDE_TYPES: tuple[tuple[str, str], ...] = (
+    ("langchain_cockroachdb.store.reconcile", "Action"),
+    ("langchain_cockroachdb.store.reconcile", "Candidate"),
+    ("langchain_cockroachdb.store.reconcile", "ConditionalWrite"),
+    ("langchain_cockroachdb.store.reconcile", "Conflicts"),
+    ("langchain_cockroachdb.store.reconcile", "Decision"),
+    ("langchain_cockroachdb.store.reconcile", "MemoryRecord"),
+    ("langchain_cockroachdb.store.reconcile", "MemoryVersion"),
+    ("langchain_cockroachdb.store.reconcile", "Proposal"),
+    ("langchain_cockroachdb.store.reconcile", "ReconcileResult"),
+    # What a Conflicts keeps for resolve()
+    ("langchain_cockroachdb.store.base", "ConflictsState"),
+    ("langchain_cockroachdb.store.base", "ProposalPlan"),
+    ("langchain_cockroachdb.store.base", "PutPlan"),
+    ("langchain_cockroachdb.store.base", "StoreIdentity"),
+    # The items that a MemoryRecord and a Candidate hold. langgraph-checkpoint
+    # already counts Item among its safe types, but not SearchItem
+    ("langgraph.store.base", "Item"),
+    ("langgraph.store.base", "SearchItem"),
+)
+"""Every class a reconcile value can hold, as ``(module, class name)`` pairs.
+
+A strict checkpoint serializer rebuilds only the classes it is given and
+gives any other back raw, as LangGraph's does with
+``LANGGRAPH_STRICT_MSGPACK=true``. To keep a Conflicts, a Decision, a
+ReconcileResult, a ConditionalWrite, a MemoryRecord or a MemoryVersion in
+graph state, give the checkpointer a serializer that allows these:
+``JsonPlusSerializer(allowed_msgpack_modules=RECONCILE_SERDE_TYPES)``, with
+your own state's types added if they are not built in. The pairs are the form
+that ``allowed_msgpack_modules`` takes, from langgraph-checkpoint 4.0.1.
+Before 4.0.1, JsonPlusSerializer has no ``allowed_msgpack_modules`` argument,
+and passing it raises TypeError; those releases rebuild every class.
+"""
+
+
+# Policy type
+Policy = Callable[[Proposal, Sequence[Candidate]], Decision]
+
+
+def _validate_threshold(threshold: float, name: str) -> None:
+    """Validate that threshold is a finite number.
+
+    Args:
+        threshold: Threshold value to validate.
+        name: Name of the parameter for error messages.
+
+    Raises:
+        ValueError: If threshold is not a finite number.
+    """
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        raise ValueError(f"{name} must be a finite number, got {type(threshold).__name__}")
+    if not math.isfinite(threshold):
+        raise ValueError(f"{name} must be a finite number, got {threshold}")
+
+
+def supersede_same_slot() -> Policy:
+    """Return a policy that supersedes older facts in the same slot.
+
+    1. If the memory under the proposal's key (the target) has a later
+       valid_at, skip the proposal, whatever reason the target has.
+    2. Otherwise, if no candidate is in the same slot (reason "slot"),
+       write the proposal and keep every candidate.
+    3. If a slot candidate has a later valid_at, record the proposal as
+       superseded by the latest such candidate.
+    4. Otherwise, supersede all slot candidates.
+
+    Returns:
+        Policy that supersedes same-slot candidates.
+    """
+
+    def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        slot_candidates = [c for c in candidates if c.reason == "slot"]
+
+        # Check if target (same key) is newer (regardless of reason)
+        target = next((c for c in candidates if c.key == proposal.key), None)
+        if target and target.valid_at > proposal.valid_at:
+            return Decision(new="skip")
+
+        if not slot_candidates:
+            return Decision()
+
+        # Check if any slot candidate is newer (excluding target)
+        newer = [
+            c for c in slot_candidates if c.valid_at > proposal.valid_at and c.key != proposal.key
+        ]
+        if newer:
+            # Find the latest one
+            latest = max(newer, key=lambda c: c.valid_at)
+            return Decision(new="superseded", superseded_by=latest.key)
+
+        # Supersede all slot candidates (excluding target)
+        return Decision(
+            actions={c.key: Action.SUPERSEDE for c in slot_candidates if c.key != proposal.key}
+        )
+
+    return policy
+
+
+def skip_duplicates(threshold: float = 0.97) -> Policy:
+    """Return a policy that skips a memory that repeats one already stored.
+
+    A new memory, one with no live memory under its key, is skipped when a
+    candidate has an equal value or scores at or above threshold, and the
+    highest-scoring such candidate is confirmed (an equal value counts as
+    score 1.0). When the proposal has a slot, only candidates in the same
+    slot count: a repeat outside the slot states another fact, and skipping
+    the new memory for it would leave an older memory in the slot live,
+    which may contradict the new one. A memory whose key holds a live
+    memory is skipped only when it saves that memory's value again, which
+    confirms it. Any other value there is an update, which this policy
+    never skips, whatever repeats it under another key: skipping it would
+    leave the key with its old value, which may contradict the new one.
+    Then it returns the decision that writes the new memory and keeps every
+    candidate, so first_of moves on to the next policy.
+
+    Args:
+        threshold: Similarity threshold (default 0.97).
+
+    Returns:
+        Policy that skips duplicates.
+
+    Raises:
+        ValueError: If threshold is not a finite number.
+    """
+    _validate_threshold(threshold, "threshold")
+
+    def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        target = next((c for c in candidates if c.key == proposal.key), None)
+        if target is not None:
+            # Saving the live memory's value again repeats it. Anything else
+            # under its key is an update, never a repeat
+            if target.item.value == proposal.value:
+                return Decision(new="skip", actions={target.key: Action.CONFIRM})
+            return Decision()
+
+        # A new memory: an equal value or a near duplicate elsewhere repeats
+        # it. With a slot, only a memory in the same slot can
+        same_fact = [c for c in candidates if proposal.slot is None or c.reason == "slot"]
+        duplicates = []
+        for c in same_fact:
+            if c.item.value == proposal.value:
+                # Equal value counts as score 1.0
+                duplicates.append((c, 1.0))
+            elif c.score is not None and c.score >= threshold:
+                duplicates.append((c, c.score))
+
+        if not duplicates:
+            return Decision()
+
+        # Confirm the highest scoring duplicate
+        best = max(duplicates, key=lambda pair: pair[1])
+        return Decision(new="skip", actions={best[0].key: Action.CONFIRM})
+
+    return policy
+
+
+def supersede_similar(threshold: float = 0.9) -> Policy:
+    """Return a policy that supersedes similar memories.
+
+    Works like supersede_same_slot, but matches the slot candidates and the
+    candidates scoring at or above threshold. As there, a target with a
+    later valid_at skips the proposal whatever it scores, and so does a
+    target without a score, as on a store without an index.
+
+    Args:
+        threshold: Similarity threshold (default 0.9).
+
+    Returns:
+        Policy that supersedes similar candidates.
+
+    Raises:
+        ValueError: If threshold is not a finite number.
+    """
+    _validate_threshold(threshold, "threshold")
+
+    def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        # Check if target (same key) is newer, whether it matches or not
+        target = next((c for c in candidates if c.key == proposal.key), None)
+        if target and target.valid_at > proposal.valid_at:
+            return Decision(new="skip")
+
+        # Find matches: slot candidates or scored >= threshold
+        matches = [
+            c
+            for c in candidates
+            if c.reason == "slot" or (c.score is not None and c.score >= threshold)
+        ]
+        if not matches:
+            return Decision()
+
+        # Check if any match is newer (excluding target)
+        newer = [c for c in matches if c.valid_at > proposal.valid_at and c.key != proposal.key]
+        if newer:
+            # Find the latest one
+            latest = max(newer, key=lambda c: c.valid_at)
+            return Decision(new="superseded", superseded_by=latest.key)
+
+        # Supersede all matches (excluding target)
+        return Decision(actions={c.key: Action.SUPERSEDE for c in matches if c.key != proposal.key})
+
+    return policy
+
+
+def keep_all() -> Policy:
+    """Return a policy that writes the new memory and keeps all candidates.
+
+    Returns:
+        Policy that keeps all candidates.
+    """
+
+    def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        return Decision()
+
+    return policy
+
+
+def first_of(*policies: Policy) -> Policy:
+    """Return a policy that uses the first decision that acts.
+
+    Tries each policy in order and returns the first decision that does
+    more than just write and keep all candidates (Decision.acts). A
+    decision whose actions only KEEP candidates keeps them all, so it does
+    not act. If no policy acts, returns a plain write decision.
+
+    Args:
+        *policies: Policies to try in order.
+
+    Returns:
+        Combined policy.
+    """
+
+    def policy(proposal: Proposal, candidates: Sequence[Candidate]) -> Decision:
+        for p in policies:
+            decision = p(proposal, candidates)
+            if decision.acts():
+                return decision
+        return Decision()
+
+    return policy
+
+
+def _validate_superseded_by(
+    proposal: Proposal,
+    candidate_keys: set[str],
+    decision: Decision,
+) -> None:
+    """Validate superseded_by field in a decision."""
+    if decision.superseded_by is None:
+        raise ValueError("Decision with new='superseded' must have superseded_by set")
+
+    if decision.superseded_by not in candidate_keys:
+        raise ValueError(
+            f"Decision superseded_by names unknown candidate key: {decision.superseded_by}"
+        )
+
+    if decision.superseded_by == proposal.key:
+        raise ValueError(
+            f"Decision superseded_by cannot be the proposal's own key: {decision.superseded_by}"
+        )
+
+    # superseded_by must be kept or confirmed
+    action = decision.action(decision.superseded_by)
+    if action not in (Action.KEEP, Action.CONFIRM):
+        raise ValueError(
+            f"Decision superseded_by key must be kept or confirmed, not {action.value}: {decision.superseded_by}"
+        )
+
+
+def validate_decision(
+    proposal: Proposal,
+    candidates: Sequence[Candidate],
+    decision: Decision,
+) -> None:
+    """Validate a decision against the proposal and candidates.
+
+    Args:
+        proposal: The proposal being reconciled.
+        candidates: Candidate memories.
+        decision: The decision to validate.
+
+    Raises:
+        ValueError: If the decision is invalid (with a message naming the key).
+    """
+    candidate_keys = {c.key for c in candidates}
+
+    # Check that all action keys are candidates
+    for key in decision.actions:
+        if key not in candidate_keys:
+            raise ValueError(f"Action names unknown candidate key: {key}")
+
+    # Check superseded_by rules
+    if decision.new == "superseded":
+        _validate_superseded_by(proposal, candidate_keys, decision)
+    elif decision.superseded_by is not None:
+        raise ValueError("Decision superseded_by can only be set when new='superseded'")
+
+    # A late fact goes to history under its own key: it cannot supersede the
+    # memory live under that key. (A write overwrites that memory, and a skip
+    # supersedes nothing; both are checked below.)
+    if decision.new == "superseded" and decision.action(proposal.key) == Action.SUPERSEDE:
+        raise ValueError(
+            f"Decision cannot supersede the proposal's own key: {proposal.key}; use DELETE or KEEP"
+        )
+
+    # Check write constraints
+    if decision.new == "write" and proposal.key in decision.actions:
+        # Target cannot have any action but KEEP
+        action = decision.actions[proposal.key]
+        if action != Action.KEEP:
+            raise ValueError(
+                f"Decision with new='write' cannot give the target key action {action.value}: {proposal.key}"
+            )
+
+    # Check skip constraints
+    if decision.new == "skip":
+        # Cannot have SUPERSEDE actions (nothing replaces it)
+        for key, action in decision.actions.items():
+            if action == Action.SUPERSEDE:
+                raise ValueError(
+                    f"Decision with new='skip' cannot have SUPERSEDE action (use DELETE): {key}"
+                )

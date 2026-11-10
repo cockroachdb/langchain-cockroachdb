@@ -8,6 +8,8 @@ repo_url: https://github.com/cockroachdb/langchain-cockroachdb
 
 theme:
   name: material
+  logo: assets/cockroachlabs-icon-dark-bg.svg
+  favicon: assets/favicon.svg
   palette:
     - scheme: default
       primary: indigo
@@ -83,6 +85,7 @@ nav:
     - Index Optimization: examples/index-optimization.md
     - Checkpointer: examples/checkpointer.md
     - Long-Term Memory: examples/long-term-memory.md
+    - Memory Reconciliation: examples/memory-reconciliation.md
   - API Reference:
     - Engine: api/engine.md
     - Vector Store: api/vectorstore.md

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import psycopg
 import pytest
+from langchain_core.embeddings import Embeddings
 from langgraph.store.memory import InMemoryStore
 from psycopg import AsyncConnection, Connection
 from psycopg.rows import dict_row
@@ -23,10 +24,41 @@ FAST = RetryPolicy(initial_backoff=0.01, max_backoff=0.05)
 Factory = Callable[..., Awaitable[AsyncCockroachDBStore]]
 
 
+class FixedEmbeddings(Embeddings):
+    """Embeds known texts to fixed vectors, so tests control similarity exactly."""
+
+    def __init__(self, vectors: Mapping[str, Sequence[float]]) -> None:
+        self.vectors = {text: list(vector) for text, vector in vectors.items()}
+        # Calls to embed_documents, which embeds the values a store writes
+        self.calls = 0
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        return [self.embed_query(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        if text not in self.vectors:
+            raise KeyError(f"FixedEmbeddings has no vector for {text!r}")
+        return list(self.vectors[text])
+
+
+SEATS = {  # dims 4, cosine scores against "Prefers window seats" in the comments
+    "Prefers window seats": [1.0, 0.0, 0.0, 0.0],
+    "Prefers window seats on long flights": [0.98, 0.199, 0.0, 0.0],  # 0.98, a near duplicate
+    "Prefers aisle seats": [0.85, 0.5268, 0.0, 0.0],  # 0.85, similar
+    "Vegetarian": [0.0, 0.0, 1.0, 0.0],  # 0.0
+    "Allergic to peanuts": [0.0, 0.0, 0.6, 0.8],  # 0.0, and 0.6 against "Vegetarian"
+}
+
+
+def seat_index(**extra: Any) -> dict[str, Any]:
+    return {"dims": 4, "embed": FixedEmbeddings(SEATS), "fields": ["text"], **extra}
+
+
 def drop_store_tables(libpq_url: str, table_name: str, schema: str = "public") -> None:
-    """Drop the items, vectors and migrations tables of a store."""
+    """Drop the items, vectors, migrations and history tables of a store."""
     with psycopg.connect(libpq_url, autocommit=True) as conn:
-        for suffix in ("", "_vectors", "_migrations"):
+        for suffix in ("", "_vectors", "_migrations", "_history"):
             conn.execute(f"DROP TABLE IF EXISTS {schema}.{table_name}{suffix} CASCADE")
 
 

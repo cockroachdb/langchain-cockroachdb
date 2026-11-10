@@ -2,35 +2,83 @@
 
 import asyncio
 import contextlib
+import dataclasses
+import functools
+import gc
+import json
 import logging
+import math
 import threading
-from collections.abc import AsyncIterator, Iterator
-from datetime import datetime, timezone
+import uuid
+import warnings
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Sequence
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
+import numpy
 import psycopg
 import pytest
 from langchain_core.embeddings import Embeddings
 from langgraph.store.base import (
+    NOT_PROVIDED,
     GetOp,
     InvalidNamespaceError,
+    Item,
     ListNamespacesOp,
     MatchCondition,
     PutOp,
+    SearchItem,
     SearchOp,
 )
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
-from langchain_cockroachdb.retry import RetryPolicy
+from langchain_cockroachdb import _psycopg_conn
+from langchain_cockroachdb._window import WINDOW_FLOOR, window_for
+from langchain_cockroachdb.retry import (
+    SCHEMA_CHANGE_BUSY_MAX_BACKOFF,
+    SCHEMA_CHANGE_PROGRESS_SECONDS,
+    SCHEMA_CHANGE_QUIET_SECONDS,
+    SCHEMA_CHANGE_SETTLE_SECONDS,
+    RetryPolicy,
+)
+from langchain_cockroachdb.store import base as store_base
 from langchain_cockroachdb.store.aio import AsyncCockroachDBStore
 from langchain_cockroachdb.store.base import (
     MAX_SEARCH_NAMESPACES,
     BaseCockroachDBStore,
+    ConflictsState,
+    ProposalPlan,
     PutPlan,
+    SchemaCheck,
+    StoreIdentity,
+    _carries_confirm_id,
     _group_ops,
+    _resolve_confirm_ttl,
+    _validate_confirm_ttl,
+    changed_keys,
+    default_valid_at,
+    merge_candidates,
+    needs_exact_candidates,
     needs_exact_search,
 )
-from langchain_cockroachdb.store.config import resolve_index_config
+from langchain_cockroachdb.store.config import resolve_history_config, resolve_index_config
+from langchain_cockroachdb.store.reconcile import (
+    RECONCILE_SERDE_TYPES,
+    Action,
+    Candidate,
+    ConditionalWrite,
+    Conflicts,
+    ConflictsChanged,
+    Decision,
+    MemoryRecord,
+    MemoryVersion,
+    Proposal,
+    ReconcileResult,
+    keep_all,
+)
+from langchain_cockroachdb.store.sql import MIGRATION_RECONCILE, StoreSQL
 from langchain_cockroachdb.store.store import CockroachDBStore
+from tests.unit.store.serde_helpers import strict_serializer
 
 FAST = RetryPolicy(initial_backoff=0.001, max_backoff=0.002)
 
@@ -66,13 +114,19 @@ class CountingEmbeddings(Embeddings):
         return [1.0, 0.0, 0.0]
 
 
-def make_base(*, fields: list[str] | None = None, ttl=None) -> BaseCockroachDBStore:
+def make_base(*, fields: list[str] | None = None, ttl=None, history=None) -> BaseCockroachDBStore:
     """BaseCockroachDBStore state built directly, without a connection."""
     store = BaseCockroachDBStore()
     index = None
     if fields is not None:
         index = resolve_index_config({"dims": 3, "embed": CountingEmbeddings(), "fields": fields})
-    store._configure(index=index, ttl=ttl, table_name="store", schema="public")
+    store._configure(
+        index=index,
+        ttl=ttl,
+        table_name="store",
+        schema="public",
+        history=resolve_history_config(history),
+    )
     return store
 
 
@@ -331,6 +385,9 @@ def test_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: say it found a table
+    # that setup() has not given migration 2 yet
+    store._cache_columns([{"ready": False}])
     flaky = FlakyCursor()
 
     @contextlib.contextmanager
@@ -355,6 +412,9 @@ async def test_async_put_plan_embeds_once_outside_retry() -> None:
         index={**INDEX, "embed": embeddings},  # type: ignore[typeddict-item]
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: say it found a table
+    # that setup() has not given migration 2 yet
+    store._cache_columns([{"ready": False}])
     flaky = FlakyCursor()
 
     @contextlib.asynccontextmanager
@@ -452,6 +512,9 @@ def test_nan_embedding_fails_before_any_statement() -> None:
         object(),  # type: ignore[arg-type]
         index={"dims": 3, "embed": NaNEmbeddings(), "fields": ["text"]},
     )
+    # The schema check runs before embedding, and the fake cursor cannot
+    # answer it: say it found migration 2
+    store._cache_columns([{"ready": True}])
     opened: list[object] = []
 
     @contextlib.contextmanager
@@ -472,6 +535,9 @@ def test_put_without_texts_skips_the_model_and_still_removes_vectors() -> None:
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: say it found a table
+    # that setup() has not given migration 2 yet
+    store._cache_columns([{"ready": False}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.contextmanager
@@ -498,6 +564,9 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
         index={"dims": 3, "embed": embeddings, "fields": ["text"]},
         retry_policy=FAST,
     )
+    # The fake cursor cannot answer the schema check: say it found a table
+    # that setup() has not given migration 2 yet
+    store._cache_columns([{"ready": False}])
     batches: list[list[tuple[str, list]]] = []
 
     @contextlib.asynccontextmanager
@@ -516,6 +585,76 @@ async def test_async_put_without_texts_skips_the_model_and_still_removes_vectors
         f"DELETE {items}",
         f"DELETE {vectors}",
     ]
+
+
+def assert_same_write_each_attempt(
+    attempts: list[list[tuple[str, list]]], store: BaseCockroachDBStore, ready: bool
+) -> None:
+    """Both attempts sent the same statements; the item upsert matches the schema."""
+    assert len(attempts) == 2
+    # The write id, like the vectors, was chosen before the first attempt
+    assert attempts[0] == attempts[1]
+    assert_write_batch(attempts[1], store)
+    [(upsert, params)] = [
+        (sql, params)
+        for sql, params in attempts[1]
+        if sql.startswith(f"INSERT INTO {store.sql.items} ")
+    ]
+    if ready:
+        uuid.UUID(params[0])
+        assert f"version = {store.sql.items}.version + 1" in upsert
+        rows = [params[i : i + 6] for i in range(1, len(params), 6)]
+        # A plain put writes no provenance and no valid time
+        assert [row[4:] for row in rows] == [[None, None]] * 3
+    else:
+        assert "write_id" not in upsert and "version" not in upsert
+        rows = [params[i : i + 4] for i in range(0, len(params), 4)]
+    assert [row[1] for row in rows] == ["k1", "k2", "k3"]
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["migrated", "0.5-table"])
+def test_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    store._cache_columns([{"ready": ready}])
+    attempts: list[list[tuple[str, list]]] = []
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+        attempts.append([])
+        yield StatementLog(attempts[-1])
+        # The first attempt fails as it ends, after all its statements were sent
+        if len(attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    store.batch(INDEXED_OPS)
+    assert_same_write_each_attempt(attempts, store, ready)
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["migrated", "0.5-table"])
+async def test_async_put_batch_sends_one_write_id_in_every_attempt(ready: bool) -> None:
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={**INDEX, "embed": CountingEmbeddings()},  # type: ignore[typeddict-item]
+        retry_policy=FAST,
+    )
+    store._cache_columns([{"ready": ready}])
+    attempts: list[list[tuple[str, list]]] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+        attempts.append([])
+        yield AsyncStatementLog(attempts[-1])
+        if len(attempts) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+
+    store._cursor = fake_cursor  # type: ignore[method-assign]
+    await store.abatch(INDEXED_OPS)
+    assert_same_write_each_attempt(attempts, store, ready)
 
 
 def test_batch_plan_keeps_search_queries_to_embed() -> None:
@@ -640,8 +779,8 @@ def assert_query_statements(conn: SearchConnection) -> None:
     assert "prefix = ANY(CAST(%s AS STRING[]))" in first[0]
     assert "count(*) OVER () AS window_size" in first[0]
     assert first[1][:3] == ["[1.0,0.0,0.0]", ["a", "a.x"], "[1.0,0.0,0.0]"]
-    # over_fetch = (limit + offset) * estimated_vectors * 2 + 1
-    assert first[1][3] == (2 + 3) * 1 * 2 + 1
+    # over_fetch = (limit + offset) * estimated_vectors * 2 + 1 = 11, raised to the floor
+    assert first[1][3] == WINDOW_FLOOR == 41
     assert second[1][1] == ["a", "a.x"]
     # A search of the whole store has no lookup and ranks exactly at once
     assert "ANY(" not in root[0] and "GROUP BY i.prefix, i.key" in root[0]
@@ -870,14 +1009,18 @@ def test_needs_exact_search() -> None:
 
 EXACT_ROWS = [search_row("best", 0.99), search_row("next", 0.5)]
 
+# The window of a search with the default limit of 10: 10 * 1 * 2 + 1 = 21,
+# raised to the floor of 41
+WINDOW = window_for(10)
+
 
 @pytest.mark.parametrize(
     ("indexed_rows", "namespaces", "runs_again"),
     [
-        ([search_row("k1", 0.9, 21)], ["a"], True),
-        ([search_row("k1", 0.9, 20)], ["a"], False),
-        ([search_row("k1", 0.9, 20, 21)], ["a"], True),
-        ([search_row(f"k{i}", 0.9, 21) for i in range(10)], ["a"], False),
+        ([search_row("k1", 0.9, WINDOW)], ["a"], True),
+        ([search_row("k1", 0.9, WINDOW - 1)], ["a"], False),
+        ([search_row("k1", 0.9, WINDOW - 1, WINDOW)], ["a"], True),
+        ([search_row(f"k{i}", 0.9, WINDOW) for i in range(10)], ["a"], False),
         ([], ["a"], True),
         ([], [], False),
     ],
@@ -896,7 +1039,6 @@ def test_short_indexed_search_runs_again_exactly(
     store, conn = fake_search_store(namespaces)
     conn.indexed_rows = indexed_rows
     conn.exact_rows = EXACT_ROWS
-    # The default limit of 10, so over_fetch is 10 * 1 * 2 + 1 = 21
     [result] = store.batch([SearchOp(("a",), query="q", filter={"x": 1})])
     labels = [label for label, _, _ in conn.executed]
     assert labels[:2] == ["store search namespaces", "store search"]
@@ -909,6 +1051,29 @@ def test_short_indexed_search_runs_again_exactly(
     else:
         assert labels[2:] == []
         assert [item.key for item in result] == [row["key"] for row in indexed_rows]
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset", "fields", "window"),
+    [
+        (3, 0, ["text"], 41),
+        (10, 0, ["text"], 41),
+        (20, 0, ["text"], 41),
+        (15, 10, ["text"], 51),
+        (10, 0, ["text", "title"], 41),
+        (12, 0, ["text", "title"], 49),
+    ],
+)
+def test_semantic_search_window_has_a_floor(
+    limit: int, offset: int, fields: list[str], window: int
+) -> None:
+    # Twice the vectors up to the end of the page, plus one, and at least 41,
+    # which costs the index about the same as a smaller window
+    store, conn = fake_search_store(["a"], fields=fields)
+    store.batch([SearchOp(("a",), query="q", limit=limit, offset=offset)])
+    [params] = [params for label, _, params in conn.executed if label == "store search"]
+    assert params[3] == window
+    assert window == window_for((limit + offset) * len(fields))
 
 
 def test_exact_search_keeps_each_result_in_its_slot() -> None:
@@ -937,7 +1102,7 @@ async def test_async_short_indexed_search_runs_again_exactly() -> None:
     )
     conn = AsyncSearchConnection(["a"])
     conn.attempts["store search"] = 1
-    conn.indexed_rows = [search_row("k1", 0.9, 21)]
+    conn.indexed_rows = [search_row("k1", 0.9, WINDOW)]
     conn.exact_rows = EXACT_ROWS
 
     @contextlib.asynccontextmanager
@@ -1067,7 +1232,8 @@ class BusyOnceCursor:
     """A cursor that fails the first TTL statement with the busy error.
 
     It records every statement, and reports ``latest`` as the migration
-    version, so setup() goes straight to its TTL step.
+    version, so setup() goes straight to its TTL step. Its TTL read finds
+    no settings in place, so every TTL change runs.
     """
 
     def __init__(self, latest: int) -> None:
@@ -1086,7 +1252,7 @@ class BusyOnceCursor:
         return self
 
     def fetchone(self) -> dict:
-        return {"v": self.latest}
+        return {"v": self.latest, "applied": False}
 
 
 class AsyncBusyOnceCursor(BusyOnceCursor):
@@ -1095,7 +1261,7 @@ class AsyncBusyOnceCursor(BusyOnceCursor):
         return self
 
     async def fetchone(self) -> dict:  # type: ignore[override]
-        return {"v": self.latest}
+        return {"v": self.latest, "applied": False}
 
 
 def ttl_statements(cursor: BusyOnceCursor) -> list[str]:
@@ -1154,6 +1320,1532 @@ async def test_async_ttl_changes_retry_a_busy_schema_change(operation: str) -> N
             assert len(ttl_statements(cursor)) == 1
 
 
+class TTLSetupCursor:
+    """A cursor that answers setup()'s reads and records its statements with their params.
+
+    It reports ``latest`` as the migration version, so setup() goes
+    straight to its schema statements, and the vectors table as the index
+    check expects it. The TTL read finds the settings in place on the
+    tables in ``applied``. The first ``busy`` ALTER TABLE statements fail
+    with the busy error. With ``winner``, each of those failures leaves its
+    table's settings in place, as another process's setup() would.
+    """
+
+    def __init__(
+        self, latest: int, *, applied: Sequence[str] = (), busy: int = 0, winner: bool = False
+    ) -> None:
+        self.latest = latest
+        self.applied = set(applied)
+        self.busy = busy
+        self.winner = winner
+        self.calls: list[tuple[str, list]] = []
+
+    def run(self, statement: str, params: Sequence[object]) -> None:
+        self.calls.append((statement, list(params)))
+        if statement.startswith("ALTER TABLE") and self.busy:
+            self.busy -= 1
+            if self.winner:
+                self.applied.add(statement.split()[2])
+            raise busy_error()
+
+    def execute(self, statement: str, params: Sequence[object] = ()) -> "TTLSetupCursor":
+        self.run(statement, params)
+        return self
+
+    def answer(self) -> dict:
+        statement, params = self.calls[-1]
+        if "reloptions" in statement:
+            return {"applied": params[-1] in self.applied}
+        if "create_statement" in statement:
+            return {"create_statement": VECTORS_TABLE.format(dims=3, index=COSINE_INDEX)}
+        return {"v": self.latest}
+
+    def fetchone(self) -> dict:
+        return self.answer()
+
+    def altered(self) -> list[str]:
+        """The table of each ALTER TABLE statement sent, failed ones included."""
+        return [s.split()[2] for s, _ in self.calls if s.startswith("ALTER TABLE")]
+
+
+class AsyncTTLSetupCursor(TTLSetupCursor):
+    async def execute(  # type: ignore[override]
+        self, statement: str, params: Sequence[object] = ()
+    ) -> "AsyncTTLSetupCursor":
+        self.run(statement, params)
+        return self
+
+    async def fetchone(self) -> dict:  # type: ignore[override]
+        return self.answer()
+
+
+def ttl_setup_cursor(make: str, **kwargs: Any) -> TTLSetupCursor:
+    """A TTLSetupCursor for the sync store, or its async form, at migration 2."""
+    cursor_class = TTLSetupCursor if make == "sync" else AsyncTTLSetupCursor
+    return cursor_class(MIGRATION_RECONCILE, **kwargs)
+
+
+def use_cursor(store: CockroachDBStore | AsyncCockroachDBStore, cursor: TTLSetupCursor) -> None:
+    """Make every connection checkout of ``store`` yield ``cursor``."""
+    if isinstance(store, AsyncCockroachDBStore):
+
+        @contextlib.asynccontextmanager
+        async def acursor(**kwargs: object) -> AsyncIterator[TTLSetupCursor]:
+            yield cursor
+
+        store._cursor = acursor  # type: ignore[method-assign,assignment]
+    else:
+
+        @contextlib.contextmanager
+        def scursor(**kwargs: object) -> Iterator[TTLSetupCursor]:
+            yield cursor
+
+        store._cursor = scursor  # type: ignore[method-assign,assignment]
+
+
+async def run_setup(store: CockroachDBStore | AsyncCockroachDBStore) -> None:
+    result = store.setup()
+    if isinstance(store, AsyncCockroachDBStore):
+        await result  # type: ignore[misc]
+
+
+def ttl_store(make: str, **settings: Any) -> CockroachDBStore | AsyncCockroachDBStore:
+    """A store with an index, a TTL configuration and history with ttl_days."""
+    settings.setdefault("index", {"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]})
+    settings.setdefault("ttl", {"sweep_interval_minutes": 5})
+    settings.setdefault("history", {"ttl_days": 30})
+    return make_store(make, **settings)
+
+
+ALL_TTL_TABLES = ("public.store_history", "public.store", "public.store_vectors")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    "applied", [(), ALL_TTL_TABLES, ("public.store",)], ids=["none", "all", "items"]
+)
+async def test_setup_changes_only_the_ttl_settings_not_in_place(
+    make: str, applied: tuple[str, ...]
+) -> None:
+    store = ttl_store(make)
+    cursor = ttl_setup_cursor(make, applied=applied)
+    use_cursor(store, cursor)
+
+    await run_setup(store)
+
+    # Each table's settings are read first, and changed only when they differ
+    create = (store.sql.create_history_table(), [])
+    expected = [create]
+    for change in (store.sql.history_ttl_change(), *store.sql.ttl_changes(store.ttl.cron)):
+        sql, params = change.applied
+        expected.append((sql, params))
+        if params[-1] not in applied:
+            expected.append((change.statement, []))
+    assert cursor.calls[cursor.calls.index(create) :] == expected
+    assert [params[-1] for _, params in expected[1:] if params] == list(ALL_TTL_TABLES)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_ttl_retry_reads_the_settings_again(make: str) -> None:
+    # The history's TTL change meets another process's schema change, which
+    # leaves the settings in place: the retry reads them and changes nothing
+    store = ttl_store(make)
+    cursor = ttl_setup_cursor(make, busy=1, winner=True)
+    use_cursor(store, cursor)
+
+    await run_setup(store)
+
+    history = store.sql.history_ttl_change()
+    items, vectors = store.sql.ttl_changes(store.ttl.cron)
+    create = (store.sql.create_history_table(), [])
+    assert cursor.calls[cursor.calls.index(create) :] == [
+        create,
+        history.applied,
+        (history.statement, []),
+        history.applied,
+        items.applied,
+        (items.statement, []),
+        vectors.applied,
+        (vectors.statement, []),
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("operation", "settings", "table"),
+    [
+        ("setup", {"history": {"ttl_days": 30}}, "public.store_history"),
+        ("setup", {"ttl": {"default_ttl": 5}}, "public.store"),
+        ("disable_ttl", {"ttl": {"default_ttl": 5}}, "public.store"),
+    ],
+    ids=["history-ttl", "ttl", "disable-ttl"],
+)
+async def test_ttl_changes_wait_out_a_schema_change_past_the_policys_attempts(
+    make: str, operation: str, settings: dict, table: str
+) -> None:
+    # The policy alone gives up after two attempts. The busy error has a
+    # budget of its own, so seven in a row are waited out
+    store = make_store(
+        make,
+        retry_policy=RetryPolicy(max_attempts=2, initial_backoff=0.001, max_backoff=0.002),
+        **settings,
+    )
+    cursor = ttl_setup_cursor(make, busy=7)
+    use_cursor(store, cursor)
+
+    if operation == "setup":
+        await run_setup(store)
+    else:
+        await call(store, operation)
+
+    assert cursor.altered() == [table] * 8
+
+
+# A setup() whose migration 2 statement meets the same migration still
+# backfilling in another process gets an answer at once, before the columns
+# exist. It waits for that migration before it records migration 2, and
+# takes it over when no job is applying it.
+
+
+class MigrationReads:
+    """Stands in for a store's _read_all while setup() waits for migration 2.
+
+    ``states`` holds (running jobs, columns public) for each check in turn,
+    and the last one again once they run out. A check starts with a read of
+    the columns, which moves to the next state. A read of the jobs answers
+    from the same state, or raises ``jobs_error``. Each read is logged in
+    ``log`` as ("read", its statements' SQL).
+    """
+
+    def __init__(
+        self,
+        states: Sequence[tuple[int, bool]],
+        log: list,
+        jobs_error: BaseException | None = None,
+    ) -> None:
+        self.states = list(states)
+        self.log = log
+        self.jobs_error = jobs_error
+        self.checks = 0
+
+    def answer(self, statements: list[tuple[str, list]]) -> list[list[dict]]:
+        [(sql, _)] = statements
+        self.log.append(("read", [sql]))
+        if "pg_attribute" in sql:
+            self.checks += 1
+        running, ready = self.states[min(self.checks, len(self.states)) - 1]
+        if "pg_attribute" in sql:
+            return [[{"ready": ready}]]
+        if self.jobs_error is not None:
+            raise self.jobs_error
+        return [[{"running": running}]]
+
+
+def wait_fakes(
+    store: CockroachDBStore | AsyncCockroachDBStore,
+    states: Sequence[tuple[int, bool]],
+    clock: "FakeClock",
+    log: list,
+    *,
+    ddl: bool = True,
+    jobs_error: BaseException | None = None,
+) -> tuple[MigrationReads, list[float]]:
+    """Answer the store's reads from ``states``, and make its sleeps move ``clock`` on.
+
+    With ``ddl``, schema statements are logged as ("ddl", statement) instead
+    of run. Returns the reads and the list of pauses slept.
+    """
+    reads = MigrationReads(states, log, jobs_error)
+    pauses: list[float] = []
+    if isinstance(store, AsyncCockroachDBStore):
+
+        async def aread_all(statements: list, label: str, session: object = None) -> list:
+            return reads.answer(statements)
+
+        async def asleep(seconds: float) -> None:
+            pauses.append(seconds)
+            clock.now += seconds
+
+        async def arun_ddl(statement: str, label: str, **kwargs: object) -> None:
+            log.append(("ddl", statement))
+
+        store._read_all = aread_all  # type: ignore[method-assign,assignment]
+        store._sleep = asleep  # type: ignore[method-assign,assignment]
+        if ddl:
+            store._run_ddl = arun_ddl  # type: ignore[method-assign,assignment]
+    else:
+
+        def read_all(statements: list, label: str, session: object = None) -> list:
+            return reads.answer(statements)
+
+        def sleep(seconds: float) -> None:
+            pauses.append(seconds)
+            clock.now += seconds
+
+        def run_ddl(statement: str, label: str, **kwargs: object) -> None:
+            log.append(("ddl", statement))
+
+        store._read_all = read_all  # type: ignore[method-assign,assignment]
+        store._sleep = sleep  # type: ignore[method-assign,assignment]
+        if ddl:
+            store._run_ddl = run_ddl  # type: ignore[method-assign,assignment]
+    return reads, pauses
+
+
+async def wait_for_migration(store: CockroachDBStore | AsyncCockroachDBStore) -> None:
+    result = store._wait_for_migration(store.sql.migrations()[MIGRATION_RECONCILE])
+    if isinstance(store, AsyncCockroachDBStore):
+        await result  # type: ignore[misc]
+
+
+def settle_reads(store: CockroachDBStore | AsyncCockroachDBStore) -> tuple[tuple, tuple, tuple]:
+    """The log entries of a read of the columns, a read of the jobs, and a takeover."""
+    columns = ("read", [store.sql.reconcile_columns_exist()[0]])
+    jobs = ("read", [store.sql.schema_changes_running()[0]])
+    return columns, jobs, ("ddl", store.sql.migrations()[MIGRATION_RECONCILE])
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_ends_at_once_when_the_columns_are_public_and_no_job_runs(
+    make: str, monkeypatch
+) -> None:
+    # The setup() that ran the migration itself finds the columns public and
+    # its job done: one read of the columns and one of SHOW JOBS
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    _, pauses = wait_fakes(store, [(0, True)], clock, log)
+
+    await wait_for_migration(store)
+
+    columns, jobs, _ = settle_reads(store)
+    assert (log, pauses) == ([columns, jobs], [])
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_lasts_while_a_job_finishes_after_the_columns_turn_public(
+    make: str, monkeypatch
+) -> None:
+    # Another setup()'s job made the columns public and is still finishing,
+    # so not every node may use them yet
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    _, pauses = wait_fakes(store, [(1, True), (1, True), (0, True)], clock, log)
+
+    await wait_for_migration(store)
+
+    columns, jobs, _ = settle_reads(store)
+    assert log == [columns, jobs] * 3
+    assert len(pauses) == 2
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("policy", [FAST, RetryPolicy(max_attempts=1)], ids=["fast", "one-attempt"])
+async def test_migration_wait_lasts_while_a_schema_change_job_runs(
+    make: str, policy: RetryPolicy, monkeypatch
+) -> None:
+    # Another setup() is backfilling. Its job runs, the columns turn public
+    # while the job finishes, then the job is done. max_attempts=1 does not
+    # shorten the wait: it is a wait for another process, not a retry
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make, retry_policy=policy)
+    log: list = []
+    _, pauses = wait_fakes(store, [(1, False), (1, False), (1, True), (0, True)], clock, log)
+
+    await wait_for_migration(store)
+
+    # SHOW JOBS is read on the first check, then not again within a minute
+    # while the columns are not public, then on every check once they are
+    columns, jobs, _ = settle_reads(store)
+    assert log == [columns, jobs, columns, columns, jobs, columns, jobs]
+    assert len(pauses) == 3
+    assert all(0 < pause <= SCHEMA_CHANGE_BUSY_MAX_BACKOFF for pause in pauses)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_takes_over_when_no_job_applies_the_migration(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The columns are not there and no job runs: a peer's migration failed or
+    # was reverted, or SHOW JOBS cannot show the job. The wait sends the
+    # idempotent statement again, which takes the migration over, then reads
+    # the columns and SHOW JOBS again. It applied the migration itself, so it
+    # neither waits nor says another process is applying it
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    _, pauses = wait_fakes(store, [(0, False), (0, True)], clock, log)
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    columns, jobs, takeover = settle_reads(store)
+    assert log == [columns, jobs, takeover, columns, jobs]
+    assert pauses == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        "setup() applied migration 2 to public.store itself: no schema change job it could "
+        "see was applying it."
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_long_takeover_after_the_wait_started_ends_the_wait(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The peer's job shows for 200 s, then is gone with the columns still
+    # missing. The wait takes over, and its own backfill runs for 700 s, past
+    # the wait's deadline. The wait ends once the columns are public, with no
+    # TimeoutError
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    start = clock.now
+    applied: list[float] = []
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        if applied:
+            reads.states = [(0, True)]
+        elif clock.now - start >= 200.0:
+            reads.states = [(0, False)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
+
+    def backfill() -> None:
+        applied.append(clock.now - start)
+        clock.now += 700.0
+
+    if isinstance(store, AsyncCockroachDBStore):
+
+        async def arun_ddl(statement: str, label: str, **kwargs: object) -> None:
+            backfill()
+
+        store._run_ddl = arun_ddl  # type: ignore[method-assign,assignment]
+    else:
+
+        def run_ddl(statement: str, label: str, **kwargs: object) -> None:
+            backfill()
+
+        store._run_ddl = run_ddl  # type: ignore[method-assign,assignment]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    # It took over at its first SHOW JOBS read after the job was gone
+    assert len(applied) == 1 and 200.0 <= applied[0] < 260.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Another process is still applying migration 2" in messages[0]
+    assert "setup() applied migration 2 to public.store itself" in messages[-2]
+    assert messages[-1].startswith("Migration 2 on public.store is in place after 9")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reads_show_jobs_once_a_minute_until_the_columns_turn_public(
+    make: str, monkeypatch
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    reads, _ = wait_fakes(store, [(1, False)], clock, [])
+    start = clock.now
+    # (seconds into the wait, what was read)
+    timeline: list[tuple[float, str]] = []
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        [(sql, _)] = statements
+        waited = clock.now - start
+        timeline.append((waited, "columns" if "pg_attribute" in sql else "jobs"))
+        if waited >= 210.0:
+            reads.states = [(0, True)]
+        elif waited >= 200.0:
+            reads.states = [(1, True)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
+
+    await wait_for_migration(store)
+
+    # While the columns are not public: the first check, then once a minute
+    before = [waited for waited, kind in timeline if kind == "jobs" and waited < 200.0]
+    assert len(before) == 4 and before[0] == 0.0
+    gaps = [later - earlier for earlier, later in zip(before, before[1:], strict=False)]
+    assert all(
+        SCHEMA_CHANGE_PROGRESS_SECONDS <= gap < SCHEMA_CHANGE_PROGRESS_SECONDS + 4 for gap in gaps
+    )
+    # Once they are public: on every check
+    after = [kind for waited, kind in timeline if waited >= 200.0]
+    assert after == ["columns", "jobs"] * (len(after) // 2) and len(after) >= 4
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_falls_back_to_the_columns_when_show_jobs_fails(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A SHOW JOBS error of SQLSTATE class 42 or 0A, such as a renamed column
+    # or a permission error, never fails setup(): it is logged once, and the
+    # columns alone decide from then on
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    renamed = psycopg.errors.lookup("42703")('column "description" does not exist')
+    _, pauses = wait_fakes(store, [(0, False), (0, True)], clock, log, jobs_error=renamed)
+
+    with caplog.at_level(logging.INFO):
+        await wait_for_migration(store)
+
+    columns, jobs, takeover = settle_reads(store)
+    assert log == [columns, jobs, takeover, columns]
+    assert pauses == []
+    fallbacks = [
+        r for r in caplog.records if "SHOW JOBS" in r.getMessage() and "cannot" in r.getMessage()
+    ]
+    assert [r.levelno for r in fallbacks] == [logging.INFO]
+    assert 'column "description" does not exist' in fallbacks[0].getMessage()
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("code", ["42703", "42501", "0A000"])
+async def test_migration_wait_skips_show_jobs_after_a_schema_or_permission_error(
+    make: str, code: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Classes 42 and 0A: a renamed column, a missing permission, a feature
+    # turned off. Skipped once, with one INFO line, for the store's lifetime
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    error = psycopg.errors.lookup(code)(f"failed with {code}")
+    wait_fakes(store, [(0, True)], clock, log, jobs_error=error)
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+        await wait_for_migration(store)
+
+    columns, jobs, _ = settle_reads(store)
+    assert log == [columns, jobs, columns]
+    assert [r.levelno for r in caplog.records] == [logging.INFO]
+    assert f"failed with {code}" in caplog.records[0].getMessage()
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        PoolTimeout("couldn't get a connection after 30.00 sec"),
+        psycopg.errors.SerializationFailure("restart transaction"),
+        psycopg.errors.lookup("25001")("active sql transaction"),
+        RuntimeError("Event loop is closed"),
+        KeyError("running"),
+    ],
+    ids=["pool-timeout", "40001", "25001", "loop-closed", "key-error"],
+)
+async def test_migration_wait_raises_any_other_show_jobs_error(
+    make: str, error: BaseException, monkeypatch
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    wait_fakes(store, [(0, True)], clock, [], jobs_error=error)
+
+    with pytest.raises(type(error)):
+        await wait_for_migration(store)
+
+    assert store._jobs_unreadable is False
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("states", "condition"),
+    [
+        (
+            [(1, False)],
+            "its columns are not public yet, and SHOW JOBS shows 1 schema change job on the table",
+        ),
+        ([(2, True)], "SHOW JOBS shows 2 schema change jobs on the table"),
+    ],
+    ids=["columns-and-job", "jobs"],
+)
+async def test_migration_wait_gives_up_saying_what_remained(
+    make: str, states: list, condition: str, monkeypatch
+) -> None:
+    public = states[0][1]
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    assert store._MIGRATION_SETTLE_SECONDS == SCHEMA_CHANGE_SETTLE_SECONDS
+    monkeypatch.setattr(store, "_MIGRATION_SETTLE_SECONDS", 10.0)
+    log: list = []
+    _, pauses = wait_fakes(store, states, clock, log)
+
+    with pytest.raises(TimeoutError) as info:
+        await wait_for_migration(store)
+
+    assert str(info.value) == (
+        f"Another process is still applying migration 2 to public.store: after 10 seconds, "
+        f"{condition}. Check SHOW JOBS for the schema change job, then run setup() again."
+    )
+    # It checked again until the budget ran out, and never slept past it. It
+    # read SHOW JOBS on every check once the columns were public, and once
+    # within the ten seconds while they were not. Before it gave up, it read
+    # the columns and SHOW JOBS fresh
+    assert sum(pauses) == pytest.approx(10.0)
+    checks = len(pauses) + 1
+    assert len(log) == (2 * checks if public else checks + 1) + 2
+    columns, jobs, _ = settle_reads(store)
+    assert log[-2:] == [columns, jobs]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reads_again_before_giving_up(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The peer's job shows at the SHOW JOBS read a minute into the wait, then
+    # fails, with the columns still missing. The next read would come after
+    # the deadline, so the job count is stale when the deadline passes. A
+    # fresh read finds no job, and the wait takes over instead of raising
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    monkeypatch.setattr(store, "_MIGRATION_SETTLE_SECONDS", 100.0)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    start = clock.now
+    answer = reads.answer
+
+    def answer_when(statements: list) -> list:
+        took_over = ("ddl", store.sql.migrations()[MIGRATION_RECONCILE]) in log
+        if took_over:
+            reads.states = [(0, True)]
+        elif clock.now - start >= 80.0:
+            reads.states = [(0, False)]
+        else:
+            reads.states = [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_when  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    _, _, takeover = settle_reads(store)
+    assert log.count(takeover) == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert "setup() applied migration 2 to public.store itself" in messages[-2]
+    assert messages[-1].startswith("Migration 2 on public.store is in place after 10")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_migration_wait_reports_its_progress(
+    make: str, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An INFO line when it starts, a WARNING once it has waited
+    # SCHEMA_CHANGE_QUIET_SECONDS, then one every SCHEMA_CHANGE_PROGRESS_SECONDS
+    # with what it still waits for, and an INFO line when it ends
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    log: list = []
+    reads, _ = wait_fakes(store, [(1, False)], clock, log)
+    done_at = clock.now + 140.0
+    answer = reads.answer
+
+    def answer_until(statements: list) -> list:
+        reads.states = [(0, True)] if clock.now >= done_at else [(1, False)]
+        return answer(statements)
+
+    reads.answer = answer_until  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger="langchain_cockroachdb.store"):
+        await wait_for_migration(store)
+
+    records = [r for r in caplog.records if r.name.startswith("langchain_cockroachdb.store")]
+    levels = [r.levelno for r in records]
+    assert levels == [logging.INFO, logging.WARNING, logging.WARNING, logging.INFO]
+    start, first, second, end = (r.getMessage() for r in records)
+    assert "Another process is still applying migration 2 to public.store" in start
+    for message in (first, second):
+        assert "its columns are not public yet" in message
+        assert "SHOW JOBS shows 1 schema change job on the table" in message
+    waited = [float(m.split("waited ")[1].split("s ")[0]) for m in (first, second)]
+    assert SCHEMA_CHANGE_QUIET_SECONDS <= waited[0] < SCHEMA_CHANGE_QUIET_SECONDS + 4
+    assert waited[1] - waited[0] >= SCHEMA_CHANGE_PROGRESS_SECONDS
+    assert "Migration 2 on public.store is in place after 14" in end
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("latest", [-1, 1], ids=["new-tables", "0.5-tables"])
+async def test_setup_records_migration_2_only_after_waiting_for_it(
+    make: str, latest: int, monkeypatch
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_store(make)
+    cursor = (TTLSetupCursor if make == "sync" else AsyncTTLSetupCursor)(latest)
+    use_cursor(store, cursor)
+    _, pauses = wait_fakes(store, [(1, False), (0, True)], clock, cursor.calls, ddl=False)
+
+    await run_setup(store)
+
+    migrations = store.sql.migrations()
+    record = f"INSERT INTO {store.sql.migrations_table} (v) VALUES (%s) ON CONFLICT DO NOTHING"
+    columns, jobs, _ = settle_reads(store)
+    expected: list = [(migrations[0], []), (store.sql.migration_version(), [])]
+    for v in range(latest + 1, len(migrations)):
+        expected.append((migrations[v], []))
+        if v == MIGRATION_RECONCILE:
+            # The statement returned before the backfill was done: wait for it
+            expected += [columns, jobs, columns, jobs]
+        expected.append((record, [v]))
+    assert cursor.calls == expected
+    assert len(pauses) == 1
+
+
+def test_cache_columns_reads_the_ready_row() -> None:
+    store = make_base()
+    assert store._columns_ready is None
+    assert store._cache_columns([]) is False
+    assert store._columns_ready is False
+    assert store._cache_columns([{"ready": False}]) is False
+    assert store._cache_columns([{"ready": True}]) is True
+    assert store._columns_ready is True
+
+
+class SchemaReads:
+    """A stand-in for a store's _read_all that answers the schema check.
+
+    It returns ``columns`` as whether migration 2's columns exist and, when
+    asked, ``history`` as whether the history table exists. It records every call.
+    """
+
+    def __init__(self, columns: bool, history: bool = False) -> None:
+        self.columns = columns
+        self.history = history
+        self.calls: list[tuple[list[tuple[str, list]], str]] = []
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        self.calls.append((statements, label))
+        found = [[{"ready": self.columns}]]
+        if len(statements) > 1:
+            found.append([{"ready": self.history}])
+        return found
+
+
+class FakeClock:
+    """Stands in for the time module in store.base: monotonic() returns ``now``."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_cached_columns_keep_true_for_good_and_false_for_a_while(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_base()
+    assert store._cached_columns(refresh=False) is None
+    store._cache_columns([{"ready": False}])
+    assert store._cached_columns(refresh=False) is False
+    # A method that needs migration 2 does not trust False at all
+    assert store._cached_columns(refresh=True) is None
+    # A plain write trusts it for _SCHEMA_RECHECK_SECONDS, then reads again
+    assert store._SCHEMA_RECHECK_SECONDS == 60.0
+    clock.now += 59.0
+    assert store._cached_columns(refresh=False) is False
+    clock.now += 1.0
+    assert store._cached_columns(refresh=False) is None
+    # The window starts again with each read that finds no migration 2
+    store._cache_columns([{"ready": False}])
+    clock.now += 59.0
+    assert store._cached_columns(refresh=False) is False
+    # Migrations are never undone, so True holds for good
+    store._cache_columns([{"ready": True}])
+    clock.now += 365 * 86400.0
+    assert store._cached_columns(refresh=False) is True
+    assert store._cached_columns(refresh=True) is True
+
+
+def test_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(columns=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    assert store._reconcile_columns() is False
+    assert store._reconcile_columns() is False
+    assert reads.calls == [([store.sql.reconcile_migration_recorded()], "store schema check")]
+    with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
+        store._require_columns(store._reconcile_columns())
+    # A method that needs migration 2 reads again rather than trust the cached False
+    assert store._reconcile_columns(refresh=True) is False
+    assert len(reads.calls) == 2
+    # So does a plain write, once the False is older than _SCHEMA_RECHECK_SECONDS
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    assert store._reconcile_columns() is False
+    assert len(reads.calls) == 3
+
+    # setup() finds migration 2 recorded, as when another process ran it,
+    # and clears the cached answer, so the next check reads again
+    cursor = BusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[BusyOnceCursor]:
+        yield cursor
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    store.setup()
+    assert store._columns_ready is None
+    reads.columns = True
+    assert store._reconcile_columns() is True
+    # True is kept for good, even with refresh and a window of 0
+    assert store._reconcile_columns() is True
+    assert store._reconcile_columns(refresh=True) is True
+    assert len(reads.calls) == 4
+    store._require_columns(store._reconcile_columns(refresh=True))
+
+
+async def test_async_schema_check_caches_its_answer_and_setup_clears_it(monkeypatch) -> None:
+    store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
+    reads = SchemaReads(columns=False)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    assert await store._areconcile_columns() is False
+    assert await store._areconcile_columns() is False
+    assert reads.calls == [([store.sql.reconcile_migration_recorded()], "store schema check")]
+    with pytest.raises(ValueError, match=r"run setup\(\)"):
+        store._require_columns(await store._areconcile_columns())
+    assert await store._areconcile_columns(refresh=True) is False
+    assert len(reads.calls) == 2
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    assert await store._areconcile_columns() is False
+    assert len(reads.calls) == 3
+
+    cursor = AsyncBusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncBusyOnceCursor]:
+        yield cursor
+
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    await store.setup()
+    assert store._columns_ready is None
+    reads.columns = True
+    assert await store._areconcile_columns() is True
+    assert await store._areconcile_columns() is True
+    assert await store._areconcile_columns(refresh=True) is True
+    assert len(reads.calls) == 4
+    store._require_columns(await store._areconcile_columns(refresh=True))
+
+
+def test_cache_columns_keeps_true_once_seen() -> None:
+    store = make_base()
+    assert store._cache_columns([{"ready": True}]) is True
+    # A read that started before another process ran setup() can finish
+    # after one that saw migration 2. It must not take the answer back
+    assert store._cache_columns([{"ready": False}]) is True
+    assert store._cache_columns([]) is True
+    assert store._columns_ready is True
+
+
+def test_require_columns_acts_on_the_check_it_is_given() -> None:
+    store = make_base()
+    # setup() in another thread can clear the cache between the check and this call
+    assert store._columns_ready is None
+    store._require_columns(True)
+    store._cache_columns([{"ready": True}])
+    with pytest.raises(ValueError, match=r"public\.store .* run setup\(\) to add them"):
+        store._require_columns(False)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_reconcile_uses_the_schema_check_it_ran(make: str, monkeypatch) -> None:
+    store = make_store(make)
+
+    def check(*, refresh: bool = False) -> bool:
+        # As if setup() in another thread cleared the cache right after the read
+        store._columns_ready = None
+        return True
+
+    async def acheck(*, refresh: bool = False) -> bool:
+        return check(refresh=refresh)
+
+    if make == "sync":
+        monkeypatch.setattr(store, "_reconcile_columns", check)
+    else:
+        monkeypatch.setattr(store, "_areconcile_columns", acheck)
+    # Past the schema check, the first attempt checks out a connection: this
+    # store has none to give
+    with pytest.raises(TypeError, match="Invalid connection type"):
+        await call(
+            store, "reconcile", ("a",), "k", {"text": "x"}, policy=lambda proposal, candidates: None
+        )
+
+
+class DeniedSchemaReads(SchemaReads):
+    """SchemaReads for a role without a grant on the migrations table, or with no such table.
+
+    The migrations read raises ``error``, by default the InsufficientPrivilege
+    that CockroachDB raises. The column read and the history check answer as
+    in SchemaReads. Every call is recorded, the failed ones too.
+    """
+
+    def __init__(
+        self, columns: bool, history: bool = False, error: Exception | None = None
+    ) -> None:
+        super().__init__(columns, history)
+        self.error = error or psycopg.errors.InsufficientPrivilege(
+            "user app does not have SELECT privilege on relation store_migrations"
+        )
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        if "_migrations" in statements[0][0]:
+            self.calls.append((statements, label))
+            raise self.error
+        return super().answer(statements, label)
+
+
+def store_reading(
+    make: str, reads: SchemaReads, **settings: object
+) -> CockroachDBStore | AsyncCockroachDBStore:
+    """A sync or async store whose reads go to ``reads``."""
+    if make == "sync":
+
+        def read_all(
+            statements: list[tuple[str, list]], label: str, session: object = None
+        ) -> list[list[dict]]:
+            return reads.answer(statements, label)
+
+        store = CockroachDBStore(object(), retry_policy=FAST, **settings)  # type: ignore[arg-type]
+        store._read_all = read_all  # type: ignore[method-assign,assignment]
+        return store
+
+    async def aread_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    astore = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        retry_policy=FAST,
+        **settings,  # type: ignore[arg-type]
+    )
+    astore._read_all = aread_all  # type: ignore[method-assign,assignment]
+    return astore
+
+
+async def check_columns(
+    store: CockroachDBStore | AsyncCockroachDBStore, *, refresh: bool = False
+) -> bool:
+    """The store's check for migration 2's columns, sync or async."""
+    if isinstance(store, AsyncCockroachDBStore):
+        return await store._areconcile_columns(refresh=refresh)
+    return store._reconcile_columns(refresh=refresh)
+
+
+# Why the migrations read fails: the role has no grant on the migrations
+# table (42501), or there is no migrations table (42P01), as when the tables
+# were created without setup(). The store falls back to the column read for both
+UNREADABLE = {
+    "denied": lambda: psycopg.errors.InsufficientPrivilege(
+        "user app does not have SELECT privilege on relation store_migrations"
+    ),
+    "missing": lambda: psycopg.errors.UndefinedTable(
+        'relation "public.store_migrations" does not exist'
+    ),
+}
+
+
+def sent(reads: SchemaReads) -> list[list[tuple[str, list]]]:
+    """The statements of every schema check round trip, in order."""
+    assert all(label == "store schema check" for _, label in reads.calls)
+    return [statements for statements, _ in reads.calls]
+
+
+@pytest.mark.parametrize("why", list(UNREADABLE))
+@pytest.mark.parametrize("history", [False, True], ids=["plain", "history"])
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_an_unreadable_migrations_table_falls_back_to_the_columns_for_good(
+    make: str, history: bool, why: str, monkeypatch
+) -> None:
+    reads = DeniedSchemaReads(columns=False, history=True, error=UNREADABLE[why]())
+    store = store_reading(make, reads, history=history)
+    migrations = store.sql.reconcile_migration_recorded()
+    columns = store.sql.reconcile_columns_exist()
+    tail = [store.sql.history_exists()] if history else []
+
+    assert await check_columns(store) is False
+    # The denial ended its round trip, so the column read and the history
+    # check go out together in a second one
+    assert sent(reads) == [[migrations, *tail], [columns, *tail]]
+    assert store._migrations_unreadable is True
+    # From then on the check reads the columns only, cached as on the
+    # migrations path: False holds for _SCHEMA_RECHECK_SECONDS, and refresh
+    # reads again
+    assert await check_columns(store) is False
+    assert len(reads.calls) == 2
+    assert await check_columns(store, refresh=True) is False
+    assert sent(reads)[2:] == [[columns, *tail]]
+    monkeypatch.setattr(store, "_SCHEMA_RECHECK_SECONDS", 0.0)
+    reads.columns = True
+    assert await check_columns(store) is True
+    assert sent(reads)[3:] == [[columns, *tail]]
+    # True holds for good
+    assert await check_columns(store, refresh=True) is True
+    assert len(reads.calls) == 4
+
+
+@pytest.mark.parametrize(("why", "sqlstate"), [("denied", "42501"), ("missing", "42P01")])
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_an_unreadable_migrations_table_logs_the_fallback_once(
+    make: str, why: str, sqlstate: str, caplog
+) -> None:
+    reads = DeniedSchemaReads(columns=True, history=False, error=UNREADABLE[why]())
+    store = store_reading(make, reads)
+
+    with caplog.at_level("INFO"):
+        await check_columns(store)
+
+    # Exactly one INFO log about the fallback, with the reason
+    info_logs = [rec for rec in caplog.records if rec.levelname == "INFO"]
+    assert len(info_logs) == 1
+    assert f"(SQLSTATE {sqlstate})" in info_logs[0].message
+    assert "The schema check now reads the items table's columns" in info_logs[0].message
+    assert store.sql.migrations_table in info_logs[0].message
+
+    # Second check does not log again
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        await check_columns(store, refresh=True)
+
+    info_logs = [rec for rec in caplog.records if rec.levelname == "INFO"]
+    assert len(info_logs) == 0
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_other_errors_of_the_migrations_read_propagate(make: str) -> None:
+    broken = psycopg.errors.UndefinedColumn('column "v" does not exist')
+    reads = DeniedSchemaReads(columns=True, error=broken)
+    store = store_reading(make, reads)
+    for _ in range(2):
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            await check_columns(store)
+    # No column read: each check tried the migrations table, and nothing was cached
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]] * 2
+    assert store._columns_ready is None
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_column_read_raises_without_trying_the_migrations_again(
+    make: str,
+) -> None:
+    reads = DeniedSchemaReads(columns=True)
+    store = store_reading(make, reads)
+
+    def deny(statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        reads.calls.append((statements, label))
+        raise psycopg.errors.InsufficientPrivilege("permission denied")
+
+    reads.answer = deny  # type: ignore[method-assign]
+    for _ in range(2):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await check_columns(store)
+    migrations = store.sql.reconcile_migration_recorded()
+    columns = store.sql.reconcile_columns_exist()
+    assert sent(reads) == [[migrations], [columns], [columns]]
+
+
+@pytest.mark.parametrize("why", list(UNREADABLE))
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_migrations_read_that_fails_in_a_callers_transaction_raises_once(
+    make: str, why: str
+) -> None:
+    error = UNREADABLE[why]()
+    _psycopg_conn.mark_in_caller_transaction(error)
+    reads = DeniedSchemaReads(columns=True, error=error)
+    store = store_reading(make, reads)
+    # The error aborted the caller's transaction, so no read can run in it:
+    # the error goes to the caller
+    with pytest.raises(type(error)):
+        await check_columns(store)
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
+    # When the caller tries again, the check goes straight to the columns
+    assert await check_columns(store) is True
+    assert sent(reads)[1:] == [[store.sql.reconcile_columns_exist()]]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_denied_write_is_not_taken_for_a_denied_migrations_read(make: str) -> None:
+    reads = SchemaReads(columns=True)
+    store = store_reading(make, reads)
+    denied = psycopg.errors.InsufficientPrivilege(
+        "user app does not have INSERT privilege on relation store"
+    )
+    if isinstance(store, CockroachDBStore):
+
+        @contextlib.contextmanager
+        def fake_cursor(**kwargs: object) -> Iterator[StatementLog]:
+            raise denied
+            yield
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            store.put(("a",), "k", {"x": 1})
+    else:
+
+        @contextlib.asynccontextmanager
+        async def afake_cursor(**kwargs: object) -> AsyncIterator[AsyncStatementLog]:
+            raise denied
+            yield
+
+        store._cursor = afake_cursor  # type: ignore[method-assign,assignment]
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await store.aput(("a",), "k", {"x": 1})
+    # The schema check read the migrations table once and was not denied
+    assert sent(reads) == [[store.sql.reconcile_migration_recorded()]]
+    assert store._migrations_unreadable is False
+
+
+def test_history_check_keeps_true_for_good_and_false_for_a_while(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(store_base, "time", clock)
+    store = make_base(history=True)
+    assert store._cached_history(refresh=False) is None
+    assert store._cache_history([{"ready": False}]) is False
+    assert store._cached_history(refresh=False) is False
+    # An operation about to refuse for a missing table does not trust False
+    assert store._cached_history(refresh=True) is None
+    clock.now += store._SCHEMA_RECHECK_SECONDS
+    assert store._cached_history(refresh=False) is None
+    assert store._cache_history([{"ready": True}]) is True
+    # setup() never drops the table, so True holds for good, even against a late read
+    assert store._cache_history([{"ready": False}]) is True
+    clock.now += 365 * 86400.0
+    assert store._cached_history(refresh=True) is True
+    # A store without history never looks for the table
+    assert make_base()._cached_history(refresh=True) is False
+
+
+def test_history_check_reads_once_with_the_schema_before_refusing() -> None:
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    missing_table = r"The history table public\.store_history does not exist yet; run setup\(\)"
+    with pytest.raises(ValueError, match=missing_table):
+        store._history_schema()
+    # One round trip reads both, once
+    statements = [store.sql.reconcile_migration_recorded(), store.sql.history_exists()]
+    assert reads.calls == [(statements, "store schema check")]
+    # A plain read of the columns trusts the answers for a while
+    assert store._reconcile_columns() is True
+    assert len(reads.calls) == 1
+    # An operation that needs the table does not trust its absence: it reads once
+    with pytest.raises(ValueError, match=missing_table):
+        store._history_schema()
+    assert len(reads.calls) == 2
+
+    # Another process runs setup(): the next operation that needs history sees it
+    reads.history = True
+    assert store._history_schema() == SchemaCheck(columns=True, history=True)
+    assert len(reads.calls) == 3
+    # and trusts it for good
+    store._history_schema()
+    assert len(reads.calls) == 3
+
+    # Without migration 2 there is no history either, and the message says
+    # what is missing
+    store = CockroachDBStore(object(), history=True, retry_policy=FAST)  # type: ignore[arg-type]
+    reads = SchemaReads(columns=False, history=True)
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError,
+        match=r"The table public\.store does not have the columns that history needs yet; "
+        r"run setup\(\) to add them and to create the history table public\.store_history\.",
+    ):
+        store._history_schema()
+    assert len(reads.calls) == 1
+
+
+async def test_async_history_check_reads_once_with_the_schema_before_refusing() -> None:
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False), history=True, retry_policy=FAST
+    )
+    reads = SchemaReads(columns=True, history=False)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
+        await store._ahistory_schema()
+    statements = [store.sql.reconcile_migration_recorded(), store.sql.history_exists()]
+    assert reads.calls == [(statements, "store schema check")]
+    reads.history = True
+    assert await store._ahistory_schema() == SchemaCheck(columns=True, history=True)
+    await store._ahistory_schema()
+    assert len(reads.calls) == 2
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_store_without_history_refuses_history_without_any_io(make: str) -> None:
+    # A connection the store must never touch: using it would raise
+    store = make_store(make)
+    with pytest.raises(ValueError, match="history=True"):
+        await call(store, "history", ("a",), "k")
+    with pytest.raises(ValueError, match="history=True"):
+        await call(store, "purge", ("a",), "k")
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_history_and_purge_validate_before_any_io(make: str) -> None:
+    store = make_store(make, history=True)
+    for check in (
+        lambda: call(store, "history", (), "k"),
+        lambda: call(store, "history", ("a.b",), "k"),
+        lambda: call(store, "purge", (), "k"),
+        lambda: call(store, "purge", ("a", ""), "k"),
+    ):
+        with pytest.raises(InvalidNamespaceError):
+            await check()
+    with pytest.raises(ValueError, match="limit must be non-negative"):
+        await call(store, "history", ("a",), "k", limit=-1)
+    # A limit that is not an int is refused before any I/O too, as find_conflicts refuses it
+    for bad in (1.5, "3", True, None):
+        with pytest.raises(ValueError, match="limit must be a non-negative integer"):
+            await call(store, "history", ("a",), "k", limit=bad)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_namespace_history_checks_what_the_key_form_checks_before_any_io(
+    make: str,
+) -> None:
+    # Without a key, history reads a whole namespace, and refuses the same
+    # things before it touches the connection, which would raise
+    with pytest.raises(ValueError, match="history=True"):
+        await call(make_store(make), "history", ("a",))
+    store = make_store(make, history=True)
+    for namespace in ((), ("a.b",), ("a", "")):
+        with pytest.raises(InvalidNamespaceError):
+            await call(store, "history", namespace)
+    with pytest.raises(ValueError, match="limit must be non-negative"):
+        await call(store, "history", ("a",), limit=-1)
+    for bad in (1.5, "3", True, None):
+        with pytest.raises(ValueError, match="limit must be a non-negative integer"):
+            await call(store, "history", ("a",), limit=bad)
+    # offset is checked the same way, with a key or without one
+    for key in (None, "k"):
+        with pytest.raises(ValueError, match="offset must be non-negative"):
+            await call(store, "history", ("a",), key, offset=-1)
+        for bad in (1.5, "3", True, None):
+            with pytest.raises(ValueError, match="offset must be a non-negative integer"):
+                await call(store, "history", ("a",), key, offset=bad)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_setup_creates_the_history_table_and_clears_its_check(make: str) -> None:
+    if make == "sync":
+        store: CockroachDBStore | AsyncCockroachDBStore = CockroachDBStore(
+            object(),  # type: ignore[arg-type]
+            history={"ttl_days": 30},
+            retry_policy=FAST,
+        )
+        cursor: BusyOnceCursor = BusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+        @contextlib.contextmanager
+        def fake_cursor(**kwargs: object) -> Iterator[BusyOnceCursor]:
+            yield cursor
+
+        store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    else:
+        store = AsyncCockroachDBStore(
+            AsyncConnectionPool("", open=False), history={"ttl_days": 30}, retry_policy=FAST
+        )
+        cursor = AsyncBusyOnceCursor(latest=MIGRATION_RECONCILE)
+
+        @contextlib.asynccontextmanager
+        async def afake_cursor(**kwargs: object) -> AsyncIterator[BusyOnceCursor]:
+            yield cursor
+
+        store._cursor = afake_cursor  # type: ignore[method-assign,assignment]
+    store._cache_history([{"ready": False}])
+
+    result = store.setup()
+    if make == "async":
+        await result  # type: ignore[misc]
+    create, ttl = store.sql.create_history_table(), store.sql.history_ttl_change().statement
+    # The TTL change met another schema change once and ran again, as the
+    # items' TTL does
+    assert [s for s in cursor.statements if store.sql.history in s] == [create, ttl, ttl]
+    assert store._history_ready is None
+
+
+def test_put_batch_with_history_archives_what_it_ends_first() -> None:
+    store = make_base(fields=["text"], history={"ttl_days": 7})
+    plan = store._plan_puts(
+        [
+            PutOp(("a",), "k1", {"text": "one"}),
+            PutOp(("b",), "k2", {"text": "two"}),
+            PutOp(("a",), "k3", None),
+        ]
+    )
+    plan.write_id = "w-1"
+    rows = store._vector_rows(plan, [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    statements = store._write_statements(plan, rows)
+    history, items, vectors = store.sql.history, store.sql.items, store.sql.vectors
+    assert statement_kinds(statements) == [
+        f"INSERT {history}",
+        f"INSERT {history}",
+        f"INSERT {history}",
+        f"DELETE {vectors}",
+        f"DELETE {vectors}",
+        f"INSERT {items}",
+        f"INSERT {vectors}",
+        f"DELETE {items}",
+        f"DELETE {vectors}",
+    ]
+    # (invalid_at, reason, superseded_by, write_id, ttl_days, prefix, keys, write_id)
+    archives = [params for _, params in statements[:3]]
+    assert [(p[1], p[5], p[6]) for p in archives] == [
+        ("overwritten", "a", ["k1"]),
+        ("overwritten", "b", ["k2"]),
+        ("deleted", "a", ["k3"]),
+    ]
+    assert all(p[0] is None and p[2] is None and p[4] == 7.0 for p in archives)
+    assert all(p[3] == p[7] == "w-1" for p in archives)
+    # The upsert numbers a new row after its versions in history
+    assert f"FROM {history} AS h" in statements[5][0]
+
+    # Without a write id the table has no migration 2 yet: nothing to archive
+    plan.write_id = None
+    assert history not in " ".join(sql for sql, _ in store._write_statements(plan, rows))
+    # And without history the batch is the one it was
+    plain = make_base(fields=["text"])
+    plan.write_id = "w-1"
+    assert history not in " ".join(sql for sql, _ in plain._write_statements(plan, rows))
+
+
+# What delete_namespace(("user", "a")) sent in 0.5.1 on a store without an index
+ZERO_FIVE_DELETE_NAMESPACE = (
+    "DELETE FROM public.store\nWHERE (prefix = %s OR (prefix >= %s AND prefix < %s))\n"
+    "RETURNING key",
+    ["user.a", "user.a.", "user.a/"],
+)
+
+
+class HistoryTableReads:
+    """A stand-in for a store's _read_all that says whether the history table exists."""
+
+    def __init__(self, exists: bool) -> None:
+        self.exists = exists
+        self.calls: list[tuple[list[tuple[str, list]], str]] = []
+
+    def answer(self, statements: list[tuple[str, list]], label: str) -> list[list[dict]]:
+        self.calls.append((statements, label))
+        return [[{"ready": self.exists}]]
+
+
+class DeleteLog:
+    """A cursor for delete_namespace that records its statement and deletes nothing."""
+
+    def __init__(self, sent: list[tuple[str, list]]) -> None:
+        self.sent = sent
+
+    def execute(self, query: str, params: list) -> None:
+        self.sent.append((query, params))
+
+    def fetchall(self) -> list:
+        return []
+
+
+class AsyncDeleteLog(DeleteLog):
+    async def execute(self, query: str, params: list) -> None:  # type: ignore[override]
+        self.sent.append((query, params))
+
+    async def fetchall(self) -> list:  # type: ignore[override]
+        return []
+
+
+def deleting_store_without_history(
+    exists: bool,
+) -> tuple[CockroachDBStore, HistoryTableReads, list[tuple[str, list]]]:
+    """A store without history whose reads and delete statements are faked."""
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    reads = HistoryTableReads(exists)
+    sent: list[tuple[str, list]] = []
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    @contextlib.contextmanager
+    def fake_cursor(**kwargs: object) -> Iterator[DeleteLog]:
+        yield DeleteLog(sent)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    return store, reads, sent
+
+
+@pytest.mark.parametrize(
+    ("make", "method", "listing"),
+    [
+        ("sync", "delete_namespace", "list_namespaces"),
+        ("async", "adelete_namespace", "alist_namespaces"),
+    ],
+)
+async def test_delete_namespace_refuses_an_empty_prefix_before_any_io(
+    make: str, method: str, listing: str
+) -> None:
+    # A connection the store must never touch: using it would raise. The
+    # error names the method that was called, and how to clear a store on purpose
+    store = make_store(make)
+    with pytest.raises(
+        InvalidNamespaceError,
+        match=rf"^{method} needs a non-empty namespace prefix\. .* {listing}\(max_depth=1\)",
+    ):
+        await call(store, "delete_namespace", ())
+    with pytest.raises(InvalidNamespaceError):
+        await call(store, "delete_namespace", ("a.b",))
+
+
+def test_delete_namespace_without_history_looks_for_a_history_table_each_time() -> None:
+    store, reads, sent = deleting_store_without_history(exists=False)
+    assert store.delete_namespace(("user", "a")) == 0
+    assert store.delete_namespace(("user", "a")) == 0
+    # One read per call while there is no history table, and the 0.5.x statement
+    assert reads.calls == [([store.sql.history_exists()], "store history check")] * 2
+    assert sent == [ZERO_FIVE_DELETE_NAMESPACE] * 2
+    # The read leaves the schema check alone: its clock did not move, and
+    # plain writes never look for the table
+    assert store._schema_read_at == 0.0
+    assert store._schema_statements(read_migrations=True) == [
+        store.sql.reconcile_migration_recorded()
+    ]
+
+
+def test_delete_namespace_without_history_stops_looking_once_it_found_the_table() -> None:
+    store, reads, sent = deleting_store_without_history(exists=True)
+    store.delete_namespace(("user", "a"))
+    reads.exists = False
+    store.delete_namespace(("user", "a"))
+    # The table was seen, so the second call trusts it and deletes history too
+    assert len(reads.calls) == 1
+    assert sent == [store.sql.delete_namespace(("user", "a"), history=True)] * 2
+    # Plain writes still never look for it
+    assert store._cached_history(refresh=True) is False
+
+
+async def test_async_delete_namespace_without_history_looks_for_a_history_table() -> None:
+    store = AsyncCockroachDBStore(AsyncConnectionPool("", open=False), retry_policy=FAST)
+    reads = HistoryTableReads(exists=False)
+    sent: list[tuple[str, list]] = []
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    @contextlib.asynccontextmanager
+    async def fake_cursor(**kwargs: object) -> AsyncIterator[AsyncDeleteLog]:
+        yield AsyncDeleteLog(sent)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    store._cursor = fake_cursor  # type: ignore[method-assign,assignment]
+    assert await store.adelete_namespace(("user", "a")) == 0
+    assert sent == [ZERO_FIVE_DELETE_NAMESPACE]
+    # Once it finds the table it deletes history too, and stops looking
+    reads.exists = True
+    await store.adelete_namespace(("user", "a"))
+    await store.adelete_namespace(("user", "a"))
+    assert reads.calls == [([store.sql.history_exists()], "store history check")] * 2
+    assert sent[1:] == [store.sql.delete_namespace(("user", "a"), history=True)] * 2
+    assert store._schema_read_at == 0.0
+
+
+def test_a_put_refused_for_a_missing_history_table_costs_no_embedding_call() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        history=True,
+        retry_policy=FAST,
+    )
+    reads = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
+        store.put(("a",), "k", {"text": "x"})
+    assert embeddings.calls == 0
+    assert len(reads.calls) == 1
+
+
+async def test_async_put_refused_for_a_missing_history_table_costs_no_embedding_call() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        AsyncConnectionPool("", open=False),
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        history=True,
+        retry_policy=FAST,
+    )
+    reads = SchemaReads(columns=True, history=False)
+
+    async def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    store._read_all = read_all  # type: ignore[method-assign,assignment]
+    with pytest.raises(
+        ValueError, match=r"public\.store_history does not exist yet; run setup\(\)"
+    ):
+        await store.aput(("a",), "k", {"text": "x"})
+    assert embeddings.async_calls == 0
+    assert embeddings.calls == 0
+    assert len(reads.calls) == 1
+
+
 def test_cancelling_the_sweeper_future_stops_it_without_a_traceback(monkeypatch) -> None:
     store = CockroachDBStore(object(), ttl={"default_ttl": 1})  # type: ignore[arg-type]
     swept: list[int] = []
@@ -1200,3 +2892,3923 @@ def test_listing_bounds_prefix_conditions_to_their_literal_labels() -> None:
         ListNamespacesOp(match_conditions=(MatchCondition("prefix", ("*", "b")),))
     )
     assert params == [r"^[^.]+\.b(\.|\z)", 100, 0]
+
+
+# Candidates, find_conflicts and record
+
+NS = ("user", "alice")
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+TEXT = {"text": "x"}
+
+
+# Both stores plan, check and decide with the same code. The tests that take
+# ``make`` run on CockroachDBStore and on AsyncCockroachDBStore, whose
+# a-prefixed coroutines must send the same statements and return the same
+# results. The fakes below answer both: the async store awaits them through
+# AsyncCursorOf and attempts_on.
+
+
+def make_store(make: str, **settings: Any) -> CockroachDBStore | AsyncCockroachDBStore:
+    """A sync or async store with FAST retries, on a connection it must never touch.
+
+    Using the connection raises TypeError. An async store must be made in a
+    running event loop, as in an async test.
+    """
+    settings.setdefault("retry_policy", FAST)
+    if make == "sync":
+        return CockroachDBStore(object(), **settings)  # type: ignore[arg-type]
+    return AsyncCockroachDBStore(object(), **settings)  # type: ignore[arg-type]
+
+
+async def call(
+    store: CockroachDBStore | AsyncCockroachDBStore, name: str, *args: Any, **kwargs: Any
+) -> Any:
+    """Call method ``name`` of a sync store, or await its a-prefixed twin on an async store."""
+    if isinstance(store, AsyncCockroachDBStore):
+        return await getattr(store, f"a{name}")(*args, **kwargs)
+    return getattr(store, name)(*args, **kwargs)
+
+
+async def raised(
+    store: CockroachDBStore | AsyncCockroachDBStore,
+    name: str,
+    *args: Any,
+    timeout: float = 5.0,
+    **kwargs: Any,
+) -> BaseException | None:
+    """What ``call(store, name, ...)`` raised, or None if it returned.
+
+    A sync call runs in another thread (raised_within), so a call that hangs
+    fails the test instead of hanging it. An async call runs under
+    asyncio.wait_for, which stops one that waits, as for a lock, but cannot
+    stop one that blocks the event loop without awaiting: only pytest's
+    timeout ends that.
+    """
+    if isinstance(store, AsyncCockroachDBStore):
+        try:
+            await asyncio.wait_for(call(store, name, *args, **kwargs), timeout)
+        except Exception as error:  # noqa: BLE001
+            return error
+        return None
+    return raised_within(lambda: getattr(store, name)(*args, **kwargs), timeout)
+
+
+@contextlib.contextmanager
+def no_unawaited_coroutines() -> Iterator[None]:
+    """Fail if the block leaves a coroutine behind that was never awaited."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]
+
+
+def embedded(embeddings: CountingEmbeddings, make: str) -> int:
+    """The embedding calls a store made, all of its own kind.
+
+    A sync store calls the model's blocking methods, and an async store
+    awaits its async ones, so the other kind must have no calls.
+    """
+    if make == "sync":
+        assert embeddings.async_calls == 0
+        return embeddings.calls
+    assert embeddings.calls == 0
+    return embeddings.async_calls
+
+
+def reading(make: str, read_all: Callable[..., Any]) -> Callable[..., Any]:
+    """``read_all``, a stand-in for a store's _read_all, as the sync or async store calls it."""
+    if make == "sync":
+        return read_all
+
+    async def aread_all(
+        statements: list[tuple[str, list]], label: str, session: list[str] | None = None
+    ) -> Any:
+        return read_all(statements, label, session)
+
+    return aread_all
+
+
+def without_columns(store: CockroachDBStore | AsyncCockroachDBStore) -> None:
+    """Make the store's schema check find no migration 2, and check that it reads again."""
+
+    def no_columns(*, refresh: bool = False) -> bool:
+        assert refresh, "a method that needs migration 2 reads the schema again"
+        return False
+
+    async def ano_columns(*, refresh: bool = False) -> bool:
+        return no_columns(refresh=refresh)
+
+    if isinstance(store, AsyncCockroachDBStore):
+        store._areconcile_columns = ano_columns  # type: ignore[method-assign]
+    else:
+        store._reconcile_columns = no_columns  # type: ignore[method-assign]
+
+
+class AsyncCursorOf:
+    """A fake cursor of the sync fakes below, as the async store awaits it.
+
+    Each call goes to the fake as the sync store would make it, so both
+    stores' statements are logged and answered alike.
+    """
+
+    def __init__(self, fake: Any) -> None:
+        self.fake = fake
+
+    @property
+    def connection(self) -> "AsyncCursorOf":
+        return self
+
+    @property
+    def description(self) -> Any:
+        return self.fake.description
+
+    @property
+    def rowcount(self) -> int:
+        return self.fake.rowcount
+
+    def cursor(self, **kwargs: object) -> "AsyncCursorOf":
+        return AsyncCursorOf(self.fake.cursor(**kwargs))
+
+    async def execute(self, *args: Any, **kwargs: Any) -> None:
+        self.fake.execute(*args, **kwargs)
+
+    async def fetchall(self) -> list[dict[str, object]]:
+        return self.fake.fetchall()
+
+    async def close(self) -> None:
+        self.fake.close()
+
+
+def attempts_on(make: str, cursor: Callable[..., Any]) -> Callable[..., Any]:
+    """``cursor``, a fake of a store's _cursor, as the sync or async store enters it.
+
+    The async form runs each attempt in the sync fake, so an error the fake
+    raises as an attempt ends reaches both stores the same way.
+    """
+    if make == "sync":
+        return cursor
+
+    @contextlib.asynccontextmanager
+    async def acursor(**kwargs: object) -> AsyncIterator[AsyncCursorOf]:
+        with cursor(**kwargs) as fake:
+            yield AsyncCursorOf(fake)
+
+    return acursor
+
+
+def proposal_store(distance: str | None = "cosine", *, ttl=None) -> BaseCockroachDBStore:
+    """Shared store state with a 3-dimension index of the given distance, or no index."""
+    store = BaseCockroachDBStore()
+    index = None
+    if distance is not None:
+        index = resolve_index_config(
+            {
+                "dims": 3,
+                "embed": CountingEmbeddings(),
+                "fields": ["text"],
+                "distance_type": distance,  # type: ignore[typeddict-item]
+            }
+        )
+    store._configure(index=index, ttl=ttl, table_name="store", schema="public")
+    return store
+
+
+def plan_proposal(store: BaseCockroachDBStore, value: object = TEXT, **kwargs) -> ProposalPlan:
+    """_plan_proposal with the find_conflicts defaults, under NS and key "k" unless given."""
+    arguments: dict = {
+        "slot": None,
+        "threshold": None,
+        "limit": 10,
+        "filter": None,
+        "index": None,
+        "ttl": NOT_PROVIDED,
+        "provenance": None,
+        "valid_at": None,
+        "method": "find_conflicts",
+    }
+    arguments.update(kwargs)
+    namespace = arguments.pop("namespace", NS)
+    key = arguments.pop("key", "k")
+    return store._plan_proposal(namespace, key, value, **arguments)  # type: ignore[arg-type]
+
+
+def test_plan_proposal_threshold_rules() -> None:
+    cosine = proposal_store("cosine")
+    # A cosine score is 1 minus the distance: the default is 0.8, and any
+    # threshold lies between -1 and 1
+    assert plan_proposal(cosine).threshold == 0.8
+    for threshold in (-1, -0.5, 0, 0.95, 1):
+        assert plan_proposal(cosine, threshold=threshold).threshold == float(threshold)
+    for bad in (1.5, -1.01, math.nan, math.inf, True, "0.9"):
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(cosine, threshold=bad)
+
+    # l2 and inner product scores are negated distances: no default fits
+    for distance in ("l2", "inner_product"):
+        store = proposal_store(distance)
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(store)
+        assert plan_proposal(store, threshold=-0.6).threshold == -0.6
+        assert plan_proposal(store, threshold=3).threshold == 3.0
+        with pytest.raises(ValueError, match="threshold"):
+            plan_proposal(store, threshold=math.nan)
+
+    # Without an index, or with index=False, no similar candidates are
+    # searched, so the threshold is ignored
+    for store, extra in ((proposal_store(None), {}), (proposal_store("l2"), {"index": False})):
+        for threshold in (None, 1.5, "0.9"):
+            assert plan_proposal(store, threshold=threshold, **extra).threshold is None
+
+
+def test_plan_proposal_slot_rules() -> None:
+    store = proposal_store("cosine")
+    for slot_value, as_json in (
+        ("x", '"x"'),
+        ("it's", '"it\'s"'),
+        (42, "42"),
+        (1.5, "1.5"),
+        (True, "true"),
+        (False, "false"),
+    ):
+        plan = plan_proposal(store, {"seat": slot_value, "text": "x"}, slot="seat")
+        assert (plan.slot, plan.slot_value, plan.slot_value_json) == ("seat", slot_value, as_json)
+    plan = plan_proposal(store)
+    assert (plan.slot, plan.slot_value, plan.slot_value_json) == (None, None, None)
+
+    # The slot must name a top-level field of the value, holding a string,
+    # number or boolean
+    with pytest.raises(ValueError, match="seat"):
+        plan_proposal(store, {"text": "x"}, slot="seat")
+    with pytest.raises(ValueError, match="seat"):
+        plan_proposal(store, {"text": "x", "nested": {"seat": "x"}}, slot="seat")
+    for bad in ({"a": 1}, [1, 2], None):
+        with pytest.raises(ValueError, match="seat"):
+            plan_proposal(store, {"seat": bad, "text": "x"}, slot="seat")
+    with pytest.raises(ValueError, match="slot"):
+        plan_proposal(store, {"1": "x"}, slot=1)
+    # A value that is not JSON fails first, so a NaN or infinite slot value does too
+    for bad in (math.nan, math.inf):
+        with pytest.raises(ValueError, match="JSON"):
+            plan_proposal(store, {"seat": bad, "text": "x"}, slot="seat")
+
+
+def test_plan_proposal_valid_at_must_be_aware() -> None:
+    store = proposal_store("cosine")
+    aware = datetime(2026, 3, 1, 12, tzinfo=timezone(timedelta(hours=-5)))
+    assert plan_proposal(store, valid_at=aware).valid_at == aware
+    # Without one, the database's clock gives the valid time once the
+    # candidates are read (default_valid_at)
+    assert plan_proposal(store).valid_at is None
+    for bad in (
+        datetime(2026, 3, 1, 12),
+        "2026-03-01T12:00:00+00:00",
+        date(2026, 3, 1),
+        1767225600,
+    ):
+        with pytest.raises(ValueError, match="valid_at"):
+            plan_proposal(store, valid_at=bad)
+
+
+def test_plan_proposal_plans_one_put_with_a_write_id() -> None:
+    store = proposal_store("cosine", ttl={"default_ttl": 30.0})
+    plan = plan_proposal(
+        store,
+        {"text": "x", "pair": (1, 2)},
+        key=None,
+        provenance={"source": "chat", "turns": (3,)},
+    )
+    uuid.UUID(plan.key)  # a uuid4 when no key is given
+    assert (plan.namespace, plan.prefix) == (NS, "user.alice")
+    # The value and the provenance as their JSON reads back
+    assert plan.value == {"text": "x", "pair": [1, 2]}
+    assert json.loads(plan.value_json) == plan.value
+    assert plan.provenance == {"source": "chat", "turns": [3]}
+    assert plan.provenance_json is not None
+    assert json.loads(plan.provenance_json) == plan.provenance
+    # One put with the store's default TTL, the write id and the texts to embed
+    assert plan.ttl == 30.0
+    assert plan.put.items == [("user.alice", plan.key, plan.value_json, 30.0)]
+    assert plan.put.write_id is not None
+    uuid.UUID(plan.put.write_id)
+    assert plan.put.write_id != plan_proposal(store).put.write_id
+    assert plan.embed_requests == [("user.alice", plan.key, "text", "x")]
+    assert plan.put.reindexed == {"user.alice": [plan.key]}
+    assert (plan.limit, plan.filter, plan.index) == (10, None, None)
+
+    # Keys become strings, as put makes them
+    assert plan_proposal(store, key=7).key == "7"
+    assert plan_proposal(store, ttl=None).ttl is None
+    assert plan_proposal(store, ttl=5).put.items[0][3] == 5
+    assert plan_proposal(store, provenance=None).provenance_json is None
+    assert plan_proposal(store, limit=0).limit == 0
+    assert plan_proposal(store, filter={"source": "chat"}).filter == {"source": "chat"}
+    assert plan_proposal(store, index=False).embed_requests == []
+    other = plan_proposal(store, {"text": "x", "other": "y"}, index=["other"])
+    assert other.embed_requests == [("user.alice", "k", "other", "y")]
+    assert plan_proposal(proposal_store(None)).embed_requests == []
+
+    for kwargs, match in (
+        ({"ttl": 0}, "ttl"),
+        ({"ttl": -1}, "ttl"),
+        ({"ttl": math.inf}, "ttl"),
+        ({"ttl": "5"}, "ttl"),
+        ({"ttl": True}, "ttl"),
+        ({"provenance": ["chat"]}, "provenance"),
+        ({"provenance": {"x": object()}}, "provenance"),
+        ({"provenance": {"x": math.nan}}, "provenance"),
+        ({"limit": -1}, "limit must be non-negative"),
+        ({"limit": 1.5}, "limit"),
+        ({"limit": True}, "limit"),
+        ({"filter": {"x": {"$bad": 1}}}, "Unknown filter operator"),
+        ({"filter": ["x"]}, "filter"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            plan_proposal(store, **kwargs)
+    for bad_value in (None, ["x"], "x"):
+        with pytest.raises(ValueError, match="value"):
+            plan_proposal(store, bad_value)
+    with pytest.raises(ValueError, match="JSON"):
+        plan_proposal(store, {"x": object()})
+    with pytest.raises(InvalidNamespaceError, match="find_conflicts"):
+        plan_proposal(store, namespace=())
+    with pytest.raises(InvalidNamespaceError):
+        plan_proposal(store, namespace=("a.b",))
+
+
+def candidate_row(
+    key: str,
+    *,
+    score: float | None = None,
+    version: int = 1,
+    updated_at: datetime = T0,
+    valid_at: datetime | None = None,
+) -> dict[str, object]:
+    """A row of a candidate statement; similar rows carry a score."""
+    row: dict[str, object] = {
+        "key": key,
+        "value": {"text": key},
+        "created_at": T0,
+        "updated_at": updated_at,
+        "version": version,
+        "valid_at": updated_at if valid_at is None else valid_at,
+        "provenance": {"source": key},
+        "confirmed_at": None,
+        "confirmations": version - 1,
+        "confirm_id": None,
+    }
+    if score is not None:
+        row["score"] = score
+    return row
+
+
+def written_row(key: str, version: int) -> dict[str, object]:
+    """A row of StoreSQL.applied_items: an item that carries the call's write id, written by it."""
+    return {"key": key, "version": version, "written": True, "confirmed": False}
+
+
+def confirmed_row(key: str, version: int = 1) -> dict[str, object]:
+    """A row of StoreSQL.applied_items: an item that carries the call's id as its confirm id."""
+    return {"key": key, "version": version, "written": False, "confirmed": True}
+
+
+def test_merge_candidates_orders_and_caps() -> None:
+    key_slot = [candidate_row("s2"), candidate_row("k", version=3), candidate_row("s1")]
+    # Scores of the key and slot candidates, one list per proposal vector
+    scores = [
+        [{"key": "k", "score": 0.2}, {"key": "s1", "score": 0.5}],
+        [{"key": "s1", "score": 0.7}],
+    ]
+    similar = [
+        [
+            candidate_row("a", score=0.6),
+            candidate_row("c", score=0.85),
+            candidate_row("d", score=0.8),
+        ],
+        [
+            candidate_row("a", score=0.95),
+            candidate_row("b", score=0.85),
+            candidate_row("s1", score=0.75),
+        ],
+    ]
+    found = merge_candidates(NS, "k", key_slot, scores, similar, limit=2)
+    # Key, then slot, then similar; best score first; then by key. A slot
+    # match without a vector has no score and comes after the scored ones
+    assert [(c.key, c.reason, c.score) for c in found] == [
+        ("k", "key", 0.2),
+        ("s1", "slot", 0.75),
+        ("s2", "slot", None),
+        ("a", "similar", 0.95),
+        ("b", "similar", 0.85),
+    ]
+    assert all(isinstance(c, Candidate) and c.item.namespace == NS for c in found)
+    target = found[0]
+    assert (target.version, target.provenance, target.confirmations) == (3, {"source": "k"}, 2)
+    assert (target.valid_at, target.confirmed_at, target.item.value) == (T0, None, {"text": "k"})
+
+    # The limit caps the similar candidates only: key and slot matches stay
+    assert [c.key for c in merge_candidates(NS, "k", key_slot, scores, similar, limit=0)] == [
+        "k",
+        "s1",
+        "s2",
+    ]
+    assert [c.key for c in merge_candidates(NS, "k", key_slot, scores, similar, limit=9)] == [
+        "k",
+        "s1",
+        "s2",
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    # The target comes by its key alone: a similar row under the proposal's
+    # key that the key read did not find is left out
+    late = [[candidate_row("k", score=0.99), candidate_row("a", score=0.9)]]
+    assert [c.key for c in merge_candidates(NS, "k", [], [], late, limit=5)] == ["a"]
+    # Negated distances (l2, inner product) order the same way
+    far_near = [[candidate_row("far", score=-0.9), candidate_row("near", score=-0.1)]]
+    assert [c.key for c in merge_candidates(NS, "new", [], [], far_near, limit=5)] == [
+        "near",
+        "far",
+    ]
+    assert merge_candidates(NS, "new", [], [], [], limit=5) == ()
+
+
+def test_default_valid_at_is_raised_to_a_later_candidate_update() -> None:
+    rows = [
+        candidate_row("old", updated_at=NOW - timedelta(days=1)),
+        candidate_row("ahead", updated_at=NOW + timedelta(seconds=5)),
+    ]
+    found = merge_candidates(NS, "new", rows, [], [], limit=10)
+    # A node whose clock runs ahead wrote "ahead" after the database's now():
+    # the proposal's valid time is not older than that write
+    assert default_valid_at(NOW, found) == NOW + timedelta(seconds=5)
+    assert default_valid_at(NOW, [c for c in found if c.key == "old"]) == NOW
+    assert default_valid_at(NOW, ()) == NOW
+
+
+def test_default_valid_at_never_takes_a_candidate_valid_at() -> None:
+    # A caller gave this memory a valid time a year ahead. It still counts as
+    # newer than the proposal, so the default is not raised to it
+    row = candidate_row(
+        "future", updated_at=NOW - timedelta(hours=1), valid_at=NOW + timedelta(days=365)
+    )
+    found = merge_candidates(NS, "new", [row], [], [], limit=10)
+    assert default_valid_at(NOW, found) == NOW
+    assert found[0].valid_at > default_valid_at(NOW, found)
+
+
+# A row of the index form of StoreSQL.similar_candidates when no candidate passes
+NO_HIT: dict[str, object] = dict.fromkeys(
+    [
+        "key",
+        "value",
+        "created_at",
+        "updated_at",
+        "version",
+        "valid_at",
+        "provenance",
+        "confirmed_at",
+        "confirmations",
+        "confirm_id",
+        "score",
+    ]
+)
+
+
+def window_rows(
+    hits: list[dict[str, object]],
+    *,
+    size: int = 21,
+    lowest: float | None = 0.0,
+    held: int | None = None,
+) -> list[dict[str, object]]:
+    """The rows of an index scan: its hits, or one row without a candidate, with the window.
+
+    ``held`` is the namespace's vectors counted up to over_fetch (default: the window's size).
+    """
+    window = {
+        "window_size": size,
+        "lowest_score": lowest,
+        "namespace_vectors": size if held is None else held,
+    }
+    return [{**row, **window} for row in hits] or [{**NO_HIT, **window}]
+
+
+class CandidateReads:
+    """Answers the read groups of find_conflicts with canned rows, and logs them.
+
+    The first group gets the database's now(), ``rows`` for the key and slot
+    statement and ``vectors`` for the count when sent. In the second, score
+    statements get ``scores`` and similar statements ``similar``. An index
+    scan's rows carry a window of 21 vectors whose lowest score is
+    ``lowest``. An exact scan run again gets ``exact``.
+    """
+
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, object]],
+        vectors: int = 0,
+        scores: list[dict[str, object]] | None = None,
+        similar: list[dict[str, object]] | None = None,
+        lowest: float | None = 0.0,
+        exact: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.rows = rows
+        self.vectors = vectors
+        self.scores = scores or []
+        self.similar = similar or []
+        self.lowest = lowest
+        self.exact = exact or []
+        self.calls: list[tuple[str, list[tuple[str, list]], list[str] | None]] = []
+
+    def __call__(
+        self, statements: list[tuple[str, list]], label: str, session: list[str] | None = None
+    ) -> list[list[dict[str, object]]]:
+        self.calls.append((label, statements, session))
+        if label == "store find conflicts":
+            found = [[{"now": NOW}], self.rows]
+            return [*found, [{"n": self.vectors}]] if len(statements) == 3 else found
+        if label == "store find conflicts exact":
+            return [self.exact for _ in statements]
+        assert label == "store find conflicts similar"
+        answers = []
+        for sql, _ in statements:
+            if sql.startswith("SELECT key,"):
+                answers.append(self.scores)
+            elif "window_stats" in sql:
+                answers.append(window_rows(self.similar, lowest=self.lowest))
+            else:
+                answers.append(self.similar)
+        return answers
+
+
+def finding_store(
+    reads: CandidateReads,
+    *,
+    index: dict | None = None,
+    make: str = "sync",
+    embeddings: CountingEmbeddings | None = None,
+    **settings: object,
+) -> tuple[Any, CountingEmbeddings]:
+    """A sync or async store with an index whose reads go to ``reads``, after migration 2.
+
+    It embeds with ``embeddings``, a new CountingEmbeddings by default.
+    """
+    embeddings = embeddings or CountingEmbeddings()
+    store = make_store(
+        make,
+        index={"dims": 3, "embed": embeddings, "fields": ["text"], **(index or {})},
+        **settings,
+    )
+    store._columns_ready = True  # migration 2 seen: no schema read
+    store._read_all = reading(make, reads)  # type: ignore[method-assign]
+    return store, embeddings
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize(("vectors", "scan"), [(5, "exact"), (6, "index")])
+async def test_find_conflicts_reads_twice_and_scans_by_the_count(
+    vectors: int, scan: str, make: str
+) -> None:
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=vectors,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95), candidate_row("b", score=0.85)],
+    )
+    store, embeddings = finding_store(
+        reads, index={"beam_size": 16}, reconcile_scan_limit=5, make=make
+    )
+    conflicts = await call(
+        store,
+        "find_conflicts",
+        NS,
+        "k",
+        {"seat": "x", "text": "aisle"},
+        slot="seat",
+        filter={"source": "chat"},
+    )
+    # One embedding call, of the document form a write stores
+    assert embedded(embeddings, make) == 1
+    assert embeddings.texts == ["aisle"]
+    [(first_label, first, first_session), (second_label, second, second_session)] = reads.calls
+    # First the clock, the target and slot matches, and the namespace's
+    # vectors counted up to one past the scan limit
+    assert (first_label, first_session) == ("store find conflicts", None)
+    assert first == [
+        store.sql.now(),
+        store.sql.key_slot_candidates(
+            "user.alice", "k", slot_field="seat", slot_value_json='"x"', filter={"source": "chat"}
+        ),
+        store.sql.namespace_vector_count("user.alice", 6),
+    ]
+    # Then, with the scan the count chose, the scores of the key and slot
+    # candidates and the similar ones, which leave those keys out
+    vector = [5.0, 0.0, 0.0]  # CountingEmbeddings: the length of "aisle"
+    assert second_label == "store find conflicts similar"
+    assert second == [
+        StoreSQL.bind_query_vector(store.sql.candidate_scores("user.alice", ["k", "s"]), vector),
+        StoreSQL.bind_query_vector(
+            store.sql.similar_candidates(
+                "user.alice",
+                threshold=0.8,
+                limit=10,
+                filter={"source": "chat"},
+                scan=scan,  # type: ignore[arg-type]
+                # The store search's window for the limit, and room for
+                # the vectors of the two excluded keys
+                over_fetch=10 * 1 * 2 + 1 + 2 * 1,
+                exclude=["k", "s"],
+            ),
+            vector,
+        ),
+    ]
+    # Only the index scan sets the beam size, in its read's transaction
+    assert second_session == (["SET LOCAL vector_search_beam_size = 16"] if scan == "index" else [])
+
+    assert [(c.key, c.reason, c.score) for c in conflicts.candidates] == [
+        ("k", "key", 0.2),
+        ("s", "slot", 0.9),
+        ("a", "similar", 0.95),
+        ("b", "similar", 0.85),
+    ]
+    assert (conflicts.target_version, conflicts.target_updated_at) == (3, T0)
+    proposal = conflicts.proposal
+    assert (proposal.namespace, proposal.key, proposal.slot, proposal.slot_value) == (
+        NS,
+        "k",
+        "seat",
+        "x",
+    )
+    assert proposal.value == {"seat": "x", "text": "aisle"} and proposal.provenance is None
+    # No valid_at was given: the database's now(), as no candidate is newer
+    assert proposal.valid_at == NOW
+    state = conflicts._state
+    assert state is not None
+    assert state.plan.valid_at is None and state.plan.key == "k"
+    assert state.vector_rows == (("user.alice", "k", "text", vector, None),)
+    assert state.target == (3, T0)
+    assert state.tokens == {"k": (3, T0), "s": (1, T0), "a": (1, T0), "b": (1, T0)}
+    assert state.store == StoreIdentity(
+        items="public.store", dims=3, distance="cosine", fields=("text",)
+    )
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_find_conflicts_skips_the_reads_it_does_not_need(make: str) -> None:
+    # No text to embed: no embedding call, no count and no second read
+    reads = CandidateReads(rows=[candidate_row("s")])
+    store, embeddings = finding_store(reads, make=make)
+    conflicts = await call(store, "find_conflicts", NS, None, {"seat": "x"}, slot="seat")
+    assert embedded(embeddings, make) == 0
+    [(_, first, _)] = reads.calls
+    assert first[0] == store.sql.now() and len(first) == 2
+    assert [(c.key, c.score) for c in conflicts.candidates] == [("s", None)]
+    assert conflicts.target_version is None and conflicts.target_updated_at is None
+    assert conflicts._state is not None and conflicts._state.target is None
+
+    # index=False on the call: nothing to embed either
+    reads = CandidateReads(rows=[])
+    store, embeddings = finding_store(reads, make=make)
+    await call(store, "find_conflicts", NS, "k", {"text": "t"}, index=False)
+    assert embedded(embeddings, make) == 0 and len(reads.calls) == 1
+
+    # limit=0 searches no similar candidates, so it counts nothing, but it
+    # still scores the key and slot candidates
+    reads = CandidateReads(rows=[candidate_row("s")], scores=[{"key": "s", "score": 0.5}])
+    store, _ = finding_store(reads, make=make)
+    conflicts = await call(
+        store, "find_conflicts", NS, None, {"seat": "x", "text": "t"}, slot="seat", limit=0
+    )
+    [(_, first, _), (_, second, _)] = reads.calls
+    assert len(first) == 2
+    assert [sql.split("\n")[0] for sql, _ in second] == [
+        "SELECT key, 1 - min(embedding <=> CAST(%s AS VECTOR)) AS score"
+    ]
+    assert [(c.key, c.score) for c in conflicts.candidates] == [("s", 0.5)]
+
+    # Nothing found and limit=0: one read
+    reads = CandidateReads(rows=[])
+    store, _ = finding_store(reads, make=make)
+    found = await call(store, "find_conflicts", NS, "k", {"text": "t"}, limit=0)
+    assert found.candidates == ()
+    assert len(reads.calls) == 1
+
+    # A flat store has no index to choose: no count, and the exact scan
+    reads = CandidateReads(rows=[], similar=[candidate_row("a", score=0.9)])
+    store, _ = finding_store(reads, index={"flat": True}, make=make)
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "t"})
+    [(_, first, _), (_, [similar], _)] = reads.calls
+    assert len(first) == 2
+    assert "GROUP BY i.prefix, i.key" in similar[0]
+    assert [c.key for c in conflicts.candidates] == ["a"]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_find_conflicts_takes_an_explicit_valid_at_as_given(make: str) -> None:
+    newer = candidate_row("s", updated_at=NOW + timedelta(minutes=1))
+    reads = CandidateReads(rows=[newer])
+    store, _ = finding_store(reads, make=make)
+    old = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    conflicts = await call(
+        store, "find_conflicts", NS, None, {"seat": "x"}, slot="seat", valid_at=old
+    )
+    assert conflicts.proposal.valid_at == old
+    assert conflicts._state is not None and conflicts._state.plan.valid_at == old
+    # Without one, the valid time is raised to the newer candidate's update
+    reads = CandidateReads(rows=[newer])
+    store, _ = finding_store(reads, make=make)
+    conflicts = await call(store, "find_conflicts", NS, None, {"seat": "x"}, slot="seat")
+    assert conflicts.proposal.valid_at == NOW + timedelta(minutes=1)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_find_conflicts_and_record_check_everything_before_any_io(make: str) -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise
+    store = make_store(
+        make, index={"dims": 3, "embed": embeddings, "fields": ["text"], "distance_type": "l2"}
+    )
+    for check in (
+        lambda: call(store, "find_conflicts", (), "k", TEXT, threshold=-1.0),
+        lambda: call(store, "find_conflicts", NS, "k", TEXT),
+        lambda: call(store, "find_conflicts", NS, "k", TEXT, threshold=-1.0, slot="seat"),
+        lambda: call(store, "find_conflicts", NS, "k", TEXT, threshold=-1.0, limit=-1),
+        lambda: call(
+            store, "find_conflicts", NS, "k", TEXT, threshold=-1.0, valid_at=datetime(2026, 1, 1)
+        ),
+        lambda: call(store, "find_conflicts", NS, "k", TEXT, threshold=-1.0, provenance="chat"),
+        lambda: call(store, "record", (), "k"),
+        lambda: call(store, "record", ("a.b",), "k"),
+    ):
+        with pytest.raises(ValueError):
+            await check()
+    assert embedded(embeddings, make) == 0
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    without_columns(store)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "find_conflicts", NS, "k", TEXT, threshold=-1.0)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "record", NS, "k")
+    assert embedded(embeddings, make) == 0
+
+
+async def test_reconcile_scan_limit_is_a_positive_int_on_both_stores() -> None:
+    assert CockroachDBStore(object()).reconcile_scan_limit == 2000  # type: ignore[arg-type]
+    assert CockroachDBStore(object(), reconcile_scan_limit=1).reconcile_scan_limit == 1  # type: ignore[arg-type]
+    pool = AsyncConnectionPool("", open=False)
+    assert AsyncCockroachDBStore(pool, reconcile_scan_limit=7).reconcile_scan_limit == 7
+    for bad in (0, -1, 1.5, True, "10", None):
+        with pytest.raises(ValueError, match="reconcile_scan_limit"):
+            CockroachDBStore(object(), reconcile_scan_limit=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="reconcile_scan_limit"):
+            AsyncCockroachDBStore(pool, reconcile_scan_limit=bad)  # type: ignore[arg-type]
+
+
+def test_the_index_window_makes_room_for_the_excluded_keys() -> None:
+    # The excluded keys, the new memory's own and the key and slot matches,
+    # are left out of the similar candidates, but their vectors still take
+    # places in the index's window. Each takes an item's estimated vectors
+    store = proposal_store()
+    store.reconcile_scan_limit = 5
+    plan = plan_proposal(store, {"text": "aisle", "seat": "x"}, slot="seat", limit=4)
+    vector_rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    rows = [candidate_row(key) for key in ("k", "s1", "s2", "s3")]
+    read = store_base.KeySlotRead(now=NOW, rows=rows, vectors=6)
+
+    similar = store._similar_read(plan, vector_rows, read)
+
+    assert store.index is not None and store.index.estimated_vectors == 1
+    # The store search's window for the limit, 4 * 1 * 2 + 1, and the four
+    # excluded keys' vectors
+    assert similar.over_fetch == 4 * 1 * 2 + 1 + 4 * 1
+    [indexed] = similar.similar
+    assert indexed[1].count(similar.over_fetch) == 2  # the window and the count's cap
+    # A new key is excluded too, so a target-less proposal makes room for itself
+    plan = plan_proposal(store, {"text": "aisle", "seat": "x"}, key="new", slot="seat", limit=4)
+    similar = store._similar_read(plan, vector_rows, read)
+    assert similar.over_fetch == 4 * 1 * 2 + 1 + 5 * 1
+
+
+def test_needs_exact_candidates() -> None:
+    hit = candidate_row("a", score=0.9)
+    other = candidate_row("b", score=0.88)
+
+    def needs(
+        rows: list[dict[str, object]],
+        *,
+        threshold: float = 0.8,
+        limit: int = 10,
+        over_fetch: int = 21,
+    ) -> bool:
+        return needs_exact_candidates(rows, threshold=threshold, limit=limit, over_fetch=over_fetch)
+
+    # The window's lowest score is below the threshold: every vector beyond it
+    # scores lower still, up to the index's approximation, so nothing is missing
+    assert not needs(window_rows([], lowest=0.5))
+    assert not needs(window_rows([hit], lowest=0.79))
+    # At or above the threshold, matches may lie beyond the window: the filter,
+    # the expiry check or the excluded keys may have taken every place in it
+    assert needs(window_rows([], lowest=0.8))
+    assert needs(window_rows([], lowest=0.95))
+    assert needs(window_rows([hit], lowest=0.85))
+    # Unless the window already filled the limit: a vector beyond it scores no
+    # higher than its lowest, so it cannot outrank any of those hits
+    assert not needs(window_rows([hit, other], lowest=0.85), limit=2)
+    assert not needs(window_rows([hit], lowest=0.95), limit=1)
+    # Fewer hits than the limit with the lowest score at or above the
+    # threshold: the exact scan runs
+    assert needs(window_rows([hit], lowest=0.85), limit=2)
+    assert needs(window_rows([hit, other], lowest=0.8), limit=3)
+    # A window the index cut short, with fewer rows than over_fetch while the
+    # namespace holds more: vectors it never reached may score higher than its
+    # lowest, so it runs again unless it filled the limit
+    assert needs(window_rows([], size=15, lowest=0.5, held=21))
+    assert needs(window_rows([hit], size=15, lowest=0.5, held=21), limit=2)
+    assert not needs(window_rows([hit], size=15, lowest=0.5, held=21), limit=1)
+    # A window smaller than over_fetch because the namespace holds no more is
+    # whole: the lowest score decides
+    assert not needs(window_rows([hit], size=5, lowest=0.5, held=5))
+    assert needs(window_rows([hit], size=5, lowest=0.85, held=5))
+    # An empty window tells nothing about the namespace
+    assert needs(window_rows([], size=0, lowest=None))
+    assert needs([])
+    # Negated distances (l2, inner product) compare the same way
+    assert not needs(window_rows([], lowest=-0.9), threshold=-0.6)
+    assert needs(window_rows([], lowest=-0.5), threshold=-0.6)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_find_conflicts_runs_the_exact_scan_where_the_window_may_hide_matches(
+    make: str,
+) -> None:
+    # Two vectors: "aaaaa" embeds to [5, 0, 0] and "bbbbbbb" to [7, 0, 0]. The
+    # first vector's window ends above the threshold with no hit, so it may
+    # hide matches; the second's ends below it
+    def windows(statements: list[tuple[str, list]]) -> list[list[dict[str, object]]]:
+        by_vector = {
+            "[5.0,0.0,0.0]": window_rows([], lowest=0.9),
+            "[7.0,0.0,0.0]": window_rows([candidate_row("b", score=0.85)], lowest=0.3),
+        }
+        return [by_vector[params[0]] for _, params in statements]
+
+    calls: list[tuple[str, list[tuple[str, list]], list[str] | None]] = []
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: list[str] | None = None
+    ) -> list[list[dict[str, object]]]:
+        calls.append((label, statements, session))
+        if label == "store find conflicts":
+            return [[{"now": NOW}], [], [{"n": 6}]]
+        if label == "store find conflicts similar":
+            return windows(statements)
+        assert label == "store find conflicts exact"
+        return [[candidate_row("a", score=0.82)] for _ in statements]
+
+    store, _ = finding_store(
+        read_all,  # type: ignore[arg-type]
+        index={"fields": ["text", "note"]},
+        reconcile_scan_limit=5,
+        make=make,
+    )
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "aaaaa", "note": "bbbbbbb"})
+
+    assert [label for label, _, _ in calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+        "store find conflicts exact",
+    ]
+    # One more round trip, with the exact form of the first vector's statement only
+    exact = store.sql.similar_candidates(
+        "user.alice",
+        threshold=0.8,
+        limit=10,
+        filter=None,
+        scan="exact",
+        over_fetch=10 * 2 * 2 + 1 + 1 * 2,
+        exclude=["k"],
+    )
+    _, sent, session = calls[2]
+    assert sent == [StoreSQL.bind_query_vector(exact, [5.0, 0.0, 0.0])]
+    assert session is None
+    # The exact rows replace that window's empty result; the other window's hit stays
+    assert [(c.key, c.reason, c.score) for c in conflicts.candidates] == [
+        ("b", "similar", 0.85),
+        ("a", "similar", 0.82),
+    ]
+
+    # When every window ends below the threshold, the index result stands
+    reads = CandidateReads(rows=[], vectors=6, similar=[candidate_row("b", score=0.85)])
+    store, _ = finding_store(reads, reconcile_scan_limit=5, make=make)
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "aisle"})
+    assert [label for label, _, _ in reads.calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
+    assert [c.key for c in conflicts.candidates] == ["b"]
+
+    # A window that ends above the threshold but already filled the limit:
+    # nothing beyond it can outrank its hits, so the index result stands too
+    hits = [candidate_row("a", score=0.95), candidate_row("b", score=0.9)]
+    reads = CandidateReads(rows=[], vectors=6, similar=hits, lowest=0.85)
+    store, _ = finding_store(reads, reconcile_scan_limit=5, make=make)
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "aisle"}, limit=2)
+    assert [label for label, _, _ in reads.calls] == [
+        "store find conflicts",
+        "store find conflicts similar",
+    ]
+    assert [c.key for c in conflicts.candidates] == ["a", "b"]
+    # One hit short of the limit, the exact scan runs
+    reads = CandidateReads(rows=[], vectors=6, similar=hits, lowest=0.85)
+    store, _ = finding_store(reads, reconcile_scan_limit=5, make=make)
+    await call(store, "find_conflicts", NS, "k", {"text": "aisle"}, limit=3)
+    assert [label for label, _, _ in reads.calls][-1] == "store find conflicts exact"
+
+    # A window that ends above the threshold with nothing beyond it: the exact
+    # scan finds nothing either, and the empty row of the window is no candidate
+    reads = CandidateReads(rows=[], vectors=6, lowest=0.9)
+    store, _ = finding_store(reads, reconcile_scan_limit=5, make=make)
+    found = await call(store, "find_conflicts", NS, "k", {"text": "aisle"})
+    assert found.candidates == ()
+    assert [label for label, _, _ in reads.calls][-1] == "store find conflicts exact"
+
+
+def test_conflicts_record_which_store_made_them() -> None:
+    def identity(**settings: object) -> StoreIdentity:
+        store = CockroachDBStore(object(), retry_policy=FAST, **settings)  # type: ignore[arg-type]
+        return store._identity()
+
+    index = {"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]}
+    base = identity(index=index, table_name="memories")
+    assert base == StoreIdentity(
+        items="public.memories", dims=3, distance="cosine", fields=("text",)
+    )
+    # The same table and index make the same store, whatever else differs
+    assert identity(index={**index, "embed": CountingEmbeddings()}, table_name="memories") == base
+    assert identity(index=index, table_name="memories", history=True) == base
+    # Another table, schema, dims, distance or fields make another store
+    others = [
+        identity(index=index, table_name="other"),
+        identity(index=index, table_name="memories", schema="app"),
+        identity(index={**index, "dims": 4}, table_name="memories"),
+        identity(index={**index, "distance_type": "l2"}, table_name="memories"),
+        identity(index={**index, "fields": ["text", "note"]}, table_name="memories"),
+        identity(table_name="memories"),
+    ]
+    assert all(other != base for other in others)
+    assert len(set(others)) == len(others)
+    assert others[-1] == StoreIdentity(
+        items="public.memories", dims=None, distance=None, fields=None
+    )
+
+
+def test_conflicts_survive_a_checkpoint_round_trip() -> None:
+    # An interrupt while a person decides keeps the Conflicts in a LangGraph
+    # checkpoint. The serializer gives tuples back as lists; the types restore them
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=6,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95)],
+    )
+    store, _ = finding_store(reads, reconcile_scan_limit=5, ttl={"default_ttl": 30.0})
+    conflicts = store.find_conflicts(
+        NS,
+        "k",
+        {"seat": "x", "text": "aisle"},
+        slot="seat",
+        index=["text"],
+        provenance={"source": "chat"},
+        valid_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+
+    assert back == conflicts
+    assert back._state == conflicts._state
+    state, plan = back._state, back._state.plan
+    assert isinstance(back.candidates, tuple) and isinstance(back.proposal.namespace, tuple)
+    assert state.store == store._identity() and isinstance(state.store.fields, tuple)
+    assert state.target == (3, T0) and state.tokens["s"] == (1, T0)
+    assert state.vector_rows == (("user.alice", "k", "text", [5.0, 0.0, 0.0], 30.0),)
+    assert plan.namespace == NS and plan.index == ["text"]
+    assert plan.put.items == [("user.alice", "k", plan.value_json, 30.0)]
+    assert plan.put.embed_requests == [("user.alice", "k", "text", "aisle")]
+    # Nested values keep their types: aware datetimes, the write id and the TTL
+    assert plan.valid_at == datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert back.candidates[0].valid_at.tzinfo is not None
+    assert back.target_updated_at == T0
+    assert (
+        isinstance(plan.put.write_id, str)
+        and plan.put.write_id == conflicts._state.plan.put.write_id
+    )
+    assert isinstance(plan.ttl, float) and plan.ttl == 30.0
+    assert back.candidates[0].item.score == 0.2
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_conflicts_survives_a_strict_serializer_only_with_the_allowlist(make: str) -> None:
+    # LangGraph's strict mode rebuilds only the types it is given. A person
+    # deciding across an interrupt needs the Conflicts back whole, plan included
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=6,
+        scores=[{"key": "k", "score": 0.2}, {"key": "s", "score": 0.9}],
+        similar=[candidate_row("a", score=0.95)],
+    )
+    finder, _ = finding_store(reads, reconcile_scan_limit=5)
+    conflicts = finder.find_conflicts(NS, "k", {"seat": "x", "text": "aisle"}, slot="seat")
+    decision = Decision(actions={"s": Action.SUPERSEDE, "a": Action.CONFIRM})
+    # A connection the store must never touch: using it would raise TypeError
+    store = make_store(make, index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]})
+
+    allowed = strict_serializer(RECONCILE_SERDE_TYPES)
+    back = allowed.loads_typed(allowed.dumps_typed(conflicts))
+    decided = allowed.loads_typed(allowed.dumps_typed(decision))
+
+    assert (back, back._state, decided) == (conflicts, conflicts._state, decision)
+    state = back._state
+    assert type(state) is ConflictsState and type(state.store) is StoreIdentity
+    assert type(state.plan) is ProposalPlan and type(state.plan.put) is PutPlan
+    assert [type(c.item) for c in back.candidates] == [SearchItem, SearchItem, SearchItem]
+    assert all(type(action) is Action for action in decided.actions.values())
+    # resolve takes them: its plan is built before any I/O
+    assert store._plan_resolve(back, decided).plan == conflicts._state.plan
+
+    # Strict mode also allows the types that a graph's state schema names,
+    # such as Conflicts, Proposal and Candidate. What a Conflicts keeps inside,
+    # its plan and its candidates' items, still comes back raw, and resolve
+    # refuses a Conflicts without its plan
+    schema_only = strict_serializer(
+        [
+            ("langchain_cockroachdb.store.reconcile", name)
+            for name in ("Conflicts", "Proposal", "Candidate")
+        ]
+    )
+    stripped = schema_only.loads_typed(schema_only.dumps_typed(conflicts))
+    assert type(stripped) is Conflicts and type(stripped._state) is dict
+    assert type(stripped.candidates[0].item) is dict
+    with pytest.raises(ValueError, match="holds no plan for the write"):
+        await call(store, "resolve", stripped, decision)
+
+
+class NumpyEmbeddings(CountingEmbeddings):
+    """CountingEmbeddings whose vectors hold numpy float64 values, as some models return."""
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [
+            [numpy.float64(value) for value in vector] for vector in super().embed_documents(texts)
+        ]
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        vectors = await super().aembed_documents(texts)
+        return [[numpy.float64(value) for value in vector] for vector in vectors]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_vector_rows_hold_plain_floats_when_the_model_returns_numpy(make: str) -> None:
+    # A Conflicts keeps its vector rows for resolve. Numpy floats in them would
+    # make LangGraph's serializer refuse the Conflicts when an interrupt
+    # checkpoints it while a person decides
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(rows=[candidate_row("k", version=3)], vectors=1)
+    store, _ = finding_store(reads, make=make, embeddings=NumpyEmbeddings())
+
+    conflicts = await call(store, "find_conflicts", NS, "k", {"text": "aisle"})
+
+    [row] = conflicts._state.vector_rows
+    assert row[3] == [5.0, 0.0, 0.0]
+    assert [type(value) for value in row[3]] == [float, float, float]
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+    assert back == conflicts and back._state == conflicts._state
+    # A plain put pairs its vectors the same way
+    plan = store._plan_puts([PutOp(NS, "p", {"text": "abc"})])
+    [(_, _, _, vector, _)] = store._vector_rows(plan, [[numpy.float64(3.0), 0.0, 0.0]])
+    assert [type(value) for value in vector] == [float, float, float]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"reconcile_scan_limit": 0},
+        {"history": {"ttl_days": -1}},
+        {"index": {"dims": 0, "embed": CountingEmbeddings()}},
+    ],
+    ids=["scan-limit", "history", "index"],
+)
+@pytest.mark.parametrize("pool_config", [None, {"min_size": 1}], ids=["connection", "pool"])
+def test_from_conn_string_checks_settings_before_connecting(
+    bad: dict, pool_config: dict | None, monkeypatch
+) -> None:
+    from langchain_cockroachdb.store import store as store_module
+
+    def connect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string connected before checking its settings")
+
+    monkeypatch.setattr(store_module.Connection, "connect", connect)
+    monkeypatch.setattr(store_module, "ConnectionPool", connect)
+    with (
+        pytest.raises(ValueError),
+        CockroachDBStore.from_conn_string(
+            "postgresql://root@localhost:1/db", pool_config=pool_config, **bad
+        ),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"reconcile_scan_limit": 0},
+        {"history": {"ttl_days": -1}},
+        {"index": {"dims": 0, "embed": CountingEmbeddings()}},
+    ],
+    ids=["scan-limit", "history", "index"],
+)
+@pytest.mark.parametrize("pool_config", [None, {"min_size": 1}], ids=["connection", "pool"])
+async def test_async_from_conn_string_checks_settings_before_connecting(
+    bad: dict, pool_config: dict | None, monkeypatch
+) -> None:
+    from langchain_cockroachdb.store import aio as aio_module
+
+    async def connect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string connected before checking its settings")
+
+    def pool(*args: object, **kwargs: object) -> None:
+        raise AssertionError("from_conn_string opened a pool before checking its settings")
+
+    monkeypatch.setattr(aio_module.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(aio_module, "AsyncConnectionPool", pool)
+    with pytest.raises(ValueError):
+        async with AsyncCockroachDBStore.from_conn_string(
+            "postgresql://root@localhost:1/db", pool_config=pool_config, **bad
+        ):
+            pass
+
+
+def test_from_conn_string_builds_the_embedding_model_once(monkeypatch) -> None:
+    # The settings are checked before connecting, and the store reuses the
+    # model that check built, so a model named by a string is built once
+    from langchain_cockroachdb.store import config as config_module
+    from langchain_cockroachdb.store import store as store_module
+
+    built: list[object] = []
+
+    def ensure_embeddings(embed: object) -> Embeddings:
+        if isinstance(embed, Embeddings):
+            return embed
+        built.append(embed)
+        return CountingEmbeddings()
+
+    class FakeConnection:
+        closed = False
+
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr(config_module, "ensure_embeddings", ensure_embeddings)
+    monkeypatch.setattr(
+        store_module.Connection, "connect", lambda *args, **kwargs: FakeConnection()
+    )
+    with CockroachDBStore.from_conn_string(
+        "postgresql://root@localhost:1/db",
+        index={"dims": 3, "embed": "fake:model"},  # type: ignore[typeddict-item]
+    ) as store:
+        assert isinstance(store.index.embeddings, CountingEmbeddings)  # type: ignore[union-attr]
+    assert built == ["fake:model"]
+
+
+# reconcile: the statements of a decision, the result, and the rebuilt result
+
+
+def make_candidate(
+    key: str, reason: str = "similar", *, valid_at: datetime = T0, version: int = 1
+) -> Candidate:
+    """A candidate under NS, as merge_candidates builds it from a row."""
+    row = candidate_row(key, version=version, valid_at=valid_at)
+    return store_base._row_to_candidate(NS, row, reason, None)  # type: ignore[arg-type]
+
+
+def history_store(*, history: object = None) -> BaseCockroachDBStore:
+    """Shared store state with a 3-dimension cosine index, and history when given."""
+    return make_base(fields=["text"], history=history)
+
+
+VALID = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+
+def test_decision_statements_write_archive_first_then_upsert_then_delete_and_confirm() -> None:
+    store = history_store(history={"ttl_days": 7})
+    plan = plan_proposal(
+        store, {"text": "aisle", "seat": "x"}, provenance={"source": "chat"}, valid_at=VALID
+    )
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("old", "slot"),
+        make_candidate("gone"),
+        make_candidate("dup"),
+        make_candidate("kept"),
+    ]
+    decision = Decision(
+        actions={"old": Action.SUPERSEDE, "gone": Action.DELETE, "dup": Action.CONFIRM}
+    )
+    statements = store._decision_statements(
+        plan, candidates, decision, vector_rows=rows, valid_at=VALID
+    )
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    assert statements == [
+        # Archiving comes first. The target and the superseded fact end at the
+        # new memory's valid time, a deleted one now
+        sql.archive(
+            "user.alice",
+            ["k"],
+            reason="overwritten",
+            superseded_by=None,
+            invalid_at=VALID,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.archive(
+            "user.alice",
+            ["old"],
+            reason="superseded",
+            superseded_by="k",
+            invalid_at=VALID,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.archive(
+            "user.alice",
+            ["gone"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        # Then the write, as put does it, with the provenance and valid time
+        sql.delete_vectors("user.alice", ["k"]),
+        sql.upsert_items(
+            [("user.alice", "k", plan.value_json, None, '{"source": "chat"}', VALID)],
+            write_id=w,
+            history=True,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old", "gone"]),
+        sql.delete_vectors("user.alice", ["old", "gone"]),
+        sql.confirm("user.alice", "dup", confirm_id=w),
+    ]
+    # Only the item upsert returns rows: the version it wrote
+    returning = [s for s, _ in statements if s.splitlines()[-1].startswith("RETURNING")]
+    assert returning == [statements[4][0]]
+    assert returning[0].endswith("\nRETURNING version")
+
+
+def test_decision_statements_with_a_default_valid_time_end_old_facts_now() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"}, key="new")
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    # No live memory under the new key: nothing to archive as overwritten
+    statements = store._decision_statements(
+        plan,
+        [make_candidate("old", "slot")],
+        Decision(actions={"old": Action.SUPERSEDE}),
+        vector_rows=rows,
+        valid_at=NOW,
+    )
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    assert statements == [
+        # No valid time was given: the archive passes none, so it is now(),
+        # and the item stores none, so its valid time is its updated_at
+        sql.archive(
+            "user.alice",
+            ["old"],
+            reason="superseded",
+            superseded_by="new",
+            invalid_at=None,
+            write_id=w,
+            ttl_days=None,
+        ),
+        sql.delete_vectors("user.alice", ["new"]),
+        sql.upsert_items(
+            [("user.alice", "new", plan.value_json, None, None, None)],
+            write_id=w,
+            history=True,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old"]),
+        sql.delete_vectors("user.alice", ["old"]),
+    ]
+
+
+def test_decision_statements_skip_and_record_a_late_fact() -> None:
+    store = history_store(history={"ttl_days": 7})
+    plan = plan_proposal(store, {"text": "aisle"}, provenance={"source": "old chat"})
+    newer_at = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("newer", "slot", valid_at=newer_at),
+        make_candidate("gone"),
+        make_candidate("dup"),
+    ]
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    rest = [
+        sql.archive(
+            "user.alice",
+            ["gone"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        sql.delete_items("user.alice", ["gone"]),
+        sql.delete_vectors("user.alice", ["gone"]),
+        sql.confirm("user.alice", "dup", confirm_id=w),
+    ]
+    actions = {"gone": Action.DELETE, "dup": Action.CONFIRM}
+
+    # A skip writes nothing for the new memory and leaves the target alone
+    skip = Decision(new="skip", actions=actions)
+    assert store._decision_statements(plan, candidates, skip, vector_rows=[], valid_at=VALID) == (
+        rest
+    )
+
+    # A late fact goes straight into history, valid from the valid time the
+    # policy saw until the newer fact became valid
+    late = Decision(new="superseded", superseded_by="newer", actions=actions)
+    statements = store._decision_statements(plan, candidates, late, vector_rows=[], valid_at=VALID)
+    assert statements == [
+        sql.history_insert_superseded(
+            "user.alice",
+            "k",
+            value_json=plan.value_json,
+            provenance_json='{"source": "old chat"}',
+            valid_at=VALID,
+            invalid_at=newer_at,
+            superseded_by="newer",
+            write_id=w,
+            ttl_days=7.0,
+        ),
+        *rest,
+    ]
+
+
+def test_decision_statements_without_history_delete_and_record_nothing() -> None:
+    store = history_store()
+    plan = plan_proposal(store, {"text": "aisle"}, valid_at=VALID)
+    rows = store._vector_rows(plan.put, [[5.0, 0.0, 0.0]])
+    candidates = [make_candidate("k", "key"), make_candidate("old", "slot"), make_candidate("dup")]
+    sql, w = store.sql, plan.put.write_id
+    assert w is not None
+    write = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+    assert store._decision_statements(
+        plan, candidates, write, vector_rows=rows, valid_at=VALID
+    ) == [
+        sql.delete_vectors("user.alice", ["k"]),
+        sql.upsert_items(
+            [("user.alice", "k", plan.value_json, None, None, VALID)],
+            write_id=w,
+            history=False,
+            return_version=True,
+        ),
+        sql.upsert_vectors(rows),
+        sql.delete_items("user.alice", ["old"]),
+        sql.delete_vectors("user.alice", ["old"]),
+        sql.confirm("user.alice", "dup", confirm_id=w),
+    ]
+    # A late fact without history is not kept anywhere
+    late = Decision(new="superseded", superseded_by="old", actions={"dup": Action.CONFIRM})
+    assert store._decision_statements(plan, candidates, late, vector_rows=rows, valid_at=VALID) == [
+        sql.confirm("user.alice", "dup", confirm_id=w)
+    ]
+
+    # Without an index there are no vectors to replace or delete
+    flat = make_base(history=True)
+    plan = plan_proposal(flat, {"text": "aisle"})
+    statements = flat._decision_statements(
+        plan, candidates, Decision(actions={"old": Action.DELETE}), vector_rows=[], valid_at=NOW
+    )
+    assert flat.sql.vectors not in " ".join(s for s, _ in statements)
+    assert statement_kinds(statements) == [
+        f"INSERT {flat.sql.history}",
+        f"INSERT {flat.sql.history}",
+        f"INSERT {flat.sql.items}",
+        f"DELETE {flat.sql.items}",
+    ]
+
+
+def test_reconcile_result_reports_what_the_decision_did() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    candidates = [
+        make_candidate("k", "key"),
+        make_candidate("old", "slot"),
+        make_candidate("gone"),
+        make_candidate("dup"),
+        make_candidate("kept"),
+    ]
+    actions = {"old": Action.SUPERSEDE, "gone": Action.DELETE, "dup": Action.CONFIRM}
+    # The version is the one the item upsert returned. The target it
+    # overwrote is not kept
+    written = store._reconcile_result(
+        plan, candidates, Decision(actions=actions), [[{"version": 4}]]
+    )
+    assert written == ReconcileResult(
+        key="k",
+        new="written",
+        version=4,
+        superseded=("old",),
+        deleted=("gone",),
+        confirmed=("dup",),
+        kept=("kept",),
+    )
+    # Without a write there is no version, and a target left alone is kept
+    actions = {"gone": Action.DELETE, "dup": Action.CONFIRM}
+    skipped = store._reconcile_result(plan, candidates, Decision(new="skip", actions=actions), [])
+    assert (skipped.new, skipped.version, skipped.kept) == ("skipped", None, ("k", "old", "kept"))
+    late = Decision(new="superseded", superseded_by="old", actions=actions)
+    assert store._reconcile_result(plan, candidates, late, []).new == "superseded"
+    # Without history a late fact is not kept anywhere: the result says skipped
+    plain = history_store()
+    assert plain._reconcile_result(plan, candidates, late, []).new == "skipped"
+    # A written memory always gets its version back from the upsert
+    with pytest.raises(RuntimeError, match="returned no version"):
+        store._reconcile_result(plan, candidates, Decision(), [[]])
+    with pytest.raises(RuntimeError, match="returned no version"):
+        store._reconcile_result(plan, candidates, Decision(), [])
+
+
+def test_decision_keys_name_the_new_key_and_every_key_acted_on() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    actions = {
+        "old": Action.SUPERSEDE,
+        "gone": Action.DELETE,
+        "dup": Action.CONFIRM,
+        "kept": Action.KEEP,
+    }
+    # The new key carries a written or confirmed memory, the version it
+    # overwrote and a late fact; the others carry what the decision did to them
+    assert store._decision_keys(plan, Decision(actions=actions)) == {"k", "old", "gone", "dup"}
+    late = Decision(new="superseded", superseded_by="newer")
+    assert store._decision_keys(plan, late) == {"k"}
+
+
+def test_applied_statements_look_up_only_the_named_keys() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    w = plan.write_id
+    statements = store._applied_statements(plan, {"old", "k", "dup"})
+    assert statements == [
+        store.sql.applied_items("user.alice", ["dup", "k", "old"], write_id=w),
+        store.sql.applied_history("user.alice", ["dup", "k", "old"], write_id=w),
+    ]
+    # Each binds the namespace, the keys and the write id, and names the
+    # keys in its WHERE clause: no read of the whole namespace. The items
+    # carry the id as the write id of what the call wrote, or as the confirm
+    # id of what it confirmed
+    for sql, params in statements:
+        assert "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))" in sql
+        assert [param for param in params if param != w] == ["user.alice", ["dup", "k", "old"]]
+    items, history = statements
+    assert "(write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))" in items[0]
+    assert items[1].count(w) == 4 and history[1].count(w) == 1
+    # Without history only the items are read, and with no keys nothing is
+    plain = history_store()
+    assert plain._applied_statements(plan, {"k"}) == [
+        plain.sql.applied_items("user.alice", ["k"], write_id=w)
+    ]
+    assert store._applied_statements(plan, set()) == []
+
+
+def test_a_write_replaced_before_the_retry_is_still_reported_written() -> None:
+    # Another writer replaced the new memory between the lost commit and the
+    # retry, so the item no longer carries the write id. Only a write archives
+    # the memory under the new key as overwritten, so that row proves the
+    # write; the version it wrote is gone from the item
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    history = [{"key": "k", "reason": "overwritten"}, {"key": "old", "reason": "superseded"}]
+    assert store._applied_result(plan, [[], history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=None,
+        superseded=("old",),
+        deleted=(),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    # A confirmation in between sets the memory's confirm id and leaves its
+    # write id: the target still proves the write, with its version
+    rebuilt = store._applied_result(plan, [[written_row("k", 4)], history])
+    assert rebuilt is not None
+    assert (rebuilt.new, rebuilt.version, rebuilt.confirmed) == ("written", 4, ())
+
+
+def test_a_superseded_memory_under_another_key_proves_the_write() -> None:
+    # The write went to a new key and superseded "old". Another writer
+    # replaced the new memory before the retry, so no item carries the write
+    # id, and no memory was overwritten under the new key. Only a write or a
+    # late fact supersedes other memories, and a late fact leaves a row of
+    # its own under the new key, so the row under "old" proves the write
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    history = [{"key": "old", "reason": "superseded"}, {"key": "gone", "reason": "deleted"}]
+    assert store._applied_result(plan, [[], history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=None,
+        superseded=("old",),
+        deleted=("gone",),
+        confirmed=(),
+        kept=(),
+        already_applied=True,
+    )
+    # With the late fact's own row, the new memory went straight into history
+    late = store._applied_result(plan, [[], [*history, {"key": "k", "reason": "superseded"}]])
+    assert late is not None and (late.new, late.superseded) == ("superseded", ("old",))
+    # A delete alone proves nothing about the new memory: any decision deletes
+    deleted = store._applied_result(plan, [[confirmed_row("dup")], history[1:]])
+    assert deleted is not None and (deleted.new, deleted.deleted) == ("skipped", ("gone",))
+
+
+def test_applied_result_lists_only_what_the_rows_prove() -> None:
+    store = history_store(history=True)
+    plan = plan_proposal(store, {"text": "aisle"})
+    # Nothing carries the write id: no earlier attempt committed
+    assert store._applied_result(plan, [[], []]) is None
+
+    # The target carries it as its write id: it was written, at the row's
+    # version. An item that carries it as its confirm id was confirmed
+    items = [written_row("k", 3), confirmed_row("dup")]
+    history = [
+        {"key": "k", "reason": "overwritten"},
+        {"key": "old", "reason": "superseded"},
+        {"key": "gone", "reason": "deleted"},
+        {"key": "after", "reason": "superseded"},
+    ]
+    assert store._applied_result(plan, [items, history]) == ReconcileResult(
+        key="k",
+        new="written",
+        version=3,
+        superseded=("after", "old"),
+        deleted=("gone",),
+        confirmed=("dup",),
+        kept=(),
+        already_applied=True,
+    )
+
+    # The target carries it as its confirm id: it was confirmed, not written
+    confirmed = [confirmed_row("k", 2)]
+    assert store._applied_result(plan, [confirmed, []]) == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=("k",),
+        kept=(),
+        already_applied=True,
+    )
+
+    # A history row of the new key ending as superseded is the late fact itself
+    late = store._applied_result(
+        plan, [[], [{"key": "k", "reason": "superseded"}, {"key": "gone", "reason": "deleted"}]]
+    )
+    assert late is not None
+    assert (late.new, late.superseded, late.deleted) == ("superseded", (), ("gone",))
+    deleted = store._applied_result(plan, [[], [{"key": "k", "reason": "deleted"}]])
+    assert deleted is not None and (deleted.new, deleted.deleted) == ("skipped", ("k",))
+
+    # Without history only the items are read
+    plain = history_store()
+    assert plain._applied_result(plan, [[]]) is None
+    assert plain._applied_result(plan, [confirmed]) == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=(),
+        confirmed=("k",),
+        kept=(),
+        already_applied=True,
+    )
+    assert plain._applied_result(plan, [[written_row("k", 1), confirmed_row("dup")]]) == (
+        ReconcileResult(
+            key="k",
+            new="written",
+            version=1,
+            superseded=(),
+            deleted=(),
+            confirmed=("dup",),
+            kept=(),
+            already_applied=True,
+        )
+    )
+
+
+def test_a_history_row_gives_the_version_with_its_key_and_confirmations() -> None:
+    # A version ends with the confirmations it had while it was live. Its key
+    # comes from the row, as the rows of a namespace's history name their keys
+    row = {
+        "key": "seat-1",
+        "version": 2,
+        "value": {"text": "window"},
+        "provenance": {"source": "chat"},
+        "valid_at": T0,
+        "invalid_at": NOW,
+        "written_at": T0,
+        "ended_at": NOW,
+        "reason": "overwritten",
+        "superseded_by": None,
+        "confirmed_at": T0 + timedelta(hours=1),
+        "confirmations": 3,
+    }
+    assert store_base._row_to_version(NS, row) == MemoryVersion(
+        namespace=NS,
+        key="seat-1",
+        version=2,
+        value={"text": "window"},
+        provenance={"source": "chat"},
+        valid_at=T0,
+        invalid_at=NOW,
+        written_at=T0,
+        ended_at=NOW,
+        reason="overwritten",
+        superseded_by=None,
+        confirmed_at=T0 + timedelta(hours=1),
+        confirmations=3,
+    )
+
+
+def test_a_policy_must_return_a_valid_decision() -> None:
+    store = history_store()
+    plan = plan_proposal(store, {"text": "aisle"})
+    proposal = Proposal(
+        namespace=NS,
+        key="k",
+        value=plan.value,
+        slot=None,
+        slot_value=None,
+        provenance=None,
+        valid_at=NOW,
+    )
+    candidates = [make_candidate("a")]
+    decision = Decision(actions={"a": Action.DELETE})
+    assert store._checked_decision(proposal, candidates, decision) is decision
+    with pytest.raises(ValueError, match="returned NoneType, not a Decision"):
+        store._checked_decision(proposal, candidates, None)
+    with pytest.raises(ValueError, match="unknown candidate key: b"):
+        store._checked_decision(proposal, candidates, Decision(actions={"b": Action.DELETE}))
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_reconcile_checks_everything_before_any_io(make: str) -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise
+    store = make_store(
+        make, index={"dims": 3, "embed": embeddings, "fields": ["text"], "distance_type": "l2"}
+    )
+    policy = keep_all()
+    for check in (
+        lambda: call(store, "reconcile", (), "k", TEXT, policy=policy, threshold=-1.0),
+        lambda: call(store, "reconcile", NS, "k", TEXT, policy=policy),
+        lambda: call(store, "reconcile", NS, "k", TEXT, policy=policy, threshold=-1.0, slot="seat"),
+        lambda: call(store, "reconcile", NS, "k", TEXT, policy=policy, threshold=-1.0, limit=-1),
+        lambda: call(store, "reconcile", NS, "k", TEXT, policy=policy, threshold=-1.0, ttl=0),
+        lambda: call(
+            store,
+            "reconcile",
+            NS,
+            "k",
+            TEXT,
+            policy=policy,
+            threshold=-1.0,
+            valid_at=datetime(2026, 1, 1),
+        ),
+        lambda: call(store, "reconcile", NS, "k", TEXT, policy="keep", threshold=-1.0),
+    ):
+        with pytest.raises(ValueError):
+            await check()
+    assert embedded(embeddings, make) == 0
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    without_columns(store)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "reconcile", NS, "k", TEXT, policy=policy, threshold=-1.0)
+    assert embedded(embeddings, make) == 0
+
+    # A store with history refuses until setup() has created the history table
+    keeping = make_store(
+        make, index={"dims": 3, "embed": embeddings, "fields": ["text"]}, history=True
+    )
+    reads = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return reads.answer(statements, label)
+
+    keeping._read_all = reading(make, read_all)  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        await call(keeping, "reconcile", NS, "k", TEXT, policy=policy)
+    assert embedded(embeddings, make) == 0
+
+
+APPLIED_READS = (
+    "SELECT key, version, write_id IS NOT DISTINCT FROM",
+    "SELECT key, reason FROM",
+)
+TOKEN_READ = "SELECT key, version, updated_at FROM"
+
+
+class ReconcileReads:
+    """Stands in for a store's _cursor in reconcile and resolve, and answers their statements.
+
+    Every attempt logs its statements. The candidate read returns ``rows``,
+    the already-applied reads ``applied`` (the items, then the history), the
+    token read ``tokens``, and the item upsert version 2. ``fail`` says how
+    the first attempt fails, or, as a tuple, each attempt in turn: "read"
+    with a 40001 at its first fetch, before any decision; "lost write" with
+    a 40003 as its first write goes out, before its COMMIT; "commit" with a
+    40001 as its block ends, after its writes and COMMIT went out, so the
+    attempt rolled back; "lost commit" with a 40003 there, as when the
+    result of its COMMIT is lost and it may have committed; or "none".
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        fail: str | tuple[str, ...],
+        applied: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], []),
+        tokens: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.rows = rows
+        self.fail = (fail,) if isinstance(fail, str) else fail
+        self.applied = applied
+        self.tokens = tokens or []
+        self.attempts: list[list[tuple[str, list]]] = []
+
+    def fails(self, mode: str) -> bool:
+        """Whether the current attempt fails as ``mode`` says."""
+        attempt = len(self.attempts)
+        return attempt <= len(self.fail) and self.fail[attempt - 1] == mode
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ReconcileCursor"]:
+        self.attempts.append([])
+        yield ReconcileCursor(self)
+        if self.fails("commit"):
+            raise psycopg.errors.SerializationFailure("restart transaction")
+        if self.fails("lost commit"):
+            raise psycopg.errors.StatementCompletionUnknown("result is ambiguous")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if self.fails("read"):
+            raise psycopg.errors.SerializationFailure("restart transaction")
+        if sql.startswith("SELECT now()"):
+            return [{"now": NOW}]
+        if sql.startswith(APPLIED_READS[0]):
+            return self.applied[0]
+        if sql.startswith(APPLIED_READS[1]):
+            return self.applied[1]
+        if sql.startswith(TOKEN_READ):
+            return self.tokens
+        if sql.startswith("SELECT key, value, created_at"):
+            return self.rows
+        # The item upsert, the only write that returns rows
+        return [{"version": 2}]
+
+
+class ReconcileCursor:
+    """A cursor of ReconcileReads: it logs each statement and answers its fetch."""
+
+    def __init__(self, reads: ReconcileReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.sql = ""
+        self.description: list[str] | None = None
+
+    def cursor(self, **kwargs: object) -> "ReconcileCursor":
+        return ReconcileCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        self.reads.attempts[-1].append((sql, params or []))
+        self.sql = sql
+        if not sql.startswith("SELECT") and self.reads.fails("lost write"):
+            raise psycopg.errors.StatementCompletionUnknown("result is ambiguous")
+        if sql.endswith("RETURNING version"):
+            self.description = ["version"]
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.reads.answer(self.sql)
+
+    def close(self) -> None:
+        pass
+
+
+def reconciling_store(reads: ReconcileReads, *, history: bool = True, make: str = "sync") -> Any:
+    """A sync or async store with no index, and history unless told otherwise, whose attempts go to ``reads``."""
+    store = make_store(make, history=history)
+    # Migration 2 and the history table were seen: no schema read
+    store._columns_ready = True
+    store._history_ready = True
+    store._cursor = attempts_on(make, reads.cursor)  # type: ignore[method-assign]
+    return store
+
+
+def applied_reads(statements: list[tuple[str, list]]) -> list[tuple[str, list]]:
+    return [(sql, params) for sql, params in statements if sql.startswith(APPLIED_READS)]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+async def test_a_retried_reconcile_looks_up_only_the_keys_its_earlier_decision_named(
+    committed: bool, make: str
+) -> None:
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup"), candidate_row("kept")]
+    target = written_row("k", 2)
+    applied = ([target], [{"key": "old", "reason": "superseded"}]) if committed else ([], [])
+    # The first attempt fails after its writes and COMMIT went out: with a
+    # 40003 when it committed and its result was lost, with a 40001 when it
+    # rolled back
+    reads = ReconcileReads(rows, fail="lost commit" if committed else "commit", applied=applied)
+    store = reconciling_store(reads, make=make)
+    decided: list[str] = []
+
+    def policy(proposal: Proposal, candidates: object) -> Decision:
+        decided.append(proposal.key)
+        return Decision(
+            actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM, "kept": Action.KEEP}
+        )
+
+    result = await call(
+        store, "reconcile", NS, "k", {"seat": "x", "text": "aisle"}, policy=policy, slot="seat"
+    )
+
+    first, second = reads.attempts
+    # The first attempt had no earlier decision to look for
+    assert applied_reads(first) == []
+    [upsert] = [params for sql, params in first if sql.startswith("INSERT INTO public.store (")]
+    write_id = upsert[0]
+    # Its retry looks up the new key and the keys that decision acted on, by
+    # primary key, in the round trip of its first candidate read
+    keys = ["dup", "k", "old"]
+    assert second[:4] == [
+        store.sql.now(),
+        store.sql.key_slot_candidates(
+            "user.alice", "k", slot_field="seat", slot_value_json='"x"', filter=None
+        ),
+        store.sql.applied_items("user.alice", keys, write_id=write_id),
+        store.sql.applied_history("user.alice", keys, write_id=write_id),
+    ]
+    assert all(
+        "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))" in sql
+        for sql, _ in applied_reads(second)
+    )
+    if committed:
+        # The rows prove the earlier attempt committed: nothing more is sent
+        assert len(second) == 4 and decided == ["k"]
+        assert result == ReconcileResult(
+            key="k",
+            new="written",
+            version=2,
+            superseded=("old",),
+            deleted=(),
+            confirmed=(),
+            kept=(),
+            already_applied=True,
+        )
+    else:
+        # Nothing carries the write id: the retry decides and writes again
+        assert decided == ["k", "k"]
+        assert second[4:] == first[2:]
+        assert result == ReconcileResult(
+            key="k",
+            new="written",
+            version=2,
+            superseded=("old",),
+            deleted=(),
+            confirmed=("dup",),
+            kept=("kept",),
+        )
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_reconcile_sends_no_applied_read_before_a_decision(make: str) -> None:
+    # The first attempt fails at its first read, so it reached no decision
+    # and could not have written anything
+    reads = ReconcileReads([candidate_row("k"), candidate_row("old")], fail="read")
+    store = reconciling_store(reads, make=make)
+
+    result = await call(
+        store, "reconcile", NS, "k", {"seat": "x", "text": "aisle"}, policy=keep_all(), slot="seat"
+    )
+
+    first, second = reads.attempts
+    assert applied_reads(first) == [] and applied_reads(second) == []
+    # The retry ran from the start: the candidate read, then the archive of
+    # the memory the new one overwrites, with no read for an earlier write
+    assert second[:2] == first[:2]
+    assert second[2][0].startswith(f"INSERT INTO {store.sql.history} (")
+    assert (result.new, result.version, result.already_applied) == ("written", 2, False)
+
+
+def raised_within(call: Callable[[], object], timeout: float = 5.0) -> BaseException | None:
+    """What ``call`` raised in another thread, or None if it returned.
+
+    A store call that waits for a connection the store itself holds never
+    returns. The thread then stays blocked and the test fails instead of
+    hanging.
+    """
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as error:  # noqa: BLE001
+            raised.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), f"the call still runs after {timeout} s"
+    return raised[0] if raised else None
+
+
+def make_proposal() -> Proposal:
+    return Proposal(
+        namespace=NS,
+        key="k",
+        value={"text": "x"},
+        slot=None,
+        slot_value=None,
+        provenance=None,
+        valid_at=NOW,
+    )
+
+
+def make_record() -> MemoryRecord:
+    return MemoryRecord(
+        item=Item(
+            namespace=NS,
+            key="k",
+            value={"text": "x"},
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+        version=1,
+        provenance=None,
+        valid_at=NOW,
+        confirmed_at=None,
+        confirmations=0,
+    )
+
+
+def test_a_policy_that_calls_the_store_fails_at_once() -> None:
+    embeddings = CountingEmbeddings()
+    store = CockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    # Migration 2 was seen, so a put would go straight to its embedding call
+    store._columns_ready = True
+    calls: list[Callable[[], object]] = [
+        lambda: store.get(NS, "k"),
+        lambda: store.put(NS, "k", {"text": "x"}),
+        lambda: store.search(NS, query="x"),
+        lambda: store.record(NS, "k"),
+        lambda: store.reconcile(NS, None, {"text": "x"}, policy=keep_all()),
+    ]
+    # On a single connection the reconcile holds the store's lock while its
+    # policy runs: a store call that reached the connection would wait forever
+    store.lock.acquire()
+    try:
+        for call in calls:
+
+            def policy(
+                proposal: Proposal, candidates: object, call: Callable[[], object] = call
+            ) -> Decision:
+                call()
+                return Decision()
+
+            error = raised_within(lambda policy=policy: store._decide(policy, make_proposal(), []))
+            assert isinstance(error, RuntimeError), error
+            assert str(error).startswith(
+                "A reconcile policy or a confirm TTL function must not call the store"
+            )
+            assert "find_conflicts" in str(error) and "resolve" in str(error)
+    finally:
+        store.lock.release()
+    # Refused before the embedding model was called, too
+    assert embeddings.calls == 0
+    # The mark lasts only while the policy runs
+    store._refuse_inside_user_callable()
+
+
+def test_the_policy_mark_belongs_to_one_thread_and_one_policy_run() -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+
+    def policy(proposal: Proposal, candidates: object) -> Decision:
+        # Another thread, as on a pool, is not inside this policy
+        assert raised_within(store._refuse_inside_user_callable) is None
+        with pytest.raises(RuntimeError, match="must not call the store"):
+            store._refuse_inside_user_callable()
+        return Decision(new="skip")
+
+    assert store._decide(policy, make_proposal(), []) == Decision(new="skip")
+    store._refuse_inside_user_callable()
+
+    def failing(proposal: Proposal, candidates: object) -> Decision:
+        raise LookupError("the judge failed")
+
+    with pytest.raises(LookupError, match="the judge failed"):
+        store._decide(failing, make_proposal(), [])
+    store._refuse_inside_user_callable()
+
+
+def drive(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run ``coro`` on this thread until it ends, as a nested event loop would run it.
+
+    A coroutine that waits, as for the store's lock, does not end here: it is
+    closed, and the test fails instead of hanging.
+    """
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    coro.close()
+    raise AssertionError("the coroutine waited instead of failing at once")
+
+
+REFUSED = "A reconcile policy or a confirm TTL function must not call the store"
+
+
+async def test_a_policy_that_calls_the_async_store_fails_at_once() -> None:
+    embeddings = CountingEmbeddings()
+    store = AsyncCockroachDBStore(
+        object(),  # type: ignore[arg-type]
+        index={"dims": 3, "embed": embeddings, "fields": ["text"]},
+        retry_policy=FAST,
+    )
+    # Migration 2 was seen, so a put would go straight to its embedding call
+    store._columns_ready = True
+    calls: list[Callable[[], object]] = [
+        # A policy is a plain function, so the sync methods are the calls it
+        # can make. On the store's own loop they raise InvalidStateError
+        # unless the policy's refusal comes first
+        lambda: store.get(NS, "k"),
+        lambda: store.put(NS, "k", {"text": "x"}),
+        lambda: store.search(NS, query="x"),
+        lambda: store.batch([GetOp(NS, "k")]),
+        # A coroutine run on the policy's thread, as a nested event loop
+        # would run it, reaches the connection, the lock or the model
+        lambda: drive(store.arecord(NS, "k")),
+        lambda: drive(store.aconfirm(NS, "k")),
+        lambda: drive(store.abatch([PutOp(NS, "k", {"text": "x"})])),
+        lambda: drive(store.abatch([SearchOp(NS, query="x")])),
+        lambda: drive(store.areconcile(NS, None, {"text": "x"}, policy=keep_all())),
+    ]
+    # On a single connection the reconcile holds the store's lock while its
+    # policy runs: a store call that reached the connection would wait
+    await store.lock.acquire()
+    try:
+        for store_call in calls:
+
+            def policy(
+                proposal: Proposal,
+                candidates: object,
+                store_call: Callable[[], object] = store_call,
+            ) -> Decision:
+                store_call()
+                return Decision()
+
+            with pytest.raises(RuntimeError) as error:
+                store._decide(policy, make_proposal(), [])
+            assert str(error.value).startswith(REFUSED)
+            # The advice names the async methods too
+            assert "afind_conflicts" in str(error.value) and "aresolve" in str(error.value)
+    finally:
+        store.lock.release()
+    # Refused before the embedding model was called, too
+    assert embeddings.calls == embeddings.async_calls == 0
+    # The mark lasts only while the policy runs
+    store._refuse_inside_user_callable()
+
+
+async def test_a_confirm_ttl_function_that_calls_the_async_store_fails_at_once() -> None:
+    store = AsyncCockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    store._columns_ready = True
+    # On a single connection the callable runs while the store holds its lock
+    await store.lock.acquire()
+    try:
+        for store_call in (lambda: store.get(NS, "k"), lambda: drive(store.arecord(NS, "k"))):
+
+            def ttl_fn(
+                record: MemoryRecord, store_call: Callable[[], object] = store_call
+            ) -> float:
+                store_call()
+                return 10.0
+
+            with pytest.raises(RuntimeError, match=REFUSED):
+                store._run_user_callable(ttl_fn, make_record())
+    finally:
+        store.lock.release()
+    # The mark lasts only while the callable runs
+    store._refuse_inside_user_callable()
+
+
+async def test_areconcile_and_aconfirm_run_their_callables_under_the_mark() -> None:
+    # A policy that calls the store fails its areconcile at once, without a
+    # retry: the attempt sent its reads and nothing more
+    reads = ReconcileReads([candidate_row("k")], fail="none")
+    store = reconciling_store(reads, make="async")
+
+    def policy(proposal: Proposal, candidates: object) -> Decision:
+        store.get(NS, "k")
+        return Decision()
+
+    with pytest.raises(RuntimeError, match=REFUSED):
+        await store.areconcile(NS, "k", {"text": "x"}, policy=policy)
+    [attempt] = reads.attempts
+    assert all(sql.startswith("SELECT") for sql, _ in attempt)
+
+    # So does a confirm TTL function: the record was read, and nothing was updated
+    record_row = {**candidate_row("k"), "value": {"text": "x"}}
+    confirms = ConfirmReads(record_row=record_row, updated=1)
+    confirming = confirming_store(confirms, make="async")
+
+    def ttl(record: MemoryRecord) -> float:
+        confirming.get(NS, "k")
+        return 10.0
+
+    with pytest.raises(RuntimeError, match=REFUSED):
+        await confirming.aconfirm(NS, "k", ttl=ttl)
+    [attempt] = confirms.attempts
+    assert [sql.split(" ", 2)[:2] for sql, _ in attempt] == [["SELECT", "key,"]]
+
+
+async def judge(proposal: Proposal, candidates: object) -> Decision:
+    """An async policy, as an LLM judge would be written."""
+    return Decision()
+
+
+class AsyncJudge:
+    """A policy object whose __call__ is async."""
+
+    async def __call__(self, proposal: Proposal, candidates: object) -> Decision:
+        return Decision()
+
+
+async def async_ttl(record: MemoryRecord) -> float:
+    """An async confirm TTL function."""
+    return 10.0
+
+
+class AsyncTTL:
+    """A confirm TTL object whose __call__ is async."""
+
+    async def __call__(self, record: MemoryRecord) -> float:
+        return 10.0
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_an_async_policy_or_ttl_function_is_refused_before_any_io(make: str) -> None:
+    embeddings = CountingEmbeddings()
+    # A connection the store must never touch: using it would raise TypeError
+    store = make_store(make, index={"dims": 3, "embed": embeddings, "fields": ["text"]})
+    # Refused before it is called, so no coroutine is left unawaited
+    with no_unawaited_coroutines():
+        for policy in (judge, AsyncJudge(), functools.partial(judge)):
+            with pytest.raises(
+                ValueError,
+                match="^policy must be a plain function that returns its answer, not an async",
+            ) as error:
+                await call(store, "reconcile", NS, "k", TEXT, policy=policy)
+            # A decision that needs async work belongs in the two-step flow
+            assert "afind_conflicts" in str(error.value) and "aresolve" in str(error.value)
+        for ttl in (async_ttl, AsyncTTL()):
+            with pytest.raises(
+                ValueError,
+                match="^ttl must be a plain function that returns its answer, not an async",
+            ):
+                await call(store, "confirm", NS, "k", ttl=ttl)
+    assert embedded(embeddings, make) == 0
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_policy_or_ttl_function_that_returns_a_coroutine_fails_without_a_warning(
+    make: str,
+) -> None:
+    # A plain function that returns a coroutine passes the check before any
+    # I/O. The store closes what it returns, so nothing warns that it was
+    # never awaited, and the error says what a policy must be
+    reads = ReconcileReads([candidate_row("k")], fail="none")
+    store = reconciling_store(reads, make=make)
+    with (
+        no_unawaited_coroutines(),
+        pytest.raises(
+            ValueError,
+            match="^policy must be a plain function that returns its answer, not an async",
+        ),
+    ):
+        await call(store, "reconcile", NS, "k", TEXT, policy=lambda p, c: judge(p, c))
+    # One attempt, which sent its reads and nothing more
+    [attempt] = reads.attempts
+    assert all(sql.startswith("SELECT") for sql, _ in attempt)
+
+    record_row = {**candidate_row("k"), "value": {"text": "x"}}
+    confirms = ConfirmReads(record_row=record_row, updated=1)
+    confirming = confirming_store(confirms, make)
+    with (
+        no_unawaited_coroutines(),
+        pytest.raises(
+            ValueError, match="^ttl must be a plain function that returns its answer, not an async"
+        ),
+    ):
+        await call(confirming, "confirm", NS, "k", ttl=lambda record: async_ttl(record))
+    [attempt] = confirms.attempts
+    assert [sql.split(" ", 2)[:2] for sql, _ in attempt] == [["SELECT", "key,"]]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_errors_name_the_method_that_was_called(make: str) -> None:
+    # Each store names its own method in its errors: the async store's
+    # methods are the sync store's with an "a" in front
+    a = "a" if make == "async" else ""
+    store = make_store(
+        make,
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"], "distance_type": "l2"},
+        history=True,
+    )
+    for name, args, kwargs, message in (
+        ("history", ((), "k"), {}, "history needs a non-empty namespace"),
+        ("purge", ((), "k"), {}, "purge needs a non-empty namespace"),
+        ("record", ((), "k"), {}, "record needs a non-empty namespace"),
+        ("confirm", ((), "k"), {}, "confirm needs a non-empty namespace"),
+        (
+            "find_conflicts",
+            ((), "k", TEXT),
+            {"threshold": -1.0},
+            "find_conflicts needs a non-empty",
+        ),
+        ("find_conflicts", (NS, "k", TEXT), {}, "find_conflicts needs a threshold"),
+        ("reconcile", ((), "k", TEXT), {"policy": keep_all()}, "reconcile needs a non-empty"),
+        ("reconcile", (NS, "k", ["x"]), {"policy": keep_all()}, "reconcile needs the value as a"),
+        ("put_if", ((), "k", TEXT), {"expected": None}, "put_if needs a non-empty namespace"),
+        ("put_if", (NS, "k", ["x"]), {"expected": None}, "put_if needs the value as a dict"),
+        ("put_if", (NS, "k", TEXT), {"expected": 1}, "put_if needs expected as the MemoryRecord"),
+        ("delete_if", ((), "k"), {"expected": None}, "delete_if needs a non-empty namespace"),
+        ("delete_if", (NS, "other"), {"expected": record_of()}, "delete_if was given the record"),
+    ):
+        with pytest.raises(ValueError, match=rf"^{a}{message}"):
+            await call(store, name, *args, **kwargs)
+
+    # resolve names itself, and the method a Conflicts comes from in both forms
+    conflicts = found_conflicts(make_store("sync"), [candidate_row("k")])
+    resolver = make_store(make)
+    edited = dataclasses.replace(
+        conflicts, proposal=dataclasses.replace(conflicts.proposal, key="other")
+    )
+    for given, decision, message in (
+        (
+            object(),
+            Decision(),
+            f"^{a}resolve needs the Conflicts that find_conflicts or afind_conflicts returned",
+        ),
+        (conflicts, None, f"^{a}resolve needs a Decision, got NoneType"),
+        (edited, Decision(), rf"in these fields: key\. {a}resolve writes the memory planned"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            await call(resolver, "resolve", given, decision)
+
+
+# resolve: the change check, the checks before any I/O, and the attempt
+
+
+def test_changed_keys_compares_version_and_updated_at_of_live_rows() -> None:
+    later = T0 + timedelta(seconds=1)
+    expected: dict = {
+        "same": (2, T0),
+        "bumped": (2, T0),
+        "touched": (2, T0),
+        "gone": (2, T0),
+        "listed": [2, T0],
+    }
+    rows = [
+        {"key": "same", "version": 2, "updated_at": T0},
+        # A write bumps the version
+        {"key": "bumped", "version": 3, "updated_at": later},
+        # A 0.5.x writer sets updated_at and leaves the version alone
+        {"key": "touched", "version": 2, "updated_at": later},
+        {"key": "listed", "version": 2, "updated_at": T0},
+        # A key nobody expects is never checked
+        {"key": "other", "version": 9, "updated_at": later},
+    ]
+    # In the order of expected. A token read back as a list is the tuple it was
+    assert changed_keys(expected, rows) == ("bumped", "touched", "gone")
+    # A live memory where none was expected changed too; no memory still is none
+    live = [{"key": "k", "version": 1, "updated_at": T0}]
+    assert changed_keys({"k": None}, live) == ("k",)
+    assert changed_keys({"k": None}, []) == ()
+    # The same instant in another zone, as a checkpoint may give it back, is no change
+    shifted = T0.astimezone(timezone(timedelta(hours=-5)))
+    assert changed_keys({"same": (2, shifted)}, rows) == ()
+
+
+def found_conflicts(
+    store: BaseCockroachDBStore, rows: list[dict[str, object]], **kwargs: object
+) -> Conflicts:
+    """What find_conflicts returns on ``store``, a store without an index, when its read finds ``rows``.
+
+    The new memory is {"seat": "x", "text": "aisle"} under NS and key "k", in slot "seat".
+    """
+    plan = plan_proposal(store, {"seat": "x", "text": "aisle"}, slot="seat", **kwargs)
+    read = store._key_slot_read(plan, [[{"now": NOW}], rows])
+    return store._conflicts(plan, [], read, store._similar_read(plan, [], read), [])
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_resolve_checks_the_conflicts_and_the_decision_before_any_io(make: str) -> None:
+    reads = CandidateReads(
+        rows=[candidate_row("k", version=3), candidate_row("s")],
+        vectors=1,
+        similar=[candidate_row("a", score=0.95)],
+    )
+    finder, embeddings = finding_store(reads)
+    conflicts = finder.find_conflicts(NS, "k", {"seat": "x", "text": "aisle"}, slot="seat")
+    found_with = embeddings.calls
+    model = CountingEmbeddings()
+    index = {"dims": 3, "embed": model, "fields": ["text"]}
+
+    def resolver(**settings: object) -> Any:
+        # A connection the store must never touch: using it would raise TypeError
+        return make_store(make, **settings)
+
+    store = resolver(index=index)
+    decision = Decision(actions={"s": Action.SUPERSEDE})
+    # A Conflicts built by hand has none of what find_conflicts planned for the write
+    by_hand = Conflicts(
+        proposal=conflicts.proposal,
+        candidates=conflicts.candidates,
+        target_version=3,
+        target_updated_at=T0,
+    )
+    for given in (by_hand, object()):
+        with pytest.raises(
+            ValueError, match="the Conflicts that find_conflicts or afind_conflicts returned"
+        ):
+            await call(store, "resolve", given, decision)
+    # Another table, schema, dims, distance or fields, or no index, is another store
+    for settings in (
+        {"index": index, "table_name": "other"},
+        {"index": index, "schema": "app"},
+        {"index": {**index, "dims": 4}},
+        {"index": {**index, "distance_type": "l2"}},
+        {"index": {**index, "fields": ["text", "note"]}},
+        {},
+    ):
+        with pytest.raises(ValueError, match="another store"):
+            await call(resolver(**settings), "resolve", conflicts, decision)
+    # A Conflicts whose proposal or candidates were changed after find_conflicts
+    renamed = dataclasses.replace(conflicts.proposal, key="other")
+    for changed in (
+        dataclasses.replace(conflicts, candidates=conflicts.candidates[1:]),
+        dataclasses.replace(conflicts, proposal=renamed),
+    ):
+        with pytest.raises(ValueError, match="changed after find_conflicts"):
+            await call(store, "resolve", changed, decision)
+    # Decisions that are not valid for this Conflicts
+    for bad, match in (
+        (None, "resolve needs a Decision, got NoneType"),
+        (Decision(actions={"missing": Action.DELETE}), "unknown candidate key: missing"),
+        (Decision(actions={"k": Action.SUPERSEDE}), "cannot give the target key"),
+        (Decision(new="superseded"), "superseded_by"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            await call(store, "resolve", conflicts, bad)
+
+    # Without migration 2 the schema check refuses, before any attempt
+    without_columns(store)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "resolve", conflicts, decision)
+    # A store with history refuses until setup() has created the history table
+    keeping = resolver(index=index, history=True)
+    schema = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return schema.answer(statements, label)
+
+    keeping._read_all = reading(make, read_all)
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        await call(keeping, "resolve", conflicts, decision)
+    # Nothing was embedded again
+    assert (embeddings.calls, embedded(model, make)) == (found_with, 0)
+
+
+def test_plan_resolve_checks_the_target_and_every_key_the_decision_names() -> None:
+    store = reconciling_store(ReconcileReads([], fail="none"))
+    keys = ["k", "old", "gone", "dup", "kept", "newer"]
+    rows = [candidate_row(key, version=2) for key in keys]
+    conflicts = found_conflicts(store, rows)
+    state = conflicts._state
+    plan, token = state.plan, (2, T0)
+    decision = Decision(
+        actions={
+            "old": Action.SUPERSEDE,
+            "gone": Action.DELETE,
+            "dup": Action.CONFIRM,
+            "kept": Action.KEEP,
+        }
+    )
+
+    resolving = store._plan_resolve(conflicts, decision)
+
+    # The new key, then the candidates the decision acts on, in candidate
+    # order. A kept candidate is not checked
+    assert [c.key for c in conflicts.candidates] == ["k", "dup", "gone", "kept", "newer", "old"]
+    assert resolving.expected == {"k": token, "dup": token, "gone": token, "old": token}
+    assert list(resolving.expected) == ["k", "dup", "gone", "old"]
+    # The candidates it deletes or supersedes may be gone on a retry
+    assert resolving.removed == {"gone", "old"}
+    # One round trip reads their live tokens, and the rows that carry the
+    # write id under the new key and every candidate's key, whatever this
+    # decision names: an earlier resolve of the same Conflicts may have
+    # decided otherwise
+    named = sorted(keys)
+    assert resolving.reads == [
+        store.sql.tokens("user.alice", ["dup", "gone", "k", "old"]),
+        store.sql.applied_items("user.alice", named, write_id=plan.write_id),
+        store.sql.applied_history("user.alice", named, write_id=plan.write_id),
+    ]
+    # The writes are reconcile's, with the stored vectors and the valid time
+    # the decision was made against
+    assert resolving.writes == store._decision_statements(
+        plan,
+        conflicts.candidates,
+        decision,
+        vector_rows=state.vector_rows,
+        valid_at=conflicts.proposal.valid_at,
+    )
+    assert (resolving.plan, resolving.candidates, resolving.decision) == (
+        plan,
+        conflicts.candidates,
+        decision,
+    )
+    # The candidate that supersedes a late fact is checked even when kept
+    late = Decision(new="superseded", superseded_by="newer")
+    assert list(store._plan_resolve(conflicts, late).expected) == ["k", "newer"]
+    # A key that had no live memory must still have none
+    absent = found_conflicts(store, rows[1:])
+    assert store._plan_resolve(absent, Decision(actions={"old": Action.DELETE})).expected == {
+        "k": None,
+        "old": token,
+    }
+
+
+# The live tokens of the candidates of resolving_store, unchanged
+TOKENS = [{"key": key, "version": 1, "updated_at": T0} for key in ("k", "old", "dup")]
+DECIDED = Decision(actions={"old": Action.SUPERSEDE, "dup": Action.CONFIRM})
+WRITTEN = ReconcileResult(
+    key="k",
+    new="written",
+    version=2,
+    superseded=("old",),
+    deleted=(),
+    confirmed=("dup",),
+    kept=(),
+)
+
+
+class LateApplied(ReconcileReads):
+    """ReconcileReads whose already-applied reads find ``applied`` from the second attempt on.
+
+    The first attempt committed and the result of its COMMIT was lost (a
+    "lost commit"): its retry finds its rows.
+    """
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if sql.startswith(APPLIED_READS) and len(self.attempts) == 1:
+            return []
+        return super().answer(sql)
+
+
+def resolving_store(
+    reads_class: type[ReconcileReads] = ReconcileReads, make: str = "sync", **reads: object
+) -> tuple[Any, ReconcileReads, Conflicts]:
+    """A sync or async store with history whose resolve attempts go to a ReconcileReads, and its Conflicts.
+
+    The Conflicts has the target "k" and the slot matches "old" and "dup".
+    """
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    calls = reads_class(rows, **reads)  # type: ignore[arg-type]
+    store = reconciling_store(calls, make=make)
+    return store, calls, found_conflicts(store, rows)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_resolve_checks_then_writes_in_one_attempt(make: str) -> None:
+    store, reads, conflicts = resolving_store(fail="none", tokens=TOKENS, make=make)
+
+    result = await call(store, "resolve", conflicts, DECIDED)
+
+    # The check goes out first, as one round trip, then the decision's statements
+    resolving = store._plan_resolve(conflicts, DECIDED)
+    assert reads.attempts == [[*resolving.reads, *resolving.writes]]
+    assert result == WRITTEN
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_resolve_raises_conflicts_changed_and_writes_nothing(make: str) -> None:
+    # "old" was written since find_conflicts, and "dup" is gone
+    tokens = [TOKENS[0], {"key": "old", "version": 2, "updated_at": T0 + timedelta(seconds=1)}]
+    store, reads, conflicts = resolving_store(fail="none", tokens=tokens, make=make)
+
+    with pytest.raises(ConflictsChanged) as error:
+        await call(store, "resolve", conflicts, DECIDED)
+
+    assert error.value.keys == ("dup", "old")
+    # One attempt, which sent only the check: it is not retried
+    assert reads.attempts == [store._plan_resolve(conflicts, DECIDED).reads]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_resolving_the_same_conflicts_again_returns_the_first_result(make: str) -> None:
+    # Rows under the new key carry the Conflicts' write id: an earlier
+    # resolve committed. The tokens changed with it, which is no conflict
+    applied = (
+        [written_row("k", 2)],
+        [{"key": "old", "reason": "superseded"}],
+    )
+    store, reads, conflicts = resolving_store(fail="none", applied=applied, tokens=[], make=make)
+    other = Decision(actions={"dup": Action.DELETE})
+
+    # Even with another decision, the first one's result comes back
+    result = await call(store, "resolve", conflicts, other)
+
+    assert result == dataclasses.replace(WRITTEN, confirmed=(), already_applied=True)
+    assert reads.attempts == [store._plan_resolve(conflicts, other).reads]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+async def test_a_retried_resolve_looks_for_its_write_id_again(committed: bool, make: str) -> None:
+    # The first attempt fails as its block ends, after its writes and COMMIT
+    # went out: with a 40003 when it committed and its result was lost, with
+    # a 40001 when it rolled back
+    applied = (
+        [written_row("k", 2)],
+        [{"key": "old", "reason": "superseded"}],
+    )
+    store, reads, conflicts = resolving_store(
+        LateApplied if committed else ReconcileReads,
+        make=make,
+        fail="lost commit" if committed else "commit",
+        applied=applied if committed else ([], []),
+        tokens=TOKENS,
+    )
+
+    result = await call(store, "resolve", conflicts, DECIDED)
+
+    resolving = store._plan_resolve(conflicts, DECIDED)
+    first, second = reads.attempts
+    assert first == [*resolving.reads, *resolving.writes]
+    if committed:
+        # Its rows prove the first attempt committed: nothing more is sent
+        assert second == resolving.reads
+        assert result == dataclasses.replace(WRITTEN, confirmed=(), already_applied=True)
+    else:
+        # Nothing carries the write id, the check passes again, and the retry writes again
+        assert second == first
+        assert result == WRITTEN
+
+
+def test_changed_keys_lets_a_key_that_may_be_gone_be_gone() -> None:
+    later = T0 + timedelta(seconds=1)
+    expected: dict = {"gone": (2, T0), "rewritten": (2, T0), "strict": (2, T0)}
+    rows = [{"key": "rewritten", "version": 3, "updated_at": later}]
+    # Gone counts as unchanged only for the keys that may be gone, and a live
+    # memory that differs still counts
+    assert changed_keys(expected, rows, may_be_gone={"gone", "rewritten"}) == (
+        "rewritten",
+        "strict",
+    )
+    assert changed_keys(expected, rows) == ("gone", "rewritten", "strict")
+
+
+def test_after_a_possible_commit_only_the_candidates_the_decision_removes_may_be_gone() -> None:
+    store = reconciling_store(ReconcileReads([], fail="none"))
+    rows = [candidate_row(key) for key in ("k", "old", "gone", "dup", "newer", "kept")]
+    conflicts = found_conflicts(store, rows)
+    # A late fact that deletes the memory under its own key, supersedes and
+    # deletes two candidates, and confirms another
+    decision = Decision(
+        new="superseded",
+        superseded_by="newer",
+        actions={
+            "k": Action.DELETE,
+            "old": Action.SUPERSEDE,
+            "gone": Action.DELETE,
+            "dup": Action.CONFIRM,
+        },
+    )
+    resolving = store._plan_resolve(conflicts, decision)
+    # The memory under the new key is removed too, since the decision deletes it
+    assert resolving.removed == {"k", "old", "gone"}
+    nothing: list = [[], [], []]
+
+    # Until an attempt may have committed, the check is strict: every key
+    # it checks must still be live. So is a retry after a serialization failure
+    with pytest.raises(ConflictsChanged) as first:
+        store._check_resolve(resolving, nothing, may_have_committed=False)
+    assert first.value.keys == ("k", "dup", "gone", "newer", "old")
+    # After an attempt that may have committed, the deleted and superseded
+    # memories may be gone, but not the confirmed one or the newer fact
+    with pytest.raises(ConflictsChanged) as again:
+        store._check_resolve(resolving, nothing, may_have_committed=True)
+    assert again.value.keys == ("dup", "newer")
+    # Gone as the decision asked, the rest unchanged: the retry applies it
+    live = [{"key": key, "version": 1, "updated_at": T0} for key in ("dup", "newer")]
+    assert store._check_resolve(resolving, [live, [], []], may_have_committed=True) is None
+    with pytest.raises(ConflictsChanged) as strict:
+        store._check_resolve(resolving, [live, [], []], may_have_committed=False)
+    assert strict.value.keys == ("k", "gone", "old")
+    # A removed memory that is live but was written since still counts, and so
+    # does a memory under the new key that another writer put again
+    later = T0 + timedelta(seconds=1)
+    for key, version in (("old", 2), ("k", 1)):
+        rewritten = [*live, {"key": key, "version": version, "updated_at": later}]
+        with pytest.raises(ConflictsChanged) as written:
+            store._check_resolve(resolving, [rewritten, [], []], may_have_committed=True)
+        assert written.value.keys == (key,)
+    # A decision that keeps the memory under the new key, or writes over it,
+    # leaves it strict
+    assert store._plan_resolve(conflicts, Decision(actions={"old": Action.DELETE})).removed == {
+        "old"
+    }
+
+
+class GoneOnRetry(ReconcileReads):
+    """ReconcileReads whose token read leaves out ``gone`` from the second attempt on.
+
+    The first attempt deleted them and committed before its 40001, and a
+    store without history keeps no row of that.
+    """
+
+    def __init__(self, rows: list[dict[str, object]], *, gone: set[str], **kwargs: object) -> None:
+        super().__init__(rows, **kwargs)  # type: ignore[arg-type]
+        self.gone = gone
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        found = super().answer(sql)
+        if sql.startswith(TOKEN_READ) and len(self.attempts) > 1:
+            return [row for row in found if row["key"] not in self.gone]
+        return found
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_retried_resolve_finishes_the_deletes_a_lost_commit_made(make: str) -> None:
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    # The first attempt sent its COMMIT, and its result was lost (40003)
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="lost commit", tokens=TOKENS)
+    store = reconciling_store(reads, history=False, make=make)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    result = await call(store, "resolve", conflicts, decision)
+
+    # The retry finds the deleted memories gone, as the decision asked, and
+    # applies it again: deleting them again changes nothing
+    resolving = store._plan_resolve(conflicts, decision)
+    first, second = reads.attempts
+    assert first == second == [*resolving.reads, *resolving.writes]
+    # No row proves the earlier commit, so the result is not marked applied
+    assert result == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("dup", "old"),
+        confirmed=(),
+        kept=("k",),
+    )
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_resolve_retried_after_a_serialization_failure_counts_a_gone_memory_as_changed(
+    make: str,
+) -> None:
+    # The first attempt failed with a 40001 as its COMMIT went out, so it
+    # rolled back. Memories gone before the retry were removed by another
+    # writer, and the decision depended on them
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="commit", tokens=TOKENS)
+    store = reconciling_store(reads, history=False, make=make)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    with pytest.raises(ConflictsChanged) as error:
+        await call(store, "resolve", conflicts, decision)
+
+    assert error.value.keys == ("dup", "old")
+    # The retry wrote nothing
+    resolving = store._plan_resolve(conflicts, decision)
+    assert reads.attempts == [[*resolving.reads, *resolving.writes], resolving.reads]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_resolve_refuses_an_edited_proposal_before_any_io(make: str) -> None:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    reads = CandidateReads(rows=[candidate_row("k", version=3), candidate_row("s")], vectors=1)
+    finder, _ = finding_store(reads)
+    value = {"seat": "x", "text": "aisle", "tags": ["a", "b"]}
+    conflicts = finder.find_conflicts(
+        NS, "k", value, slot="seat", provenance={"source": "chat"}, valid_at=VALID
+    )
+    # A connection the store must never touch: using it would raise TypeError
+    store = make_store(make, index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]})
+    decision = Decision(actions={"s": Action.SUPERSEDE})
+    proposal = conflicts.proposal
+
+    def edited(**fields: object) -> Conflicts:
+        return dataclasses.replace(conflicts, proposal=dataclasses.replace(proposal, **fields))
+
+    # resolve writes the memory find_conflicts planned, with its embedding, so
+    # a person who edited the proposal would lose the edit without a word
+    for fields, named in (
+        ({"namespace": ("user", "bob")}, "namespace"),
+        ({"key": "other"}, "key"),
+        ({"value": {**value, "text": "window"}}, "value"),
+        ({"slot": "tags"}, "slot"),
+        ({"slot_value": "y"}, "slot_value"),
+        ({"provenance": {"source": "person"}}, "provenance"),
+        ({"provenance": None}, "provenance"),
+        ({"valid_at": VALID + timedelta(days=1)}, "valid_at"),
+        ({"value": {**value, "seat": 1}, "provenance": None}, "value, provenance"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match=rf"The proposal changed after find_conflicts or afind_conflicts returned it, in "
+            rf"these fields: {named}\. .*find the conflicts again with the edited memory",
+        ):
+            await call(store, "resolve", edited(**fields), decision)
+    # A slot value of 1 made True is another JSON value, though Python finds them equal
+    numbered = finder.find_conflicts(NS, "k", {"seat": 1, "text": "aisle"}, slot="seat")
+    made_true = dataclasses.replace(numbered.proposal, slot_value=True)
+    with pytest.raises(ValueError, match=r"in these fields: slot_value\."):
+        await call(store, "resolve", dataclasses.replace(numbered, proposal=made_true), decision)
+
+    # Equal values after a checkpoint's normalization are no edit, and neither
+    # is the same JSON with its keys in another order or a tuple for a list
+    serde = JsonPlusSerializer()
+    back = serde.loads_typed(serde.dumps_typed(conflicts))
+    assert store._plan_resolve(back, decision).plan == back._state.plan
+    same = edited(
+        namespace=["user", "alice"], value={"tags": ("a", "b"), "text": "aisle", "seat": "x"}
+    )
+    store._plan_resolve(same, decision)
+    # Without a valid time given to find_conflicts, the proposal holds the
+    # default it worked out, and the state keeps it. A person who set when
+    # the fact became true would lose that edit too
+    found = finder.find_conflicts(NS, "k", value, slot="seat")
+    assert found._state.valid_at == found.proposal.valid_at == NOW
+
+    def timed(given: Conflicts, valid_at: datetime) -> Conflicts:
+        return dataclasses.replace(
+            given, proposal=dataclasses.replace(given.proposal, valid_at=valid_at)
+        )
+
+    with pytest.raises(ValueError, match=r"in these fields: valid_at\."):
+        await call(store, "resolve", timed(found, NOW - timedelta(days=7)), decision)
+    # The same instant in another time zone is no edit, default or given
+    east = timezone(timedelta(hours=9))
+    for given in (found, conflicts):
+        store._plan_resolve(timed(given, given.proposal.valid_at.astimezone(east)), decision)
+    # An edit in place counts too: the proposal and the plan share the value
+    # dict, but the plan writes the JSON find_conflicts serialized
+    back.proposal.value["text"] = "window"
+    proposal.value["text"] = "window"
+    for changed in (back, conflicts):
+        with pytest.raises(ValueError, match="in these fields: value\\."):
+            await call(store, "resolve", changed, decision)
+
+
+def test_a_confirm_ttl_function_that_calls_the_store_fails_at_once() -> None:
+    store = CockroachDBStore(object(), retry_policy=FAST)  # type: ignore[arg-type]
+    store._columns_ready = True
+    # On a single connection the callable holds the store's lock
+    store.lock.acquire()
+    try:
+
+        def ttl_fn(record: MemoryRecord) -> float:
+            store.record(NS, "k")
+            return 10.0
+
+        error = raised_within(lambda: store._run_user_callable(ttl_fn, make_record()))
+        assert isinstance(error, RuntimeError), error
+        assert "A reconcile policy or a confirm TTL function must not call the store" in str(error)
+    finally:
+        store.lock.release()
+    # The mark lasts only while the callable runs
+    store._refuse_inside_user_callable()
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_validate_confirm_ttl_before_io(make: str) -> None:
+    """Invalid ttl raises ValueError before any I/O."""
+    store = make_store(make)
+    # These should raise before touching the connection
+    with pytest.raises(ValueError, match="ttl must be"):
+        await call(store, "confirm", NS, "k", ttl=-1)
+    with pytest.raises(ValueError, match="ttl must be"):
+        await call(store, "confirm", NS, "k", ttl="x")
+    with pytest.raises(ValueError, match="ttl must be"):
+        await call(store, "confirm", NS, "k", ttl=math.nan)
+    with pytest.raises(ValueError, match="ttl must be"):
+        await call(store, "confirm", NS, "k", ttl=True)
+
+
+def test_validate_and_resolve_confirm_ttl() -> None:
+    """Test module-level validation and resolution functions."""
+    record = make_record()
+    # Validation accepts valid values
+    _validate_confirm_ttl(NOT_PROVIDED)
+    _validate_confirm_ttl(None)
+    _validate_confirm_ttl(10.0)
+    _validate_confirm_ttl(lambda r: 10.0)
+    # Validation rejects invalid values
+    with pytest.raises(ValueError, match="got -1"):
+        _validate_confirm_ttl(-1)
+    with pytest.raises(ValueError, match="got 'x'"):
+        _validate_confirm_ttl("x")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="got nan"):
+        _validate_confirm_ttl(math.nan)
+    with pytest.raises(ValueError, match="got True"):
+        _validate_confirm_ttl(True)  # type: ignore[arg-type]
+    # Resolution returns non-callable as-is
+    assert _resolve_confirm_ttl(NOT_PROVIDED, record) is NOT_PROVIDED
+    assert _resolve_confirm_ttl(None, record) is None
+    assert _resolve_confirm_ttl(10.0, record) == 10.0
+    # Resolution calls callable and validates
+    assert _resolve_confirm_ttl(lambda r: (r.confirmations + 1) * 60.0, record) == 60.0
+    assert _resolve_confirm_ttl(lambda r: None, record) is None
+    # Resolution rejects invalid returns
+    with pytest.raises(ValueError, match="got -1"):
+        _resolve_confirm_ttl(lambda r: -1, record)
+    with pytest.raises(ValueError, match="got nan"):
+        _resolve_confirm_ttl(lambda r: math.nan, record)
+
+
+def test_confirm_result_interprets_rowcount_and_check_rows() -> None:
+    """_confirm_result returns True for an update or a found confirm id, False otherwise."""
+    store = CockroachDBStore(object())  # type: ignore[arg-type]
+    # Updated row means confirmed
+    assert store._confirm_result(rowcount=1, check_rows=[]) is True
+    # No update but check row means retried after lost commit
+    assert store._confirm_result(rowcount=0, check_rows=[{"x": 1}]) is True
+    # No update and no check row means no live memory
+    assert store._confirm_result(rowcount=0, check_rows=[]) is False
+
+
+def test_carries_confirm_id_matches_the_uuid_psycopg_reads_with_the_string_a_call_chose() -> None:
+    confirm_id = str(uuid.uuid4())
+    # psycopg reads a UUID column as a uuid.UUID, which never equals a str
+    assert uuid.UUID(confirm_id) != confirm_id
+    assert _carries_confirm_id({"confirm_id": uuid.UUID(confirm_id)}, confirm_id)
+    assert _carries_confirm_id({"confirm_id": confirm_id.upper()}, confirm_id)
+    assert not _carries_confirm_id({"confirm_id": uuid.uuid4()}, confirm_id)
+    assert not _carries_confirm_id({"confirm_id": None}, confirm_id)
+    assert not _carries_confirm_id({}, confirm_id)
+    # The write id of the write that put the value there is not the confirm id
+    assert not _carries_confirm_id({"write_id": uuid.UUID(confirm_id)}, confirm_id)
+
+
+def as_read(row: dict[str, object]) -> dict[str, object]:
+    """``row`` as psycopg reads it back: a UUID column, such as confirm_id, comes as a uuid.UUID."""
+    return {
+        name: uuid.UUID(value) if name.endswith("_id") and isinstance(value, str) else value
+        for name, value in row.items()
+    }
+
+
+class ConfirmReads:
+    """Stands in for a store's _cursor in confirm, and answers its statements.
+
+    Every attempt logs its statements. The record read returns ``record_row``
+    (or no rows if None), with its confirm id as a uuid.UUID, as psycopg reads
+    it. The UPDATE returns ``updated`` rows, and the confirm id check returns
+    ``check_rows``. ``fail`` makes the first attempt fail with a retryable
+    40003 as its block ends.
+    """
+
+    def __init__(
+        self,
+        *,
+        record_row: dict[str, object] | None = None,
+        updated: int = 1,
+        check_rows: list[dict[str, object]] | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.record_row = record_row
+        self.updated = updated
+        self.check_rows = check_rows if check_rows is not None else []
+        self.fail = fail
+        self.attempts: list[list[tuple[str, list]]] = []
+        self.closed = False
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ConfirmCursor"]:
+        self.closed = False
+        self.attempts.append([])
+        yield ConfirmCursor(self)
+        self.closed = True
+        if self.fail and len(self.attempts) == 1:
+            raise psycopg.errors.StatementCompletionUnknown("40003")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if sql.startswith("SELECT key, value"):
+            return [as_read(self.record_row)] if self.record_row else []
+        if sql.startswith("SELECT 1 FROM"):
+            return self.check_rows
+        return []
+
+
+class ConfirmCursor:
+    """A cursor of ConfirmReads: it logs each statement and answers its fetch.
+
+    Like psycopg, execute computes and stores the result immediately, and
+    fetchall returns the stored result even after the block closes. Only
+    execute after the block raises.
+    """
+
+    def __init__(self, reads: ConfirmReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.sql = ""
+        self.rowcount = 0
+        self._result: list[dict[str, object]] = []
+
+    def cursor(self, **kwargs: object) -> "ConfirmCursor":
+        return ConfirmCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        if self.reads.closed:
+            raise RuntimeError("Statement sent after _cursor block closed")
+        self.reads.attempts[-1].append((sql, params or []))
+        self.sql = sql
+        # Store the result immediately, like psycopg does
+        self._result = self.reads.answer(sql)
+        if sql.startswith("WITH renewed") or sql.startswith("UPDATE"):
+            self.rowcount = self.reads.updated
+
+    def fetchall(self) -> list[dict[str, object]]:
+        # Return stored result, even after block closed
+        return self._result
+
+    def close(self) -> None:
+        pass
+
+
+def confirming_store(reads: ConfirmReads, make: str = "sync") -> Any:
+    """A sync or async store whose confirm attempts go to ``reads``."""
+    store = make_store(make)
+    store._columns_ready = True
+    store._cursor = attempts_on(make, reads.cursor)  # type: ignore[method-assign]
+    return store
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_confirm_sends_all_statements_inside_the_attempt(make: str) -> None:
+    """Every statement is sent inside the _cursor block, nothing after it exits."""
+    # With a number TTL: UPDATE and confirm id check
+    reads = ConfirmReads(updated=1, check_rows=[])
+    store = confirming_store(reads, make)
+
+    result = await call(store, "confirm", NS, "k", ttl=10.0)
+
+    assert result is True
+    assert len(reads.attempts) == 1
+    statements = reads.attempts[0]
+    # UPDATE (may include CTE for vectors) and confirm id check
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+    assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
+    # Nothing sent after the block closed
+    # (The ConfirmCursor raises if a statement arrives while closed)
+
+    # With a callable TTL: record read, UPDATE, and confirm id check
+    record_row = {
+        "key": "k",
+        "value": '{"text": "x"}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        "version": 1,
+        "valid_at": NOW,
+        "provenance": None,
+        "confirmed_at": None,
+        "confirmations": 0,
+        "confirm_id": None,
+    }
+    reads = ConfirmReads(record_row=record_row, updated=1, check_rows=[])
+    store = confirming_store(reads, make)
+
+    result = await call(store, "confirm", NS, "k", ttl=lambda r: 10.0)
+
+    assert result is True
+    assert len(reads.attempts) == 1
+    statements = reads.attempts[0]
+    # Record read, UPDATE, and confirm id check
+    assert any("SELECT key, value" in stmt[0] for stmt in statements)
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+    assert any("SELECT 1 FROM" in stmt[0] for stmt in statements)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_confirm_with_invalid_callable_return_raises_and_sends_no_update(make: str) -> None:
+    """A TTL callable returning invalid values raises ValueError inside the attempt."""
+    record_row = {
+        "key": "k",
+        "value": '{"text": "x"}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        "version": 1,
+        "valid_at": NOW,
+        "provenance": None,
+        "confirmed_at": None,
+        "confirmations": 0,
+        "confirm_id": None,
+    }
+
+    for invalid, pattern in [
+        (0, "got 0"),
+        (-1, "got -1"),
+        (math.nan, "got nan"),
+        ("x", "got 'x'"),
+        (True, "got True"),
+    ]:
+        reads = ConfirmReads(record_row=record_row, updated=1, check_rows=[])
+        store = confirming_store(reads, make)
+
+        error = await raised(store, "confirm", NS, "k", ttl=lambda r, i=invalid: i)
+
+        assert isinstance(error, ValueError), (invalid, error)
+        assert pattern in str(error), (invalid, error)
+        # One attempt
+        assert len(reads.attempts) == 1
+        statements = reads.attempts[0]
+        # Record read sent, but no UPDATE (callable failed)
+        assert any("SELECT key, value" in stmt[0] for stmt in statements)
+        assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in statements)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_confirm_on_retry_skips_callable_when_record_has_its_confirm_id(make: str) -> None:
+    """On a retry, if the record has this confirm id, return True without calling the callable."""
+    called = []
+
+    def track_callable(r: MemoryRecord) -> float:
+        called.append(True)
+        return 10.0
+
+    # Subclass to capture the confirm id and return it on retry
+    class RetryReads(ConfirmReads):
+        def __init__(self) -> None:
+            super().__init__(
+                record_row={
+                    "key": "k",
+                    "value": '{"text": "x"}',
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "version": 1,
+                    "valid_at": NOW,
+                    "provenance": None,
+                    "confirmed_at": None,
+                    "confirmations": 0,
+                    "confirm_id": None,
+                },
+                updated=1,
+                check_rows=[],
+                fail=True,
+            )
+            self.captured_confirm_id: str | None = None
+
+        def answer(self, sql: str) -> list[dict[str, object]]:
+            # On retry, return the record with the captured confirm id, as
+            # psycopg reads a UUID column back: a uuid.UUID, not a str
+            if (
+                sql.startswith("SELECT key, value")
+                and len(self.attempts) > 1
+                and self.captured_confirm_id
+            ):
+                row = dict(self.record_row)  # type: ignore[arg-type]
+                row["confirm_id"] = uuid.UUID(self.captured_confirm_id)
+                return [row]
+            return super().answer(sql)
+
+        @contextlib.contextmanager
+        def cursor(self, **kwargs: object) -> Iterator[ConfirmCursor]:
+            try:
+                with super().cursor(**kwargs) as cur:
+                    yield cur
+            finally:
+                # After first attempt, capture the confirm id from UPDATE
+                if len(self.attempts) == 1 and not self.captured_confirm_id:
+                    for stmt_sql, params in self.attempts[0]:
+                        if ("UPDATE" in stmt_sql or "WITH renewed" in stmt_sql) and params:
+                            # Find UUID in params
+                            for p in params:
+                                if isinstance(p, str) and len(p) == 36 and p.count("-") == 4:
+                                    self.captured_confirm_id = p
+                                    break
+                            break
+
+    reads = RetryReads()
+    store = confirming_store(reads, make)
+
+    result = await call(store, "confirm", NS, "k", ttl=track_callable)
+
+    assert result is True
+    # Callable called only once (first attempt, not retry)
+    assert len(called) == 1
+    # Two attempts
+    assert len(reads.attempts) == 2
+    # First attempt has record read and UPDATE
+    first = reads.attempts[0]
+    assert any("SELECT key, value" in stmt[0] for stmt in first)
+    assert any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in first)
+    # Second attempt has only record read, no UPDATE (early return on confirm id match)
+    second = reads.attempts[1]
+    assert any("SELECT key, value" in stmt[0] for stmt in second)
+    assert not any("UPDATE" in stmt[0] or "WITH renewed" in stmt[0] for stmt in second)
+
+
+# put_if and delete_if: the checks before any I/O, the plan, the check and the attempt
+
+LATER = T0 + timedelta(seconds=1)
+
+
+def record_of(namespace: tuple[str, ...] = NS, key: str = "k", **row: object) -> MemoryRecord:
+    """The MemoryRecord that record() returns for the live row candidate_row(key, **row)."""
+    return store_base._row_to_record(namespace, candidate_row(key, **row))  # type: ignore[arg-type]
+
+
+def conditional_store(*, history: bool = False, ttl: object = None, make: str = "sync") -> Any:
+    """A sync or async store with a 3-dimension index, on a connection it must never touch."""
+    return make_store(
+        make,
+        index={"dims": 3, "embed": CountingEmbeddings(), "fields": ["text"]},
+        history=history,
+        ttl=ttl,
+    )
+
+
+def plan_put_if(store: BaseCockroachDBStore, value: object = TEXT, **kwargs: object):  # type: ignore[no-untyped-def]
+    """_plan_put_if with put_if's defaults, under NS and key "k" unless given."""
+    arguments: dict = {
+        "expected": None,
+        "index": None,
+        "ttl": NOT_PROVIDED,
+        "provenance": None,
+        "valid_at": None,
+    }
+    arguments.update(kwargs)
+    namespace = arguments.pop("namespace", NS)
+    key = arguments.pop("key", "k")
+    return store._plan_put_if(namespace, key, value, **arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_put_if_rejects_a_record_for_another_key_before_any_io(make: str) -> None:
+    store = conditional_store(make=make)
+    embeddings = store.index.embeddings
+    record = record_of()
+
+    def put_if(*args: Any, **kwargs: Any) -> Any:
+        return lambda: call(store, "put_if", *args, **kwargs)
+
+    def delete_if(*args: Any, **kwargs: Any) -> Any:
+        return lambda: call(store, "delete_if", *args, **kwargs)
+
+    for check, match in (
+        # The record of another namespace or key
+        (put_if(NS, "k", TEXT, expected=record_of(("user", "bob"))), "record of"),
+        (put_if(NS, "other", TEXT, expected=record), "record of"),
+        (delete_if(NS, "other", expected=record), "record of"),
+        (delete_if(("user", "bob"), "k", expected=record), "record of"),
+        # Something other than a record
+        (put_if(NS, "k", TEXT, expected={"version": 1}), "MemoryRecord"),
+        (delete_if(NS, "k", expected=1), "MemoryRecord"),
+        # The other arguments, checked as put and reconcile check them
+        (put_if((), "k", TEXT, expected=None), "put_if needs a non-empty namespace"),
+        (delete_if((), "k", expected=None), "delete_if needs a non-empty namespace"),
+        (put_if(("a.b",), "k", TEXT, expected=None), "a.b"),
+        (put_if(NS, "k", None, expected=None), "put_if needs the value as a dict"),
+        (put_if(NS, "k", ["x"], expected=None), "put_if needs the value as a dict"),
+        (put_if(NS, "k", {"x": object()}, expected=None), "not JSON serializable"),
+        (put_if(NS, "k", {"x": math.nan}, expected=None), "not JSON serializable"),
+        (put_if(NS, "k", TEXT, expected=None, ttl=0), "ttl"),
+        (put_if(NS, "k", TEXT, expected=None, ttl=True), "ttl"),
+        (put_if(NS, "k", TEXT, expected=None, provenance="chat"), "provenance"),
+        (put_if(NS, "k", TEXT, expected=None, provenance={"x": object()}), "provenance"),
+        (put_if(NS, "k", TEXT, expected=None, valid_at=datetime(2026, 1, 1)), "valid_at"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            await check()
+    assert embedded(embeddings, make) == 0
+
+    # A namespace given as a list names the record's namespace, and a record
+    # that came back from a checkpoint is the record it was
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    serde = JsonPlusSerializer()
+    saved = serde.loads_typed(serde.dumps_typed(record))
+    assert plan_put_if(store, namespace=list(NS), expected=saved).expected == (1, T0)
+    assert store._plan_delete_if(list(NS), "k", expected=saved).expected == (1, T0)  # type: ignore[arg-type]
+
+    # Without migration 2 the schema check refuses, before anything is embedded
+    without_columns(store)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "put_if", NS, "k", TEXT, expected=record)
+    with pytest.raises(ValueError, match=r"setup\(\)"):
+        await call(store, "delete_if", NS, "k", expected=record)
+    assert embedded(embeddings, make) == 0
+
+    # A store with history refuses until setup() has created the history table
+    keeping = conditional_store(history=True, make=make)
+    schema = SchemaReads(columns=True, history=False)
+
+    def read_all(
+        statements: list[tuple[str, list]], label: str, session: object = None
+    ) -> list[list[dict]]:
+        return schema.answer(statements, label)
+
+    keeping._read_all = reading(make, read_all)
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        await call(keeping, "put_if", NS, "k", TEXT, expected=record)
+    with pytest.raises(ValueError, match=r"store_history does not exist yet; run setup\(\)"):
+        await call(keeping, "delete_if", NS, "k", expected=record)
+    assert embedded(keeping.index.embeddings, make) == 0
+
+
+def test_plan_put_if_reads_the_live_memory_and_writes_as_put_does() -> None:
+    store = conditional_store(history=True)
+    plan = plan_put_if(
+        store,
+        {"text": "aisle"},
+        expected=record_of(version=2),
+        ttl=30.0,
+        provenance={"source": "chat"},
+        valid_at=VALID,
+    )
+
+    assert (plan.namespace, plan.prefix, plan.key) == (NS, "user.alice", "k")
+    # The token resolve compares: the record's version and updated_at
+    assert plan.expected == (2, T0)
+    assert not plan.deletes
+    write_id = plan.write_id
+    uuid.UUID(write_id)
+    # Every attempt reads the live memory, whose token it compares and which
+    # a conflict returns. A retry also looks for the item that carries the
+    # write id, live or expired, by primary key
+    read = store.sql.record("user.alice", "k")
+    assert plan.reads(may_have_committed=False) == [read]
+    assert plan.reads(may_have_committed=True) == [
+        read,
+        store.sql.applied_items("user.alice", ["k"], write_id=write_id),
+    ]
+    # It writes as put does, with the write id, the provenance and the valid
+    # time, after keeping the version it replaces, which ends at the valid time
+    vector_rows = store._vector_rows(plan.put, [[1.0, 0.0, 0.0]])
+    assert store._conditional_writes(plan, vector_rows) == [
+        store.sql.archive(
+            "user.alice",
+            ["k"],
+            reason="overwritten",
+            superseded_by=None,
+            invalid_at=VALID,
+            write_id=write_id,
+            ttl_days=None,
+        ),
+        store.sql.delete_vectors("user.alice", ["k"]),
+        store.sql.upsert_items(
+            [("user.alice", "k", '{"text": "aisle"}', 30.0, '{"source": "chat"}', VALID)],
+            write_id=write_id,
+            history=True,
+            return_version=True,
+        ),
+        store.sql.upsert_vectors([("user.alice", "k", "text", [1.0, 0.0, 0.0], 30.0)]),
+    ]
+    # Each call has a write id of its own
+    assert plan_put_if(store).write_id != write_id
+
+    # Create only, on a store without history and with a default TTL: no
+    # archive, no valid time and no provenance, and the default TTL
+    plain = conditional_store(ttl={"default_ttl": 5.0})
+    created = plan_put_if(plain, {"text": "aisle"})
+    assert created.expected is None
+    assert plain._conditional_writes(created, []) == [
+        plain.sql.delete_vectors("user.alice", ["k"]),
+        plain.sql.upsert_items(
+            [("user.alice", "k", '{"text": "aisle"}', 5.0, None, None)],
+            write_id=created.write_id,
+            history=False,
+            return_version=True,
+        ),
+    ]
+
+
+def test_plan_delete_if_deletes_as_delete_does() -> None:
+    for history in (False, True):
+        store = conditional_store(history=history)
+        plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+
+        assert (plan.namespace, plan.prefix, plan.key, plan.expected) == (
+            NS,
+            "user.alice",
+            "k",
+            (2, T0),
+        )
+        assert plan.deletes
+        write_id = plan.write_id
+        read = store.sql.record("user.alice", "k")
+        assert plan.reads(may_have_committed=False) == [read]
+        # A retry on a store with history looks for its own history row.
+        # Without history no row can prove which attempt deleted the memory
+        proof = [store.sql.applied_history("user.alice", ["k"], write_id=write_id)]
+        assert plan.reads(may_have_committed=True) == [read, *(proof if history else [])]
+        # The statements delete sends, with the write id on the archived version
+        deleting = store._plan_puts([PutOp(NS, "k", None)])
+        deleting.write_id = write_id
+        writes = store._conditional_writes(plan)
+        assert writes == store._write_statements(deleting)
+        archive = store.sql.archive(
+            "user.alice",
+            ["k"],
+            reason="deleted",
+            superseded_by=None,
+            invalid_at=None,
+            write_id=write_id,
+            ttl_days=None,
+        )
+        assert writes == [
+            *([archive] if history else []),
+            store.sql.delete_items("user.alice", ["k"]),
+            store.sql.delete_vectors("user.alice", ["k"]),
+        ]
+
+
+def test_check_conditional_compares_the_live_memory_with_the_record() -> None:
+    store = conditional_store()
+    live = candidate_row("k", version=2)
+    put = plan_put_if(store, expected=record_of(version=2))
+
+    # Unchanged: the attempt writes
+    assert store._check_conditional(put, [[live]], may_have_committed=False) is None
+    # Written since, written by a 0.5.x store, which leaves the version, or
+    # gone: a conflict, with the live memory as current
+    for rows in (
+        [candidate_row("k", version=3, updated_at=LATER)],
+        [candidate_row("k", version=2, updated_at=LATER)],
+        [],
+    ):
+        assert store._check_conditional(put, [rows], may_have_committed=False) == ConditionalWrite(
+            applied=False,
+            key="k",
+            version=None,
+            current=store_base._row_to_record(NS, rows[0]) if rows else None,
+        )
+    # Create only: no live memory may have the key
+    create = plan_put_if(store)
+    assert store._check_conditional(create, [[]], may_have_committed=False) is None
+    assert store._check_conditional(create, [[live]], may_have_committed=False) == ConditionalWrite(
+        applied=False, key="k", version=None, current=record_of(version=2)
+    )
+    # After an attempt that may have committed, the item that carries the
+    # write id proves that it wrote, which moved the token itself
+    proof = [written_row("k", 3)]
+    written = [{**candidate_row("k", version=3, updated_at=LATER), "value": TEXT}]
+    for plan in (put, create):
+        assert store._check_conditional(
+            plan, [written, proof], may_have_committed=True
+        ) == ConditionalWrite(applied=True, key="k", version=3, current=None, already_applied=True)
+        # So does an item that expired since, with no live row to compare
+        assert store._check_conditional(
+            plan, [[], proof], may_have_committed=True
+        ) == ConditionalWrite(applied=True, key="k", version=3, current=None, already_applied=True)
+        # A 0.5.x store leaves the write id alone: a live item with another
+        # value was replaced since, and is the current state
+        replaced = [candidate_row("k", version=3, updated_at=LATER)]
+        assert store._check_conditional(
+            plan, [replaced, proof], may_have_committed=True
+        ) == ConditionalWrite(
+            applied=False, key="k", version=None, current=store_base._row_to_record(NS, replaced[0])
+        )
+    # Without it the check is as strict as the first attempt's
+    assert store._check_conditional(put, [[], []], may_have_committed=True) == ConditionalWrite(
+        applied=False, key="k", version=None, current=None
+    )
+    assert store._check_conditional(put, [[live], []], may_have_committed=True) is None
+
+
+def test_check_conditional_lets_a_retried_delete_if_find_the_memory_gone() -> None:
+    put_again = candidate_row("k", version=3, updated_at=LATER)
+    for history in (False, True):
+        store = conditional_store(history=history)
+        plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+        no_proof: list = [[]] if history else []
+
+        assert (
+            store._check_conditional(
+                plan, [[candidate_row("k", version=2)]], may_have_committed=False
+            )
+            is None
+        )
+        # The first attempt is strict: a memory gone since is a conflict
+        assert store._check_conditional(plan, [[]], may_have_committed=False) == ConditionalWrite(
+            applied=False, key="k", version=None, current=None
+        )
+        # A retry that finds it gone has the state delete_if asked for. It
+        # deletes again, which changes nothing, as no row proves the earlier commit
+        assert store._check_conditional(plan, [[], *no_proof], may_have_committed=True) is None
+        # A live memory written since still counts
+        assert store._check_conditional(
+            plan, [[put_again], *no_proof], may_have_committed=True
+        ) == (
+            ConditionalWrite(
+                applied=False,
+                key="k",
+                version=None,
+                current=store_base._row_to_record(NS, put_again),
+            )
+        )
+    # With history, its own history row proves that an earlier attempt deleted it
+    store = conditional_store(history=True)
+    plan = store._plan_delete_if(NS, "k", expected=record_of(version=2))
+    deleted = [{"key": "k", "reason": "deleted"}]
+    assert store._check_conditional(
+        plan, [[], deleted], may_have_committed=True
+    ) == ConditionalWrite(applied=True, key="k", version=None, current=None, already_applied=True)
+    # unless another writer put the key again since: that memory is the current state
+    assert store._check_conditional(
+        plan, [[put_again], deleted], may_have_committed=True
+    ) == ConditionalWrite(
+        applied=False, key="k", version=None, current=store_base._row_to_record(NS, put_again)
+    )
+
+
+def test_conditional_result_reports_the_version_written() -> None:
+    store = conditional_store()
+    put = plan_put_if(store)
+    assert store._conditional_result(put, [[{"version": 4}]]) == ConditionalWrite(
+        applied=True, key="k", version=4, current=None
+    )
+    # The write id is new, so the upsert always writes its row: no version is a broken invariant
+    for returned in ([], [[]]):
+        with pytest.raises(RuntimeError, match="committed but returned no version"):
+            store._conditional_result(put, returned)
+    deleting = store._plan_delete_if(NS, "k", expected=None)
+    assert store._conditional_result(deleting, []) == ConditionalWrite(
+        applied=True, key="k", version=None, current=None
+    )
+
+
+class ConditionalReads:
+    """Stands in for a store's _cursor in put_if and delete_if, and answers their statements.
+
+    Every attempt logs its statements and the arguments of its _cursor. The
+    record read returns ``row`` on the first attempt and ``retry_row`` on
+    the others, or no row for None, with its confirm id as a uuid.UUID, as
+    psycopg reads it. The reads of the rows that carry the write id return
+    ``proof``, rows of written_row; like the real reads, they have no write
+    id column. The item
+    upsert returns version 2. ``failures`` are the errors that attempts
+    raise, the first attempt's first, each with where it raises: "read" at
+    the record read, before anything was written; "write" as the first
+    write goes out, before the COMMIT; or "commit" as the block ends, after
+    the writes and the COMMIT went out. A 40003 at the commit is a commit
+    whose result was lost, and a 40001 a serialization failure, which rolled
+    the attempt back. Like psycopg, a cursor keeps its result from execute,
+    and an execute after the block raises.
+    """
+
+    def __init__(
+        self,
+        row: dict[str, object] | None,
+        *,
+        retry_row: dict[str, object] | None = None,
+        proof: list[dict[str, object]] | None = None,
+        failures: Sequence[tuple[type[psycopg.Error], str]] = (),
+    ) -> None:
+        self.row = row
+        self.retry_row = retry_row
+        self.proof = proof or []
+        self.failures = failures
+        self.attempts: list[list[tuple[str, list]]] = []
+        self.arguments: list[dict[str, object]] = []
+        self.closed = False
+
+    def fail(self, at: str) -> None:
+        """Raise the current attempt's error if it fails ``at`` this point."""
+        attempt = len(self.attempts)
+        if attempt <= len(self.failures):
+            error, where = self.failures[attempt - 1]
+            if where == at:
+                raise error(f"injected at the {at}")
+
+    @contextlib.contextmanager
+    def cursor(self, **kwargs: object) -> Iterator["ConditionalCursor"]:
+        self.attempts.append([])
+        self.arguments.append(kwargs)
+        self.closed = False
+        yield ConditionalCursor(self)
+        self.closed = True
+        self.fail("commit")
+
+    def answer(self, sql: str) -> list[dict[str, object]]:
+        if not sql.startswith("SELECT"):
+            self.fail("write")
+        if sql.startswith("SELECT key, value, created_at"):
+            self.fail("read")
+            row = self.row if len(self.attempts) == 1 else self.retry_row
+            return [] if row is None else [as_read(row)]
+        if sql.startswith(APPLIED_READS):
+            return self.proof
+        if sql.endswith("RETURNING version"):
+            return [{"version": 2}]
+        return []
+
+
+class ConditionalCursor:
+    """A cursor of ConditionalReads."""
+
+    def __init__(self, reads: ConditionalReads) -> None:
+        self.reads = reads
+        self.connection = self
+        self.description: list[str] | None = None
+        self._result: list[dict[str, object]] = []
+
+    def cursor(self, **kwargs: object) -> "ConditionalCursor":
+        return ConditionalCursor(self.reads)
+
+    def execute(self, sql: str, params: list | None = None, **kwargs: object) -> None:
+        if self.reads.closed:
+            raise RuntimeError("A statement was sent after the _cursor block ended")
+        self.reads.attempts[-1].append((sql, params or []))
+        self._result = self.reads.answer(sql)
+        self.description = ["version"] if sql.endswith("RETURNING version") else None
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self._result
+
+    def close(self) -> None:
+        pass
+
+
+def conditional_attempts(
+    reads: ConditionalReads, *, history: bool = False, make: str = "sync"
+) -> tuple[Any, list]:
+    """A sync or async store without an index whose attempts go to ``reads``, and the plans it makes."""
+    store = make_store(make, history=history)
+    # Migration 2 and the history table were seen: no schema read
+    store._columns_ready = True
+    store._history_ready = True
+    store._cursor = attempts_on(make, reads.cursor)  # type: ignore[method-assign]
+    plans: list = []
+    for name in ("_plan_put_if", "_plan_delete_if"):
+        planner = getattr(store, name)
+
+        def keep(*args: object, planner=planner, **kwargs: object) -> object:  # type: ignore[no-untyped-def]
+            plans.append(planner(*args, **kwargs))
+            return plans[-1]
+
+        setattr(store, name, keep)
+    return store, plans
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_put_if_checks_then_writes_in_one_attempt(make: str) -> None:
+    reads = ConditionalReads(candidate_row("k", version=2))
+    store, plans = conditional_attempts(reads, history=True, make=make)
+
+    result = await call(store, "put_if", NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    # The read goes out first, as one round trip, then the writes, in one
+    # transaction: nothing is sent after the block
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *store._conditional_writes(plan)]
+    ]
+    assert reads.arguments == [
+        {
+            "pipeline": True,
+            "transaction": True,
+            "timeout": store.retry_policy.attempt_timeout,
+            "label": "store put_if",
+        }
+    ]
+    assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_put_if_returns_the_current_record_and_writes_nothing(make: str) -> None:
+    newer = candidate_row("k", version=3, updated_at=LATER)
+    reads = ConditionalReads(newer)
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "put_if", NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    # One attempt, which sent only the read: a conflict is returned, not retried
+    [plan] = plans
+    assert reads.attempts == [plan.reads(may_have_committed=False)]
+    assert result == ConditionalWrite(
+        applied=False, key="k", version=None, current=store_base._row_to_record(NS, newer)
+    )
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("committed", [False, True], ids=["rolled-back", "committed"])
+async def test_a_retried_put_if_looks_for_its_write_id(
+    committed: bool, make: str, monkeypatch
+) -> None:
+    # The first attempt fails with a 40003 as its block ends, after its writes went out
+    mine = uuid.UUID(int=7)
+    monkeypatch.setattr(store_base.uuid, "uuid4", lambda: mine)
+    # The row the first attempt wrote has its value, and the read of the
+    # rows that carry its write id finds it
+    row = candidate_row("k", version=2)
+    written = {**candidate_row("k", version=3, updated_at=LATER), "value": {"text": "aisle"}}
+    proof = [written_row("k", 3)]
+    reads = ConditionalReads(
+        row,
+        retry_row=written if committed else row,
+        proof=proof if committed else [],
+        failures=[(psycopg.errors.StatementCompletionUnknown, "commit")],
+    )
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "put_if", NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    assert plan.write_id == str(mine)
+    writes = store._conditional_writes(plan)
+    first, second = reads.attempts
+    assert first == [*plan.reads(may_have_committed=False), *writes]
+    if committed:
+        # Its write id on the row proves the first attempt committed: nothing more is sent
+        assert second == plan.reads(may_have_committed=True)
+        assert result == ConditionalWrite(
+            applied=True, key="k", version=3, current=None, already_applied=True
+        )
+    else:
+        # Nothing carries the write id, the record still matches, and the retry writes again
+        assert second == [*plan.reads(may_have_committed=True), *writes]
+        assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("history", [False, True], ids=["no-history", "history"])
+async def test_a_retried_delete_if_reports_a_memory_it_finds_gone_as_deleted(
+    history: bool, make: str
+) -> None:
+    # The first attempt deleted the memory and committed, and its result was lost
+    proof = [{"key": "k", "reason": "deleted"}] if history else []
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=None,
+        proof=proof,
+        failures=[(psycopg.errors.StatementCompletionUnknown, "commit")],
+    )
+    store, plans = conditional_attempts(reads, history=history, make=make)
+
+    result = await call(store, "delete_if", NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    first, second = reads.attempts
+    assert first == [*plan.reads(may_have_committed=False), *writes]
+    assert [arguments["label"] for arguments in reads.arguments] == ["store delete_if"] * 2
+    if history:
+        # Its own history row proves the delete: nothing more is sent
+        assert second == plan.reads(may_have_committed=True)
+        assert result == ConditionalWrite(
+            applied=True, key="k", version=None, current=None, already_applied=True
+        )
+    else:
+        # Gone is the state it asked for. It deletes again, which changes
+        # nothing, and no row proves which attempt deleted the memory
+        assert second == [*plan.reads(may_have_committed=True), *writes]
+        assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+
+
+@pytest.mark.parametrize(
+    ("fail", "fail_at", "may_have_committed"),
+    [
+        (psycopg.errors.SerializationFailure, "commit", False),
+        (psycopg.errors.StatementCompletionUnknown, "read", False),
+        (psycopg.errors.StatementCompletionUnknown, "commit", True),
+    ],
+    ids=["40001 at the commit", "40003 before the commit", "40003 at the commit"],
+)
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_retried_delete_if_counts_a_gone_memory_as_deleted_only_after_a_possible_commit(
+    fail: type[psycopg.Error], fail_at: str, may_have_committed: bool, make: str
+) -> None:
+    # The memory is gone when the retry reads it
+    reads = ConditionalReads(
+        candidate_row("k", version=2), retry_row=None, failures=[(fail, fail_at)]
+    )
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "delete_if", NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    second = reads.attempts[1]
+    if may_have_committed:
+        # The first attempt sent its COMMIT and its result was lost, so it may
+        # have deleted the memory: gone is the state it asked for
+        assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+        assert second == [*plan.reads(may_have_committed=True), *store._conditional_writes(plan)]
+    else:
+        # A serialization failure rolled the first attempt back, and one that
+        # failed before its COMMIT wrote nothing: another writer removed the
+        # memory, and the retry, as strict as the first attempt, says so
+        assert result == ConditionalWrite(applied=False, key="k", version=None, current=None)
+        assert second == plan.reads(may_have_committed=False)
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_put_if_retried_after_a_serialization_failure_checks_as_the_first_attempt_did(
+    make: str,
+) -> None:
+    # The first attempt rolled back, so no row can carry its write id: the
+    # retry reads no proof, compares the record again and writes again
+    row = candidate_row("k", version=2)
+    reads = ConditionalReads(
+        row, retry_row=row, failures=[(psycopg.errors.SerializationFailure, "commit")]
+    )
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "put_if", NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    assert reads.attempts == [[*plan.reads(may_have_committed=False), *writes]] * 2
+    assert result == ConditionalWrite(applied=True, key="k", version=2, current=None)
+
+
+# Leniency is sticky: once an attempt may have committed, a later
+# definite abort proves nothing about it
+
+LOST = psycopg.errors.StatementCompletionUnknown
+ABORTED = psycopg.errors.SerializationFailure
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+@pytest.mark.parametrize("history", [False, True], ids=["no-history", "history"])
+async def test_a_delete_if_stays_lenient_once_an_attempt_may_have_committed(
+    history: bool, make: str
+) -> None:
+    # The first attempt sent its COMMIT and its result was lost, so it may
+    # have deleted the memory. The second finds it gone, deletes again and
+    # fails with a 40001, which rolls back only itself. The third still lets
+    # the memory be gone
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=None,
+        failures=[(LOST, "commit"), (ABORTED, "commit")],
+    )
+    store, plans = conditional_attempts(reads, history=history, make=make)
+
+    result = await call(store, "delete_if", NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    writes = store._conditional_writes(plan)
+    assert result == ConditionalWrite(applied=True, key="k", version=None, current=None)
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *writes],
+        [*plan.reads(may_have_committed=True), *writes],
+        [*plan.reads(may_have_committed=True), *writes],
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_put_if_stays_lenient_once_an_attempt_may_have_committed(make: str) -> None:
+    # The first attempt sent its COMMIT and its result was lost. The second
+    # fails with a 40001 at its first read, which proves nothing about the
+    # first. The third still looks for the write id, and finds it on the row
+    written = {**candidate_row("k", version=3, updated_at=LATER), "value": {"text": "aisle"}}
+    proof = [written_row("k", 3)]
+    reads = ConditionalReads(
+        candidate_row("k", version=2),
+        retry_row=written,
+        proof=proof,
+        failures=[(LOST, "commit"), (ABORTED, "read")],
+    )
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "put_if", NS, "k", {"text": "aisle"}, expected=record_of(version=2))
+
+    [plan] = plans
+    assert result == ConditionalWrite(
+        applied=True, key="k", version=3, current=None, already_applied=True
+    )
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), *store._conditional_writes(plan)],
+        [plan.read],
+        plan.reads(may_have_committed=True),
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_resolve_stays_lenient_once_an_attempt_may_have_committed(make: str) -> None:
+    # As for delete_if: a lost commit, then a 40001 as the retry's COMMIT
+    # goes out. The third attempt still lets the deleted memories be gone,
+    # and applies the decision instead of raising ConflictsChanged
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail=("lost commit", "commit"), tokens=TOKENS)
+    store = reconciling_store(reads, history=False, make=make)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    result = await call(store, "resolve", conflicts, decision)
+
+    resolving = store._plan_resolve(conflicts, decision)
+    assert result == ReconcileResult(
+        key="k",
+        new="skipped",
+        version=None,
+        superseded=(),
+        deleted=("dup", "old"),
+        confirmed=(),
+        kept=("k",),
+    )
+    assert reads.attempts == [[*resolving.reads, *resolving.writes]] * 3
+
+
+# The commit marker: only an attempt whose writes all went out, so that its
+# COMMIT went out too, may have committed
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_delete_if_that_failed_while_its_writes_went_out_retries_strictly(
+    make: str,
+) -> None:
+    # A 40003 while the delete goes out, before the COMMIT: the attempt
+    # cannot have committed, so the memory gone before the retry was
+    # removed by another writer
+    reads = ConditionalReads(
+        candidate_row("k", version=2), retry_row=None, failures=[(LOST, "write")]
+    )
+    store, plans = conditional_attempts(reads, make=make)
+
+    result = await call(store, "delete_if", NS, "k", expected=record_of(version=2))
+
+    [plan] = plans
+    first_write = store._conditional_writes(plan)[0]
+    assert result == ConditionalWrite(applied=False, key="k", version=None, current=None)
+    assert reads.attempts == [
+        [*plan.reads(may_have_committed=False), first_write],
+        plan.reads(may_have_committed=False),
+    ]
+
+
+@pytest.mark.parametrize("make", ["sync", "async"])
+async def test_a_resolve_that_failed_while_its_writes_went_out_retries_strictly(
+    make: str,
+) -> None:
+    # The same for resolve: memories gone before its retry count as changed
+    rows = [candidate_row("k"), candidate_row("old"), candidate_row("dup")]
+    reads = GoneOnRetry(rows, gone={"old", "dup"}, fail="lost write", tokens=TOKENS)
+    store = reconciling_store(reads, history=False, make=make)
+    conflicts = found_conflicts(store, rows)
+    decision = Decision(new="skip", actions={"old": Action.DELETE, "dup": Action.DELETE})
+
+    with pytest.raises(ConflictsChanged) as error:
+        await call(store, "resolve", conflicts, decision)
+
+    assert error.value.keys == ("dup", "old")
+    resolving = store._plan_resolve(conflicts, decision)
+    assert reads.attempts == [[*resolving.reads, resolving.writes[0]], resolving.reads]

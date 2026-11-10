@@ -8,7 +8,8 @@ search form:
 - 60 items in ("mem",), 3 of them {"type": "rare"}, a filter on "rare" and
   limit=3. InMemoryStore returns all three.
 - 40 expired items (ttl=0.001 minutes, not yet deleted) and 4 live ones in
-  ("u",), limit=4. The live items are the answer.
+  ("u",), limit=4. The live items are the answer. The tests use 100 expired
+  items, so that the window of 41, the floor, can leave out every live one.
 
 The forms are the indexed search (C-SPANN), whose short first pass from a
 full window runs again exactly; a flat store; a search of the whole store,
@@ -36,6 +37,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import psycopg
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langgraph.store.base import PutOp, SearchItem
@@ -43,6 +45,7 @@ from langgraph.store.memory import InMemoryStore
 
 from langchain_cockroachdb import AsyncCockroachDBStore, CockroachDBStore
 from langchain_cockroachdb._sql import vector_literal
+from langchain_cockroachdb._window import window_for
 from langchain_cockroachdb.store.sql import NAMESPACES, StoreSQL, bind
 
 DIMS = 16
@@ -98,7 +101,7 @@ def rare_items() -> list[Item]:
 
 RARE = {"k07", "k27", "k47"}
 EXTRA_MEM: Item = (("mem", "x"), "extra", {"text": "another memory", "type": "common"})
-EXPIRED = [(("u",), f"old{i:02}", {"text": f"old memory {i}"}) for i in range(40)]
+EXPIRED = [(("u",), f"old{i:03}", {"text": f"old memory {i}"}) for i in range(100)]
 LIVE = [(("u",), f"live{i}", {"text": f"live memory {i}"}) for i in range(4)]
 EXTRA_EXPIRED: Item = (("u", "x"), "old_extra", {"text": "old memory extra"})
 
@@ -203,8 +206,8 @@ def test_selective_filter_matches_in_memory_store(store_factory, mode, form, mon
     store = store_factory(mode, **form_kwargs(form))
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
     force_fallback(form, monkeypatch)
-    # over_fetch for limit=3 and one vector per item: 3 * 1 * 2 + 1 = 7
-    query = query_missing(items, RARE, 7)
+    # The window for limit=3 and one vector per item: 3 * 1 * 2 + 1, raised to 41
+    query = query_missing(items, RARE, window_for(3))
     prefix = form_prefix(form, ("mem",))
     reads = record_reads(store)
     mine = store.search(prefix, query=query, filter={"type": "rare"}, limit=3)
@@ -222,8 +225,8 @@ def test_expired_items_do_not_crowd_out_live_ones(store_factory, mode, form, mon
     store.batch([PutOp(ns, key, value) for ns, key, value in LIVE])
     time.sleep(0.2)
     force_fallback(form, monkeypatch)
-    # over_fetch for limit=4: 4 * 1 * 2 + 1 = 9
-    query = query_missing(expired + LIVE, {key for _, key, _ in LIVE}, 9)
+    # The window for limit=4: 4 * 1 * 2 + 1, raised to 41
+    query = query_missing(expired + LIVE, {key for _, key, _ in LIVE}, window_for(4))
     prefix = form_prefix(form, ("u",))
     plain = store.search(prefix, limit=4)
     assert {item.key for item in plain} == {key for _, key, _ in LIVE}
@@ -262,8 +265,9 @@ def test_full_window_with_selective_filter_is_exact_and_ordered(store_factory, m
     store = store_factory(mode, index=index_config())
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
     rare = {key for _, key, value in items if value["type"] == "rare" and key.startswith("a")}
-    # A window of (5 + 2) * 1 * 2 + 1 = 15; keep the rare items out of twice that
-    query = query_missing([item for item in items if item[1].startswith("a")], rare, 30)
+    # A window of (5 + 2) * 1 * 2 + 1, raised to 41; keep the rare items out of twice that
+    alice = [item for item in items if item[1].startswith("a")]
+    query = query_missing(alice, rare, 2 * window_for(5 + 2))
     reads = record_reads(store)
     mine = store.search(("user", "alice"), query=query, filter={"type": "rare"}, limit=5, offset=2)
     theirs = reference(items).search(
@@ -293,7 +297,7 @@ def test_partial_window_is_exact_without_a_second_pass(store_factory, mode) -> N
     store = store_factory(mode, index=index_config())
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
     reads = record_read_rows(store)
-    # The window of 7 holds all 4 vectors, and the count of the namespace's
+    # The window of 41 holds all 4 vectors, and the count of the namespace's
     # vectors says so, so filtering the window is exact
     mine = store.search(("mem",), query="memory", filter={"type": "rare"}, limit=3)
     assert_same_results(
@@ -306,8 +310,9 @@ def test_partial_window_is_exact_without_a_second_pass(store_factory, mode) -> N
 
 
 def test_full_window_short_page_runs_again_exactly(store_factory, mode) -> None:
-    # 240 vectors in the namespace and a window of (5 + 0) * 1 * 2 + 1 = 11:
-    # the count stops at 11 too, so a short page from that window runs again
+    # 240 vectors in the namespace and a window of 5 * 1 * 2 + 1, raised to
+    # 41: the count stops at 41 too, so a short page from that window runs again
+    window = window_for(5)
     items = [item for item in alice_items() if item[1].startswith("a")]
     store = store_factory(mode, index=index_config())
     store.batch([PutOp(ns, key, value) for ns, key, value in items])
@@ -316,7 +321,9 @@ def test_full_window_short_page_runs_again_exactly(store_factory, mode) -> None:
     vectors = {key: MODEL.embed_query(text) for key, text in texts.items()}
 
     def rare_nearby(key: str) -> int:
-        nearest = sorted(vectors, key=lambda other: -cosine(vectors[key], vectors[other]))[:22]
+        nearest = sorted(vectors, key=lambda other: -cosine(vectors[key], vectors[other]))[
+            : 2 * window
+        ]
         return len(set(nearest) & set(rare))
 
     # A rare item's own text puts it first, and few other rare items are near
@@ -329,7 +336,7 @@ def test_full_window_short_page_runs_again_exactly(store_factory, mode) -> None:
     assert_same_results(mine, theirs)
     rows = first_pass(reads)
     assert 0 < len(rows) < 5
-    assert rows[0]["window_size"] == rows[0]["namespace_vectors"] == 11
+    assert rows[0]["window_size"] == rows[0]["namespace_vectors"] == window
     assert [label for label, _ in reads][-1] == "store search exact"
 
 
@@ -338,7 +345,7 @@ def test_window_cut_short_by_the_index_runs_again_exactly(store_factory, mode, m
 
     The window's LIMIT is lowered to 5 here, standing in for an index that
     returns fewer vectors than it was asked for. The count of the
-    namespace's vectors still stops at over_fetch, 21, so the store sees
+    namespace's vectors still stops at over_fetch, 41, so the store sees
     that the window is short of the namespace, whatever C-SPANN's
     partitions look like at the time.
     """
@@ -361,7 +368,7 @@ def test_window_cut_short_by_the_index_runs_again_exactly(store_factory, mode, m
     assert_same_results(mine, theirs)
     rows = first_pass(reads)
     assert 0 < len(rows) < 3
-    assert rows[0]["window_size"] <= 5 < rows[0]["namespace_vectors"] == 21
+    assert rows[0]["window_size"] <= 5 < rows[0]["namespace_vectors"] == window_for(10)
     assert [label for label, _ in reads][-1] == "store search exact"
 
 
@@ -389,16 +396,26 @@ def steady_capped_queries(
     vectors = {text: vector_literal(MODEL.embed_query(text)) for text in texts if text not in tried}
     seen: dict[str, list[int]] = {text: [] for text in vectors}
     while time.monotonic() < deadline:
-        with admin.transaction():
-            admin.execute("SET LOCAL vector_search_beam_size = 1")
-            for text, vector in vectors.items():
-                row = admin.execute(
-                    f"SELECT count(*) AS n FROM (SELECT 1 FROM {store.sql.vectors}"
-                    f"@{store.sql.vector_index_name} WHERE prefix = ANY(CAST(%s AS STRING[])) "
-                    "ORDER BY embedding <=> CAST(%s AS VECTOR) LIMIT %s) AS w",
-                    [[namespace], vector, window],
-                ).fetchone()
-                seen[text].append(row["n"])
+        sizes_now: dict[str, int] = {}
+        try:
+            with admin.transaction():
+                admin.execute("SET LOCAL vector_search_beam_size = 1")
+                for text, vector in vectors.items():
+                    row = admin.execute(
+                        f"SELECT count(*) AS n FROM (SELECT 1 FROM {store.sql.vectors}"
+                        f"@{store.sql.vector_index_name} WHERE prefix = ANY(CAST(%s AS STRING[])) "
+                        "ORDER BY embedding <=> CAST(%s AS VECTOR) LIMIT %s) AS w",
+                        [[namespace], vector, window],
+                    ).fetchone()
+                    sizes_now[text] = row["n"]
+        except psycopg.errors.SerializationFailure:
+            # On a multi-node cluster a search can meet a C-SPANN split
+            # inside its uncertainty interval and fail with 40001. The store
+            # retries that; this poll is dropped and taken again
+            time.sleep(0.5)
+            continue
+        for text, size in sizes_now.items():
+            seen[text].append(size)
         steady = [
             text
             for text, sizes in seen.items()
@@ -468,7 +485,7 @@ def test_second_pass_refreshes_what_it_returns(store_factory, admin, mode) -> No
     items = rare_items()
     store = store_factory(mode, index=index_config(), ttl={"default_ttl": 10})
     store.batch([PutOp(ns, key, value, ttl=10) for ns, key, value in items])
-    query = query_missing(items, RARE, 7)
+    query = query_missing(items, RARE, window_for(3))
 
     def expiries() -> dict[str, Any]:
         rows = admin.execute(f"SELECT key, expires_at FROM {store.sql.items}").fetchall()
@@ -518,10 +535,12 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     def bound(statement: tuple[str, list]) -> tuple[str, list]:
         return StoreSQL.bind_query_vector(bind(statement, NAMESPACES, ["user.big"]), query)
 
+    # The window the store sends for limit=3: 3 * 1 * 2 + 1, raised to 41
+    window = window_for(3)
     # On a cluster with several nodes, each node picks up new statistics a few
     # seconds after ANALYZE. Until then the optimizer may plan with the empty
     # table it saw at creation and scan, so plan again until it sees them.
-    statement = bound(store.sql.semantic_search_in(over_fetch=7, **common))
+    statement = bound(store.sql.semantic_search_in(over_fetch=window, **common))
     deadline = time.monotonic() + STATS_WAIT
     while "vector search" not in (indexed := explain(admin, statement)):
         if time.monotonic() > deadline:
@@ -538,7 +557,7 @@ def test_only_the_indexed_form_uses_the_vector_index(store_factory, admin) -> No
     vectors = store.sql.vectors.split(".", 1)[1]
     assert f"table: {vectors}@{vectors}_pkey" in count, indexed
     assert "spans: [/'user.big' - /'user.big']" in count, indexed
-    assert "limit: 7" in count, indexed
+    assert f"limit: {window}" in count, indexed
     assert "FULL SCAN" not in count, indexed
     for statement in (
         store.sql.semantic_search(namespace_prefix=("user",), **common),
@@ -561,7 +580,7 @@ async def test_async_selective_filter_matches_in_memory_store(
     store = await astore_factory(mode, **form_kwargs(form))
     await store.abatch([PutOp(ns, key, value) for ns, key, value in items])
     force_fallback(form, monkeypatch)
-    query = query_missing(items, RARE, 7)
+    query = query_missing(items, RARE, window_for(3))
     prefix = form_prefix(form, ("mem",))
     reads = arecord_reads(store)
     mine = await store.asearch(prefix, query=query, filter={"type": "rare"}, limit=3)
@@ -581,7 +600,7 @@ async def test_async_expired_items_do_not_crowd_out_live_ones(
     await store.abatch([PutOp(ns, key, value) for ns, key, value in LIVE])
     await asyncio.sleep(0.2)
     force_fallback(form, monkeypatch)
-    query = query_missing(expired + LIVE, {key for _, key, _ in LIVE}, 9)
+    query = query_missing(expired + LIVE, {key for _, key, _ in LIVE}, window_for(4))
     prefix = form_prefix(form, ("u",))
     plain = await store.asearch(prefix, limit=4)
     assert {item.key for item in plain} == {key for _, key, _ in LIVE}
@@ -600,7 +619,8 @@ async def test_async_full_window_with_selective_filter_is_exact_and_ordered(
     store = await astore_factory(mode, index=index_config())
     await store.abatch([PutOp(ns, key, value) for ns, key, value in items])
     rare = {key for _, key, value in items if value["type"] == "rare" and key.startswith("a")}
-    query = query_missing([item for item in items if item[1].startswith("a")], rare, 30)
+    alice = [item for item in items if item[1].startswith("a")]
+    query = query_missing(alice, rare, 2 * window_for(5 + 2))
     reads = arecord_reads(store)
     mine = await store.asearch(
         ("user", "alice"), query=query, filter={"type": "rare"}, limit=5, offset=2

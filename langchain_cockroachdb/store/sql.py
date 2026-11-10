@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal, NamedTuple
+
+from langgraph.store.base import NOT_PROVIDED, NotProvided
 
 from langchain_cockroachdb._sql import validate_identifier, vector_literal
 from langchain_cockroachdb.indexes import DistanceStrategy
@@ -19,6 +22,38 @@ QUERY_VECTOR = object()
 # Stands in the params for the namespaces found by namespace_lookup
 NAMESPACES = object()
 
+# The migration that adds the columns reconcile, history and confirm use.
+# Until setup() applies it, the store writes with the 0.5 statements.
+MIGRATION_RECONCILE = 2
+# The columns migration 2 adds. A store whose role cannot read the migrations
+# table, or that finds no migrations table, looks for all of them in the
+# items table instead.
+_RECONCILE_COLUMNS = (
+    "version",
+    "provenance",
+    "confirmed_at",
+    "confirmations",
+    "write_id",
+    "valid_at",
+    "confirm_id",
+)
+
+# The schedule of the history table's TTL job, which deletes the versions
+# past their history TTL
+HISTORY_TTL_CRON = "@hourly"
+
+# The job types of a schema change on a table, and the states of such a job
+# that is not done yet, as SHOW JOBS reports them
+SCHEMA_CHANGE_JOB_TYPES = ("SCHEMA CHANGE", "NEW SCHEMA CHANGE")
+UNFINISHED_JOB_STATES = (
+    "pending",
+    "running",
+    "paused",
+    "pause-requested",
+    "cancel-requested",
+    "reverting",
+)
+
 # Most namespaces a semantic search sends to the vector index in one array.
 # namespace_lookup stops after one more, and a search whose lookup finds
 # more uses the exact one-statement form instead, so the lookup, the array
@@ -27,9 +62,27 @@ MAX_SEARCH_NAMESPACES = 1000
 
 # Type aliases
 ItemRow = tuple[str, str, str, float | None]  # prefix, key, value_json, ttl_minutes
+ItemRowV2 = tuple[
+    str, str, str, float | None, str | None, datetime | None
+]  # prefix, key, value_json, ttl_minutes, provenance_json, valid_at
 VectorRow = tuple[
     str, str, str, list[float], float | None
 ]  # prefix, key, field_name, embedding, ttl_minutes
+
+# The columns of a candidate row, as the candidate statements return them
+_CANDIDATE_NAMES = (
+    "key",
+    "value",
+    "created_at",
+    "updated_at",
+    "version",
+    "valid_at",
+    "provenance",
+    "confirmed_at",
+    "confirmations",
+    "confirm_id",
+)
+_CANDIDATE_OUTPUT = ", ".join(_CANDIDATE_NAMES)
 
 
 def _validate_paging(limit: int, offset: int) -> None:
@@ -48,6 +101,18 @@ def bind(statement: tuple[str, list], placeholder: object, value: Any) -> tuple[
     """A copy of ``statement`` with ``value`` wherever ``placeholder`` is in its params."""
     sql, params = statement
     return (sql, [value if param is placeholder else param for param in params])
+
+
+class TTLChange(NamedTuple):
+    """A statement that turns on a table's row-level TTL, and the read that can skip it.
+
+    ``applied`` returns no row for a missing table, and otherwise one row
+    whose ``applied`` column says whether the table already has the
+    settings, so that the statement would change nothing.
+    """
+
+    statement: str
+    applied: tuple[str, list]
 
 
 class StoreSQL:
@@ -81,6 +146,7 @@ class StoreSQL:
         self.items = f"{self._schema}.{self._table_name}"
         self.vectors = f"{self._schema}.{self._table_name}_vectors"
         self.migrations_table = f"{self._schema}.{self._table_name}_migrations"
+        self.history = f"{self._schema}.{self._table_name}_history"
 
         # Vector index name (public)
         self.vector_index_name = f"{self._table_name}_vectors_embedding_idx"
@@ -89,7 +155,8 @@ class StoreSQL:
         """Return numbered migration statements for items table.
 
         Returns:
-            List of 2 idempotent DDL statements: (0) migrations table, (1) items table.
+            List of 3 idempotent DDL statements: (0) migrations table, (1) items
+            table, (2) the columns reconcile, history and confirm use.
         """
         return [
             # Migration 0: migrations tracking table
@@ -107,7 +174,77 @@ class StoreSQL:
     ttl_minutes DECIMAL,
     PRIMARY KEY (prefix, key)
 );""",
+            # Migration 2 (MIGRATION_RECONCILE): one statement, so it is one
+            # schema change in its own implicit transaction, as a schema_locked
+            # table needs. Existing rows get version 1 and no confirmations.
+            # write_id marks the rows a write wrote and confirm_id the rows a
+            # confirmation confirmed, so a retry of either finds its own work.
+            f"""ALTER TABLE {self.items} ADD COLUMN IF NOT EXISTS version INT8 NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS provenance JSONB,
+    ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirmations INT8 NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS write_id UUID,
+    ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirm_id UUID;""",
         ]
+
+    def migration_version(self) -> str:
+        """The statement that reads the latest migration recorded, if any.
+
+        setup() reads it to find the migrations it still has to run.
+        """
+        return f"SELECT v FROM {self.migrations_table} ORDER BY v DESC LIMIT 1"
+
+    def reconcile_migration_recorded(self) -> tuple[str, list]:
+        """The statement that tells whether setup() has recorded migration 2, as ``ready``.
+
+        The schema check reads it first. setup() records a migration only
+        after its schema change has settled on every node, so once the row
+        exists every node can use the new columns.
+        """
+        return (
+            f"SELECT EXISTS (SELECT 1 FROM {self.migrations_table} WHERE v >= %s) AS ready",
+            [MIGRATION_RECONCILE],
+        )
+
+    def reconcile_columns_exist(self) -> tuple[str, list]:
+        """The statement that tells whether the items table has migration 2's columns, as ``ready``.
+
+        The schema check reads it instead of the migrations table when the
+        store's role has no grant on that table. pg_attribute lists only
+        public columns, so columns that a schema change is still adding do
+        not count. A missing items table has none of them.
+        """
+        return (
+            "SELECT count(*) = %s AS ready FROM pg_catalog.pg_attribute\n"
+            "WHERE attrelid = to_regclass(%s) AND NOT attisdropped AND attname = ANY(%s)",
+            [len(_RECONCILE_COLUMNS), self.items, list(_RECONCILE_COLUMNS)],
+        )
+
+    def schema_changes_running(self) -> tuple[str, list]:
+        """The statement that counts the schema change jobs on the items table not done yet, as ``running``.
+
+        setup() reads it once migration 2's columns are public, before it
+        records the migration. SHOW JOBS lists no descriptor ids on v25.4,
+        so a job is matched by the start of its description, which is its
+        statement: ALTER TABLE and the table's qualified name, the values
+        bound. SHOW JOBS shortens a description to about its first 60
+        characters, so a long qualified name may be cut from it, and a role
+        without admin sees only its own jobs. Then no job is found, and
+        setup()'s column check alone guards.
+        """
+        return (
+            "SELECT count(*) AS running FROM [SHOW JOBS]\n"
+            "WHERE job_type = ANY(CAST(%s AS STRING[])) AND status = ANY(CAST(%s AS STRING[]))\n"
+            "AND strpos(description, "
+            "CAST(%s AS STRING) || quote_ident(current_database()) || CAST(%s AS STRING)) = 1",
+            [
+                list(SCHEMA_CHANGE_JOB_TYPES),
+                list(UNFINISHED_JOB_STATES),
+                "ALTER TABLE ",
+                f".{self.items.lower()} ",
+            ],
+        )
 
     def vector_statements(self) -> list[str]:
         """Return idempotent DDL statements for vectors table and index.
@@ -151,6 +288,44 @@ class StoreSQL:
 
         return stmts
 
+    def create_history_table(self) -> str:
+        """The idempotent statement that creates the history table.
+
+        setup() runs it only on a store with history.
+        """
+        return f"""CREATE TABLE IF NOT EXISTS {self.history} (
+    prefix TEXT NOT NULL,
+    key TEXT NOT NULL,
+    version INT8 NOT NULL,
+    value JSONB NOT NULL,
+    provenance JSONB,
+    valid_at TIMESTAMPTZ NOT NULL,
+    invalid_at TIMESTAMPTZ,
+    written_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL,
+    superseded_by TEXT,
+    confirmations INT8 NOT NULL DEFAULT 0,
+    confirmed_at TIMESTAMPTZ,
+    write_id UUID,
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (prefix, key, version)
+);"""
+
+    def history_ttl_change(self) -> TTLChange:
+        """The TTL change of the history table, for a store with history ``ttl_days``.
+
+        CockroachDB's row-level TTL then deletes a version once its
+        ``expires_at`` passes. The archive statement sets that from
+        ``ttl_days``, so the days are not in the DDL. The job runs on
+        HISTORY_TTL_CRON.
+        """
+        return self._ttl_change(self.history, HISTORY_TTL_CRON)
+
+    def history_exists(self) -> tuple[str, list]:
+        """The statement that tells whether the history table exists, as ``ready``."""
+        return ("SELECT to_regclass(%s) IS NOT NULL AS ready", [self.history])
+
     def show_create_vectors(self) -> str:
         """The statement that reads the vectors table's definition.
 
@@ -190,31 +365,49 @@ class StoreSQL:
         """A copy of a semantic search statement with its query vector bound."""
         return bind(statement, QUERY_VECTOR, vector_literal(embedding))
 
-    def ttl_statements(self, cron: str) -> list[str]:
-        """Return ALTER TABLE statements to enable TTL.
+    def ttl_changes(self, cron: str) -> list[TTLChange]:
+        """The TTL changes of the items table, and of the vectors table with an index.
 
         Args:
             cron: Cron expression for TTL job.
 
         Returns:
-            List of ALTER TABLE SET statements.
+            One TTLChange per table.
+
+        Raises:
+            ValueError: If cron contains single quote.
+        """
+        changes = [self._ttl_change(self.items, cron)]
+        if self._index is not None:
+            changes.append(self._ttl_change(self.vectors, cron))
+        return changes
+
+    @staticmethod
+    def _ttl_change(table: str, cron: str) -> TTLChange:
+        """The statement that turns on row-level TTL on ``table``, and the read that can skip it.
+
+        CockroachDB takes no bound parameters in storage parameters, so the
+        cron is formatted into the statement, and a cron with a quote is
+        refused. The read binds its values. It reads pg_class.reloptions,
+        which lists a table's storage parameters as CockroachDB renders
+        them, ``key='value'``.
 
         Raises:
             ValueError: If cron contains single quote.
         """
         if "'" in cron:
             raise ValueError("cron expression cannot contain single quote")
-
-        stmts = [
-            f"ALTER TABLE {self.items} SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
-        ]
-
-        if self._index is not None:
-            stmts.append(
-                f"ALTER TABLE {self.vectors} SET (ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
-            )
-
-        return stmts
+        statement = (
+            f"ALTER TABLE {table} SET "
+            f"(ttl_expiration_expression = 'expires_at', ttl_job_cron = '{cron}');"
+        )
+        wanted = ["ttl_expiration_expression='expires_at'", f"ttl_job_cron='{cron}'"]
+        applied = (
+            "SELECT COALESCE(reloptions @> CAST(%s AS STRING[]), false) AS applied\n"
+            "FROM pg_catalog.pg_class WHERE oid = to_regclass(%s)",
+            [wanted, table],
+        )
+        return TTLChange(statement, applied)
 
     def disable_ttl_statements(self) -> list[str]:
         """Return ALTER TABLE statements to disable TTL.
@@ -297,39 +490,99 @@ WHERE {where}"""
             + f"\nSELECT {columns}\nFROM search_results\nORDER BY {order_by}"
         )
 
-    def upsert_items(self, rows: Sequence[ItemRow]) -> tuple[str, list]:
+    def upsert_items(
+        self,
+        rows: Sequence[ItemRow] | Sequence[ItemRowV2],
+        *,
+        write_id: str | None = None,
+        history: bool = False,
+        return_version: bool = False,
+    ) -> tuple[str, list]:
         """Build multi-row INSERT for items with ON CONFLICT.
 
+        Without ``write_id`` this is the 0.5 statement, for a table that
+        setup() has not given migration 2's columns yet. With it, the rows'
+        provenance, valid time and the write id are written too, and an
+        update bumps the row's version. A row that already carries the write
+        id is left as it is, so a batch retried after its commit changes nothing.
+
+        With a write id, an update keeps the row's updated_at when it is
+        later than now(), so a key's updated_at never goes back. now() is
+        fixed when a transaction starts, and a transaction pushed past a
+        later writer can still overwrite that writer's row. The 0.5
+        statement sets now(), as 0.5 did.
+
+        Confirmations belong to the fact, not the key: an update that changes
+        the value starts confirmations and confirmed_at again from none,
+        while an exact re-save of the live value keeps them. A memory that
+        expired counts as gone, so a write over it starts from none as well.
+        The id of the last confirmation stays on the row, so a confirmation
+        retried after it committed still finds it and counts nothing again.
+
         Args:
-            rows: Sequence of (prefix, key, value_json, ttl_minutes) tuples.
-                Callers must dedupe (prefix, key) rows (ON CONFLICT cannot touch a row twice).
+            rows: (prefix, key, value_json, ttl_minutes) tuples without
+                ``write_id``, (prefix, key, value_json, ttl_minutes,
+                provenance_json, valid_at) tuples with it. Callers must dedupe
+                (prefix, key) rows (ON CONFLICT cannot touch a row twice).
+            write_id: The batch's write id, chosen before its first attempt.
+            history: For a store with history. A key's versions then stay
+                unique across its live row and its history: every new
+                version, inserted or updated, is one more than the larger of
+                the live version and the highest version the key has in the
+                history table. So a key written again after a delete, or
+                after reconcile recorded a late fact under it straight into
+                history, never reuses a version kept there. Its timestamps
+                follow the history too: a new row's created_at and
+                updated_at, and an update's updated_at, are never earlier
+                than the latest time a version of the key in history ended.
+                One read of the history table gives the version and that
+                floor. Needs ``write_id``.
+            return_version: Whether the statement returns the version of
+                each row it inserts or updates, as ``version``. A row it
+                leaves as it is returns nothing. Needs ``write_id``.
 
         Returns:
             Tuple of (SQL, parameters).
 
         Raises:
-            ValueError: If rows is empty.
+            ValueError: If rows is empty, a row has the wrong number of
+                fields, or ``history`` or ``return_version`` is set without
+                ``write_id``.
         """
         if not rows:
             raise ValueError("rows cannot be empty")
+        if history and write_id is None:
+            raise ValueError("upsert_items with history needs a write id")
+        if return_version and write_id is None:
+            raise ValueError("upsert_items needs a write id to return the version")
+
+        columns = [
+            ("prefix", "STRING"),
+            ("key", "STRING"),
+            ("value", "JSONB"),
+            ("ttl_minutes", "DECIMAL"),
+        ]
+        if write_id is not None:
+            columns += [("provenance", "JSONB"), ("valid_at", "TIMESTAMPTZ")]
 
         # Use UNION ALL to reference ttl_minutes only once per row, with typed placeholders
-        selects = []
-        for i in range(len(rows)):
-            if i == 0:
-                selects.append(
-                    "SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, "
-                    "CAST(%s AS JSONB) AS value, CAST(%s AS DECIMAL) AS ttl_minutes"
-                )
-            else:
-                selects.append(
-                    "UNION ALL SELECT CAST(%s AS STRING), CAST(%s AS STRING), "
-                    "CAST(%s AS JSONB), CAST(%s AS DECIMAL)"
-                )
+        first = "SELECT " + ", ".join(f"CAST(%s AS {kind}) AS {name}" for name, kind in columns)
+        others = "UNION ALL SELECT " + ", ".join(f"CAST(%s AS {kind})" for _, kind in columns)
+        union_sql = "\n    ".join([first] + [others] * (len(rows) - 1))
 
-        union_sql = "\n    ".join(selects)
+        # The write id's placeholder comes first, in the outer SELECT. Then
+        # each row's fields, in the order of columns
+        params: list[Any] = [] if write_id is None else [write_id]
+        for row in rows:
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"item rows have {len(columns)} fields "
+                    f"{'without' if write_id is None else 'with'} a write id, got {len(row)}"
+                )
+            params.extend(row)
 
-        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes)
+        if write_id is None:
+            sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes)
 SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes
 FROM ({union_sql}) AS rows_to_insert
 ON CONFLICT (prefix, key) DO UPDATE SET
@@ -337,13 +590,87 @@ ON CONFLICT (prefix, key) DO UPDATE SET
     updated_at = now(),
     expires_at = EXCLUDED.expires_at,
     ttl_minutes = EXCLUDED.ttl_minutes"""
+            return (sql, params)
 
-        # Flatten parameters: for each row, emit prefix, key, value, ttl
-        params: list[Any] = []
-        for prefix, key, value_json, ttl_minutes in rows:
-            params.extend([prefix, key, value_json, ttl_minutes])
-
+        # Without history a new row starts at version 1, the column's
+        # default, and an update adds one. An update never moves updated_at
+        # back. With history both take the next version over the live row and
+        # the key's history, computed once here, and a new row's timestamps
+        # start no earlier than the key's history ended. EXCLUDED.updated_at
+        # then carries that floor into the update
+        extra_columns, extra_values, key_history = "", "", ""
+        version_update = f"{self.items}.version + 1"
+        updated_at = f"GREATEST(now(), {self.items}.updated_at)"
+        if history:
+            live_version = (
+                f"(SELECT i.version FROM {self.items} AS i "
+                "WHERE i.prefix = rows_to_insert.prefix AND i.key = rows_to_insert.key)"
+            )
+            extra_columns = ", version, created_at, updated_at"
+            extra_values = (
+                ",\n    "
+                + self._next_version(live_version)
+                + ",\n    GREATEST(now(), kh.ended_at), GREATEST(now(), kh.ended_at)"
+            )
+            key_history = "\n" + self._key_history("rows_to_insert")
+            version_update = "EXCLUDED.version"
+            updated_at = f"GREATEST(EXCLUDED.updated_at, {self.items}.updated_at)"
+        # The SET expressions read the row as it was before the update
+        same_fact = (
+            f"{self.items}.value = EXCLUDED.value AND "
+            f"({self.items}.expires_at IS NULL OR {self.items}.expires_at > now())"
+        )
+        sql = f"""INSERT INTO {self.items} (prefix, key, value, expires_at, ttl_minutes, provenance, valid_at, write_id{extra_columns})
+SELECT prefix, key, value, now() + CAST(ttl_minutes AS DECIMAL) * INTERVAL '1 minute', ttl_minutes, provenance, valid_at, CAST(%s AS UUID){extra_values}
+FROM ({union_sql}) AS rows_to_insert{key_history}
+ON CONFLICT (prefix, key) DO UPDATE SET
+    value = EXCLUDED.value,
+    updated_at = {updated_at},
+    expires_at = EXCLUDED.expires_at,
+    ttl_minutes = EXCLUDED.ttl_minutes,
+    provenance = EXCLUDED.provenance,
+    valid_at = EXCLUDED.valid_at,
+    write_id = EXCLUDED.write_id,
+    version = {version_update},
+    confirmations = CASE WHEN {same_fact} THEN {self.items}.confirmations ELSE 0 END,
+    confirmed_at = CASE WHEN {same_fact} THEN {self.items}.confirmed_at ELSE NULL END
+WHERE {self.items}.write_id IS DISTINCT FROM EXCLUDED.write_id"""
+        if return_version:
+            sql += "\nRETURNING version"
         return (sql, params)
+
+    @staticmethod
+    def _next_version(live_version: str) -> str:
+        """The next version of a key, on a store with history.
+
+        One more than the larger of ``live_version``, the key's version in
+        the items table, live or not, and ``kh.version``, its highest version
+        in the history table as the _key_history join reads it. So a key's
+        versions stay unique across both.
+        """
+        return (
+            "GREATEST(\n"
+            f"        COALESCE({live_version}, 0),\n"
+            "        COALESCE(kh.version, 0)\n"
+            "    ) + 1"
+        )
+
+    def _key_history(self, source: str) -> str:
+        """The join that reads the history of the key that ``source`` names once, as ``kh``.
+
+        ``kh.version`` is the key's highest version in the history table and
+        ``kh.ended_at`` the latest time one of its versions ended, both NULL
+        for a key with no history, which GREATEST then ignores. The
+        aggregate returns one row for every row of ``source``, the alias of
+        a relation with ``prefix`` and ``key`` columns, so no row is lost.
+        """
+        return (
+            "CROSS JOIN LATERAL (\n"
+            "    SELECT max(h.version) AS version, max(h.ended_at) AS ended_at\n"
+            f"    FROM {self.history} AS h\n"
+            f"    WHERE h.prefix = {source}.prefix AND h.key = {source}.key\n"
+            ") AS kh"
+        )
 
     def delete_items(self, namespace_text: str, keys: Sequence[str]) -> tuple[str, list]:
         """Build DELETE for items by namespace and keys.
@@ -809,6 +1136,313 @@ LIMIT %s OFFSET %s"""
             )
         return (sql, params)
 
+    # How find_conflicts, and reconcile in its transaction, find the memories
+    # a new one may conflict with, in two round trips. The first sends now(),
+    # key_slot_candidates and, when the similar read must choose a scan,
+    # namespace_vector_count. The second sends, for each vector of the new
+    # memory, candidate_scores for the key and slot candidates and
+    # similar_candidates for the others. Candidates come only from the new
+    # memory's own namespace, never its descendants, so every statement
+    # matches prefix = %s. Expired memories are never candidates, whatever
+    # omit_expired says, and none of these statements pushes back an expiry.
+    #
+    # A namespace with at most reconcile_scan_limit vectors gets the exact
+    # form of similar_candidates: it ranks every vector of the namespace,
+    # read by primary key, which also lets a serializable transaction notice
+    # a concurrent insert. A larger one gets the index form: a window of the
+    # nearest vectors from the C-SPANN index, as in semantic_search_in, then
+    # the join, filter and expiry check. The window makes room for the
+    # vectors of the excluded keys, the target and the slot matches, at the
+    # index's estimated vectors per item. Rows that the filter or the expiry
+    # check remove, or excluded keys with more vectors than estimated, still
+    # take places in it, so a match beyond it would be missed. The index form
+    # therefore reports the window's size and lowest score, over every vector
+    # in it, and the namespace's vectors counted up to over_fetch, as
+    # semantic_search_in does. When it returned limit rows, or the window is whole and its
+    # lowest score is below the threshold, no vector beyond the window can
+    # change the result, up to the index's approximation, and the result
+    # stands. Otherwise matches may lie beyond the window: the store runs
+    # the exact form for that vector (needs_exact_candidates in base.py).
+    # The window is not whole when it holds fewer than over_fetch vectors
+    # while the namespace holds more: C-SPANN cut it short, as a small
+    # beam size or small partitions can. The exact form costs one more
+    # round trip, and only when fewer than limit rows pass.
+    #
+    # Measured with EXPLAIN on v26.3.3, with 3,000 vectors in one namespace
+    # and a C-SPANN index: the index form computes nearest once, as a buffer,
+    # with a vector search on the vector index over the namespace's prefix
+    # span under a top-k of over_fetch; the window's count and lowest score
+    # read that buffer, and so do the excluded keys' filter and the items
+    # lookup join; the namespace's count is a scan of the vectors primary
+    # key over the namespace's span, with limit over_fetch. The exact form
+    # is a merge join of the items and vectors primary keys over the
+    # namespace's span. candidate_scores reads its keys from the vectors
+    # primary key. test_only_the_index_form_uses_the_vector_index checks
+    # the index form's plan.
+
+    @staticmethod
+    def _candidate_columns(alias: str = "") -> str:
+        """The columns of a candidate row, read from the items table under ``alias``.
+
+        A row without a valid time, from 0.5.x or a plain put, reads as valid
+        from its updated_at. confirm_id, the id of the memory's last
+        confirmation, tells a confirm retried after a lost commit that its
+        earlier attempt confirmed the memory.
+        """
+        a = f"{alias}." if alias else ""
+        return (
+            f"{a}key, {a}value, {a}created_at, {a}updated_at, {a}version, "
+            f"COALESCE({a}valid_at, {a}updated_at) AS valid_at, {a}provenance, "
+            f"{a}confirmed_at, {a}confirmations, {a}confirm_id"
+        )
+
+    @staticmethod
+    def now() -> tuple[str, list]:
+        """The statement that reads the database's clock, as ``now``.
+
+        In a transaction it reads the transaction's timestamp. That is also
+        the updated_at of every row the transaction writes, unless the live
+        row it overwrites was written later or, on a store with history, a
+        version of the key in history ended later. A version never starts
+        before the one it follows.
+        """
+        return ("SELECT now() AS now", [])
+
+    def key_slot_candidates(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        slot_field: str | None,
+        slot_value_json: str | None,
+        filter: Mapping | None,
+    ) -> tuple[str, list]:
+        """Build the read of a new memory's target and of the memories in its slot.
+
+        The live row under ``key`` comes back whatever ``filter`` says. With a
+        slot, so do the live rows whose value holds the same value in the
+        slot field, compared as JSON, if they also match ``filter``. The slot
+        field and value are bound, never formatted into the text.
+
+        Args:
+            prefix: Namespace text. Its descendants are not read.
+            key: The new memory's key.
+            slot_field: The top-level field that holds the slot, or None.
+            slot_value_json: The slot's value serialized as JSON, or None.
+            filter: Narrows the slot matches, as in search.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has the candidate columns.
+
+        Raises:
+            ValueError: If the filter has an unknown operator.
+        """
+        params: list[Any] = [prefix, key]
+        match = "key = %s"
+        if slot_field is not None:
+            conditions, filter_params = translate_filter(filter)
+            slot = " AND ".join(["value -> %s = CAST(%s AS JSONB)", *conditions])
+            match = f"(key = %s OR ({slot}))"
+            params.extend([slot_field, slot_value_json, *filter_params])
+        sql = f"""SELECT {self._candidate_columns()}
+FROM {self.items}
+WHERE prefix = %s AND {match}
+    AND (expires_at IS NULL OR expires_at > now())"""
+        return (sql, params)
+
+    def similar_candidates(
+        self,
+        prefix: str,
+        *,
+        threshold: float,
+        limit: int,
+        filter: Mapping | None,
+        scan: Literal["exact", "index"],
+        over_fetch: int,
+        exclude: Sequence[str] = (),
+    ) -> tuple[str, list]:
+        """Build the read of the memories similar to one vector of a new memory.
+
+        Every row is live, matches ``filter`` and scores at or above
+        ``threshold`` with the store's score function. Rows come best first,
+        then by key, up to ``limit``. The ``exclude`` keys are left out: the
+        target and the slot matches, which candidate_scores scores.
+
+        The index form also reports the window it ranked: ``window_size``,
+        the vectors the C-SPANN index returned, ``lowest_score``, the lowest
+        score among them, before the filter, the expiry check and the
+        excluded keys, and ``namespace_vectors``, the namespace's vectors
+        counted from the primary key up to ``over_fetch``. Every row carries
+        all three, and when no row passes, one row still does, with NULL
+        candidate columns. See needs_exact_candidates in base.py.
+
+        Args:
+            prefix: Namespace text. Its descendants are not read.
+            threshold: The lowest score a row may have.
+            limit: Most rows.
+            filter: Narrows the rows by value, as in search.
+            scan: "exact" ranks every vector of the namespace. "index" ranks
+                the ``over_fetch`` nearest vectors the C-SPANN index returns,
+                then filters them.
+            over_fetch: The window of the index scan. The exact scan has none.
+            exclude: Keys to leave out.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has the candidate columns
+            and ``score``, and with the index scan ``window_size``,
+            ``lowest_score`` and ``namespace_vectors``. Bind the query vector
+            in place of QUERY_VECTOR.
+
+        Raises:
+            ValueError: If limit is negative, the scan is unknown, there is no
+                index, or the filter has an unknown operator.
+        """
+        _validate_paging(limit, 0)
+        if self._index is None:
+            raise ValueError("similar_candidates requires an index configuration")
+        if scan not in ("exact", "index"):
+            raise ValueError(f"scan must be 'exact' or 'index', got {scan!r}")
+        operator = self._index.distance.get_operator()
+        conditions, filter_params = self._item_conditions(filter, omit_expired=True)
+        score = self._score("distance")
+        if scan == "exact":
+            # No LIMIT in ranked: see the notes above _candidate_columns
+            where = " AND ".join(
+                ["v.prefix = %s", "NOT (v.key = ANY(CAST(%s AS STRING[])))", *conditions]
+            )
+            sql = f"""WITH ranked AS (
+    SELECT {self._candidate_columns("i")},
+        min(v.embedding {operator} CAST(%s AS VECTOR)) AS distance
+    FROM {self.vectors} AS v
+    JOIN {self.items} AS i ON v.prefix = i.prefix AND v.key = i.key
+    WHERE {where}
+    GROUP BY i.prefix, i.key
+)
+SELECT {_CANDIDATE_OUTPUT}, {score} AS score
+FROM ranked
+WHERE {score} >= CAST(%s AS FLOAT8)
+ORDER BY score DESC, key
+LIMIT %s"""
+            params: list[Any] = [
+                QUERY_VECTOR,
+                prefix,
+                list(exclude),
+                *filter_params,
+                threshold,
+                limit,
+            ]
+            return (sql, params)
+
+        # No filter in nearest, so the C-SPANN index serves it: see the notes
+        # above semantic_search. window_stats reads every vector it kept, and
+        # the LEFT JOIN returns its row even when no candidate passes
+        where = " AND ".join(["NOT (i.key = ANY(CAST(%s AS STRING[])))", *conditions])
+        hit_columns = ", ".join(f"h.{name}" for name in _CANDIDATE_NAMES)
+        sql = f"""WITH nearest AS (
+    SELECT prefix, key, embedding {operator} CAST(%s AS VECTOR) AS distance
+    FROM {self.vectors}
+    WHERE prefix = %s
+    ORDER BY embedding {operator} CAST(%s AS VECTOR)
+    LIMIT %s
+),
+window_stats AS (
+    SELECT count(*) AS window_size, min({score}) AS lowest_score, (
+        SELECT count(*) FROM (
+            SELECT 1 FROM {self.vectors} WHERE prefix = %s LIMIT %s
+        ) AS c
+    ) AS namespace_vectors
+    FROM nearest
+),
+best AS (
+    SELECT DISTINCT ON (i.key)
+        {self._candidate_columns("i")}, r.distance
+    FROM nearest AS r
+    JOIN {self.items} AS i ON r.prefix = i.prefix AND r.key = i.key
+    WHERE {where}
+    ORDER BY i.key, r.distance
+),
+hits AS (
+    SELECT {_CANDIDATE_OUTPUT}, {score} AS score
+    FROM best
+    WHERE {score} >= CAST(%s AS FLOAT8)
+    ORDER BY score DESC, key
+    LIMIT %s
+)
+SELECT {hit_columns}, h.score, w.window_size, w.lowest_score, w.namespace_vectors
+FROM window_stats AS w
+LEFT JOIN hits AS h ON TRUE
+ORDER BY h.score DESC, h.key"""
+        params = [
+            QUERY_VECTOR,
+            prefix,
+            QUERY_VECTOR,
+            over_fetch,
+            prefix,
+            over_fetch,
+            list(exclude),
+            *filter_params,
+            threshold,
+            limit,
+        ]
+        return (sql, params)
+
+    def candidate_scores(self, prefix: str, keys: Sequence[str]) -> tuple[str, list]:
+        """Build the scores of some memories against one vector of a new memory.
+
+        A memory scores as its best vector, with the store's score function,
+        and one without vectors returns no row. No threshold or filter
+        applies: these are the target and the slot matches, found already.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key`` and ``score``.
+            Bind the query vector in place of QUERY_VECTOR.
+
+        Raises:
+            ValueError: If there is no index.
+        """
+        if self._index is None:
+            raise ValueError("candidate_scores requires an index configuration")
+        operator = self._index.distance.get_operator()
+        best = self._score(f"min(embedding {operator} CAST(%s AS VECTOR))")
+        sql = f"""SELECT key, {best} AS score
+FROM {self.vectors}
+WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))
+GROUP BY key"""
+        return (sql, [QUERY_VECTOR, prefix, list(keys)])
+
+    def namespace_vector_count(self, prefix: str, cap: int) -> tuple[str, list]:
+        """Build the count of one namespace's vectors, up to ``cap``.
+
+        It reads at most ``cap`` rows of the vectors primary key, so a count
+        of ``cap`` means at least that many. Expired vectors count, and the
+        namespace's descendants do not.
+
+        Returns:
+            Tuple of (SQL, parameters). The row has the count as ``n``.
+
+        Raises:
+            ValueError: If there is no index.
+        """
+        if self._index is None:
+            raise ValueError("namespace_vector_count requires an index configuration")
+        sql = f"""SELECT count(*) AS n FROM (
+    SELECT 1 FROM {self.vectors} WHERE prefix = %s LIMIT %s
+) AS c"""
+        return (sql, [prefix, cap])
+
+    def record(self, prefix: str, key: str) -> tuple[str, list]:
+        """Build the read of one live memory with its version, provenance and confirmations.
+
+        It never pushes back the expiry: reading a memory does not confirm it.
+
+        Returns:
+            Tuple of (SQL, parameters). The row, if any, has the candidate columns.
+        """
+        sql = f"""SELECT {self._candidate_columns()}
+FROM {self.items}
+WHERE prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())"""
+        return (sql, [prefix, key])
+
     def list_namespaces(
         self,
         *,
@@ -871,14 +1505,376 @@ LIMIT %s OFFSET %s"""
 
         return (sql, params)
 
-    def delete_namespace(self, namespace_prefix: Sequence[str]) -> tuple[str, list]:
+    def archive(
+        self,
+        prefix: str,
+        keys: Sequence[str],
+        *,
+        reason: str,
+        superseded_by: str | None,
+        invalid_at: datetime | None,
+        write_id: str,
+        ttl_days: float | None,
+    ) -> tuple[str, list]:
+        """Build the INSERT that copies live items into the history table.
+
+        A write runs it first, in the write's transaction, before it
+        overwrites or deletes the items. It copies each live item of ``keys``
+        with its version, value, provenance, valid time (``updated_at`` when
+        the row has none), confirmations and confirmed_at, and records when
+        the store wrote it (its updated_at), when the version ended, why, and
+        what replaced it. The version ends now, but never before it was
+        written: now() is fixed when the transaction starts, and a
+        transaction pushed past the version's writer can have an earlier
+        one. Rows that already carry ``write_id`` were written by this
+        batch, in an attempt that committed before its result was lost, so
+        they are not old versions and are left out. A version already in
+        history is left as it is, so a retried attempt never adds a row twice.
+
+        Args:
+            prefix: Namespace text.
+            keys: Item keys whose live versions end.
+            reason: Why they end: "overwritten", "superseded" or "deleted".
+            superseded_by: The key that replaces them, or None.
+            invalid_at: When the facts stopped being true, or None for now.
+                A version never ends before its own valid time: an earlier
+                time is raised to it, as when a fact written with an older
+                valid time overwrites a newer one.
+            write_id: The write id of the batch that ends them.
+            ttl_days: Days the versions stay in history, or None to keep them.
+
+        Returns:
+            Tuple of (SQL, parameters).
+        """
+        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmations, confirmed_at, write_id, expires_at)
+SELECT prefix, key, version, value, provenance, COALESCE(valid_at, updated_at),
+    GREATEST(COALESCE(CAST(%s AS TIMESTAMPTZ), now()), COALESCE(valid_at, updated_at)),
+    updated_at, GREATEST(now(), updated_at),
+    CAST(%s AS STRING), CAST(%s AS STRING), confirmations, confirmed_at, CAST(%s AS UUID),
+    now() + CAST(%s AS DECIMAL) * INTERVAL '1 day'
+FROM {self.items}
+WHERE prefix = %s AND key = ANY(%s)
+    AND (expires_at IS NULL OR expires_at > now())
+    AND write_id IS DISTINCT FROM CAST(%s AS UUID)
+ON CONFLICT (prefix, key, version) DO NOTHING"""
+        params: list[Any] = [
+            invalid_at,
+            reason,
+            superseded_by,
+            write_id,
+            ttl_days,
+            prefix,
+            list(keys),
+            write_id,
+        ]
+        return (sql, params)
+
+    def history_insert_superseded(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        value_json: str,
+        provenance_json: str | None,
+        valid_at: datetime,
+        invalid_at: datetime,
+        superseded_by: str,
+        write_id: str,
+        ttl_days: float | None,
+    ) -> tuple[str, list]:
+        """Build the INSERT that records a new memory straight into history, as superseded.
+
+        reconcile runs it when the policy decides that a candidate whose
+        fact is newer already supersedes the new memory, so the new memory
+        is never live. The row takes the key's next version, as the item
+        upsert numbers them on a store with history, so it never takes a
+        version the key has or gets later. It is valid from ``valid_at``
+        until ``invalid_at``, never earlier, and the store held it for no
+        time: written_at and ended_at are the same, and it has no
+        confirmations. That time is now, but never before the key's row in
+        the items table was written or a version in its history ended, as
+        for any version that follows them. One read of each gives the
+        version and that floor. If a superseded row of the key already carries
+        ``write_id``, this write inserted it in an attempt that committed
+        before its result was lost, and nothing is inserted. The same
+        write's archive of the memory under the key, as when it deletes that
+        memory, has another reason and never counts, whatever order the
+        statements run in.
+
+        Args:
+            prefix: Namespace text.
+            key: The new memory's key.
+            value_json: Its value, serialized.
+            provenance_json: Its provenance, serialized, or None.
+            valid_at: When its fact became true, as the policy saw it.
+            invalid_at: When the newer fact became true.
+            superseded_by: The key of the newer fact.
+            write_id: The write id of the reconcile.
+            ttl_days: Days the row stays in history, or None to keep it.
+
+        Returns:
+            Tuple of (SQL, parameters).
+        """
+        sql = f"""INSERT INTO {self.history} (prefix, key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, write_id, expires_at)
+SELECT p.prefix, p.key,
+    {self._next_version("i.version")},
+    p.value, p.provenance, p.valid_at, GREATEST(p.invalid_at, p.valid_at),
+    GREATEST(now(), i.updated_at, kh.ended_at), GREATEST(now(), i.updated_at, kh.ended_at),
+    p.reason, p.superseded_by, p.write_id, now() + p.ttl_days * INTERVAL '1 day'
+FROM (
+    SELECT CAST(%s AS STRING) AS prefix, CAST(%s AS STRING) AS key, CAST(%s AS JSONB) AS value,
+        CAST(%s AS JSONB) AS provenance, CAST(%s AS TIMESTAMPTZ) AS valid_at,
+        CAST(%s AS TIMESTAMPTZ) AS invalid_at, CAST(%s AS STRING) AS reason,
+        CAST(%s AS STRING) AS superseded_by, CAST(%s AS UUID) AS write_id,
+        CAST(%s AS DECIMAL) AS ttl_days
+) AS p
+LEFT JOIN {self.items} AS i ON i.prefix = p.prefix AND i.key = p.key
+{self._key_history("p")}
+WHERE NOT EXISTS (
+    SELECT 1 FROM {self.history} AS h
+    WHERE h.prefix = p.prefix AND h.key = p.key AND h.write_id = p.write_id
+        AND h.reason = p.reason
+)
+ON CONFLICT (prefix, key, version) DO NOTHING"""
+        params: list[Any] = [
+            prefix,
+            key,
+            value_json,
+            provenance_json,
+            valid_at,
+            invalid_at,
+            "superseded",
+            superseded_by,
+            write_id,
+            ttl_days,
+        ]
+        return (sql, params)
+
+    def confirm(
+        self,
+        prefix: str,
+        key: str,
+        *,
+        confirm_id: str,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+    ) -> tuple[str, list]:
+        """Build the UPDATE that confirms one live memory.
+
+        It sets confirmed_at to now(), adds one to confirmations and stores
+        ``confirm_id``, the id of the confirmation: confirm's own, or the
+        write id of the reconcile or resolve that confirms. Without ``ttl``
+        the memory's expiry is renewed from its own TTL, and a memory without
+        a TTL keeps none. A number of minutes becomes its TTL, and None
+        removes its expiry. Its vectors get the same expiry, in the same
+        statement and only when the memory is confirmed: the CTE reads the
+        item as it was before the update. The version, updated_at and the
+        write id stay as they are, so confirming never invalidates a pending
+        find_conflicts, and a write retried after a lost commit still finds
+        its write id on the memory. A memory that already carries
+        ``confirm_id`` was confirmed by this confirmation, in an attempt that
+        committed before its result was lost, and is left as it is, with
+        its vectors.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement updates one row when it
+            confirms the memory, and none when no live memory has the key or
+            the memory already carries ``confirm_id``.
+        """
+        match = (
+            "prefix = %s AND key = %s AND (expires_at IS NULL OR expires_at > now())\n"
+            "{indent}AND confirm_id IS DISTINCT FROM CAST(%s AS UUID)"
+        )
+        match_params: list[Any] = [prefix, key, confirm_id]
+        ttl_params: list[Any] = []
+        if isinstance(ttl, NotProvided):
+            item_expiry = (
+                "expires_at = COALESCE(now() + ttl_minutes * INTERVAL '1 minute', expires_at)"
+            )
+            vector_expiry = "expires_at = now() + ttl_minutes * INTERVAL '1 minute'"
+            vector_filter = " AND ttl_minutes IS NOT NULL"
+        else:
+            new_ttl = (
+                "ttl_minutes = CAST(%s AS DECIMAL),\n"
+                "{indent}expires_at = now() + CAST(%s AS DECIMAL) * INTERVAL '1 minute'"
+            )
+            item_expiry = new_ttl.format(indent="    ")
+            vector_expiry = new_ttl.format(indent="        ")
+            vector_filter = ""
+            ttl_params = [ttl, ttl]
+        sql = (
+            f"UPDATE {self.items} SET confirmed_at = now(), confirmations = confirmations + 1,\n"
+            f"    confirm_id = CAST(%s AS UUID),\n    {item_expiry}\n"
+            f"WHERE {match.format(indent='    ')}"
+        )
+        params: list[Any] = [confirm_id, *ttl_params, *match_params]
+        if self._index is None:
+            return (sql, params)
+        renewed = (
+            "WITH renewed AS (\n"
+            f"    UPDATE {self.vectors} SET {vector_expiry}\n"
+            f"    WHERE prefix = %s AND key = %s{vector_filter} AND EXISTS (\n"
+            f"        SELECT 1 FROM {self.items}\n"
+            f"        WHERE {match.format(indent='            ')}\n"
+            "    )\n"
+            "    RETURNING key\n"
+            ")\n"
+        )
+        return (renewed + sql, [*ttl_params, prefix, key, *match_params, *params])
+
+    def confirm_check(self, prefix: str, key: str, *, confirm_id: str) -> tuple[str, list]:
+        """Build the read of the live memory under ``key`` if it carries ``confirm_id``.
+
+        confirm sends it with its UPDATE. An UPDATE that changed no row
+        either found no live memory, or found one that an earlier attempt of
+        the same confirm already confirmed, in an attempt that committed
+        before its result was lost. Only then does this find the memory.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement returns a row if the
+            live memory carries ``confirm_id``, or no rows otherwise.
+        """
+        sql = (
+            f"SELECT 1 FROM {self.items} WHERE prefix = %s AND key = %s "
+            "AND (expires_at IS NULL OR expires_at > now()) "
+            "AND confirm_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, key, confirm_id])
+
+    def applied_items(self, prefix: str, keys: Sequence[str], *, write_id: str) -> tuple[str, list]:
+        """Build the read of the items under ``keys`` that carry a call's id.
+
+        A reconcile or resolve retried after a commit whose result was lost
+        reads them, with applied_history, to tell what its earlier attempt
+        did: the memory it wrote carries ``write_id`` as its write id, and the
+        memories it confirmed carry it as their confirm id. put_if reads them
+        for the memory it wrote. ``keys`` are the keys that the decisions of
+        earlier attempts named, looked up by primary key, so the retry's
+        transaction reads only their rows, not the whole namespace. Expired
+        rows count, since they were written all the same.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key``, ``version``,
+            ``written``, whether it carries the id as its write id, and
+            ``confirmed``, whether it carries it as its confirm id.
+        """
+        sql = (
+            "SELECT key, version, write_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS written,\n"
+            "    confirm_id IS NOT DISTINCT FROM CAST(%s AS UUID) AS confirmed\n"
+            f"FROM {self.items}\n"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+            "    AND (write_id = CAST(%s AS UUID) OR confirm_id = CAST(%s AS UUID))"
+        )
+        return (sql, [write_id, write_id, prefix, list(keys), write_id, write_id])
+
+    def applied_history(
+        self, prefix: str, keys: Sequence[str], *, write_id: str
+    ) -> tuple[str, list]:
+        """Build the read of the history rows under ``keys`` that carry a write id.
+
+        They are the versions a reconcile archived, and a new memory it
+        recorded straight into history. History's primary key starts with
+        (prefix, key), so only the versions of ``keys`` are read. See
+        applied_items.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key`` and ``reason``.
+        """
+        sql = (
+            f"SELECT key, reason FROM {self.history}\n"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[])) AND write_id = CAST(%s AS UUID)"
+        )
+        return (sql, [prefix, list(keys), write_id])
+
+    def tokens(self, prefix: str, keys: Sequence[str]) -> tuple[str, list]:
+        """Build the read of the version and updated_at of the live items under ``keys``.
+
+        resolve() compares them with what find_conflicts read, to tell
+        whether a memory changed in between (base.changed_keys). A put
+        bumps the version, and a 0.5.x store, which does not, still sets
+        updated_at, so both are read. An expired item is not read: it counts
+        as gone. The keys are looked up by primary key, and the read pushes
+        back no expiry.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has ``key``, ``version`` and
+            ``updated_at``.
+        """
+        sql = (
+            f"SELECT key, version, updated_at FROM {self.items}\n"
+            "WHERE prefix = %s AND key = ANY(CAST(%s AS STRING[]))\n"
+            "    AND (expires_at IS NULL OR expires_at > now())"
+        )
+        return (sql, [prefix, list(keys)])
+
+    def history_versions(
+        self, prefix: str, key: str | None, *, limit: int, offset: int
+    ) -> tuple[str, list]:
+        """Build the SELECT for versions in history, newest first.
+
+        With a key, it reads that key's versions, highest version first.
+        Without one, it reads the versions of every key in exactly the
+        namespace ``prefix``, not its descendants, newest first by
+        ``ended_at``, then by key, then highest version first. History's
+        primary key is (prefix, key, version), so no two rows of a namespace
+        tie and pages are stable. That read scans the namespace's rows
+        through the primary key, which leads with prefix, and sorts them.
+
+        Versions past their history TTL are left out, though CockroachDB's
+        TTL job may not have deleted them yet.
+
+        Returns:
+            Tuple of (SQL, parameters). Each row has the version's ``key``.
+
+        Raises:
+            ValueError: If limit or offset is negative.
+        """
+        _validate_paging(limit, offset)
+        params: list[Any] = [prefix]
+        condition = "prefix = %s"
+        order_by = "ended_at DESC, key, version DESC"
+        if key is not None:
+            condition += " AND key = %s"
+            params.append(key)
+            order_by = "version DESC"
+        sql = f"""SELECT key, version, value, provenance, valid_at, invalid_at, written_at, ended_at, reason, superseded_by, confirmed_at, confirmations
+FROM {self.history}
+WHERE {condition} AND (expires_at IS NULL OR expires_at > now())
+ORDER BY {order_by}
+LIMIT %s OFFSET %s"""
+        params.extend([limit, offset])
+        return (sql, params)
+
+    def purge(self, prefix: str, key: str) -> tuple[str, list]:
+        """Build one statement that deletes an item, its vectors and its history.
+
+        Each table's rows go in a data-modifying CTE of the same statement,
+        so they are deleted together.
+
+        Returns:
+            Tuple of (SQL, parameters). The statement returns one row whose
+            ``removed`` says whether any row was deleted.
+        """
+        where = "WHERE prefix = %s AND key = %s RETURNING 1"
+        tables = [("deleted_items", self.items)]
+        if self._index is not None:
+            tables.append(("deleted_vectors", self.vectors))
+        tables.append(("deleted_history", self.history))
+        ctes = [f"{name} AS (\n    DELETE FROM {table} {where}\n)" for name, table in tables]
+        found = "\n    OR ".join(f"EXISTS (SELECT 1 FROM {name})" for name, _ in tables)
+        sql = "WITH " + ",\n".join(ctes) + f"\nSELECT {found} AS removed"
+        return (sql, [prefix, key] * len(tables))
+
+    def delete_namespace(
+        self, namespace_prefix: Sequence[str], *, history: bool = False
+    ) -> tuple[str, list]:
         """Build one DELETE for a namespace and its descendants.
 
         With an index, the vectors go in a data-modifying CTE of the same
-        statement.
+        statement, and with ``history`` so do the history rows.
 
         Args:
             namespace_prefix: Namespace prefix to delete.
+            history: Whether to delete the namespace's history rows too.
 
         Returns:
             Tuple of (SQL, parameters). The statement returns the key of
@@ -886,13 +1882,18 @@ LIMIT %s OFFSET %s"""
         """
         ns_condition, ns_params = prefix_condition("prefix", namespace_prefix)
         sql = f"DELETE FROM {self.items}\nWHERE {ns_condition}\nRETURNING key"
-        if self._index is None:
+        tables = []
+        if self._index is not None:
+            tables.append(("deleted_vectors", self.vectors))
+        if history:
+            tables.append(("deleted_history", self.history))
+        if not tables:
             return (sql, list(ns_params))
-        cte = (
-            f"WITH deleted_vectors AS (\n    DELETE FROM {self.vectors}\n"
-            f"    WHERE {ns_condition}\n    RETURNING key\n)\n"
-        )
-        return (cte + sql, list(ns_params) + list(ns_params))
+        ctes = [
+            f"{name} AS (\n    DELETE FROM {table}\n    WHERE {ns_condition}\n    RETURNING key\n)"
+            for name, table in tables
+        ]
+        return ("WITH " + ",\n".join(ctes) + "\n" + sql, list(ns_params) * (len(tables) + 1))
 
     def sweep(self) -> list[tuple[str, list]]:
         """Build DELETE statements for expired rows.

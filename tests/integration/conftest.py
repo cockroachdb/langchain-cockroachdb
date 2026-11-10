@@ -1,0 +1,22 @@
+"""Setup shared by the integration tests."""
+
+from __future__ import annotations
+
+import pytest
+
+from langchain_cockroachdb.checkpointer.base import BaseCockroachDBSaver
+
+
+@pytest.fixture(autouse=True)
+def _short_ttl_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the wait enable_ttl makes for the savers under a second.
+
+    When the TTL setting changes, enable_ttl pauses TTL and waits
+    TTL_STATE_CACHE_SECONDS, 10 by default, plus TTL_PAUSE_MARGIN_SECONDS,
+    5 by default, so that every saver reads the new setting. Lowering both
+    for every saver keeps that wait, and the savers' cache, short in tests.
+    A saver whose retry policy has a longer attempt_timeout waits that
+    instead of the margin.
+    """
+    monkeypatch.setattr(BaseCockroachDBSaver, "TTL_STATE_CACHE_SECONDS", 0.5)
+    monkeypatch.setattr(BaseCockroachDBSaver, "TTL_PAUSE_MARGIN_SECONDS", 0.1)
