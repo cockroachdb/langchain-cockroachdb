@@ -516,12 +516,16 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
         )
         # Only a put that uses blob rows it does not write needs the TTL setting
         candidates = self._refresh_candidates(checkpoint, blob_values, blob_versions)
-        window = await self._ttl_refresh_window() if candidates else None
-        refresh = (
-            None if window is None else (thread_id, checkpoint_ns, candidates, _duration(window))
-        )
 
         async def write() -> None:
+            # Decided in each attempt, before its cursor opens, so a retry that
+            # comes after the saver learns that TTL is on refreshes too
+            window = await self._ttl_refresh_window() if candidates else None
+            refresh = (
+                None
+                if window is None
+                else (thread_id, checkpoint_ns, candidates, _duration(window))
+            )
             async with self._cursor(
                 pipeline=True,
                 transaction=bool(blob_rows) or refresh is not None,
@@ -541,22 +545,26 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
         """The refresh window for blob rows, or None when puts refresh nothing.
 
         The saver reads the TTL setting of checkpoint_blobs from the catalog
-        when it has not read it for TTL_STATE_CACHE_SECONDS, or since its own
-        aenable_ttl or adisable_ttl ran. If that read fails with a database
-        error that the retry policy does not retry, such as a missing
-        privilege, the put goes on without refreshing, and the saver logs a
-        WARNING and reads again after the cache interval.
+        once TTL_STATE_CACHE_SECONDS have passed since its last read started,
+        since what a read finds may be that old, or once its own aenable_ttl
+        or adisable_ttl has run. The read is one attempt: the put calls this
+        in each of its attempts, and its retry covers a transient error. If
+        the read fails with a database error that the retry policy does
+        not retry, such as a missing privilege, the put goes on without
+        refreshing, and the saver logs a WARNING and reads again after the
+        cache interval.
         """
         state = self._fresh_ttl_state()
         if state is None:
+            started = self._ttl_read_starts()
             try:
-                reloptions = await self._retry(self._read_blob_ttl, label="read checkpoint TTL")
+                reloptions = await self._read_blob_ttl()
             except Exception as error:
                 if not self._skips_ttl_read(error):
                     raise
-                state = self._ttl_read_failed(error)
+                state = self._ttl_read_failed(error, started)
             else:
-                state = self._keep_ttl_state(reloptions)
+                state = self._keep_ttl_state(reloptions, started)
         return state.window
 
     async def _read_blob_ttl(self) -> builtins.list[str] | None:
@@ -788,26 +796,31 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
 
         When the TTL setting of checkpoint_blobs is to change, it writes the
         new settings with TTL paused, so nothing is deleted, and waits
-        TTL_STATE_CACHE_SECONDS plus TTL_PAUSE_MARGIN_SECONDS, so that every
-        saver reads them and refreshes on its puts; savers refresh while TTL
-        is paused. Then it makes one pass, so threads idle at that moment
-        keep their state too: each blob row that checkpoints inside the
-        interval use, and that is older than the newest of them by more than
-        the refresh window, is brought forward to now. Only rows left
-        unchanged that long are rewritten. The pass reads every checkpoint
-        once, TTL_REFRESH_BATCH_SIZE at a time, changes at most
-        TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at INFO when it
-        starts and ends. Then it resumes TTL. So it blocks for about a minute
-        when the setting changes. With the same setting in place and
+        TTL_STATE_CACHE_SECONDS plus TTL_PAUSE_MARGIN_SECONDS, or plus the
+        retry policy's attempt_timeout when that is longer, so that every
+        saver reads them and refreshes on its puts, and puts already under
+        way finish; savers refresh while TTL is paused. Then it makes one
+        pass, so threads idle at that moment keep their state too: each blob
+        row that checkpoints inside the interval use, and that is older than
+        the newest of them by more than the refresh window, is brought
+        forward to now. Only rows left unchanged that long are rewritten. The
+        pass reads every checkpoint once, TTL_REFRESH_BATCH_SIZE at a time,
+        changes at most TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at
+        INFO when it starts and ends. Then it reads the setting again and
+        resumes TTL, unless another run has written a different setting
+        since: that run resumes it, and this one logs at INFO. So it blocks
+        for about 15 seconds by default, plus the pass, whenever the setting
+        changes, on a table of any size. With the same setting in place and
         running, it only updates the cron and returns at once; any other
         change makes the whole run, a longer interval too. A run that stops
-        partway leaves TTL paused, which deletes nothing, and the next run
-        finishes it, even with the same arguments; to force a pass, call
-        disable_ttl first. On a large table, run it once from a single
-        process before a rollout. After upgrading from 0.5, run it again with
-        the same arguments, which adds the grace and covers threads idle
-        since the upgrade. Intervals over 106,751 days, the longest duration
-        CockroachDB keeps, are refused.
+        partway leaves TTL paused, on checkpoint_blobs at least, and the next
+        run finishes it, even with the same arguments; to force a pass, call
+        disable_ttl first. If startup probes are tight, run it once from a
+        single process or a one-off job before a rollout. Use one interval,
+        and change it from one process. After upgrading from 0.5, run it
+        again with the same arguments, which adds the grace and covers
+        threads idle since the upgrade. Intervals over 106,751 days, the
+        longest duration CockroachDB keeps, are refused.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
@@ -836,10 +849,15 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
             self._forget_ttl_state()
             await self._wait_for_savers(plan)
             await self._refresh_used_blobs(plan)
-            # checkpoint_blobs last, so a run that stops here is redone in full
-            for statement in plan.resume:
-                await self._run_ddl(statement, "enable TTL", policy=policy)
-            self._pause_ended()
+            # Only this run's own setting: a run that wrote another since resumes it
+            current = await self._retry(self._read_blob_ttl, label="read checkpoint TTL")
+            if self._resume_allowed(current, plan):
+                # checkpoint_blobs last, so a run that stops here is redone in full.
+                # CockroachDB may skip the next scheduled TTL job once after this,
+                # for the recent schema change, which delays deletion one cron period
+                for statement in plan.resume:
+                    await self._run_ddl(statement, "enable TTL", policy=policy)
+                self._pause_ended()
         finally:
             # Even a failed run may have changed a table
             self._forget_ttl_state()

@@ -748,19 +748,31 @@ def pause_as_a_stopped_run_leaves_it(url: str, saver: Any, interval: str, cron: 
             conn.execute(statement)
 
 
+def paused_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "is paused by enable_ttl" in r.getMessage()
+    ]
+
+
 def test_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused(
-    libpq_url: str, caplog: pytest.LogCaptureFixture
+    libpq_url: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.INFO, logger=base.__name__)
+    # As in a fresh process, which has logged no pause yet
+    monkeypatch.setattr(base, "_LOGGED_TTL_PAUSED", set())
     with fresh_database(libpq_url) as url, sync_saver(url) as saver:
         pause_as_a_stopped_run_leaves_it(url, saver, "1 hour", "@daily")
         assert "ttl_pause=true" in ttl_options(url, "checkpoint_blobs")
         thread = Thread(saver)
         thread.put(facts=FACTS, messages=["hello"])
         age(url, "facts", "2 hours")
-        # Puts refresh while TTL is paused
+        # Puts refresh while TTL is paused, and the saver says TTL is paused
         thread.put(messages=["hello", "hi"])
         assert blob_age(url, "facts") < timedelta(minutes=1)
+        [warning] = paused_warnings(caplog)
+        assert "run enable_ttl again" in warning
         # The same interval again: the paused setting is a run that stopped,
         # so this run refreshes and resumes TTL
         saver.enable_ttl("1 hour")
@@ -771,9 +783,10 @@ def test_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused(
 
 
 async def test_async_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused(
-    libpq_url: str, caplog: pytest.LogCaptureFixture
+    libpq_url: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.INFO, logger=base.__name__)
+    monkeypatch.setattr(base, "_LOGGED_TTL_PAUSED", set())
     with fresh_database(libpq_url) as url:
         async with async_saver(url) as saver:
             pause_as_a_stopped_run_leaves_it(url, saver, "1 hour", "@daily")
@@ -782,8 +795,68 @@ async def test_async_enable_ttl_finishes_a_run_that_stopped_while_ttl_was_paused
             age(url, "facts", "2 hours")
             await thread.aput(messages=["hello", "hi"])
             assert blob_age(url, "facts") < timedelta(minutes=1)
+            [warning] = paused_warnings(caplog)
+            assert "run enable_ttl again" in warning
             await saver.aenable_ttl("1 hour")
             assert len(refresh_logs(caplog)) == 2
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert "ttl_pause=true" not in ttl_options(url, table)
+
+
+def resume_left(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "changed while this run ran" in r.getMessage()
+    ]
+
+
+def test_enable_ttl_leaves_the_resume_to_a_run_that_wrote_another_setting(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url, sync_saver(url) as saver:
+        refresh = saver._refresh_used_blobs
+
+        def another_run_pauses_meanwhile(plan: Any) -> None:
+            refresh(plan)
+            # Another run, with another interval, writes its own setting paused
+            pause_as_a_stopped_run_leaves_it(url, saver, "2 hours", "@daily")
+
+        saver._refresh_used_blobs = another_run_pauses_meanwhile  # type: ignore[method-assign]
+        saver.enable_ttl("1 hour")
+        # This run left TTL paused for the other run, whose setting is in place
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+            options = ttl_options(url, table)
+            assert "ttl_pause=true" in options
+            assert "2 hours" in " ".join(options)
+        [message] = resume_left(caplog)
+        assert "'2 hours'" in message
+        # The other run finishes and resumes TTL
+        del saver._refresh_used_blobs
+        saver.enable_ttl("2 hours")
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+            assert "ttl_pause=true" not in ttl_options(url, table)
+        assert len(resume_left(caplog)) == 1
+
+
+async def test_async_enable_ttl_leaves_the_resume_to_a_run_that_wrote_another_setting(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        async with async_saver(url) as saver:
+            refresh = saver._refresh_used_blobs
+
+            async def another_run_pauses_meanwhile(plan: Any) -> None:
+                await refresh(plan)
+                pause_as_a_stopped_run_leaves_it(url, saver, "2 hours", "@daily")
+
+            saver._refresh_used_blobs = another_run_pauses_meanwhile  # type: ignore[method-assign]
+            await saver.aenable_ttl("1 hour")
+            assert "ttl_pause=true" in ttl_options(url, "checkpoint_blobs")
+            [message] = resume_left(caplog)
+            assert "'2 hours'" in message
+            del saver._refresh_used_blobs
+            await saver.aenable_ttl("2 hours")
             for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
                 assert "ttl_pause=true" not in ttl_options(url, table)
 

@@ -52,14 +52,18 @@ MetadataInput = dict[str, Any] | None
 # forward, once, the blob rows that checkpoints inside the interval use, so
 # threads idle then keep theirs too, and resumes TTL.
 TTL_REFRESH_FRACTION = 10
-# Seconds a saver uses what it read about TTL from the catalog. After that,
-# the next put that needs it reads it again, so a change another process
-# makes is seen within this time. The saver's own enable_ttl and disable_ttl
-# make it read again at once.
-TTL_STATE_CACHE_SECONDS = 60.0
+# Seconds a saver uses what it read about TTL from the catalog, counted from
+# when the read started. After that, the next put that needs it reads it
+# again, so a change another process makes is seen within this time. The
+# saver's own enable_ttl and disable_ttl make it read again at once.
+# enable_ttl waits this long while TTL is paused, so it is kept short. That
+# costs at most one read every 10 seconds per saver, made only by puts that
+# use blob rows they do not write.
+TTL_STATE_CACHE_SECONDS = 10.0
 # Seconds enable_ttl waits on top of TTL_STATE_CACHE_SECONDS after it writes
 # a new setting with TTL paused, so that puts already under way when the
-# savers' caches ran out have finished before the refresh starts
+# savers' caches ran out have finished before the refresh starts. The retry
+# policy's attempt_timeout takes its place when that is longer.
 TTL_PAUSE_MARGIN_SECONDS = 5.0
 # Checkpoints that one statement of the refresh in enable_ttl reads
 TTL_REFRESH_BATCH_SIZE = 500
@@ -404,6 +408,9 @@ _SQL_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"
 # the setting, by (table, SQLSTATE)
 _LOGGED_TTL_SETTINGS: set[tuple[str, str]] = set()
 _LOGGED_TTL_READ_ERRORS: set[tuple[str, str]] = set()
+# The tables a saver in the process has found paused by enable_ttl, logged
+# once per pause: a table leaves the set when a saver finds it unpaused
+_LOGGED_TTL_PAUSED: set[str] = set()
 # The most cut DeltaChannel chains a saver remembers having logged. When it
 # has logged this many, it forgets them and starts again.
 _CUT_CHAINS_REMEMBERED = 4096
@@ -553,6 +560,7 @@ class _TTLState:
     """What a saver read about TTL on checkpoint_blobs, and when, by monotonic().
 
     ``window`` is the refresh window, or None when puts refresh nothing.
+    ``read_at`` is when the read started, since what it found may be that old.
     """
 
     window: timedelta | None
@@ -778,9 +786,34 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
         """Seconds enable_ttl waits while TTL is paused, before it refreshes.
 
         TTL_STATE_CACHE_SECONDS, so that every saver has read the new
-        setting and refreshes on its puts, plus TTL_PAUSE_MARGIN_SECONDS.
+        setting and refreshes on its puts, plus a margin for puts already
+        under way: TTL_PAUSE_MARGIN_SECONDS, or the retry policy's
+        attempt_timeout when that is longer, since an attempt can last that
+        long.
         """
-        return max(0.0, self.TTL_STATE_CACHE_SECONDS + self.TTL_PAUSE_MARGIN_SECONDS)
+        margin = max(self.TTL_PAUSE_MARGIN_SECONDS, self.retry_policy.attempt_timeout or 0.0)
+        return max(0.0, self.TTL_STATE_CACHE_SECONDS + margin)
+
+    @staticmethod
+    def _resume_allowed(current: Sequence[str] | None, plan: _TTLPlan) -> bool:
+        """Whether enable_ttl may resume TTL, given checkpoint_blobs' reloptions now.
+
+        Only while the expression is still the one this run wrote. If
+        another run has written its own since, that run resumes TTL when it
+        has finished, and this one leaves it paused, logging that at INFO.
+        The same goes when disable_ttl has turned TTL off meanwhile.
+        """
+        found = _blob_expression(current)
+        if found == plan.blob_expression:
+            return True
+        logger.info(
+            "enable_ttl: the TTL setting of checkpoint_blobs changed while this run ran. "
+            "It wrote %s and now finds %s, so it leaves the resume to the run that changed "
+            "the setting. Use one interval, and change it from one process.",
+            plan.blob_expression,
+            "no TTL expression" if found is None else found,
+        )
+        return False
 
     @staticmethod
     def _pause_started(plan: _TTLPlan, seconds: float) -> None:
@@ -888,11 +921,22 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
             return None
         return state
 
-    def _keep_ttl_state(self, reloptions: Sequence[str] | None) -> _TTLState:
+    @staticmethod
+    def _ttl_read_starts() -> float:
+        """When a read of the TTL setting starts, by monotonic().
+
+        What the read finds may be as old as its start, so the saver keeps
+        it for the cache interval from then, not from when the read returned.
+        """
+        return monotonic()
+
+    def _keep_ttl_state(self, reloptions: Sequence[str] | None, read_at: float) -> _TTLState:
         """Keep what the saver read about TTL on checkpoint_blobs, for the cache interval.
 
         A TTL setting that enable_ttl did not write turns the refresh off. It
-        is logged at INFO once per process.
+        is logged at INFO once per process. A setting of enable_ttl's that is
+        paused is logged at WARNING once per process each time it is found
+        paused, since TTL deletes nothing until a run resumes it.
         """
         window, foreign = _parse_blob_ttl(reloptions, self.TTL_REFRESH_FRACTION)
         if foreign is not None and ("checkpoint_blobs", foreign) not in _LOGGED_TTL_SETTINGS:
@@ -904,7 +948,17 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                 "the setting.",
                 foreign,
             )
-        return self._set_ttl_state(window)
+        if window is None or not _ttl_paused(reloptions):
+            _LOGGED_TTL_PAUSED.discard("checkpoint_blobs")
+        elif "checkpoint_blobs" not in _LOGGED_TTL_PAUSED:
+            _LOGGED_TTL_PAUSED.add("checkpoint_blobs")
+            logger.warning(
+                "TTL on checkpoint_blobs is paused by enable_ttl, so TTL deletes nothing until "
+                "an enable_ttl run resumes it. Puts still refresh blob rows. If no enable_ttl "
+                "run is under way, one stopped before it finished: run enable_ttl again to "
+                "finish it."
+            )
+        return self._set_ttl_state(window, read_at)
 
     def _skips_ttl_read(self, error: BaseException) -> bool:
         """Whether a put goes on without the TTL setting after reading it failed with ``error``.
@@ -920,7 +974,7 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
             and not in_caller_transaction(error)
         )
 
-    def _ttl_read_failed(self, error: BaseException) -> _TTLState:
+    def _ttl_read_failed(self, error: BaseException, read_at: float) -> _TTLState:
         """Keep "no refresh" for the cache interval, and log a WARNING once per process."""
         key = ("checkpoint_blobs", get_sqlstate(error) or "")
         if key not in _LOGGED_TTL_READ_ERRORS:
@@ -933,10 +987,10 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                 _describe(error),
                 self.TTL_STATE_CACHE_SECONDS,
             )
-        return self._set_ttl_state(None)
+        return self._set_ttl_state(None, read_at)
 
-    def _set_ttl_state(self, window: timedelta | None) -> _TTLState:
-        state = _TTLState(window, monotonic())
+    def _set_ttl_state(self, window: timedelta | None, read_at: float) -> _TTLState:
+        state = _TTLState(window, read_at)
         self._ttl_state = state
         return state
 

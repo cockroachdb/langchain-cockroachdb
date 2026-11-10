@@ -20,7 +20,7 @@ against CockroachDB.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -40,6 +40,8 @@ from tests.unit.checkpointer_fakes import (
     FakeAsyncPool,
     FakeConnection,
     FakePool,
+    FakeSingleAsyncConnection,
+    FakeSingleConnection,
     close_sockets,
 )
 
@@ -87,9 +89,11 @@ def _forget_what_was_logged() -> Iterator[None]:
     """Each test starts as a fresh process would, with nothing logged yet."""
     base._LOGGED_TTL_SETTINGS.clear()
     base._LOGGED_TTL_READ_ERRORS.clear()
+    base._LOGGED_TTL_PAUSED.clear()
     yield
     base._LOGGED_TTL_SETTINGS.clear()
     base._LOGGED_TTL_READ_ERRORS.clear()
+    base._LOGGED_TTL_PAUSED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -142,18 +146,33 @@ class Catalog:
     """Stands in for the saver's read of checkpoint_blobs' reloptions, and counts the reads."""
 
     def __init__(
-        self, kind: str, saver: Any, reloptions: list[str] | None, error: Exception | None = None
+        self,
+        kind: str,
+        saver: Any,
+        reloptions: list[str] | None,
+        error: Exception | None = None,
+        *,
+        then: list[str] | None = None,
+        on_read: Callable[[], None] | None = None,
     ) -> None:
         self.reloptions = reloptions
         # Raised by every read while set
         self.error = error
+        # What reads after the first find, when given: the setting enable_ttl wrote
+        self.then = then
+        # Called as each read runs, so a test can move the clock while it does
+        self.on_read = on_read
         self.reads = 0
         saver._read_blob_ttl = self.read if kind == "sync" else self.aread
 
     def read(self) -> list[str] | None:
         self.reads += 1
+        if self.on_read is not None:
+            self.on_read()
         if self.error is not None:
             raise self.error
+        if self.reads > 1 and self.then is not None:
+            return self.then
         return self.reloptions
 
     async def aread(self) -> list[str] | None:
@@ -234,7 +253,7 @@ def test_the_refresh_statement_binds_every_value() -> None:
 
 def test_the_named_defaults() -> None:
     assert base.TTL_REFRESH_FRACTION == CockroachDBSaver.TTL_REFRESH_FRACTION == 10
-    assert base.TTL_STATE_CACHE_SECONDS == AsyncCockroachDBSaver.TTL_STATE_CACHE_SECONDS == 60
+    assert base.TTL_STATE_CACHE_SECONDS == AsyncCockroachDBSaver.TTL_STATE_CACHE_SECONDS == 10
 
 
 @KINDS
@@ -435,6 +454,29 @@ async def test_the_saver_keeps_what_it_read_for_the_cache_interval(
 
 
 @KINDS
+async def test_what_a_read_finds_is_kept_from_when_the_read_started(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # It may be that old, so a slow read leaves less of the cache interval
+    clock = fake_clock(monkeypatch)
+    saver, _ = saver_for(kind)
+
+    def takes_four_seconds() -> None:
+        clock[0] += 4
+
+    catalog = Catalog(kind, saver, NEW_V26, on_read=takes_four_seconds)
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    await put(kind, saver, checkpoint, new_versions)
+    clock[0] += saver.TTL_STATE_CACHE_SECONDS - 4 - 0.5
+    await put(kind, saver, checkpoint, new_versions)
+    assert catalog.reads == 1
+    # The cache interval from the start of the read has passed
+    clock[0] += 0.5
+    await put(kind, saver, checkpoint, new_versions)
+    assert catalog.reads == 2
+
+
+@KINDS
 @pytest.mark.parametrize("change", ["enable_ttl", "disable_ttl"])
 async def test_enable_and_disable_ttl_make_the_next_put_read_the_catalog(
     kind: str, change: str, monkeypatch: pytest.MonkeyPatch
@@ -547,6 +589,8 @@ PAUSED_1_HOUR = [
     "ALTER TABLE checkpoint_writes SET ( ttl_expiration_expression = "
     "$$(created_at + '1 hour')$$, ttl_job_cron = '@daily', ttl_pause = true );",
 ]
+# checkpoint_blobs' reloptions once enable_ttl("1 hour") has written them paused
+PAUSED_1_HOUR_FOUND = [*NEW_V26[:3], "ttl_pause=true", "schema_locked=true"]
 RESUME = [
     "ALTER TABLE checkpoints RESET (ttl_pause);",
     "ALTER TABLE checkpoint_writes RESET (ttl_pause);",
@@ -557,6 +601,8 @@ RESUME = [
 @KINDS
 async def test_enable_ttl_pauses_waits_refreshes_and_resumes(kind: str, waits: list[float]) -> None:
     saver, used = saver_for(kind)
+    # No setting at first; before it resumes, the run reads its own, paused
+    catalog = Catalog(kind, saver, None, then=PAUSED_1_HOUR_FOUND)
     await enable_ttl(kind, saver, "1 hour")
     # The settings with TTL paused, checkpoint_blobs first, so blob rows stop
     # expiring before anything else changes; checkpoint_blobs resumes last,
@@ -566,13 +612,14 @@ async def test_enable_ttl_pauses_waits_refreshes_and_resumes(kind: str, waits: l
     calls = executed(used)
     # DDL takes no parameters, so the validated interval and cron are in the text
     assert [params for s, params in calls if s.lstrip().startswith("ALTER")] == [None] * 6
-    # It reads the setting first; the fakes find none and no checkpoint, so
-    # after the wait it reads one empty page for its refresh
-    assert calls[0] == (base.SELECT_BLOB_TTL_SQL, ("checkpoint_blobs",))
-    assert calls[4] == (base.SELECT_CHECKPOINT_PAGE_SQL, ["1:00:00.000000", 500])
-    assert len(calls) == 8
-    # One wait for every saver to read the new setting: 60 seconds, plus 5
-    assert waits == [65.0]
+    # The fakes find no checkpoint, so after the wait it reads one empty
+    # page for its refresh
+    assert calls[3] == (base.SELECT_CHECKPOINT_PAGE_SQL, ["1:00:00.000000", 500])
+    assert len(calls) == 7
+    # The setting read before the run, and again before it resumes
+    assert catalog.reads == 2
+    # One wait for every saver to read the new setting: 10 seconds, plus 5
+    assert waits == [15.0]
     # What enable_ttl writes is what the saver parses
     blob_expression = PAUSED_1_HOUR[0].split("$$")[1]
     assert base._parse_blob_ttl([rendered(blob_expression)], 10) == (SIX_MINUTES, None)
@@ -588,6 +635,145 @@ async def test_the_wait_follows_the_saver_cache_interval_and_margin(
     await enable_ttl(kind, saver, "1 hour")
     assert waits == [9.0]
     assert base.TTL_PAUSE_MARGIN_SECONDS == CockroachDBSaver.TTL_PAUSE_MARGIN_SECONDS == 5.0
+
+
+@KINDS
+@pytest.mark.parametrize(("attempt_timeout", "wait"), [(None, 15.0), (2.0, 15.0), (30.0, 40.0)])
+async def test_the_margin_is_at_least_the_attempt_timeout(
+    kind: str, waits: list[float], attempt_timeout: float | None, wait: float
+) -> None:
+    # An attempt can last that long, so a put under way can too
+    saver, _ = saver_for(kind)
+    saver.retry_policy = RetryPolicy(
+        initial_backoff=0.01, max_backoff=0.05, attempt_timeout=attempt_timeout
+    )
+    await enable_ttl(kind, saver, "1 hour")
+    assert waits == [wait]
+
+
+@KINDS
+async def test_a_retried_put_decides_again_and_refreshes_once_ttl_is_on(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = fake_clock(monkeypatch)
+    catalog: Catalog
+
+    def turn_ttl_on(statement: str) -> None:
+        # While the first attempt runs, the saver's cache runs out and TTL is on
+        catalog.reloptions = NEW_V26
+        clock[0] += base.TTL_STATE_CACHE_SECONDS
+
+    async def aturn_ttl_on(statement: str) -> None:
+        turn_ttl_on(statement)
+
+    restart = pg_errors.SerializationFailure("restart transaction")
+    saver: Any
+    if kind == "sync":
+        pool: Any = FakePool(FakeConnection(restart, on_statement=turn_ttl_on))
+        saver = CockroachDBSaver(pool, retry_policy=POLICY)
+    else:
+        pool = FakeAsyncPool(FakeAsyncConnection(restart, on_statement=aturn_ttl_on))
+        saver = AsyncCockroachDBSaver(pool, retry_policy=POLICY)
+    saver.supports_pipeline = True
+    catalog = Catalog(kind, saver, None)
+    checkpoint, _ = checkpoint_using_old_blobs()
+    await put(kind, saver, checkpoint, {})
+    first, second = pool.handed_out
+    # The first attempt saw TTL off: one statement, no refresh
+    assert first.statements == [CHECKPOINT]
+    # Its retry read the setting again, saw TTL on and refreshed
+    assert second.statements == ["BEGIN", base.REFRESH_CHECKPOINT_BLOBS_SQL, CHECKPOINT, "COMMIT"]
+    assert catalog.reads == 2
+
+
+@KINDS
+@pytest.mark.timeout(20)
+async def test_the_ttl_read_comes_before_the_write_opens_its_cursor(kind: str) -> None:
+    # On a single connection the saver holds its lock while a cursor is
+    # open, so a read inside the write's cursor would wait on it forever
+    saver: Any
+    if kind == "sync":
+        conn: Any = FakeSingleConnection()
+        saver = CockroachDBSaver(conn, retry_policy=POLICY)
+    else:
+        conn = FakeSingleAsyncConnection()
+        saver = AsyncCockroachDBSaver(conn, retry_policy=POLICY)
+    saver.supports_pipeline = True
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    await put(kind, saver, checkpoint, new_versions)
+    # The read, then the write in one batch; the fakes find no TTL, so no refresh
+    assert conn.statements == [base.SELECT_BLOB_TTL_SQL, "BEGIN", BLOBS, CHECKPOINT, "COMMIT"]
+
+
+@KINDS
+@pytest.mark.parametrize(
+    ("found", "named"),
+    [
+        # Another run has written its own setting, paused, to resume when it is done
+        (
+            ["ttl='on'", rendered(new("2 hours")), "ttl_job_cron='@daily'", "ttl_pause=true"],
+            new("2 hours"),
+        ),
+        # disable_ttl has turned TTL off
+        (["schema_locked=true"], "no TTL expression"),
+    ],
+    ids=["another-run", "disabled"],
+)
+async def test_enable_ttl_resumes_only_its_own_setting(
+    kind: str, found: list[str], named: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    saver, used = saver_for(kind)
+    catalog = Catalog(kind, saver, None, then=found)
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    await enable_ttl(kind, saver, "1 hour")
+    # Its own settings, paused, and no resume: that is left to the other run
+    assert ddl(used) == PAUSED_1_HOUR
+    assert catalog.reads == 2
+    [message] = [
+        r.getMessage() for r in caplog.records if "changed while this run ran" in r.getMessage()
+    ]
+    assert named in message
+    assert "one interval" in message
+
+
+@KINDS
+async def test_a_paused_setting_is_logged_at_warning_once_per_pause(
+    kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = fake_clock(monkeypatch)
+    saver, _ = saver_for(kind)
+    catalog = Catalog(kind, saver, PAUSED_1_HOUR_FOUND)
+    checkpoint, new_versions = checkpoint_using_old_blobs()
+    caplog.set_level(logging.WARNING, logger=base.__name__)
+
+    def warned() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "paused" in r.getMessage()
+        ]
+
+    async def put_later(on: Any) -> None:
+        await put(kind, on, checkpoint, new_versions)
+        clock[0] += saver.TTL_STATE_CACHE_SECONDS
+
+    await put_later(saver)
+    await put_later(saver)
+    # Read twice, logged once
+    assert catalog.reads == 2
+    [message] = warned()
+    assert "deletes nothing" in message and "run enable_ttl again" in message
+    # Another saver in the process stays quiet about the same pause
+    other, _ = saver_for(kind)
+    Catalog(kind, other, PAUSED_1_HOUR_FOUND)
+    await put_later(other)
+    assert len(warned()) == 1
+    # Once a saver finds TTL running again, a later pause is logged again
+    catalog.reloptions = NEW_V26
+    await put_later(saver)
+    catalog.reloptions = PAUSED_1_HOUR_FOUND
+    await put_later(saver)
+    assert len(warned()) == 2
 
 
 @KINDS
@@ -622,7 +808,7 @@ async def test_a_paused_setting_is_a_run_that_stopped_partway(
     refresh = Pass(kind, saver, [[]])
     Catalog(kind, saver, [*NEW_V26, "ttl_pause=true"])
     await enable_ttl(kind, saver, "1 hour")
-    assert waits == [65.0]
+    assert waits == [15.0]
     assert len(refresh.reads) == 1
     assert ddl(used)[-3:] == RESUME
 
@@ -1058,11 +1244,14 @@ def caller_transaction_error() -> Exception:
 )
 async def test_other_read_errors_fail_the_put(kind: str, error: Exception) -> None:
     saver, used = saver_for(kind)
-    Catalog(kind, saver, NEW_V26, error)
+    catalog = Catalog(kind, saver, NEW_V26, error)
     checkpoint, new_versions = checkpoint_using_old_blobs()
     with pytest.raises(type(error)):
         await put(kind, saver, checkpoint, new_versions)
     assert statements(used) == []
+    if isinstance(error, pg_errors.SerializationFailure):
+        # Each attempt of the put reads once: the read has no retry of its own
+        assert catalog.reads == POLICY.max_attempts
 
 
 def _config(checkpoint_id: str) -> Any:
