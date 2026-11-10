@@ -103,7 +103,8 @@ class FakeConnection:
     ``on_statement`` is called with each statement as it runs (awaited for the
     async fakes), so a test can hold an operation inside its connection.
     ``events`` records statements, rollbacks and the pipeline and transaction
-    blocks around them, in order.
+    blocks around them, in order. ``executed`` records each statement a
+    cursor ran with the parameters it was given.
 
     BEGIN, COMMIT, a failing statement and rollback() move
     ``info.transaction_status`` the way they move libpq's. The server answers
@@ -145,6 +146,7 @@ class FakeConnection:
         self.rollback_error = rollback_error
         self.in_pipeline_mode = False
         self.statements: list[str] = []
+        self.executed: list[tuple[str, Any]] = []
         self.events: list[tuple[str, ...]] = []
         self._info = FakeInfo()
         self._broken = False
@@ -303,11 +305,13 @@ class FakeCursor:
 
     def execute(self, query: Any, params: Any = None, **kwargs: Any) -> FakeCursor:
         self._last = str(query).strip()
+        self._conn.executed.append((str(query), params))
         self._conn.run(query)
         return self
 
     def executemany(self, query: Any, params_seq: Any, **kwargs: Any) -> None:
         self._last = str(query).strip()
+        self._conn.executed.append((str(query), params_seq))
         self._conn.run(query)
 
     def fetchone(self) -> None:
@@ -332,11 +336,13 @@ class FakeAsyncCursor(FakeCursor):
 
     async def execute(self, query: Any, params: Any = None, **kwargs: Any) -> FakeAsyncCursor:
         self._last = str(query).strip()
+        self._aconn.executed.append((str(query), params))
         await self._aconn.arun(query)
         return self
 
     async def executemany(self, query: Any, params_seq: Any, **kwargs: Any) -> None:
         self._last = str(query).strip()
+        self._aconn.executed.append((str(query), params_seq))
         await self._aconn.arun(query)
 
     async def fetchone(self) -> None:

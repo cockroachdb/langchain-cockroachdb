@@ -15,6 +15,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from functools import partial
 from typing import Any
 
@@ -327,7 +328,9 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         LangGraph's default walks the parent chain with one get_tuple per
         ancestor, which is three queries per ancestor. This fetches the chain
         a page at a time instead, in pages that grow up to DELTA_HISTORY_PAGE_SIZE,
-        and returns the same result.
+        and returns the same result. A walk that stops at a missing ancestor,
+        as when row-level TTL deleted it, before a channel's snapshot logs a
+        WARNING: that channel's state may be incomplete.
 
         Args:
             config: Config identifying the checkpoint.
@@ -352,7 +355,7 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
                 walk.visit(tup)
                 if not walk.remaining:
                     break
-            start = page[-1].parent_config if page and len(page) == limit else None
+            start = walk.next_start(start, page, limit)
             limit = max(1, min(limit * 4, self.DELTA_HISTORY_PAGE_SIZE))
         return walk.result()
 
@@ -387,6 +390,11 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint to the database.
+
+        With row-level TTL on, the put also brings forward created_at on the
+        blob rows the checkpoint uses but does not write, once they are
+        older than the refresh window, in the same transaction, so TTL keeps
+        them as long as the checkpoint.
 
         Args:
             config: Config to associate with the checkpoint.
@@ -434,20 +442,48 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
             Jsonb(copy),
             Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
         )
+        # Only a put that uses blob rows it does not write needs the TTL setting
+        candidates = self._refresh_candidates(checkpoint, blob_values, blob_versions)
+        window = self._ttl_refresh_window() if candidates else None
+        refresh = None if window is None else (thread_id, checkpoint_ns, candidates, window)
 
         def write() -> None:
             with self._cursor(
                 pipeline=True,
-                transaction=bool(blob_rows),
+                transaction=bool(blob_rows) or refresh is not None,
                 timeout=self.retry_policy.attempt_timeout,
                 label="put checkpoint",
             ) as cur:
                 if blob_rows:
                     cur.executemany(self.UPSERT_CHECKPOINT_BLOBS_SQL, blob_rows)
+                if refresh is not None:
+                    cur.execute(self.REFRESH_CHECKPOINT_BLOBS_SQL, refresh)
                 cur.execute(self.UPSERT_CHECKPOINTS_SQL, checkpoint_row)
 
         self._retry(write, label="put checkpoint")
         return next_config
+
+    def _ttl_refresh_window(self) -> timedelta | None:
+        """The refresh window for blob rows, or None when puts refresh nothing.
+
+        The saver reads the TTL setting of checkpoint_blobs from the catalog
+        when it has not read it for TTL_STATE_CACHE_SECONDS, or since its own
+        enable_ttl or disable_ttl ran.
+        """
+        state = self._fresh_ttl_state()
+        if state is None:
+            reloptions = self._retry(self._read_blob_ttl, label="read checkpoint TTL")
+            state = self._keep_ttl_state(reloptions)
+        return state.window
+
+    def _read_blob_ttl(self) -> builtins.list[str] | None:
+        """The pg_class.reloptions of checkpoint_blobs, or None if it has none."""
+        with self._cursor(
+            timeout=self.retry_policy.attempt_timeout, label="read checkpoint TTL"
+        ) as cur:
+            cur.execute(self.SELECT_BLOB_TTL_SQL, ("checkpoint_blobs",))
+            row = cur.fetchone()
+        return None if row is None else row["reloptions"]
 
     def put_writes(
         self,
@@ -513,23 +549,33 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         """Enable CockroachDB row-level TTL on checkpoint tables.
 
         Rows older than ttl_interval will be automatically deleted by a
-        background CockroachDB job on the specified cron schedule.
+        background CockroachDB job on the specified cron schedule. Blob rows,
+        which hold channel values, expire a tenth of ttl_interval later
+        (TTL_REFRESH_FRACTION), and each put brings forward those its
+        checkpoint still uses. So a thread keeps its state while it is
+        active, and expires once it has been idle for ttl_interval. After
+        upgrading from 0.5, run it again with the same arguments to add that
+        grace to blob rows.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is
         retried with the budget that schema_change_policy gives it, up to ten
         minutes by default, even if the policy's ``retry_on`` would refuse it.
-        ``max_attempts=1`` turns this off.
+        ``max_attempts=1`` turns this off. Other savers see the change within
+        TTL_STATE_CACHE_SECONDS.
 
         Args:
             ttl_interval: Interval after which rows expire (e.g., '7 days', '30 days').
             cron: Cron schedule for the TTL deletion job (default: '@daily').
         """
-        self._validate_ttl_params(ttl_interval, cron)
-        statements = [sql.format(interval=ttl_interval, cron=cron) for sql in self.ENABLE_TTL_SQL]
+        statements = self._enable_ttl_statements(ttl_interval, cron)
         policy = schema_change_policy(self.retry_policy)
-        for statement in statements:
-            self._run_ddl(statement, "enable TTL", policy=policy)
+        try:
+            for statement in statements:
+                self._run_ddl(statement, "enable TTL", policy=policy)
+        finally:
+            # Even a failed run may have changed a table
+            self._forget_ttl_state()
 
     def disable_ttl(self) -> None:
         """Disable CockroachDB row-level TTL on checkpoint tables.
@@ -538,11 +584,15 @@ class CockroachDBSaver(PsycopgOps, BaseCockroachDBSaver):
         change fails while another one runs on the same table; that error is
         retried with the budget that schema_change_policy gives it, up to ten
         minutes by default, even if the policy's ``retry_on`` would refuse it.
-        ``max_attempts=1`` turns this off.
+        ``max_attempts=1`` turns this off. Other savers see the change within
+        TTL_STATE_CACHE_SECONDS.
         """
         policy = schema_change_policy(self.retry_policy)
-        for statement in self.DISABLE_TTL_SQL:
-            self._run_ddl(statement, "disable TTL", policy=policy)
+        try:
+            for statement in self.DISABLE_TTL_SQL:
+                self._run_ddl(statement, "disable TTL", policy=policy)
+        finally:
+            self._forget_ttl_state()
 
     def _load_checkpoint_tuple_with_cursor(
         self, cur: Cursor[DictRow], value: DictRow
