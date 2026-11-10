@@ -282,8 +282,11 @@ class FakeSingleAsyncConnection(FakeAsyncConnection, psycopg.AsyncConnection):
 class FakeCursor:
     """Runs statements on a fake connection. Reads find an empty database.
 
-    ``statusmessage`` is the command tag of the last statement it ran.
+    ``statusmessage`` is the command tag of the last statement it ran, and
+    ``rowcount`` is 0: no write changes a row.
     """
+
+    rowcount = 0
 
     def __init__(self, conn: FakeConnection) -> None:
         self._conn = conn

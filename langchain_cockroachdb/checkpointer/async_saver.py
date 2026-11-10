@@ -569,43 +569,53 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
         """Bring forward the blob rows that checkpoints inside the interval use.
 
         aenable_ttl runs this once, before it changes the TTL settings, so the
-        blob rows of threads that are idle then live as long as their
-        checkpoints. It
-        reads the checkpoints a page at a time in primary key order, each
-        page in its own retried operation, so no transaction grows with the
-        table. A row is brought forward only once it is older than the
-        refresh window, so a page that runs twice changes nothing more.
+        blob rows of threads that are idle then live as long as their newest
+        checkpoints. It reads the checkpoints a page at a time in primary key
+        order, and updates the rows a page needs TTL_REFRESH_UPDATE_SIZE at a
+        time. Each read and each UPDATE is its own retried operation under
+        the policy's ddl_attempt_timeout, so no transaction grows with the
+        table. A row is brought forward to its newest checkpoint only when it
+        is older than that by more than the refresh window, so only rows left
+        unchanged that long are rewritten, and running a page twice changes
+        nothing more.
         """
         limit = max(1, self.TTL_REFRESH_BATCH_SIZE)
         started = self._refresh_started(plan, limit)
         after: tuple[str, str, str] | None = None
         refreshed = 0
         while True:
-            read, brought, after = await self._retry(
-                partial(self._refresh_page, after, plan, limit), label="refresh checkpoint blobs"
+            page = await self._retry(
+                partial(self._read_checkpoint_page, after, plan, limit),
+                label="refresh checkpoint blobs",
             )
-            refreshed += brought
-            if read < limit:
+            for params in self._refresh_batches(self._used_blobs(page), plan):
+                refreshed += await self._retry(
+                    partial(self._refresh_blob_rows, params), label="refresh checkpoint blobs"
+                )
+            if len(page) < limit:
                 break
+            after = self._page_end(page, after)
         self._refresh_finished(refreshed, started)
 
-    async def _refresh_page(
+    async def _read_checkpoint_page(
         self, after: tuple[str, str, str] | None, plan: _TTLPlan, limit: int
-    ) -> tuple[int, int, tuple[str, str, str] | None]:
-        """Refresh the blob rows of one page: (checkpoints read, rows refreshed, the page's last key)."""
-        query, params = self._checkpoint_page(after, plan.interval, limit)
+    ) -> builtins.list[DictRow]:
+        """The page of checkpoints after ``after``, for the refresh in aenable_ttl."""
+        query, params = self._checkpoint_page(after, plan, limit)
         async with self._cursor(
-            timeout=self.retry_policy.attempt_timeout, label="refresh checkpoint blobs"
+            timeout=self.retry_policy.ddl_attempt_timeout, label="refresh checkpoint blobs"
         ) as cur:
             await cur.execute(query, params)
-            page = await cur.fetchall()
-            used = self._used_blobs(page)
-            refreshed = 0
-            if used:
-                await cur.execute(self.REFRESH_USED_BLOBS_SQL, (used, plan.window))
-                await self._sync_pipeline()
-                refreshed = max(cur.rowcount, 0)
-        return len(page), refreshed, self._page_end(page, after)
+            return await cur.fetchall()
+
+    async def _refresh_blob_rows(self, params: builtins.list[Any]) -> int:
+        """Run one UPDATE of the refresh in aenable_ttl, and return the rows it changed."""
+        async with self._cursor(
+            timeout=self.retry_policy.ddl_attempt_timeout, label="refresh checkpoint blobs"
+        ) as cur:
+            await cur.execute(self.REFRESH_USED_BLOBS_SQL, params)
+            await self._sync_pipeline()
+            return max(cur.rowcount, 0)
 
     async def aput_writes(
         self,
@@ -773,15 +783,22 @@ class AsyncCockroachDBSaver(AsyncPsycopgOps, BaseCockroachDBSaver):
         and years are stored as days, 30 to a month and 365 to a year, so the
         interval has a fixed length.
 
-        When the TTL setting of checkpoint_blobs is to change, it first brings
-        forward, once, the blob rows that checkpoints inside the interval
-        use, so threads idle at that moment keep their state too. That reads
-        every checkpoint once, TTL_REFRESH_BATCH_SIZE at a time, and logs at
-        INFO when it starts and ends. Only then does it change the settings,
-        so a run that stops partway runs the pass again next time, and a run
-        with the setting already in place skips it. After upgrading from 0.5,
-        run it again with the same arguments, which adds the grace and covers
-        threads idle since the upgrade.
+        When the TTL setting of checkpoint_blobs is to change, it first makes
+        one pass, so threads idle at that moment keep their state too: each
+        blob row that checkpoints inside the interval use, and that is older
+        than the newest of them by more than the refresh window, is brought
+        forward to when that checkpoint was written. Only rows left unchanged
+        that long are rewritten. The pass reads every checkpoint once,
+        TTL_REFRESH_BATCH_SIZE at a time, changes at most
+        TTL_REFRESH_UPDATE_SIZE rows per UPDATE, and logs at INFO when it
+        starts and ends. Only then does it change the settings, so a run that
+        stops partway runs the pass again next time. A run with the setting
+        already in place, or with only a longer interval, skips it; to force
+        it, call disable_ttl first. On a large table, run it once from a
+        single process before a rollout. After upgrading from 0.5, run it
+        again with the same arguments, which adds the grace and covers
+        threads idle since the upgrade. Intervals over 106,751 days, the
+        longest duration CockroachDB keeps, are refused.
 
         Safe to run from several processes at once. On CockroachDB v25.4 a TTL
         change fails while another one runs on the same table; that error is

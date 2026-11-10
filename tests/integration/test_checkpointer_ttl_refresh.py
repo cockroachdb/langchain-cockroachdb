@@ -413,12 +413,14 @@ def test_enable_ttl_refreshes_once_per_setting(
         saver.enable_ttl("1 hour")
         started, finished = refresh_logs(caplog)
         assert finished.endswith("Blob rows brought forward: 0.")
-        # The same setting, with another cron: nothing to refresh
+        # The same setting, with another cron, and a longer interval: the
+        # setting in place already covers them
         caplog.clear()
         saver.enable_ttl("1 hour", "@weekly")
-        assert refresh_logs(caplog) == []
-        # Another interval refreshes again
         saver.enable_ttl("2 hours")
+        assert refresh_logs(caplog) == []
+        # A shorter interval refreshes again
+        saver.enable_ttl("30 minutes")
         assert len(refresh_logs(caplog)) == 2
 
 
@@ -433,9 +435,136 @@ async def test_async_enable_ttl_refreshes_once_per_setting(
             assert finished.endswith("Blob rows brought forward: 0.")
             caplog.clear()
             await saver.aenable_ttl("1 hour", "@weekly")
-            assert refresh_logs(caplog) == []
             await saver.aenable_ttl("2 hours")
+            assert refresh_logs(caplog) == []
+            await saver.aenable_ttl("30 minutes")
             assert len(refresh_logs(caplog)) == 2
+
+
+PROFILE = {"name": "Ada", "plan": "pro"}
+
+
+def write_six_steps(url: str) -> None:
+    """One thread of six steps, the newest five minutes ago and one each ten minutes before.
+
+    Its messages change every step, so each step writes a blob row for
+    them. Its profile is set on the first step and never changes, so every
+    checkpoint uses that one row.
+    """
+    steps = []
+    with CockroachDBSaver.from_conn_string(url) as writer:
+        thread = Thread(writer, "six")
+        for step in range(1, 7):
+            changed: dict[str, Any] = {"messages": [f"m{i}" for i in range(1, step + 1)]}
+            if step == 1:
+                changed["profile"] = PROFILE
+            thread.put(**changed)
+            steps.append((thread.config["configurable"]["checkpoint_id"], dict(thread.versions)))
+    with psycopg.connect(url, autocommit=True) as conn:
+        for step, (checkpoint_id, versions) in enumerate(steps, start=1):
+            ago = f"{65 - 10 * step} minutes"
+            conn.execute(
+                "UPDATE checkpoints SET created_at = now() - CAST(%s AS INTERVAL) "
+                "WHERE thread_id = 'six' AND checkpoint_id = %s",
+                [ago, checkpoint_id],
+            )
+            conn.execute(
+                "UPDATE checkpoint_blobs SET created_at = now() - CAST(%s AS INTERVAL) "
+                "WHERE thread_id = 'six' AND channel = 'messages' AND version = %s",
+                [ago, versions["messages"]],
+            )
+        conn.execute(
+            "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '55 minutes' "
+            "WHERE thread_id = 'six' AND channel = 'profile'"
+        )
+
+
+def blob_times(url: str) -> dict[tuple[str, str], Any]:
+    with psycopg.connect(url, autocommit=True) as conn:
+        rows = conn.execute(
+            "SELECT channel, version, created_at FROM checkpoint_blobs WHERE thread_id = 'six'"
+        ).fetchall()
+    return {(channel, version): written for channel, version, written in rows}
+
+
+def newest_checkpoint(url: str) -> Any:
+    with psycopg.connect(url, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT max(created_at) FROM checkpoints WHERE thread_id = 'six'"
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+@MODES
+def test_enable_ttl_rewrites_only_blob_rows_left_unchanged_too_long(
+    libpq_url: str, mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        write_six_steps(url)
+        before = blob_times(url)
+        assert len(before) == 7
+        with sync_saver(url, mode) as saver:
+            saver.enable_ttl("1 hour")
+            after = blob_times(url)
+            # Only the profile: each messages row is used by the one checkpoint
+            # that wrote it. It is brought forward to the newest checkpoint
+            # that uses it, not to now
+            changed = {key for key in before if after[key] != before[key]}
+            assert {channel for channel, _ in changed} == {"profile"}
+            [profile] = changed
+            assert after[profile] == newest_checkpoint(url)
+            assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 1.")
+            # Run again, the pass changes nothing more
+            saver._refresh_used_blobs(saver._ttl_plan("1 hour", "@daily"))
+            assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 0.")
+            assert blob_times(url) == after
+
+
+async def test_async_enable_ttl_rewrites_only_blob_rows_left_unchanged_too_long(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        write_six_steps(url)
+        before = blob_times(url)
+        async with async_saver(url) as saver:
+            await saver.aenable_ttl("1 hour")
+            after = blob_times(url)
+            changed = {key for key in before if after[key] != before[key]}
+            assert {channel for channel, _ in changed} == {"profile"}
+            [profile] = changed
+            assert after[profile] == newest_checkpoint(url)
+            await saver._refresh_used_blobs(saver._ttl_plan("1 hour", "@daily"))
+            assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 0.")
+            assert blob_times(url) == after
+
+
+def test_enable_ttl_refreshes_more_rows_than_one_update_takes(
+    libpq_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 150 channels set once and left unchanged: two UPDATEs, of 100 and 50
+    caplog.set_level(logging.INFO, logger=base.__name__)
+    with fresh_database(libpq_url) as url:
+        with CockroachDBSaver.from_conn_string(url) as writer:
+            Thread(writer).put(**{f"ch{i:03}": [i] for i in range(150)})
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE checkpoint_blobs SET created_at = now() - INTERVAL '2 hours' "
+                "WHERE thread_id = %s",
+                [THREAD],
+            )
+        with sync_saver(url) as saver:
+            saver.enable_ttl("1 hour")
+        assert refresh_logs(caplog)[-1].endswith("Blob rows brought forward: 150.")
+        with psycopg.connect(url, autocommit=True) as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM checkpoint_blobs "
+                "WHERE thread_id = %s AND created_at > now() - INTERVAL '1 minute'",
+                [THREAD],
+            ).fetchone()
+        assert row is not None and row[0] == 150
 
 
 def test_enable_ttl_stores_a_month_as_30_days(libpq_url: str) -> None:

@@ -15,7 +15,7 @@ import random
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from time import monotonic
 from typing import Any, cast
 
@@ -28,7 +28,6 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
     get_checkpoint_id,
 )
-from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.types import TASKS
 from psycopg.types.json import Jsonb
 
@@ -59,6 +58,8 @@ TTL_REFRESH_FRACTION = 10
 TTL_STATE_CACHE_SECONDS = 60.0
 # Checkpoints that one statement of the refresh in enable_ttl reads
 TTL_REFRESH_BATCH_SIZE = 500
+# Blob rows that one UPDATE of the refresh in enable_ttl changes at most
+TTL_REFRESH_UPDATE_SIZE = 100
 
 # Schema migrations. Position in list = version number.
 # CockroachDB differences from PostgresSaver:
@@ -253,12 +254,12 @@ SELECT_BLOB_TTL_SQL = """
 """
 
 # One page of checkpoints in primary key order, for the refresh enable_ttl
-# runs: the channel versions of each checkpoint still inside the TTL
-# interval, and NULL for the others. Paging by key keeps every statement
-# small, whatever the table holds. Params: the interval, the last key of the
-# page before (in the second form only), the page size.
+# runs: when each was written, and the channel versions of each checkpoint
+# still inside the TTL interval, NULL for the others. Paging by key keeps
+# every statement small, whatever the table holds. Params: the interval, the
+# last key of the page before (in the second form only), the page size.
 _CHECKPOINT_PAGE_SQL = """
-    SELECT thread_id, checkpoint_ns, checkpoint_id,
+    SELECT thread_id, checkpoint_ns, checkpoint_id, created_at,
         CASE WHEN created_at > now() - CAST(%s AS INTERVAL)
             THEN checkpoint -> 'channel_versions' END AS channel_versions
     FROM checkpoints
@@ -271,14 +272,25 @@ SELECT_CHECKPOINT_PAGE_AFTER_SQL = _CHECKPOINT_PAGE_SQL.format(
     after="WHERE (thread_id, checkpoint_ns, checkpoint_id) > (%s, %s, %s)"
 )
 
-# Brings created_at forward on the blob rows that the checkpoints of such a
-# page use, when they are older than the refresh window. Run again, it
-# changes nothing more. Params: the (thread_id, checkpoint_ns, channel,
-# version) rows, the window.
+# Brings each blob row forward to when the newest checkpoint inside the TTL
+# interval that uses it was written, when it is older than that by more than
+# the refresh window: what a put of that checkpoint would have done. Only
+# rows left unchanged that long are rewritten, and none ends up newer than
+# its newest checkpoint. Run again, it changes nothing more. CockroachDB
+# gives every array of a multi-array unnest one type unless each is cast.
+# Params: arrays of thread_id, checkpoint_ns, channel, version and the
+# newest checkpoint's created_at, then the window.
 REFRESH_USED_BLOBS_SQL = """
-    UPDATE checkpoint_blobs SET created_at = now()
-    WHERE (thread_id, checkpoint_ns, channel, version) = ANY(%s)
-        AND created_at < now() - CAST(%s AS INTERVAL)
+    UPDATE checkpoint_blobs AS b SET created_at = u.newest
+    FROM unnest(
+        CAST(%s AS STRING[]), CAST(%s AS STRING[]), CAST(%s AS STRING[]),
+        CAST(%s AS STRING[]), CAST(%s AS TIMESTAMPTZ[])
+    ) AS u (thread_id, checkpoint_ns, channel, version, newest)
+    WHERE b.thread_id = u.thread_id
+        AND b.checkpoint_ns = u.checkpoint_ns
+        AND b.channel = u.channel
+        AND b.version = u.version
+        AND b.created_at < u.newest - CAST(%s AS INTERVAL)
 """
 
 UPSERT_CHECKPOINTS_SQL = """
@@ -375,6 +387,10 @@ _LOGGED_TTL_READ_ERRORS: set[tuple[str, str]] = set()
 # The most cut DeltaChannel chains a saver remembers having logged. When it
 # has logged this many, it forgets them and starts again.
 _CUT_CHAINS_REMEMBERED = 4096
+# The longest duration CockroachDB keeps. It holds the hours, minutes and
+# seconds of an interval as int64 nanoseconds, and longer duration text
+# wraps to a negative interval with no error: about 106,751 days.
+_LONGEST_DURATION = timedelta(microseconds=(2**63 - 1) // 1000)
 
 
 def _fixed_interval(ttl_interval: str) -> str:
@@ -386,19 +402,16 @@ def _fixed_interval(ttl_interval: str) -> str:
     return f"{int(found['amount']) * days} days"
 
 
-def _interval_length(interval: str) -> timedelta:
-    """How long an interval that enable_ttl takes is.
+def _interval_length(interval: str) -> timedelta | None:
+    """How long an interval that enable_ttl takes is, or None if it is not one.
 
     Raises:
-        ValueError: If it is not such an interval, or too long for a timedelta.
+        OverflowError: If it is too long for a timedelta.
     """
     found = _TTL_INTERVAL.match(interval)
     if found is None:
-        raise ValueError(f"Invalid ttl_interval: {interval!r}.")
-    try:
-        return _TTL_UNITS[found["unit"]] * int(found["amount"])
-    except ArithmeticError:
-        raise ValueError(f"Invalid ttl_interval: {interval!r} is too long.") from None
+        return None
+    return _TTL_UNITS[found["unit"]] * int(found["amount"])
 
 
 def _duration(length: timedelta) -> str:
@@ -432,27 +445,47 @@ def _sql_string(literal: str) -> str | None:
     return None
 
 
-def _refresh_window(expression: str, fraction: int) -> timedelta | None:
-    """The refresh window of an expression enable_ttl wrote, or None for any other."""
+def _expression_setting(expression: str) -> tuple[timedelta, int | None] | None:
+    """The interval of an expression enable_ttl wrote, and the divisor of its grace.
+
+    The divisor is None for the expression without the grace, as 0.5 wrote
+    it. Returns None for any other expression, and for an interval too long
+    for a timedelta.
+    """
     found = _BLOB_TTL_WITH_GRACE.fullmatch(expression)
+    divisor: int | None = None
     if found is not None:
         again = found["cast"] if found["cast"] is not None else found["colons"]
         if again != found["interval"]:
             return None
-        # The grace in the catalog sets the window, so the window never exceeds it
-        fraction = int(found["fraction"])
+        divisor = int(found["fraction"])
     else:
         found = _BLOB_TTL_WITHOUT_GRACE.fullmatch(expression)
         if found is None:
             return None
-    interval = _TTL_INTERVAL.match(found["interval"])
-    if interval is None:
-        return None
     try:
-        return _TTL_UNITS[interval["unit"]] * int(interval["amount"]) / fraction
-    except ArithmeticError:
-        # An interval too long for timedelta, or a saver's fraction of 0
+        length = _interval_length(found["interval"])
+    except OverflowError:
         return None
+    return None if length is None else (length, divisor)
+
+
+def _refresh_window(expression: str, fraction: int) -> timedelta | None:
+    """The refresh window of an expression enable_ttl wrote, or None for any other.
+
+    With the grace, its divisor sets the window, so the window never exceeds
+    the grace in effect. Without it, ``fraction`` does.
+    """
+    setting = _expression_setting(expression)
+    if setting is None:
+        return None
+    length, divisor = setting
+    try:
+        window = length / (fraction if divisor is None else divisor)
+    except ArithmeticError:
+        # A saver's fraction of 0
+        return None
+    return window if window <= _LONGEST_DURATION else None
 
 
 def _parse_blob_ttl(
@@ -499,18 +532,17 @@ class _TTLState:
 
 @dataclass(frozen=True)
 class _TTLPlan:
-    """What enable_ttl writes, and what the refresh it runs after that needs.
+    """What enable_ttl writes, and what the refresh it runs first needs.
 
     ``stored`` is the interval as stored, with months and years as days.
-    ``interval`` and ``window`` are its length and the refresh window, as
-    duration text for SQL (see _duration).
+    ``interval`` is its length, and ``window`` the refresh window.
     """
 
     statements: tuple[str, ...]
     blob_expression: str
     stored: str
-    interval: str
-    window: str
+    interval: timedelta
+    window: timedelta
 
 
 class _DeltaHistoryWalk:
@@ -606,19 +638,18 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
     TTL_REFRESH_FRACTION = TTL_REFRESH_FRACTION
     # Seconds the saver uses what it read about TTL before it reads it again
     TTL_STATE_CACHE_SECONDS = TTL_STATE_CACHE_SECONDS
-    # Checkpoints one statement of the refresh in enable_ttl reads. Sizes
-    # below 1 count as 1.
+    # Checkpoints one statement of the refresh in enable_ttl reads, and blob
+    # rows one of its UPDATEs changes at most. Sizes below 1 count as 1.
     TTL_REFRESH_BATCH_SIZE = TTL_REFRESH_BATCH_SIZE
+    TTL_REFRESH_UPDATE_SIZE = TTL_REFRESH_UPDATE_SIZE
     supports_pipeline: bool
     retry_policy: RetryPolicy
     # What the saver last read about TTL on checkpoint_blobs; None to read it
     _ttl_state: _TTLState | None = None
-
-    def __init__(self, *, serde: SerializerProtocol | None = None) -> None:
-        super().__init__(serde=serde)
-        # The cut DeltaChannel chains this saver has logged, as (thread_id,
-        # checkpoint_ns, missing checkpoint_id)
-        self._cut_chains_logged: set[tuple[str, str, str]] = set()
+    # The cut DeltaChannel chains the saver has logged, as (thread_id,
+    # checkpoint_ns, missing checkpoint_id). Made on first use, so a subclass
+    # with an __init__ of its own needs nothing.
+    _cut_chains_logged: set[tuple[str, str, str]]
 
     def _chain_page_params(self, start: RunnableConfig, limit: int) -> dict[str, Any]:
         configurable = start["configurable"]
@@ -667,50 +698,90 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
                 f"Invalid TTL_REFRESH_FRACTION: {fraction!r}. Must be a whole number of at least 1."
             )
         stored = _fixed_interval(ttl_interval)
-        length = _interval_length(stored)
+        try:
+            length = _interval_length(stored)
+        except OverflowError:
+            length = None
+        # The refresh binds the interval as a duration, which CockroachDB
+        # would wrap to a negative one past this
+        if length is None or length > _LONGEST_DURATION:
+            raise ValueError(
+                f"Invalid ttl_interval: {ttl_interval!r}. Must be at most "
+                f"{_LONGEST_DURATION.days} days, the longest duration CockroachDB keeps."
+            )
         values = {"interval": stored, "cron": cron, "fraction": fraction}
         return _TTLPlan(
             statements=tuple(sql.format(**values) for sql in self.ENABLE_TTL_SQL),
             blob_expression=BLOB_TTL_EXPRESSION.format(**values),
             stored=stored,
-            interval=_duration(length),
-            window=_duration(length / fraction),
+            interval=length,
+            window=length / fraction,
         )
 
     @staticmethod
     def _refresh_needed(before: Sequence[str] | None, plan: _TTLPlan) -> bool:
-        """Whether enable_ttl refreshes blob rows: unless the table already has this expression.
+        """Whether enable_ttl refreshes blob rows before it changes the settings.
 
         ``before`` is the reloptions of checkpoint_blobs as enable_ttl found
-        them. enable_ttl refreshes before it writes the expression, so with
-        the expression in place a refresh has finished, and puts have
-        refreshed blob rows since.
+        them. No refresh when they already hold this expression: enable_ttl
+        refreshes before it writes an expression, so a refresh has finished,
+        and puts have refreshed blob rows since. Nor when they hold an
+        expression with the grace that this one only lengthens: every blob
+        row is then within the old window of its newest checkpoint, so within
+        the new, longer one too.
         """
-        return _blob_expression(before) != plan.blob_expression
+        expression = _blob_expression(before)
+        if expression is None:
+            return True
+        if expression == plan.blob_expression:
+            return False
+        setting = _expression_setting(expression)
+        if setting is None:
+            return True
+        length, divisor = setting
+        if divisor is None:
+            # The 0.5 expression, with no grace
+            return True
+        return length > plan.interval or length / divisor > plan.window
 
     def _checkpoint_page(
-        self, after: tuple[str, str, str] | None, interval: str, limit: int
+        self, after: tuple[str, str, str] | None, plan: _TTLPlan, limit: int
     ) -> tuple[str, list[Any]]:
         """The statement and parameters that read the page of checkpoints after ``after``."""
+        interval = _duration(plan.interval)
         if after is None:
             return self.SELECT_CHECKPOINT_PAGE_SQL, [interval, limit]
         return self.SELECT_CHECKPOINT_PAGE_AFTER_SQL, [interval, *after, limit]
 
     @staticmethod
-    def _used_blobs(page: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, str, str]]:
+    def _used_blobs(
+        page: Sequence[Mapping[str, Any]],
+    ) -> list[tuple[str, str, str, str, datetime]]:
         """The blob rows that the page's checkpoints inside the interval use, each once.
 
-        As (thread_id, checkpoint_ns, channel, version), sorted, so that two
-        refreshes at once update rows in the same order.
+        As (thread_id, checkpoint_ns, channel, version, newest), where newest
+        is when the newest of those checkpoints that uses the row was
+        written. Sorted by row, so that two refreshes at once update rows in
+        the same order.
         """
-        return sorted(
-            {
-                (row["thread_id"], row["checkpoint_ns"], channel, str(version))
-                for row in page
-                if row["channel_versions"]
-                for channel, version in row["channel_versions"].items()
-            }
-        )
+        newest: dict[tuple[str, str, str, str], datetime] = {}
+        for row in page:
+            for channel, version in (row["channel_versions"] or {}).items():
+                key = (row["thread_id"], row["checkpoint_ns"], channel, str(version))
+                if key not in newest or row["created_at"] > newest[key]:
+                    newest[key] = row["created_at"]
+        return [(*key, written) for key, written in sorted(newest.items())]
+
+    def _refresh_batches(
+        self, used: list[tuple[str, str, str, str, datetime]], plan: _TTLPlan
+    ) -> list[list[Any]]:
+        """The parameters of each UPDATE that refreshes ``used``, TTL_REFRESH_UPDATE_SIZE rows each."""
+        size = max(1, self.TTL_REFRESH_UPDATE_SIZE)
+        window = _duration(plan.window)
+        return [
+            [*(list(column) for column in zip(*used[start : start + size], strict=True)), window]
+            for start in range(0, len(used), size)
+        ]
 
     @staticmethod
     def _page_end(
@@ -728,7 +799,8 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
         logger.info(
             "enable_ttl: bringing forward the blob rows that checkpoints written in the last %s "
             "use, so TTL keeps them as long as those checkpoints. This reads each checkpoint "
-            "once, %d at a time.",
+            "once, %d at a time, and rewrites only blob rows left unchanged for longer than the "
+            "refresh window.",
             plan.stored,
             limit,
         )
@@ -831,7 +903,9 @@ class BaseCockroachDBSaver(BaseCheckpointSaver[str]):
             str(configurable.get("checkpoint_ns", "")),
             str(configurable.get("checkpoint_id")),
         )
-        logged = self._cut_chains_logged
+        logged = getattr(self, "_cut_chains_logged", None)
+        if logged is None:
+            logged = self._cut_chains_logged = set()
         if key in logged:
             return
         if len(logged) >= _CUT_CHAINS_REMEMBERED:
