@@ -42,6 +42,9 @@ python examples/hybrid_search.py
 # Metadata filtering - advanced filter queries
 python examples/metadata_filtering.py
 
+# Document refresh - replace or remove source chunks
+python examples/document_refresh.py
+
 # Chat history - conversation persistence
 python examples/chat_history.py
 

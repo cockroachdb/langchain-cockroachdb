@@ -153,6 +153,32 @@ def _metadata_json(metadatas: Sequence[dict | None]) -> list[str]:
     return serialized
 
 
+def _require_deletion_filter(filter: Any) -> None:
+    """Reject a missing or effectively-empty metadata filter.
+
+    Deleting by filter must never fall back to deleting a whole table, so an
+    empty predicate anywhere in the filter is an error, not a match-all.
+    """
+    if not isinstance(filter, dict) or not filter:
+        raise ValueError("delete_by_filter requires a non-empty metadata filter")
+    _require_nonempty_predicate(filter)
+
+
+def _require_nonempty_predicate(node: Any) -> None:
+    if not isinstance(node, dict) or not node:
+        raise ValueError("a metadata filter predicate cannot be empty")
+    for key, value in node.items():
+        if key in ("$and", "$or"):
+            if not isinstance(value, list) or not value:
+                raise ValueError(f"{key} requires a non-empty list of filters")
+            for item in value:
+                _require_nonempty_predicate(item)
+        elif key == "$not":
+            _require_nonempty_predicate(value)
+        elif isinstance(value, dict) and not value:
+            raise ValueError(f"empty operator dict for {key!r}")
+
+
 class AsyncCockroachDBVectorStore(VectorStore):
     """Async vector store using CockroachDB native VECTOR type and C-SPANN indexes.
 
@@ -1180,6 +1206,37 @@ LIMIT :k"""
             return True
         await self.engine._run_as_async(self._delete(ids))
         return True
+
+    async def adelete_by_filter(self, filter: dict[str, Any]) -> bool:
+        """Delete every row whose metadata matches ``filter``.
+
+        Deletes by metadata predicate instead of by id, for example to remove
+        every chunk of one source document. The delete is scoped to this
+        store's namespace. The filter uses the same operator grammar as search
+        filters (see ``_filters``). An empty or missing filter is rejected, so a
+        missing predicate never becomes an unscoped delete. A broad non-empty
+        predicate can still match every row.
+
+        Args:
+            filter: A non-empty metadata filter.
+
+        Returns:
+            True if the delete ran.
+        """
+        await self.engine._run_as_async(self._delete_by_filter(filter))
+        return True
+
+    async def _delete_by_filter(self, filter: dict[str, Any]) -> None:
+        _require_deletion_filter(filter)
+        builder = FilterBuilder(self.metadata_column)
+        where = self._where(builder, filter)
+        statement = text(f"DELETE FROM {self._fqn} {where}")
+        await self._execute(
+            statement,
+            builder.params,
+            label=f"delete by filter from {self._fqn}",
+            begin=True,
+        )
 
     async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         """Get documents by their IDs (order not guaranteed)."""
