@@ -70,7 +70,8 @@ async def rag_pipeline(query: str):
 ✅ **Streaming Applications**
 ```python
 async def stream_results(query: str):
-    async for doc in vectorstore.astream_search(query):
+    # Retrieval returns a batch; the application can yield its documents.
+    for doc in await vectorstore.asimilarity_search(query):
         yield doc
 ```
 

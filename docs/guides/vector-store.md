@@ -148,6 +148,20 @@ results = await vectorstore.asimilarity_search_with_relevance_scores(
 )
 ```
 
+Relevance scores are bounded similarity transformations, not probabilities.
+Cosine uses `1 - distance / 2` (opposite vectors score 0, orthogonal vectors
+0.5, identical directions 1). L2 uses `1 / (1 + distance)`. Inner product
+uses `1 / (1 + exp(distance))`, where distance is the negative dot product.
+Thresholds depend on the metric and embedding model; choose them using your
+own retrieval examples. Raw `similarity_search_with_score` results stay unchanged.
+
+Pass `relevance_score_fn` to the store constructor to supply your own conversion.
+Hybrid search requires this conversion explicitly because fusion scores are not
+vector distances. Otherwise use `similarity_search_with_score` for raw fusion scores.
+
+`delete` and `adelete` accept IDs only and reject unknown keyword arguments,
+including `filter`, instead of silently returning success.
+
 ## Filtering
 
 ### Supported Operators

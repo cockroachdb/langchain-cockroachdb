@@ -165,6 +165,10 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
 
     def delete(self, ids: list[str] | None = None, **kwargs: Any) -> bool | None:
         """Delete documents (sync)."""
+        if kwargs:
+            raise TypeError(
+                f"Unsupported delete arguments: {sorted(kwargs)}; delete accepts IDs only"
+            )
         if not ids:
             return True
         self.engine._run_as_sync(self._delete(ids))

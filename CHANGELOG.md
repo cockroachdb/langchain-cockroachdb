@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Vector-store relevance searches and threshold retrievers now convert cosine, L2 and negative inner-product distances to bounded scores. A custom `relevance_score_fn` can override the conversion and is required for hybrid relevance searches.
+- `delete` and `adelete` reject unsupported keyword arguments rather than reporting success without deleting rows. Correct the async guide's nonexistent streaming-search example.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

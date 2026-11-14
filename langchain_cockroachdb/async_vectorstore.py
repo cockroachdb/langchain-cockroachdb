@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -186,6 +187,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         namespace: str | None = None,
         hybrid_search_config: HybridSearchConfig | None = None,
         batch_size: int = 100,
+        relevance_score_fn: Callable[[float], float] | None = None,
         retry_policy: RetryPolicy | None = None,
         retry_max_attempts: int | None = None,
         retry_initial_backoff: float | None = None,
@@ -213,6 +215,8 @@ class AsyncCockroachDBVectorStore(VectorStore):
             hybrid_search_config: Optional hybrid search configuration
             batch_size: Rows per insert statement; CockroachDB works best with
                 smaller VECTOR batches (default: 100)
+            relevance_score_fn: Optional conversion from raw score to relevance in [0, 1].
+                Required for relevance searches when hybrid search is configured.
             retry_policy: How operations retry (default: the engine's policy)
             retry_max_attempts: Override for retry_policy.max_attempts
             retry_initial_backoff: Override for retry_policy.initial_backoff
@@ -243,6 +247,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
         self.namespace = namespace
         self.hybrid_search_config = hybrid_search_config
         self.batch_size = _check_batch_size(batch_size)
+        if relevance_score_fn is not None and not callable(relevance_score_fn):
+            raise TypeError("relevance_score_fn must be callable")
+        self._relevance_score_fn = relevance_score_fn
         self.retry_policy = resolve_retry_policy(
             retry_policy,
             base=engine.retry_policy,
@@ -253,6 +260,29 @@ class AsyncCockroachDBVectorStore(VectorStore):
             jitter=retry_jitter,
         )
         self._fqn = f"{schema}.{collection_name}"
+
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        """Convert distances monotonically to [0, 1], independent of the result set."""
+        if self._relevance_score_fn is not None:
+            return self._relevance_score_fn
+        if self.hybrid_search_config is not None:
+            raise ValueError(
+                "Hybrid relevance searches require relevance_score_fn; "
+                "use similarity_search_with_score for raw fusion scores"
+            )
+        if self.distance_strategy == DistanceStrategy.COSINE:
+            return lambda distance: max(0.0, min(1.0, 1.0 - distance / 2.0))
+        if self.distance_strategy == DistanceStrategy.EUCLIDEAN:
+            return lambda distance: 1.0 / (1.0 + max(0.0, distance))
+        if self.distance_strategy == DistanceStrategy.INNER_PRODUCT:
+            # <#> returns the negative dot product. Split the sigmoid to avoid
+            # overflow for either sign, without assuming unit-length vectors.
+            return lambda distance: (
+                math.exp(-distance) / (1.0 + math.exp(-distance))
+                if distance >= 0
+                else 1.0 / (1.0 + math.exp(distance))
+            )
+        raise ValueError(f"Unsupported distance strategy: {self.distance_strategy}")
 
     @property
     def embeddings(self) -> Embeddings:
@@ -1176,6 +1206,10 @@ LIMIT :k"""
         Returns:
             True if successful
         """
+        if kwargs:
+            raise TypeError(
+                f"Unsupported delete arguments: {sorted(kwargs)}; delete accepts IDs only"
+            )
         if not ids:
             return True
         await self.engine._run_as_async(self._delete(ids))
