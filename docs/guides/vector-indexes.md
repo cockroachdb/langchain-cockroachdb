@@ -367,3 +367,46 @@ index = CSPANNIndex(
 - [Hybrid Search](hybrid-search.md) - Combine indexes with FTS
 - [Configuration](../getting-started/configuration.md) - Optimize for your workload
 - [API Reference](../api/indexes.md) - Full index API
+
+## Observe search execution
+
+Pass a synchronous callback through `CSPANNQueryOptions` to receive one immutable
+`SearchDiagnostics` record after each successful vector search:
+
+```python
+from langchain_cockroachdb import CSPANNQueryOptions
+
+observations = []
+results = await vectorstore.asimilarity_search(
+    "query", k=10, filter={"category": "research"},
+    query_options=CSPANNQueryOptions(beam_size=64, on_search=observations.append),
+)
+print(observations[-1])
+```
+
+The callback is optional and adds no SQL. It runs on the engine's event loop;
+keep it fast and thread-safe, for example by forwarding events to a queue.
+Callback exceptions are logged by type without their message and do not fail
+retrieval. Failed searches do not emit a success record.
+
+| Path | Meaning |
+|------|---------|
+| `direct` | No metadata filter; the database optimizer selects the plan |
+| `filtered_exact` | Metadata filter without a usable indexed-window path |
+| `filtered_index` | The filtered indexed window supplied the result |
+| `exact_fallback` | The window could have missed matches, so an exact query followed |
+| `empty` | A non-positive k returned no rows without SQL |
+
+Records include requested k, returned count, elapsed seconds, and the window's
+limit, candidate count, and returned match count when available. If a window
+returns no matching rows, its candidate count is unknown (`None`). The match
+count is capped by k. No query text, vectors, metadata, or tenant IDs are included.
+
+Elapsed time includes connection checkout, retries, and index discovery, but
+excludes embedding calls, MMR selection, and hybrid fusion. For MMR and hybrid
+search, diagnostics describe the vector candidate search, so k is its candidate
+pool size. The path is a library decision, not an `EXPLAIN` plan.
+
+For a reproducible exact-versus-indexed comparison, run
+`tests/performance/bench_vector_search.py`. Its README explains the JSON output,
+filter selectivity, recall@k, latency percentiles, and measurement limits.

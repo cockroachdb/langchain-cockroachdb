@@ -84,7 +84,9 @@ Thumbs.db
 uv.lock
 
 # Performance tests and benchmarks (local only)
-tests/performance/
+tests/performance/*
+!tests/performance/bench_vector_search.py
+!tests/performance/README.md
 *_benchmark_results.txt
 *_results.txt
 

@@ -22,6 +22,7 @@ from sqlalchemy.sql.elements import TextClause
 from langchain_cockroachdb._filters import FilterBuilder
 from langchain_cockroachdb._sql import parse_vector, validate_identifier, vector_literal
 from langchain_cockroachdb._window import window_for, window_needs_exact_search
+from langchain_cockroachdb.diagnostics import SearchDiagnostics, SearchPath
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import (
     FusionType,
@@ -540,9 +541,35 @@ class AsyncCockroachDBVectorStore(VectorStore):
         without a filter or a usable index, it runs the exact statement,
         which filters before it ranks.
         """
+        callback = query_options.on_search if query_options else None
+        started = time.monotonic() if callback is not None else 0.0
+        window_limit: int | None = None
+        window_candidates: int | None = None
+        window_matches: int | None = None
+        path: SearchPath = "filtered_exact" if filter else "direct"
         limit = int(k)
+
+        def finish(matches: list[_Match]) -> list[_Match]:
+            if callback is not None:
+                event = SearchDiagnostics(
+                    path=path,
+                    requested_k=limit,
+                    returned_count=len(matches),
+                    elapsed_seconds=time.monotonic() - started,
+                    window_limit=window_limit,
+                    window_candidates=window_candidates,
+                    window_matches=window_matches,
+                )
+                try:
+                    callback(event)
+                except Exception as error:
+                    # A telemetry sink must not break retrieval or leak its payload.
+                    logger.warning("Search diagnostics callback failed (%s)", type(error).__name__)
+            return matches
+
         if limit <= 0:
-            return []
+            path = "empty"
+            return finish([])
         settings = query_options.get_session_settings() if query_options else None
         if filter and await self._has_usable_index():
             statement, params, window = self._windowed_statement(
@@ -555,6 +582,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
                 settings=settings or None,
                 fetch=True,
             )
+            window_limit = window
+            window_candidates = int(rows[0][-2]) if rows else None
+            window_matches = len(rows)
             # Every row carries the window's size and the scope's count last
             window_size, scope_rows = (int(rows[0][-2]), int(rows[0][-1])) if rows else (0, 0)
             exact = window_needs_exact_search(
@@ -576,7 +606,9 @@ class AsyncCockroachDBVectorStore(VectorStore):
                 ", so it runs the exact search" if exact else "",
             )
             if not exact:
-                return self._matches(rows, with_embeddings)
+                path = "filtered_index"
+                return finish(self._matches(rows, with_embeddings))
+            path = "exact_fallback"
         builder = FilterBuilder(self.metadata_column)
         where = self._where(builder, filter)
         distance = self._distance()
@@ -590,7 +622,7 @@ class AsyncCockroachDBVectorStore(VectorStore):
         rows = await self._execute(
             text(sql), params, label=f"search {self._fqn}", settings=settings or None, fetch=True
         )
-        return self._matches(rows, with_embeddings)
+        return finish(self._matches(rows, with_embeddings))
 
     def _distance(self) -> str:
         """The distance from the query vector, in the distance strategy's operator."""

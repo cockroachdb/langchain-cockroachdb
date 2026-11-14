@@ -23,3 +23,7 @@ C-SPANN index configuration.
 ## Examples
 
 See [Vector Indexes Guide](../guides/vector-indexes.md) for complete examples.
+
+## Search diagnostics
+
+::: langchain_cockroachdb.diagnostics.SearchDiagnostics

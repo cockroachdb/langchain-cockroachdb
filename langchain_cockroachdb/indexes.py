@@ -1,11 +1,12 @@
 """Vector index abstractions for CockroachDB C-SPANN indexes."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
 from langchain_cockroachdb._sql import validate_identifier
+from langchain_cockroachdb.diagnostics import SearchDiagnostics
 
 
 def _check_positive_int(value: object, what: str) -> None:
@@ -130,15 +131,26 @@ class CSPANNIndex:
 class CSPANNQueryOptions:
     """Query-time options for C-SPANN vector search."""
 
-    def __init__(self, beam_size: int | None = None):
+    def __init__(
+        self,
+        beam_size: int | None = None,
+        *,
+        on_search: Callable[[SearchDiagnostics], None] | None = None,
+    ):
         """Initialize query options.
 
         Args:
             beam_size: Search beam size (higher = more accurate, slower)
                       Default is CockroachDB's vector_search_beam_size setting
+            on_search: Optional synchronous callback after a successful vector search.
+                Runs on the engine loop; keep it fast and thread-safe. Callback
+                exceptions are logged without their message and do not fail retrieval.
         """
         _check_positive_int(beam_size, "beam_size")
         self.beam_size = beam_size
+        if on_search is not None and not callable(on_search):
+            raise TypeError("on_search must be callable")
+        self.on_search = on_search
 
     def get_session_settings(self) -> dict[str, int]:
         """Get session settings to apply before query.

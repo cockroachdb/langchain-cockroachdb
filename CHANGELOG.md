@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `CSPANNQueryOptions(on_search=...)` reports immutable `SearchDiagnostics` after each successful vector search: the library's execution path, elapsed time, result count, and indexed-window counts. No query or tenant payload is included; callback failures do not fail retrieval.
+- A seeded vector-search benchmark compares a C-SPANN table with a separate exact baseline across filter selectivities and beam sizes, reporting recall@k, latency percentiles, ingestion rate, and fallback counts.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

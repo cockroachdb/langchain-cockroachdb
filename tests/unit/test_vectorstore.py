@@ -868,3 +868,105 @@ class TestHybridVectorLeg:
 def test_the_refresh_interval_is_exported() -> None:
     assert langchain_cockroachdb.VECTOR_INDEX_REFRESH_SECONDS == 60.0
     assert "VECTOR_INDEX_REFRESH_SECONDS" in langchain_cockroachdb.__all__
+
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize(
+    "indexed,filtered,matched,k,path",
+    [
+        (False, False, 0, 4, "direct"),
+        (False, True, 0, 4, "filtered_exact"),
+        (True, True, 4, 4, "filtered_index"),
+        (True, True, 1, 4, "exact_fallback"),
+        (True, True, 0, 4, "exact_fallback"),
+        (True, True, 0, 0, "empty"),
+    ],
+)
+async def test_search_diagnostics(make_store, indexed, filtered, matched, k, path, sync):
+    from dataclasses import FrozenInstanceError
+
+    db = FakeDatabase(create_statement(COSINE_INDEX) if indexed else create_statement())
+    db.window_rows = window_rows(matched, window_size=41, scope_rows=41)
+    db.exact_rows = [hit(0)]
+    store = make_store(db, cls=CockroachDBVectorStore if sync else AsyncCockroachDBVectorStore)
+    events = []
+    options = CSPANNQueryOptions(on_search=events.append)
+    if sync:
+        result = store.similarity_search_by_vector(
+            QUERY, k=k, filter=FILTER if filtered else None, query_options=options
+        )
+    else:
+        result = await store.asimilarity_search_by_vector(
+            QUERY, k=k, filter=FILTER if filtered else None, query_options=options
+        )
+    [event] = events
+    assert event.path == path
+    assert event.returned_count == len(result)
+    assert event.requested_k == k
+    assert event.elapsed_seconds >= 0
+    if path in ("filtered_index", "exact_fallback"):
+        assert event.window_limit == 41
+        assert event.window_candidates == (41 if matched else None)
+        assert event.window_matches == matched
+    else:
+        assert event.window_limit is None
+    with pytest.raises(FrozenInstanceError):
+        event.path = "changed"
+
+
+async def test_diagnostics_failure_does_not_break_search_or_log_payload(make_store, caplog):
+    def failing(event):
+        raise RuntimeError("private query payload")
+
+    db = FakeDatabase()
+    db.exact_rows = [hit(0)]
+    store = make_store(db)
+    result = await store.asimilarity_search_by_vector(
+        QUERY, query_options=CSPANNQueryOptions(on_search=failing)
+    )
+    assert len(result) == 1
+    assert "Search diagnostics callback failed (RuntimeError)" in caplog.text
+    assert "private query payload" not in caplog.text
+
+
+async def test_disabled_diagnostics_does_not_change_sql(make_store):
+    db = FakeDatabase()
+    store = make_store(db)
+    await store.asimilarity_search_by_vector(QUERY)
+    before = list(db.sent)
+    db.sent.clear()
+    await store.asimilarity_search_by_vector(
+        QUERY, query_options=CSPANNQueryOptions(on_search=lambda _: None)
+    )
+    assert db.sent == before
+
+
+async def test_hybrid_and_mmr_report_the_vector_candidate_pool(make_store):
+    db = FakeDatabase(create_statement(COSINE_INDEX))
+    db.window_rows = [hit(i, "[0.1,0.2,0.3]", 3, 3) for i in range(3)]
+    store = make_store(db, hybrid_search_config=HybridSearchConfig())
+    events = []
+    options = CSPANNQueryOptions(on_search=events.append)
+    # Hybrid reads rows without embeddings; MMR includes the embedding column.
+    db.window_rows = window_rows(3, window_size=3, scope_rows=3)
+    await store.asimilarity_search("query", k=2, filter=FILTER, query_options=options)
+    assert events[-1].requested_k == 20
+    assert events[-1].returned_count == 3
+    db.window_rows = [hit(i, "[0.1,0.2,0.3]", 3, 3) for i in range(3)]
+    await store.amax_marginal_relevance_search_by_vector(
+        QUERY, k=2, fetch_k=5, filter=FILTER, query_options=options
+    )
+    assert events[-1].requested_k == 5
+    assert events[-1].returned_count == 3
+
+
+async def test_failed_search_does_not_report_success(make_store):
+    db = FakeDatabase(create_statement(COSINE_INDEX))
+    db.read_error = RuntimeError("failed database operation")
+    store = make_store(db)
+    events = []
+    with pytest.raises(RuntimeError, match="failed database operation"):
+        await store.asimilarity_search_by_vector(
+            QUERY, filter=FILTER, query_options=CSPANNQueryOptions(on_search=events.append)
+        )
+    assert events == []
