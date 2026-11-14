@@ -170,6 +170,14 @@ class CockroachDBVectorStore(AsyncCockroachDBVectorStore):
         self.engine._run_as_sync(self._delete(ids))
         return True
 
+    def delete_by_filter(self, filter: dict[str, Any]) -> bool:
+        """Delete every row whose metadata matches ``filter`` (sync).
+
+        See ``AsyncCockroachDBVectorStore.adelete_by_filter``.
+        """
+        self.engine._run_as_sync(self._delete_by_filter(filter))
+        return True
+
     def apply_vector_index(
         self, index: CSPANNIndex, prefix_columns: list[str] | None = None
     ) -> None:

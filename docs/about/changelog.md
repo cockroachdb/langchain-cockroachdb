@@ -5,6 +5,13 @@ All notable changes to langchain-cockroachdb will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `delete_by_filter` and `adelete_by_filter` remove vector-store documents by metadata, scoped to the store's namespace. Empty predicates are rejected and values are bound parameters. Deletes use the existing retry policy and return success rather than a potentially misleading count after a retry.
+- A runnable document-refresh recipe writes replacement chunks with stable IDs before removing older revisions. It covers source removal, replay, and the requirement to serialize refreshes for each tenant/source.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

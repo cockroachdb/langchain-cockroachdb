@@ -48,6 +48,8 @@ Complete API reference for AsyncCockroachDBVectorStore and CockroachDBVectorStor
 |--------|-------|-------------|
 | `adelete()` | ✓ | Delete documents |
 | `delete()` | - | Sync wrapper |
+| `adelete_by_filter()` | ✓ | Delete documents matching metadata |
+| `delete_by_filter()` | - | Sync wrapper |
 
 ## Examples
 

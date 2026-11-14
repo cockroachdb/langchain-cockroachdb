@@ -301,12 +301,27 @@ ids_to_delete = ["id1", "id2", "id3"]
 await vectorstore.adelete(ids=ids_to_delete)
 ```
 
-### Delete All
+### Delete by Metadata Filter
+
+Delete every row whose metadata matches a filter, without listing ids. This is
+useful for removing all chunks of one source, for example to replace a document
+that was re-ingested. The delete is scoped to the store's namespace and uses the
+same operator grammar as search filters.
 
 ```python
-# Delete all documents in collection
-await vectorstore.adelete()
+# Remove every chunk that came from one source document
+await vectorstore.adelete_by_filter({"source": "report-2024.pdf"})
+
+# Sync
+vectorstore.delete_by_filter({"source": "report-2024.pdf"})
 ```
+
+An empty or missing filter raises `ValueError`. Review non-empty filters carefully: a broad predicate can still match every row in the namespace or table.
+
+The result is `True` when the statement succeeds, including when it matches no rows. It is not a count, because a retry after a committed delete can match zero rows.
+
+Calling `adelete()` without IDs does nothing. To remove an entire collection,
+use the engine's explicit table-drop API only when you intend to remove its schema too.
 
 ## Retriever Interface
 
@@ -602,3 +617,21 @@ except Exception as e:
 - [Hybrid Search](hybrid-search.md) - Combine FTS with vectors
 - [Configuration](../getting-started/configuration.md) - Tune for your workload
 - [LangChain Official: CockroachDB Vector Store](https://docs.langchain.com/oss/python/integrations/vectorstores/cockroachdb)
+
+## Refresh source documents
+
+Run `examples/document_refresh.py` for a complete source-update and removal recipe
+using local deterministic embeddings. It hashes the new chunks and assigns stable
+IDs that include the tenant, source, revision, and chunk position. Replaying the
+same revision updates the same rows instead of creating duplicates.
+
+The recipe writes all new chunks before deleting older revisions with
+`adelete_by_filter`. If embedding or insertion fails, it leaves the old revision
+in place. A partial insert can leave some new chunks too; rerun the same revision
+to complete it. Passing an empty chunk list removes the source.
+
+This is not an atomic switch: readers can see both revisions during a refresh.
+Serialize jobs for each tenant/source, including retries, because a stale job
+can otherwise delete a newer revision. The recipe embeds unchanged content again;
+use an indexing record manager if you need to skip unchanged documents. Changing
+embedding models or dimensions needs a separate collection and a migration plan.
