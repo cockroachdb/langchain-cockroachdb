@@ -6,6 +6,7 @@ from langchain_cockroachdb.async_vectorstore import (
 )
 from langchain_cockroachdb.chat_message_histories import CockroachDBChatMessageHistory
 from langchain_cockroachdb.checkpointer import AsyncCockroachDBSaver, CockroachDBSaver
+from langchain_cockroachdb.diagnostics import SearchDiagnostics
 from langchain_cockroachdb.engine import CockroachDBEngine
 from langchain_cockroachdb.hybrid_search_config import FusionType, HybridSearchConfig
 from langchain_cockroachdb.indexes import (
@@ -48,6 +49,7 @@ __all__ = [
     "CockroachDBVectorStore",
     "CSPANNIndex",
     "CSPANNQueryOptions",
+    "SearchDiagnostics",
     "DistanceStrategy",
     "VECTOR_INDEX_REFRESH_SECONDS",
     "FusionType",
