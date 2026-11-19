@@ -56,8 +56,11 @@ class CSPANNIndex:
 
         Args:
             distance_strategy: Distance metric to use
-            min_partition_size: Minimum partition size for C-SPANN
-            max_partition_size: Maximum partition size for C-SPANN
+            min_partition_size: Minimum partition size for C-SPANN. Give
+                max_partition_size with it: CockroachDB v26.4 rejects a
+                minimum given alone
+            max_partition_size: Maximum partition size for C-SPANN. On
+                CockroachDB v26.4 it must be at least four times the minimum
             name: Optional custom index name
         """
         if name is not None:

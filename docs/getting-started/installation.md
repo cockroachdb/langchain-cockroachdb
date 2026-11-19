@@ -3,7 +3,7 @@
 ## Requirements
 
 - Python 3.10 or higher
-- CockroachDB v25.4 or later (tested on v25.4 LTS and v26.3)
+- CockroachDB v25.4 or later (tested on v25.4 LTS and v26.4)
 - The package uses psycopg 3 only
 
 ## Install from PyPI

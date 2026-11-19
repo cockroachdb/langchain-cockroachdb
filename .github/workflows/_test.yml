@@ -11,7 +11,7 @@ on:
         description: CockroachDB image tag
         required: false
         type: string
-        default: "v26.3.2"
+        default: "v26.4.1"
       resolution:
         description: "highest, or lowest-direct to test the minimum declared versions"
         required: false

@@ -81,6 +81,8 @@ await vectorstore.aapply_vector_index(index)
 - Larger partitions = faster queries, lower accuracy
 - Default (None) = CockroachDB chooses optimal size
 
+Give both sizes, with the maximum at least four times the minimum. CockroachDB v26.4 enforces that ratio. It also rejects a `min_partition_size` given without a `max_partition_size`, with the error "max_partition_size (0) must be at least four times the value of min_partition_size" ([cockroachlabs/cockroach#13982](https://github.com/cockroachlabs/cockroach/issues/13982)). Earlier versions accept a minimum on its own.
+
 ### Custom Index Name
 
 ```python
