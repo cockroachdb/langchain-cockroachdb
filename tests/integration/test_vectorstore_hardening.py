@@ -273,7 +273,8 @@ async def test_index_warns_on_partition_size_difference(engine_factory, caplog) 
     await engine.ainit_vectorstore_table(table, DIM)
     store = AsyncCockroachDBVectorStore(engine, DeterministicFakeEmbedding(size=DIM), table)
     await store.aadd_texts(["a"])
-    await store.aapply_vector_index(CSPANNIndex(min_partition_size=100))
+    # Created with both sizes: CockroachDB v26.4 rejects a minimum given alone
+    await store.aapply_vector_index(CSPANNIndex(min_partition_size=100, max_partition_size=400))
     with caplog.at_level(logging.WARNING, logger="langchain_cockroachdb.async_vectorstore"):
         await store.aapply_vector_index(CSPANNIndex(min_partition_size=200))
     assert any("min_partition_size = 200" in record.message for record in caplog.records)

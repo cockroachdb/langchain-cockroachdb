@@ -214,9 +214,11 @@ class TestAsyncCockroachDBVectorStore:
         """Test creating vector index."""
         await vectorstore.aadd_texts(sample_texts)
 
+        # Both sizes: CockroachDB v26.4 rejects a minimum given alone
         index = CSPANNIndex(
             distance_strategy=DistanceStrategy.COSINE,
             min_partition_size=10,
+            max_partition_size=50,
         )
 
         await vectorstore.aapply_vector_index(index)
