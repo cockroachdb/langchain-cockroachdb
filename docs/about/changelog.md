@@ -5,6 +5,12 @@ All notable changes to langchain-cockroachdb will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Tested on CockroachDB v26.4. CI's main jobs now run on v26.4.1, next to the v25.4 minimum. On v26.4 a vector index that sets `min_partition_size` must set `max_partition_size` too, at least four times it: v26.4 enforces that ratio and rejects a minimum given alone (cockroachlabs/cockroach#13982). Earlier versions accept a minimum on its own. The vector index guide and the `CSPANNIndex` docstring now say so. The memory store's `cspann` setting already required both sizes.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added
