@@ -2131,7 +2131,9 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Minimum partition size for C-SPANN</p>
+                <p>Minimum partition size for C-SPANN. Give
+max_partition_size with it: CockroachDB v26.4 rejects a
+minimum given alone</p>
               </div>
             </td>
             <td>
@@ -2147,7 +2149,8 @@ Based on Microsoft's SPANN (Space Partition with Approximate Nearest Neighbor).<
             </td>
             <td>
               <div class="doc-md-description">
-                <p>Maximum partition size for C-SPANN</p>
+                <p>Maximum partition size for C-SPANN. On
+CockroachDB v26.4 it must be at least four times the minimum</p>
               </div>
             </td>
             <td>

@@ -2676,6 +2676,7 @@
 - Smaller partitions = higher accuracy, slower queries
 - Larger partitions = faster queries, lower accuracy
 - Default (None) = CockroachDB chooses optimal size</p>
+<p>Give both sizes, with the maximum at least four times the minimum. CockroachDB v26.4 enforces that ratio. It also rejects a <code>min_partition_size</code> given without a <code>max_partition_size</code>, with the error "max_partition_size (0) must be at least four times the value of min_partition_size" (<a href="https://github.com/cockroachlabs/cockroach/issues/13982">cockroachlabs/cockroach#13982</a>). Earlier versions accept a minimum on its own.</p>
 <h3 id="custom-index-name">Custom Index Name<a class="headerlink" href="#custom-index-name" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">index</span> <span class="o">=</span> <span class="n">CSPANNIndex</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"my_custom_index_name"</span><span class="p">)</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">await</span> <span class="n">vectorstore</span><span class="o">.</span><span class="n">aapply_vector_index</span><span class="p">(</span><span class="n">index</span><span class="p">)</span>
